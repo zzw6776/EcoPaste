@@ -1,10 +1,10 @@
-import type { WindowPosition as WindowPositionType } from "@/types/store";
+import type { ClipboardStore } from "@/types/store";
 import { Flex, Segmented } from "antd";
 import { useSnapshot } from "valtio";
 
 interface Option {
 	label: string;
-	value: WindowPositionType;
+	value: ClipboardStore["windowPosition"];
 }
 
 const WindowPosition = () => {
@@ -25,7 +25,7 @@ const WindowPosition = () => {
 		},
 	];
 
-	const handleChange = (value: WindowPositionType) => {
+	const handleChange = (value: Option["value"]) => {
 		clipboardStore.windowPosition = value;
 	};
 
