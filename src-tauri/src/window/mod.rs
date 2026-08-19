@@ -144,7 +144,7 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     let result = windows::show_window(app_handle, label);
     if result.is_ok() && !delays_clipboard_visibility_event(label) {
         if label == CLIPBOARD_WINDOW_LABEL {
-            preview::resume_after_clipboard_show();
+            preview::resume_after_clipboard_show(app_handle);
         }
         emit_visibility(app_handle, label, true);
         lifecycle::on_shown(app_handle, label);
@@ -201,6 +201,11 @@ pub fn show_taskbar_icon(app_handle: &AppHandle, visible: bool) -> Result<()> {
 pub fn position_window(app_handle: &AppHandle, label: &str, pos: WindowPosition) -> Result<()> {
     let window = get_window(app_handle, label)?;
     position::position_window(&window, pos)
+}
+
+pub fn resize_clipboard_window(app_handle: &AppHandle, height: f64) -> Result<()> {
+    let window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
+    position::set_clipboard_height(&window, height)
 }
 
 /// 剪贴板窗口显示前按设置应用窗口定位策略。

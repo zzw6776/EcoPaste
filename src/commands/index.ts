@@ -130,6 +130,8 @@ export interface ClipboardPreviewPayload {
   kind: ClipboardKind;
   subKind: ClipboardSubKind | null;
   updatedAt: string;
+  sourceAppName?: string | null;
+  sourceAppIconPath?: string | null;
   text: string | null;
   imagePath: string | null;
   imageWidth: number | null;
@@ -305,6 +307,13 @@ const toAppError = (error: unknown): AppError => {
   return { kind: "Unknown", message: String(error) };
 };
 
+import { isTauri } from "@/utils/is";
+import {
+  DEFAULT_MOCK_SETTINGS,
+  MOCK_GROUPS,
+  MOCK_PAGE,
+} from "@/utils/mockData";
+
 /**
  * invoke 的通用包装：失败 → log + toast + rethrow。
  * `label` 用于 toast 文案（"xxx 失败：message"）。
@@ -314,6 +323,19 @@ const call = async <T>(
   labelKey: string,
   args?: Record<string, unknown>,
 ): Promise<T> => {
+  if (!isTauri) {
+    if (command === TAURI_COMMAND.GET_SETTINGS) {
+      return DEFAULT_MOCK_SETTINGS as unknown as T;
+    }
+    if (command === TAURI_COMMAND.LIST_CLIPBOARD_ITEMS) {
+      return MOCK_PAGE as unknown as T;
+    }
+    if (command === TAURI_COMMAND.LIST_CLIPBOARD_GROUPS) {
+      return MOCK_GROUPS as unknown as T;
+    }
+    return undefined as unknown as T;
+  }
+
   try {
     return await invoke<T>(command, args);
   } catch (error) {
@@ -1294,6 +1316,19 @@ export const setClipboardWindowPinned = (pinned: boolean) => {
     "commands:labels.setClipboardWindowPinned",
     {
       pinned,
+    },
+  );
+};
+
+/**
+ * 动态调整剪贴板主窗口高度（顶部边框拖拽拉伸）。
+ */
+export const resizeClipboardWindow = (height: number) => {
+  return call<void>(
+    TAURI_COMMAND.RESIZE_CLIPBOARD_WINDOW,
+    "commands:labels.resizeClipboardWindow",
+    {
+      height,
     },
   );
 };

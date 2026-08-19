@@ -1,3 +1,11 @@
+html,
+body,
+#root,
+.ant-app {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
 html {
   --uno: scheme-light select-none overscroll-none antialiased;
 
@@ -15,6 +23,20 @@ html {
     * {
       outline: none;
     }
+  }
+}
+
+/* 彻底隐藏所有滚动条（对标 Paste 原生极简视觉，手势/触摸板/鼠标滚轮/键盘滚动依然完美生效） */
+*,
+*::before,
+*::after {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+
+  &::-webkit-scrollbar {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
   }
 }
 

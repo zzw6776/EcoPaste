@@ -14,17 +14,17 @@ import { settingsState } from "@/stores/settings";
 import { cn } from "@/utils/cn";
 import { log } from "@/utils/log";
 import { cacheKey } from "./cache";
-import { PreviewContent, PreviewHeader } from "./components/PreviewContent";
-import PreviewContentTransition from "./components/PreviewContentTransition";
 import {
-  PREVIEW_CONNECTOR_VARIANTS,
-  PREVIEW_PANEL_TRANSITION,
-  PREVIEW_PANEL_VARIANTS,
-} from "./constants";
+  PreviewContent,
+  PreviewFooter,
+  PreviewHeader,
+} from "./components/PreviewContent";
+import PreviewContentTransition from "./components/PreviewContentTransition";
+import { PREVIEW_PANEL_TRANSITION, PREVIEW_PANEL_VARIANTS } from "./constants";
 import { resolveConnector } from "./geometry";
 import { usePreviewPayload, usePreviewRenderState } from "./hooks";
 import {
-  rectStyle,
+  clamp,
   resolveDynamicPanelRect,
   resolveEffectivePanelSize,
   resolveMeasurePanelStyle,
@@ -130,48 +130,21 @@ const Preview: FC = () => {
 
   const isLoading = loadingItemId !== null;
   const payloadKey = payload ? cacheKey(payload, redactSecrets) : "empty";
-  const { layout } = visibleState;
-  const svgStyle = rectStyle(layout.overlayRect);
+  const sourceRect = visibleState.layout.sourceRect;
+  const arrowLeft =
+    panelRect && panelRect.width > 0
+      ? clamp(
+          sourceRect.left + sourceRect.width / 2 - panelRect.left,
+          24,
+          panelRect.width - 24,
+        )
+      : "50%";
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-transparent">
-      <motion.svg
-        animate={active ? "open" : "closed"}
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0 z-10 overflow-visible"
-        initial="closed"
-        role="presentation"
-        style={svgStyle}
-        transition={PREVIEW_PANEL_TRANSITION}
-        variants={PREVIEW_CONNECTOR_VARIANTS}
-        viewBox={`0 0 ${layout.overlayRect.width} ${layout.overlayRect.height}`}
-      >
-        <motion.path
-          className="stroke-ant-primary"
-          d={motionLayout.path}
-          fill="none"
-          strokeLinecap="round"
-          strokeWidth="2"
-        />
-        <motion.circle
-          className="fill-ant-container stroke-ant-primary"
-          cx={motionLayout.sourceDotX}
-          cy={motionLayout.sourceDotY}
-          r="4"
-          strokeWidth="2.5"
-        />
-        <motion.circle
-          className="fill-ant-container stroke-ant-primary"
-          cx={motionLayout.targetDotX}
-          cy={motionLayout.targetDotY}
-          r="4"
-          strokeWidth="2.5"
-        />
-      </motion.svg>
-
       <div
         aria-hidden="true"
-        className="pointer-events-none invisible absolute top-0 left-0 z-0 flex w-fit min-w-72 max-w-120 flex-col overflow-visible rounded-2 border border-ant-border bg-ant-container/95 shadow-lg backdrop-blur"
+        className="pointer-events-none invisible absolute top-0 left-0 z-0 flex w-fit min-w-[460px] max-w-[680px] flex-col overflow-visible rounded-[20px] bg-white dark:bg-[#1E1E1E]"
         ref={panelMeasureRef}
         style={panelMeasureStyle}
       >
@@ -182,33 +155,48 @@ const Preview: FC = () => {
             <PreviewContent payload={payload} />
           </div>
         )}
+
+        <PreviewFooter payload={payload} />
       </div>
 
       <motion.div
         animate={active ? "open" : "closed"}
-        className="absolute z-5 flex max-h-120 min-w-72 max-w-120 flex-col overflow-hidden rounded-2 border border-ant-border bg-ant-container/95 shadow-lg backdrop-blur"
+        className="absolute z-10 flex max-h-[600px] min-h-[260px] min-w-[460px] max-w-[680px] flex-col overflow-visible rounded-[22px] border-0 bg-white shadow-[0_25px_65px_-10px_rgba(0,0,0,0.28),0_10px_25px_-5px_rgba(0,0,0,0.12),0_0_1px_rgba(0,0,0,0.18)] dark:bg-[#1E1E1E] dark:shadow-[0_25px_65px_-10px_rgba(0,0,0,0.65),0_0_1px_rgba(255,255,255,0.15)]"
         initial="closed"
         style={motionLayout.panelStyle}
         transition={PREVIEW_PANEL_TRANSITION}
         variants={PREVIEW_PANEL_VARIANTS}
       >
-        <PreviewContentTransition contentKey={payloadKey}>
-          <PreviewHeader payload={payload} />
+        <div className="relative flex size-full flex-col overflow-hidden rounded-[22px]">
+          <PreviewContentTransition contentKey={payloadKey}>
+            <PreviewHeader payload={payload} />
 
-          <div
-            className={cn("min-h-0 flex-1 overflow-hidden transition-opacity", {
-              "opacity-60": isLoading && payload !== null,
-            })}
-          >
-            <PreviewContent payload={payload} />
-          </div>
-        </PreviewContentTransition>
+            <div
+              className={cn(
+                "min-h-0 flex-1 overflow-hidden transition-opacity",
+                {
+                  "opacity-60": isLoading && payload !== null,
+                },
+              )}
+            >
+              <PreviewContent payload={payload} />
+            </div>
 
-        {isLoading && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-ant-mask/10">
-            <Spin size="small" />
-          </div>
-        )}
+            <PreviewFooter payload={payload} />
+          </PreviewContentTransition>
+
+          {isLoading && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/10">
+              <Spin size="small" />
+            </div>
+          )}
+        </div>
+
+        {/* 底部居中下指小箭头（精确指向当前选中卡片的水平中心点） */}
+        <div
+          className="pointer-events-none absolute -bottom-1.5 size-3.5 -translate-x-1/2 rotate-45 bg-white shadow-[2px_2px_4px_rgba(0,0,0,0.06)] dark:bg-[#1E1E1E]"
+          style={{ left: arrowLeft }}
+        />
       </motion.div>
     </div>
   );

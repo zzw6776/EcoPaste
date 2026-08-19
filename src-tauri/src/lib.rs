@@ -137,6 +137,7 @@ pub fn run() {
             commands::get_context_menu_payload,
             commands::get_context_submenu_payload,
             commands::toggle_window,
+            commands::resize_clipboard_window,
             commands::notify_window_ready,
             commands::set_window_dirty,
             commands::acquire_window_keepalive,

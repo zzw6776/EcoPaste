@@ -14,9 +14,9 @@ import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
 import { router } from "./router";
 import { settingsReady, settingsState } from "./stores/settings";
-import "./stores/windowLifecycle";
 import type { Language } from "./types/settings";
 import { setMessageApi, setModalApi } from "./utils/feedback";
+import { isTauri } from "./utils/is";
 import { log } from "./utils/log";
 
 const ANTD_MODAL_CONFIG = {
@@ -52,7 +52,9 @@ const App: FC = () => {
 
   const { i18n } = useTranslation();
   const settings = useSnapshot(settingsState);
-  const windowLabel = getCurrentWebviewWindow().label;
+  const windowLabel = isTauri
+    ? getCurrentWebviewWindow().label
+    : WINDOW_LABEL.CLIPBOARD;
   const mode =
     windowLabel === WINDOW_LABEL.ONBOARDING
       ? "dark"
@@ -94,7 +96,7 @@ const App: FC = () => {
 
   return (
     <ConfigProvider locale={locale} modal={ANTD_MODAL_CONFIG} theme={antdTheme}>
-      <AntdApp>
+      <AntdApp message={{ duration: 1.5, maxCount: 2, top: 56 }}>
         <AppContent />
       </AntdApp>
     </ConfigProvider>

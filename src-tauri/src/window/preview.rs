@@ -33,8 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const PREVIEW_UPDATED_EVENT: &str = "preview://updated";
-const PREVIEW_PANEL_WIDTH: f64 = 480.0;
-const PREVIEW_PANEL_HEIGHT: f64 = 480.0;
+const PREVIEW_PANEL_WIDTH: f64 = 680.0;
+const PREVIEW_PANEL_HEIGHT: f64 = 600.0;
 const PREVIEW_PANEL_GAP: f64 = 40.0;
 const PREVIEW_PANEL_MARGIN: f64 = 32.0;
 const PREVIEW_POINTER_ANCHOR_SIZE: f64 = 1.0;
@@ -216,10 +216,14 @@ pub fn suppress_for_clipboard_hide(app: &AppHandle) {
     }
 }
 
-/// 剪贴板窗口重新显示后允许新的预览请求进入。预览窗口不随剪贴板窗口预创建，
-/// 由首次 [`show_clipboard_preview`] 经 `ensure_preview_window` 按需建窗。
-pub fn resume_after_clipboard_show() {
+/// 剪贴板窗口重新显示后允许新的预览请求进入，并在后台静默预热预览窗口，
+/// 确保用户按下空格键时能够 0 延迟秒开预览。
+pub fn resume_after_clipboard_show(app: &AppHandle) {
     PREVIEW_SUPPRESSED.store(false, Ordering::SeqCst);
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = ensure_preview_window(&app_handle);
+    });
 }
 
 /// 返回预览窗口最近一次收到的状态，供预览页首屏补拉。
@@ -446,6 +450,7 @@ fn ensure_macos_preview_panel(app: &AppHandle, window: &WebviewWindow) -> Result
 
 #[cfg(target_os = "macos")]
 fn setup_macos_preview_panel(app: &AppHandle, window: &WebviewWindow) -> Result<()> {
+    let _ = window.set_background_color(Some(tauri_utils::config::Color(0, 0, 0, 0)));
     let panel = match app.get_webview_panel(CLIPBOARD_PREVIEW_WINDOW_LABEL) {
         Ok(panel) => panel,
         Err(_) => window
@@ -676,6 +681,11 @@ fn resolve_panel_rect(
     let panel_size = (PREVIEW_PANEL_WIDTH, PREVIEW_PANEL_HEIGHT);
     let candidates = [
         (
+            PreviewPlacement::Top,
+            source_rect.top - PREVIEW_PANEL_GAP - PREVIEW_PANEL_HEIGHT - PREVIEW_PANEL_MARGIN
+                >= overlay_rect.top,
+        ),
+        (
             PreviewPlacement::Right,
             source_rect.right() + PREVIEW_PANEL_GAP + PREVIEW_PANEL_WIDTH + PREVIEW_PANEL_MARGIN
                 <= overlay_rect.right(),
@@ -690,17 +700,12 @@ fn resolve_panel_rect(
             source_rect.bottom() + PREVIEW_PANEL_GAP + PREVIEW_PANEL_HEIGHT + PREVIEW_PANEL_MARGIN
                 <= overlay_rect.bottom(),
         ),
-        (
-            PreviewPlacement::Top,
-            source_rect.top - PREVIEW_PANEL_GAP - PREVIEW_PANEL_HEIGHT - PREVIEW_PANEL_MARGIN
-                >= overlay_rect.top,
-        ),
     ];
 
     let placement = candidates
         .iter()
         .find_map(|(placement, fits)| fits.then_some(*placement))
-        .unwrap_or(PreviewPlacement::Right);
+        .unwrap_or(PreviewPlacement::Top);
     let raw = raw_panel_rect(source_rect, placement, panel_size);
 
     (

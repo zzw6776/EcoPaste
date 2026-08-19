@@ -272,6 +272,8 @@ pub struct ClipboardPreviewPayload {
     pub kind: ClipboardKind,
     pub sub_kind: Option<ClipboardSubKind>,
     pub updated_at: DateTime<Utc>,
+    pub source_app_name: Option<String>,
+    pub source_app_icon_path: Option<String>,
     /// 预览窗口展示用纯文本。HTML / RTF 条目返回 `search_text`，不返回富文本源。
     pub text: Option<String>,
     pub image_path: Option<String>,
@@ -327,6 +329,7 @@ pub async fn get_clipboard_preview_payload(
     db: State<'_, DatabaseState>,
     image_store: State<'_, ImageStore>,
     file_icon_store: State<'_, FileIconStore>,
+    app_icon_store: State<'_, AppIconStore>,
     item_id: String,
 ) -> Result<Option<ClipboardPreviewPayload>> {
     let pool = db.pool().await;
@@ -344,6 +347,7 @@ pub async fn get_clipboard_preview_payload(
         &pool,
         &image_store,
         &file_icon_store,
+        &app_icon_store,
         item,
         redact_sensitive,
     )
@@ -871,9 +875,11 @@ async fn build_clipboard_preview_payload(
     pool: &SqlitePool,
     image_store: &ImageStore,
     file_icon_store: &FileIconStore,
-    item: ClipboardItem,
+    app_icon_store: &AppIconStore,
+    mut item: ClipboardItem,
     redact_sensitive: bool,
 ) -> Result<ClipboardPreviewPayload> {
+    attach_source_app_icon_path(app_icon_store, &mut item);
     let mut text = None;
     let mut image_path = None;
     let mut image_exists = false;
@@ -902,6 +908,8 @@ async fn build_clipboard_preview_payload(
         kind: item.kind,
         sub_kind: preview_sub_kind,
         updated_at: item.updated_at,
+        source_app_name: item.source_app_name,
+        source_app_icon_path: item.source_app_icon_path,
         text,
         image_path,
         image_width: item.width,

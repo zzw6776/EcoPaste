@@ -15,8 +15,7 @@
 //! 纯文本模式（`plain = true`）：忽略 `sub_kind`，写 `search_text`（OS 提供的纯文本表示），
 //! 缺失时退回 `content`。供「纯文本粘贴」快捷路径使用。
 
-use clipboard_rs::common::RustImage;
-use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, RustImageData};
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 use super::guard::WritebackGuard;
 use super::storage::ImageStore;
@@ -95,7 +94,7 @@ fn write_text(
 }
 
 fn write_image(
-    ctx: &ClipboardContext,
+    _ctx: &ClipboardContext,
     store: &ImageStore,
     guard: &WritebackGuard,
     item: &ClipboardItem,
@@ -105,10 +104,37 @@ fn write_image(
         log::error!("read image {path:?} failed: {err}");
         AppError::Clipboard(err.to_string())
     })?;
-    let image = RustImageData::from_bytes(&bytes).map_err(clip_err)?;
 
     guard.suppress(item.content_hash.clone());
-    ctx.set_image(image).map_err(clip_err)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::runtime::ProtocolObject;
+        use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypePNG};
+        use objc2_foundation::{NSArray, NSData};
+
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let ns_data = unsafe {
+            NSData::dataWithBytes_length(bytes.as_ptr() as *const std::ffi::c_void, bytes.len())
+        };
+        let item_obj = NSPasteboardItem::new();
+        unsafe {
+            item_obj.setData_forType(&ns_data, NSPasteboardTypePNG);
+            let write_objects =
+                NSArray::from_retained_slice(&[ProtocolObject::from_retained(item_obj)]);
+            if !pasteboard.writeObjects(&write_objects) {
+                return Err(AppError::Clipboard("writeObjects failed".to_owned()));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let image = RustImageData::from_bytes(&bytes).map_err(clip_err)?;
+        ctx.set_image(image).map_err(clip_err)?;
+    }
+
     Ok(())
 }
 

@@ -3,8 +3,6 @@
 
 #![allow(clippy::unused_unit)]
 
-use std::time::Duration;
-
 use tauri::{AppHandle, Manager};
 use tauri_nspanel::{
     tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt,
@@ -13,8 +11,6 @@ use tauri_nspanel::{
 use super::{get_window, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
 use crate::core::Result;
 use crate::settings::SettingsStore;
-
-const CLIPBOARD_PANEL_SHOW_DELAY: Duration = Duration::from_millis(16);
 
 tauri_panel! {
     panel!(MainPanel {
@@ -37,6 +33,7 @@ pub fn register_plugin(app_handle: &AppHandle) {
 
 /// setup 末尾调用：转 NSPanel + 绑事件 emit。
 pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
+    disable_app_nap();
     show_taskbar_icon(app_handle, false)?;
 
     let clipboard_window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
@@ -45,9 +42,15 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
         .to_panel::<MainPanel>()
         .map_err(|e| anyhow::anyhow!("to_panel failed: {e:?}"))?;
 
-    panel.set_corner_radius(16.0);
+    panel.set_corner_radius(26.0);
     panel.set_level(PanelLevel::Dock.value());
-    panel.set_style_mask(StyleMask::empty().resizable().nonactivating_panel().into());
+    panel.set_style_mask(
+        StyleMask::empty()
+            .borderless()
+            .resizable()
+            .nonactivating_panel()
+            .into(),
+    );
     panel.set_collection_behavior(
         CollectionBehavior::new()
             .stationary()
@@ -74,6 +77,16 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     panel.set_event_handler(Some(handler.as_ref()));
 
     Ok(())
+}
+
+/// 禁用 macOS App Nap，确保长时间未唤醒时依然保持 0 毫秒即时响应。
+pub fn disable_app_nap() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let process_info = NSProcessInfo::processInfo();
+    let reason = NSString::from_str("Keep clipboard manager responsive for global hotkeys");
+    let options = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+    let activity = process_info.beginActivityWithOptions_reason(options, &reason);
+    std::mem::forget(activity);
 }
 
 pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
@@ -128,13 +141,9 @@ pub fn handle_reopen(app_handle: &AppHandle, has_visible_windows: bool) {
 
 /// 所有 panel 方法必须在主线程。
 fn show_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
-    let handle = app_handle.clone();
-
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(CLIPBOARD_PANEL_SHOW_DELAY).await;
-
-        let panel_handle = handle.clone();
-        if let Err(err) = handle.run_on_main_thread(move || {
+    let panel_handle = app_handle.clone();
+    app_handle
+        .run_on_main_thread(move || {
             if let Ok(panel) = panel_handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 panel.show_and_make_key();
                 // show 时切到 can_join_all_spaces：跟随用户当前 space 出现。
@@ -145,14 +154,12 @@ fn show_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
                         .full_screen_auxiliary()
                         .into(),
                 );
-                super::preview::resume_after_clipboard_show();
+                super::preview::resume_after_clipboard_show(&panel_handle);
                 super::emit_visibility(&panel_handle, CLIPBOARD_WINDOW_LABEL, true);
                 super::lifecycle::on_shown(&panel_handle, CLIPBOARD_WINDOW_LABEL);
             }
-        }) {
-            log::warn!("show clipboard panel on main thread failed: {err}");
-        }
-    });
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(())
 }

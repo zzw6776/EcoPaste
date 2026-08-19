@@ -1,4 +1,4 @@
-import { useDebounceFn } from "ahooks";
+import { useDebounceFn, useMount } from "ahooks";
 import type { MenuProps } from "antd";
 import type { ChangeEvent, FC } from "react";
 import { useState } from "react";
@@ -6,21 +6,31 @@ import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import {
   clearClipboardItems,
-  setClipboardWindowPinned,
+  createClipboardGroup,
+  deleteClipboardGroup,
+  listClipboardGroups,
   showWindow,
+  updateClipboardGroup,
 } from "@/commands";
-import CustomIconButton from "@/components/CustomIconButton";
+import ClipboardGroupIcon from "@/components/ClipboardGroupIcon";
+import ClipboardGroupPopover, {
+  parseGroupIcon,
+} from "@/components/ClipboardGroupPopover";
 import Dropdown, {
   type AppDropdownProps,
   type DropdownMenuItems,
 } from "@/components/Dropdown";
-import KeyHint from "@/components/KeyHint";
-import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
+import type {
+  ClipboardGroupInput,
+  ClipboardGroupRecord,
+} from "@/types/clipboard";
+import { cn } from "@/utils/cn";
+import { getModalApi } from "@/utils/feedback";
 import { formatShortcutDisplay } from "@/utils/shortcut";
 import SearchInput from "./SearchInput";
 
@@ -35,100 +45,122 @@ const MORE_ACTION_TRIGGER: AppDropdownProps["trigger"] = ["click"];
 const PREFERENCE_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+,", " ");
 
 /**
- * 剪贴板窗口顶部条：logo、搜索框（⌘F / Ctrl+F 聚焦）、固定窗口与更多操作入口。
+ * 1:1 复刻 Paste 官方顶部栏：
+ * 左侧 🔍 极简搜索，中间绝对居中 Pinboards（剪贴板胶囊 + 收藏 + 自定义画板 + 新建），右侧极简 `...` 更多。
  */
 const Header: FC = () => {
   const { t } = useTranslation("clipboard");
   const settings = useSnapshot(settingsState);
-  const [pinned, setPinned] = useState(false);
+  const snapshot = useSnapshot(clipboardViewState);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [customGroups, setCustomGroups] = useState<ClipboardGroupRecord[]>([]);
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const [popoverGroup, setPopoverGroup] = useState<ClipboardGroupRecord | null>(
+    null,
+  );
+  const [popoverMode, setPopoverMode] = useState<"create" | "edit">("create");
+
   const [searchBlurToken, setSearchBlurToken] = useState(0);
   const [searchClearToken, setSearchClearToken] = useState(0);
   const [searchFocusToken, setSearchFocusToken] = useState(0);
 
-  /**
-   * 统一处理偏好设置入口（按钮点击/快捷键）。
-   */
+  const { groupId, range } = snapshot;
+
+  const loadGroups = async () => {
+    const groups = await listClipboardGroups();
+    setCustomGroups((groups || []).filter((g) => !g.isHidden));
+  };
+
+  useMount(() => {
+    void loadGroups();
+  });
+
+  useTauriListen(TAURI_EVENT.CLIPBOARD_GROUPS_UPDATED, () => {
+    void loadGroups();
+  });
+
   const handleOpenPreference = () => {
     return showWindow(WINDOW_LABEL.PREFERENCE);
   };
 
-  /**
-   * 清空剪贴板历史；确认、toast 与后端调用统一收口在命令包装内。
-   */
   const handleClearClipboardItems = async () => {
     await clearClipboardItems();
   };
 
-  /**
-   * 更多操作菜单分发：危险操作走确认弹窗，偏好设置打开独立窗口。
-   */
   const handleMoreMenuClick: MenuProps["onClick"] = async (info) => {
     const key = info.key as HeaderMoreMenuKey;
-
     if (key === "clear") {
       await handleClearClipboardItems();
-
       return;
     }
-
     await handleOpenPreference();
   };
 
-  /**
-   * 切换剪贴板窗口固定态：Rust 侧立即生效（resign_key / 外部点击钩子读取），本地态仅用于按钮渲染。
-   */
-  const handleTogglePinned = async () => {
-    const next = !pinned;
+  const [searchValue, setSearchValue] = useState("");
 
-    await setClipboardWindowPinned(next);
-    setPinned(next);
-  };
-
-  /**
-   * 防抖写入共享 store：连续打字时仅保留最后一次值，下游 List 直接消费 store 触发查询。
-   * 搜索框自身不受 store 控制（非受控），避免 IME composition 期回灌导致重复字符。
-   */
-  const { cancel: cancelKeywordChange, run: handleKeywordChange } =
+  const { cancel: cancelKeywordChange, run: debouncedSetKeyword } =
     useDebounceFn(
-      (event: ChangeEvent<HTMLInputElement>) => {
-        clipboardViewState.keyword = event.target.value.trim();
+      (val: string) => {
+        clipboardViewState.keyword = val;
       },
       { wait: 200 },
     );
 
-  /**
-   * 递增 token 触发搜索框清空，同时同步查询状态回到完整列表。
-   */
+  const handleKeywordChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const val = event.target.value;
+    setSearchValue(val);
+    debouncedSetKeyword(val.trim());
+  };
+
   const clearSearch = () => {
     cancelKeywordChange();
+    setSearchValue("");
     clipboardViewState.keyword = "";
-
-    setSearchClearToken((current) => {
-      return current + 1;
-    });
+    setSearchClearToken((c) => c + 1);
   };
 
-  /**
-   * 递增 token 让搜索框失焦，避免窗口重新打开时保留上一次 activeElement。
-   */
   const blurSearch = () => {
-    setSearchBlurToken((current) => {
-      return current + 1;
-    });
+    setSearchBlurToken((c) => c + 1);
   };
 
-  /**
-   * 递增 token 触发搜索框在窗口完成显示后的下一帧聚焦。
-   */
   const focusSearch = () => {
-    setSearchFocusToken((current) => {
-      return current + 1;
-    });
+    setSearchOpen(true);
+    setSearchFocusToken((c) => c + 1);
   };
 
-  /**
-   * 剪贴板窗口显隐变化时执行搜索框偏好：下次显示时清空关键词，显示后按设置自动聚焦。
-   */
+  useMount(() => {
+    void loadGroups();
+
+    const handleTypeToSearch = (event: Event) => {
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === "INPUT" ||
+          activeEl.tagName === "TEXTAREA" ||
+          (activeEl as HTMLElement).isContentEditable)
+      ) {
+        return;
+      }
+
+      const customEvent = event as CustomEvent<{ key?: string }>;
+      const key = customEvent.detail?.key;
+      if (!key) return;
+
+      setSearchOpen(true);
+      setSearchValue((prev) => {
+        const next = prev ? prev + key : key;
+        debouncedSetKeyword(next.trim());
+        return next;
+      });
+      setSearchFocusToken((c) => c + 1);
+    };
+
+    window.addEventListener("ecopaste:type-to-search", handleTypeToSearch);
+    return () => {
+      window.removeEventListener("ecopaste:type-to-search", handleTypeToSearch);
+    };
+  });
+
   const handleWindowVisibility = (event: {
     payload: WindowVisibilityPayload;
   }) => {
@@ -137,11 +169,10 @@ const Header: FC = () => {
 
     if (!visible) {
       blurSearch();
-
       if (settings.clipboard.search.clearOnHide) {
         clearSearch();
+        setSearchOpen(false);
       }
-
       return;
     }
 
@@ -149,19 +180,79 @@ const Header: FC = () => {
       clearSearch();
     }
 
-    if (!settings.clipboard.search.defaultFocus) {
-      blurSearch();
-
-      return;
+    if (settings.clipboard.search.defaultFocus) {
+      focusSearch();
     }
-
-    focusSearch();
   };
 
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
     handleWindowVisibility,
   );
+
+  const selectAllHistory = () => {
+    clipboardViewState.range = "all";
+    clipboardViewState.groupId = null;
+    clipboardViewState.category = null;
+  };
+
+  const selectFavoriteHistory = () => {
+    clipboardViewState.range = "favorite";
+    clipboardViewState.groupId = null;
+    clipboardViewState.category = null;
+  };
+
+  const selectCustomGroup = (id: string) => {
+    clipboardViewState.range = "all";
+    clipboardViewState.groupId = id;
+    clipboardViewState.category = null;
+  };
+
+  const handleOpenCreateGroup = () => {
+    setPopoverGroup(null);
+    setPopoverMode("create");
+    setPopoverOpen(true);
+  };
+
+  const handleEditGroup = (group: ClipboardGroupRecord) => {
+    setPopoverGroup(group);
+    setPopoverMode("edit");
+    setPopoverOpen(true);
+  };
+
+  const handleDeleteGroup = (group: ClipboardGroupRecord) => {
+    getModalApi().confirm({
+      centered: true,
+      content: t("groups.deleteConfirmContent", {
+        defaultValue:
+          "删除画板后，画板内的剪贴板记录不会被删除，将保留在全部历史中。",
+      }),
+      okButtonProps: { danger: true },
+      okText: t("common:confirm.delete", { defaultValue: "删除" }),
+      onOk: async () => {
+        await deleteClipboardGroup(group.id);
+        if (clipboardViewState.groupId === group.id) {
+          selectAllHistory();
+        }
+        await loadGroups();
+      },
+      title: t("groups.deleteConfirmTitle", {
+        defaultValue: `确定删除画板「${group.name}」吗？`,
+        name: group.name,
+      }),
+    });
+  };
+
+  const handleGroupPopoverSubmit = async (input: ClipboardGroupInput) => {
+    if (popoverMode === "edit" && popoverGroup) {
+      await updateClipboardGroup(popoverGroup.id, input);
+    } else {
+      await createClipboardGroup(input);
+    }
+    setPopoverOpen(false);
+    setPopoverGroup(null);
+    await loadGroups();
+  };
 
   const moreMenuItems: DropdownMenuItems = [
     {
@@ -178,56 +269,240 @@ const Header: FC = () => {
     },
   ];
 
+  const isAllActive = range === "all" && groupId === null;
+  const isFavoriteActive = range === "favorite" && groupId === null;
+
   return (
     <div
-      className="flex items-center justify-between p-3 pb-2"
+      className="relative flex h-11 shrink-0 select-none items-center justify-between px-5"
       data-tauri-drag-region
     >
-      <img alt={t("header.logoAlt")} className="size-5" src="/logo.png" />
+      {/* 左侧：保持通透拖拽区 */}
+      <div className="w-8 shrink-0" />
 
-      <div className="flex items-center gap-1">
-        <SearchInput
-          allowClear
-          blurToken={searchBlurToken}
-          className="w-40"
-          clearToken={searchClearToken}
-          focusToken={searchFocusToken}
-          onChange={handleKeywordChange}
-          placeholder={t("header.searchPlaceholder")}
-          size="small"
-        />
+      {/* 中间：搜索与 Pinboard 画板组（整体水平居中，1:1 完全对齐 Paste） */}
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        {searchOpen ? (
+          <div className="pointer-events-auto z-20 flex items-center gap-2">
+            <SearchInput
+              allowClear
+              blurToken={searchBlurToken}
+              className="w-64"
+              clearToken={searchClearToken}
+              focusToken={searchFocusToken}
+              onChange={handleKeywordChange}
+              placeholder={t("header.searchPlaceholder")}
+              size="small"
+              value={searchValue}
+            />
+            <button
+              className="cursor-pointer px-2.5 py-1 text-neutral-500 text-xs hover:text-neutral-900"
+              onClick={() => {
+                clearSearch();
+                setSearchOpen(false);
+              }}
+              type="button"
+            >
+              取消
+            </button>
+          </div>
+        ) : (
+          <div className="pointer-events-auto flex select-none items-center gap-2">
+            {/* 搜索纯图标按钮（无外层灰圈，1:1 对齐 Paste） */}
+            <button
+              className="mr-1 flex size-6 cursor-pointer items-center justify-center text-neutral-800 transition-opacity hover:opacity-70 dark:text-white/80"
+              onClick={focusSearch}
+              title="搜索 (⌘F)"
+              type="button"
+            >
+              <i className="i-lucide:search size-4 stroke-[1.75]" />
+            </button>
 
-        <Tooltip title={t(pinned ? "header.unpin" : "header.pin")}>
-          <CustomIconButton
-            icon={
-              <KeyHint
-                hintKey="P"
-                iconName="i-lets-icons:pin"
-                onKeyPress={handleTogglePinned}
-              />
-            }
-            onClick={handleTogglePinned}
-            size="small"
-            type={pinned ? "primary" : "text"}
-          />
-        </Tooltip>
+            {/* 全部历史（剪贴板胶囊） */}
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    danger: true,
+                    icon: "i-lucide:trash-2",
+                    key: "clearHistory",
+                    label: "清空历史记录...",
+                    onClick: handleClearClipboardItems,
+                  },
+                ],
+              }}
+              trigger={["contextMenu"]}
+            >
+              <button
+                className={cn(
+                  "flex cursor-pointer items-center gap-1.5 rounded-full px-3 py-1 font-medium text-[13px] transition-all",
+                  isAllActive
+                    ? "bg-[#E5E7EB] text-[#111827] dark:bg-white/20 dark:text-white"
+                    : "text-neutral-700 hover:bg-black/[0.04] hover:text-neutral-900 dark:text-neutral-300",
+                )}
+                onClick={selectAllHistory}
+                type="button"
+              >
+                <i
+                  className={cn(
+                    "i-lucide:history size-3.5 stroke-[1.75]",
+                    isAllActive
+                      ? "text-[#4B5563] dark:text-white/80"
+                      : "text-neutral-400 dark:text-white/60",
+                  )}
+                />
+                <span>剪贴板</span>
+              </button>
+            </Dropdown>
 
+            {/* 收藏 */}
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    danger: true,
+                    icon: "i-lucide:trash-2",
+                    key: "clearFavorites",
+                    label: "清空历史记录...",
+                    onClick: handleClearClipboardItems,
+                  },
+                ],
+              }}
+              trigger={["contextMenu"]}
+            >
+              <button
+                className={cn(
+                  "flex cursor-pointer items-center gap-1.5 rounded-full px-3 py-1 font-medium text-[13px] transition-all",
+                  isFavoriteActive
+                    ? "bg-[#E5E7EB] text-[#111827] dark:bg-white/20 dark:text-white"
+                    : "text-neutral-700 hover:bg-black/[0.04] hover:text-neutral-900 dark:text-neutral-300",
+                )}
+                onClick={selectFavoriteHistory}
+                type="button"
+              >
+                <i
+                  className={cn(
+                    "i-lucide:star size-3.5 stroke-[1.75]",
+                    isFavoriteActive
+                      ? "fill-amber-500 text-amber-500 dark:fill-amber-400 dark:text-amber-400"
+                      : "text-neutral-400 dark:text-white/60",
+                  )}
+                />
+                <span>收藏</span>
+              </button>
+            </Dropdown>
+
+            {/* 自定义画板 */}
+            {customGroups.map((group) => {
+              const isCurrent = groupId === group.id;
+              const { color, icon } = parseGroupIcon(group.icon);
+              const isEditingThis =
+                popoverOpen &&
+                popoverMode === "edit" &&
+                popoverGroup?.id === group.id;
+
+              const groupMenuItems: DropdownMenuItems = [
+                {
+                  icon: "i-lucide:edit-3",
+                  key: "edit",
+                  label: "编辑画板",
+                  onClick: () => handleEditGroup(group),
+                },
+                {
+                  danger: true,
+                  icon: "i-lucide:trash-2",
+                  key: "delete",
+                  label: "删除画板",
+                  onClick: () => handleDeleteGroup(group),
+                },
+              ];
+
+              const tabButton = (
+                <button
+                  className={cn(
+                    "flex cursor-pointer items-center gap-1.5 rounded-full px-3 py-1 font-medium text-[13px] transition-all",
+                    isCurrent
+                      ? "bg-[#E5E7EB] text-[#111827] dark:bg-white/20 dark:text-white"
+                      : "text-neutral-700 hover:bg-black/[0.04] hover:text-neutral-900 dark:text-neutral-300",
+                  )}
+                  onClick={() => selectCustomGroup(group.id)}
+                  type="button"
+                >
+                  {color ? (
+                    <span
+                      className="size-2.5 shrink-0 rounded-full transition-colors"
+                      style={{ backgroundColor: color }}
+                    />
+                  ) : null}
+                  {icon ? (
+                    <ClipboardGroupIcon
+                      className="size-3.5 shrink-0 text-current"
+                      icon={icon}
+                    />
+                  ) : null}
+                  <span>{group.name}</span>
+                </button>
+              );
+
+              return (
+                <ClipboardGroupPopover
+                  group={group}
+                  key={group.id}
+                  mode="edit"
+                  onClose={() => {
+                    setPopoverOpen(false);
+                    setPopoverGroup(null);
+                  }}
+                  onSubmit={handleGroupPopoverSubmit}
+                  open={isEditingThis}
+                >
+                  <Dropdown
+                    menu={{ items: groupMenuItems }}
+                    trigger={["contextMenu"]}
+                  >
+                    {tabButton}
+                  </Dropdown>
+                </ClipboardGroupPopover>
+              );
+            })}
+
+            {/* 新建画板加号 */}
+            <ClipboardGroupPopover
+              group={null}
+              mode="create"
+              onClose={() => {
+                setPopoverOpen(false);
+                setPopoverGroup(null);
+              }}
+              onSubmit={handleGroupPopoverSubmit}
+              open={popoverOpen && popoverMode === "create"}
+            >
+              <button
+                className="ml-1 flex size-6 cursor-pointer items-center justify-center text-neutral-800 transition-opacity hover:opacity-70 dark:text-white/80"
+                onClick={handleOpenCreateGroup}
+                title="新建画板"
+                type="button"
+              >
+                <i className="i-lucide:plus size-4 stroke-[1.75]" />
+              </button>
+            </ClipboardGroupPopover>
+          </div>
+        )}
+      </div>
+
+      {/* 右侧：极简 `...` 更多操作 */}
+      <div className="z-10 flex items-center gap-1">
         <Dropdown
           menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
           tooltip={t("header.moreActions")}
           trigger={MORE_ACTION_TRIGGER}
         >
-          <CustomIconButton
-            icon={
-              <KeyHint
-                hintKey=","
-                iconName="i-lets-icons:meatballs-menu"
-                onKeyPress={handleOpenPreference}
-              />
-            }
-            size="small"
-            type="text"
-          />
+          <button
+            className="flex size-7 cursor-pointer items-center justify-center rounded-full text-neutral-600 transition-colors hover:bg-black/5 hover:text-neutral-900 dark:text-white/70 dark:hover:bg-white/10 dark:hover:text-white"
+            type="button"
+          >
+            <i className="i-lucide:more-horizontal size-4" />
+          </button>
         </Dropdown>
       </div>
     </div>
