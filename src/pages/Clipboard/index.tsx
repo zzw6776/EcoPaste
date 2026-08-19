@@ -1,14 +1,16 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { resizeClipboardWindow } from "@/commands";
 import { useClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
-import { isTauri } from "@/utils/is";
+import { cn } from "@/utils/cn";
+import { isMobile, isTauri } from "@/utils/is";
 import Header from "./components/Header";
 import List from "./components/List";
 
 /**
- * 剪贴板主窗口：Paste 官方 1:1 通透毛玻璃全景托盘。
- * 支持鼠标按住顶部上边框上下拖动，动态平滑放大/缩小弹出框高度。
+ * 剪贴板主窗口：
+ * - 桌面端 (Mac/Win)：Paste 官方 1:1 通透毛玻璃底栏抽屉，支持上下拉伸与高度记忆；
+ * - 移动端 (Android/iOS)：顺滑 Bottom Sheet 抽屉，支持左右底角上滑呼出与手势收起。
  */
 const Clipboard = () => {
   useClipboardWindowEditableFocus();
@@ -17,6 +19,20 @@ const Clipboard = () => {
   const startYRef = useRef(0);
   const startHeightRef = useRef(340);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // 移动端/桌面端视口自适应与预览状态
+  const [mobileMode, setMobileMode] = useState(() => isMobile());
+  const [sheetOpen, setSheetOpen] = useState(true);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (!isTauri) {
+        setMobileMode(window.innerWidth < 768);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   const handleResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
     isDraggingRef.current = true;
@@ -52,17 +68,27 @@ const Clipboard = () => {
 
   const content = (
     <div
-      className="relative flex h-full w-full select-none flex-col overflow-hidden rounded-[26px] border border-white/50 bg-white/70 text-neutral-800 shadow-[0_20px_50px_rgba(0,0,0,0.2)] dark:border-white/15 dark:bg-black/60 dark:text-white"
+      className={cn(
+        "relative flex h-full w-full select-none flex-col overflow-hidden border border-white/50 bg-white/75 text-neutral-800 shadow-[0_20px_50px_rgba(0,0,0,0.2)] backdrop-blur-3xl transition-all duration-300 dark:border-white/15 dark:bg-black/65 dark:text-white",
+        mobileMode ? "rounded-t-[32px] rounded-b-none pb-2" : "rounded-[26px]",
+      )}
       data-tauri-drag-region
     >
-      {/* 顶部上下拉伸调节隐形热区（完全不显示小横条） */}
-      <div
-        className="absolute top-0 right-0 left-0 z-50 h-2.5 cursor-ns-resize touch-none"
-        onPointerCancel={handleResizeEnd}
-        onPointerDown={handleResizeStart}
-        onPointerMove={handleResizeMove}
-        onPointerUp={handleResizeEnd}
-      />
+      {/* 移动端顶部药丸拖动手柄 */}
+      {mobileMode ? (
+        <div className="flex w-full justify-center pt-2.5 pb-1">
+          <div className="h-1.2 w-10 rounded-full bg-neutral-300 dark:bg-neutral-600" />
+        </div>
+      ) : (
+        /* 桌面端顶部上下拉伸调节隐形热区 */
+        <div
+          className="absolute top-0 right-0 left-0 z-50 h-2.5 cursor-ns-resize touch-none"
+          onPointerCancel={handleResizeEnd}
+          onPointerDown={handleResizeStart}
+          onPointerMove={handleResizeMove}
+          onPointerUp={handleResizeEnd}
+        />
+      )}
 
       <Header />
 
@@ -72,10 +98,11 @@ const Clipboard = () => {
     </div>
   );
 
+  // 非 Tauri 环境（Web 预览模式）：支持自由切换桌面底栏与手机版底角上滑演示
   if (!isTauri) {
     return (
       <div
-        className="relative flex h-screen w-screen select-none items-end justify-center overflow-hidden px-4 pb-4"
+        className="relative flex h-screen w-screen select-none items-end justify-center overflow-hidden"
         style={{
           background: `
             radial-gradient(at 0% 0%, rgba(255, 182, 193, 0.7) 0px, transparent 50%),
@@ -86,12 +113,95 @@ const Clipboard = () => {
           `,
         }}
       >
-        <div
-          className="flex h-[340px] w-full max-w-full flex-col rounded-[24px] border border-white/30 bg-white/20 drop-shadow-2xl backdrop-blur-2xl"
-          ref={containerRef}
-        >
-          {content}
+        {/* 顶部预览模式切换栏 */}
+        <div className="absolute top-4 z-50 flex items-center gap-2 rounded-full border border-white/40 bg-white/60 px-3.5 py-1.5 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-black/50">
+          <button
+            className={cn(
+              "cursor-pointer rounded-full px-3 py-1 font-semibold text-xs transition-all",
+              !mobileMode
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "text-neutral-600 hover:text-neutral-900 dark:text-neutral-300",
+            )}
+            onClick={() => {
+              setMobileMode(false);
+              setSheetOpen(true);
+            }}
+            type="button"
+          >
+            🖥️ Mac/Win 桌面底栏
+          </button>
+          <button
+            className={cn(
+              "cursor-pointer rounded-full px-3 py-1 font-semibold text-xs transition-all",
+              mobileMode
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "text-neutral-600 hover:text-neutral-900 dark:text-neutral-300",
+            )}
+            onClick={() => {
+              setMobileMode(true);
+              setSheetOpen(true);
+            }}
+            type="button"
+          >
+            📱 安卓/移动端手势抽屉
+          </button>
         </div>
+
+        {/* 移动端手势演示模式 */}
+        {mobileMode ? (
+          <div className="relative flex h-full w-full max-w-sm flex-col items-center justify-end overflow-hidden pb-1 sm:h-[780px] sm:rounded-[44px] sm:border-[8px] sm:border-neutral-800 sm:bg-black/90 sm:shadow-[0_25px_60px_rgba(0,0,0,0.5)]">
+            {/* 手机状态栏模拟 */}
+            <div className="absolute top-3 right-0 left-0 hidden items-center justify-between px-7 font-semibold text-neutral-800 text-xs sm:flex dark:text-white/80">
+              <span>09:41</span>
+              <div className="h-4 w-20 rounded-full bg-black/40 dark:bg-white/20" />
+              <span>5G 100%</span>
+            </div>
+
+            {/* 左右底角上滑手势触发区提示 */}
+            {!sheetOpen ? (
+              <div className="absolute inset-x-0 bottom-0 z-40 flex h-24 items-end justify-between px-3 pb-3">
+                <button
+                  className="flex h-14 w-28 animate-bounce cursor-pointer flex-col items-center justify-center rounded-2xl border border-[#007AFF]/40 bg-[#007AFF]/20 font-medium text-[#007AFF] text-[11px] shadow-lg backdrop-blur-md"
+                  onClick={() => setSheetOpen(true)}
+                  type="button"
+                >
+                  <span>↖ 左底角上滑</span>
+                  <span className="text-[9px] opacity-75">呼出剪贴板</span>
+                </button>
+                <div className="text-[10px] text-neutral-400">系统桌面区</div>
+                <button
+                  className="flex h-14 w-28 animate-bounce cursor-pointer flex-col items-center justify-center rounded-2xl border-[#007AFF]/40 bg-[#007AFF]/20 font-medium text-[#007AFF] text-[11px] shadow-lg backdrop-blur-md"
+                  onClick={() => setSheetOpen(true)}
+                  type="button"
+                >
+                  <span>↗ 右底角上滑</span>
+                  <span className="text-[9px] opacity-75">呼出剪贴板</span>
+                </button>
+              </div>
+            ) : null}
+
+            {/* 移动端 Bottom Sheet 抽屉卡片 */}
+            <div
+              className={cn(
+                "w-full drop-shadow-2xl transition-transform duration-300 ease-out",
+                sheetOpen
+                  ? "h-[380px] translate-y-0"
+                  : "pointer-events-none h-[380px] translate-y-full",
+              )}
+              ref={containerRef}
+            >
+              {content}
+            </div>
+          </div>
+        ) : (
+          /* 桌面端 1:1 毛玻璃底栏 */
+          <div
+            className="flex h-[340px] w-full max-w-full flex-col px-4 pb-4 drop-shadow-2xl"
+            ref={containerRef}
+          >
+            {content}
+          </div>
+        )}
       </div>
     );
   }
