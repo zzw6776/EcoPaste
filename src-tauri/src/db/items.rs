@@ -8,9 +8,17 @@ use crate::db::models::{
     ClipboardGroupFilter, ClipboardItem, ClipboardItemQuery, ClipboardItemSort, ClipboardKind,
 };
 
-const SELECT_ITEM: &str = "SELECT id, kind, sub_kind, group_id, source_app_id, content, \
-     content_hash, search_text, summary, file_types, size, width, height, use_count, is_favorite, is_pinned, \
-     is_sensitive, platform, note, created_at, updated_at FROM clipboard_items";
+const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clipboard_items.sub_kind, \
+     clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.content, \
+     clipboard_items.content_hash, clipboard_items.search_text, clipboard_items.summary, \
+     clipboard_items.file_types, clipboard_items.size, clipboard_items.width, clipboard_items.height, \
+     clipboard_items.use_count, clipboard_items.is_favorite, clipboard_items.is_pinned, \
+     clipboard_items.is_sensitive, clipboard_items.platform, clipboard_items.note, \
+     clipboard_items.created_at, clipboard_items.updated_at, \
+     clipboard_apps.name AS source_app_name, \
+     clipboard_apps.icon_file AS source_app_icon_file \
+     FROM clipboard_items \
+     LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
 
 /// 列表/单条刷新场景的精简 SELECT：text 类型条目的 `content` 与 `search_text` 一律置空，
 /// 由前端用 `summary` 渲染。HTML/RTF/长纯文本可能很大（用户复制整段文档），
@@ -35,6 +43,14 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
 
+fn kind_tag(kind: ClipboardKind) -> &'static str {
+    match kind {
+        ClipboardKind::Text => "text",
+        ClipboardKind::Image => "image",
+        ClipboardKind::Files => "files",
+    }
+}
+
 /// 入库去重的结果：`id` 为生效行的主键（命中时是已有行，未命中时是新插入行），
 /// `deduplicated` 表示是否命中了已有内容（命中则只 `use_count + 1` 未插入新行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,14 +69,6 @@ pub fn content_hash(kind: ClipboardKind, content: &str) -> String {
     hasher.update(b":");
     hasher.update(content.as_bytes());
     hasher.finalize().to_hex().to_string()
-}
-
-fn kind_tag(kind: ClipboardKind) -> &'static str {
-    match kind {
-        ClipboardKind::Text => "text",
-        ClipboardKind::Image => "image",
-        ClipboardKind::Files => "files",
-    }
 }
 
 /// 入库主入口：按 `item.content_hash` 去重。
@@ -88,9 +96,9 @@ pub async fn find_item_by_content_hash(
     hash: &str,
 ) -> Result<Option<ClipboardItem>> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
-    qb.push(" WHERE content_hash = ")
+    qb.push(" WHERE clipboard_items.content_hash = ")
         .push_bind(hash.to_owned())
-        .push(" ORDER BY created_at DESC LIMIT 1");
+        .push(" ORDER BY clipboard_items.created_at DESC LIMIT 1");
 
     let item = qb
         .build_query_as::<ClipboardItem>()
@@ -160,7 +168,8 @@ pub async fn query_items_page(
 /// 按 `id` 查找单条记录，不存在时返回 `None`。
 pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ClipboardItem>> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
-    qb.push(" WHERE id = ").push_bind(id.to_owned());
+    qb.push(" WHERE clipboard_items.id = ")
+        .push_bind(id.to_owned());
 
     let item = qb
         .build_query_as::<ClipboardItem>()

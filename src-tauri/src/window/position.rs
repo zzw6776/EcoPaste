@@ -34,19 +34,20 @@ fn monitor_from_cursor(
 }
 
 pub fn position_window(window: &WebviewWindow, position: WindowPosition) -> Result<()> {
-    let Some((monitor, cursor)) = monitor_from_cursor(window)? else {
+    let Some((monitor, _cursor)) = monitor_from_cursor(window)? else {
         return Ok(());
     };
 
     match position {
         WindowPosition::Remember => {}
-        WindowPosition::FollowCursor => apply_follow(window, &monitor, &cursor)?,
-        WindowPosition::Center => apply_center(window, &monitor)?,
+        WindowPosition::FollowCursor => apply_bottom(window, &monitor)?,
+        WindowPosition::Center => apply_bottom(window, &monitor)?,
     }
 
     Ok(())
 }
 
+#[allow(dead_code)]
 fn apply_follow(
     window: &WebviewWindow,
     monitor: &MonitorInfo,
@@ -67,24 +68,118 @@ fn apply_follow(
     Ok(())
 }
 
-/// 将窗口居中到当前光标所在显示器。
-/// 用于存档位置已失效（显示器被拔出）时的 fallback。
+/// 将窗口停靠到当前光标所在显示器底部居中。
 pub(super) fn center_on_cursor_monitor(window: &WebviewWindow) -> Result<()> {
     let Some((monitor, _)) = monitor_from_cursor(window)? else {
         return Ok(());
     };
-    apply_center(window, &monitor)
+    apply_bottom(window, &monitor)
 }
 
+#[allow(dead_code)]
 fn apply_center(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
-    let win_size = window.inner_size().map_err(|e| anyhow::anyhow!(e))?;
+    apply_bottom(window, monitor)
+}
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use tauri::Manager;
+
+static CLIPBOARD_HEIGHT: AtomicU32 = AtomicU32::new(340);
+
+pub fn get_clipboard_height() -> f64 {
+    CLIPBOARD_HEIGHT.load(Ordering::Relaxed) as f64
+}
+
+pub fn set_cached_clipboard_height(height_logical: f64) {
+    let clamped = height_logical.clamp(200.0, 750.0);
+    CLIPBOARD_HEIGHT.store(clamped.round() as u32, Ordering::Relaxed);
+}
+
+pub fn set_clipboard_height(window: &WebviewWindow, height_logical: f64) -> Result<()> {
+    let scale = window.scale_factor().map_err(|e| anyhow::anyhow!(e))?;
+    let height_clamped = height_logical.clamp(200.0, 750.0);
+    CLIPBOARD_HEIGHT.store(height_clamped.round() as u32, Ordering::Relaxed);
+
+    if let Some(store) = window
+        .app_handle()
+        .try_state::<crate::window::state::WindowStateStore>()
+    {
+        let pos = window.outer_position().unwrap_or_default();
+        let width = window.inner_size().map(|s| s.width).unwrap_or(800);
+        let _ = store.save(
+            window.label(),
+            crate::window::state::WindowState {
+                x: pos.x,
+                y: pos.y,
+                width,
+                height: (height_clamped * scale).round() as u32,
+            },
+        );
+    }
+
+    let Some((monitor, _)) = monitor_from_cursor(window)? else {
+        return Ok(());
+    };
+
     let mon_x = monitor.position.x as f64;
     let mon_y = monitor.position.y as f64;
     let mon_w = monitor.size.width as f64;
     let mon_h = monitor.size.height as f64;
 
-    let x = mon_x + (mon_w - win_size.width as f64) / 2.0;
-    let y = mon_y + (mon_h - win_size.height as f64) / 2.0;
+    let target_width_logical = ((mon_w / scale) - 32.0).max(600.0);
+    let target_size = PhysicalSize::new(
+        (target_width_logical * scale).round() as u32,
+        (height_clamped * scale).round() as u32,
+    );
+    let _ = window.set_size(target_size);
+
+    let x = mon_x + (16.0 * scale);
+    let y = mon_y + mon_h - (height_clamped * scale);
+
+    window
+        .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(())
+}
+
+fn apply_bottom(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
+    let scale = window.scale_factor().map_err(|e| anyhow::anyhow!(e))?;
+    let mon_x = monitor.position.x as f64;
+    let mon_y = monitor.position.y as f64;
+    let mon_w = monitor.size.width as f64;
+    let mon_h = monitor.size.height as f64;
+
+    let height_logical = if let Some(store) = window
+        .app_handle()
+        .try_state::<crate::window::state::WindowStateStore>()
+    {
+        if let Some(state) = store.get(window.label()) {
+            if state.height > 0 {
+                let h = (state.height as f64 / scale).clamp(200.0, 750.0);
+                CLIPBOARD_HEIGHT.store(h.round() as u32, Ordering::Relaxed);
+                h
+            } else {
+                get_clipboard_height()
+            }
+        } else {
+            get_clipboard_height()
+        }
+    } else {
+        get_clipboard_height()
+    };
+
+    // Paste 官方体验：自适应横跨整个屏幕底栏（左右各留 16px 呼吸边距）
+    let target_width_logical = ((mon_w / scale) - 32.0).max(600.0);
+
+    let target_size = PhysicalSize::new(
+        (target_width_logical * scale).round() as u32,
+        (height_logical * scale).round() as u32,
+    );
+    let _ = window.set_size(target_size);
+
+    let x = mon_x + (16.0 * scale);
+    let y = mon_y + mon_h - (height_logical * scale);
 
     window
         .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))

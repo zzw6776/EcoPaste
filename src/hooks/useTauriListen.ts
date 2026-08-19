@@ -5,6 +5,7 @@ import {
 } from "@tauri-apps/api/event";
 import { useMount, useUnmount } from "ahooks";
 import { useRef } from "react";
+import { isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
 
 /**
@@ -20,6 +21,8 @@ export const useTauriListen = <T>(
   handlerRef.current = handler;
 
   useMount(async () => {
+    if (!isTauri) return;
+
     try {
       unlistenRef.current = await listen<T>(event, (payload) => {
         handlerRef.current(payload);

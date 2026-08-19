@@ -314,7 +314,7 @@ function insetRect(rect: ClipboardPreviewRect, amount: number) {
 /**
  * 限制数值范围。
  */
-function clamp(value: number, min: number, max: number) {
+export function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 

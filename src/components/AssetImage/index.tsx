@@ -1,27 +1,38 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { FC, ImgHTMLAttributes } from "react";
+import { useState } from "react";
 import { cn } from "@/utils/cn";
+import { isTauri } from "@/utils/is";
 
 interface AssetImageProps
   extends Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> {
   src?: string | null;
   protocol?: string;
+  fallbackSrc?: string;
 }
 
 /**
- * 统一渲染 Tauri 本地文件图片：输入文件路径，内部转成 webview 可加载 URL。
+ * 统一渲染 Tauri 本地文件图片：输入本地绝对文件路径，内部转成 asset:// 可加载 URL。
  */
 const AssetImage: FC<AssetImageProps> = (props) => {
-  const { alt, protocol, src, className, ...rest } = props;
+  const { alt, protocol, src, fallbackSrc, className, ...rest } = props;
+  const [loadFailed, setLoadFailed] = useState(false);
 
   if (!src) return null;
+
+  const resolvedUrl = loadFailed
+    ? fallbackSrc || ""
+    : toAssetUrl(src, protocol);
+
+  if (!resolvedUrl) return null;
 
   return (
     <img
       alt={alt}
-      src={toAssetUrl(src, protocol)}
-      {...rest}
       className={cn("pointer-events-none", className)}
+      onError={() => setLoadFailed(true)}
+      src={resolvedUrl}
+      {...rest}
     />
   );
 };
@@ -32,9 +43,25 @@ const AssetImage: FC<AssetImageProps> = (props) => {
 const toAssetUrl = (filePath?: string | null, protocol?: string) => {
   if (!filePath) return "";
 
-  if (!protocol) return convertFileSrc(filePath);
+  if (
+    filePath.startsWith("http://") ||
+    filePath.startsWith("https://") ||
+    filePath.startsWith("data:")
+  ) {
+    return filePath;
+  }
 
-  return convertFileSrc(filePath, protocol);
+  if (isTauri) {
+    try {
+      if (!protocol) return convertFileSrc(filePath);
+
+      return convertFileSrc(filePath, protocol);
+    } catch {
+      return filePath;
+    }
+  }
+
+  return filePath;
 };
 
 export default AssetImage;
