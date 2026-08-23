@@ -2,20 +2,14 @@ name: Release CI
 
 "on":
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: "Release tag to build, for example v0.6.0-beta.4"
-        required: true
-        type: string
+    branches:
+      - master
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  group: release-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -26,122 +20,105 @@ jobs:
       prerelease: ${{ steps.release.outputs.prerelease }}
       release_id: ${{ steps.release.outputs.release_id }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create draft release from changelogs
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Validate version and create draft release
         id: release
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         run: |
           set -euo pipefail
 
-          tag_name="${GITHUB_REF_NAME}"
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            tag_name="${INPUT_TAG_NAME}"
-          fi
+          target_sha="${GITHUB_SHA}"
+          version="$(node -p "require('./package.json').version")"
+          previous_version="$(git show "${target_sha}^:package.json" 2>/dev/null | node -e "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).version));" || true)"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          lock_version="$(awk '
+            /^name = "EcoPaste"$/ { package_found = 1; next }
+            package_found && /^version = "/ {
+              value = $0
+              sub(/^version = "/, "", value)
+              sub(/"$/, "", value)
+              print value
+              exit
+            }
+          ' src-tauri/Cargo.lock)"
 
-          if [[ ! "${tag_name}" =~ ^v[0-9]+ ]]; then
-            echo "::error::Release tag must start with v followed by a version, got '${tag_name}'."
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::package.json version must be valid semver, got '${version}'."
+            exit 1
+          fi
+          if [[ -n "${previous_version}" && "${version}" == "${previous_version}" ]]; then
+            echo "::error::Every master commit must bump the project version; both commits use '${version}'."
+            exit 1
+          fi
+          if [[ "${cargo_version}" != "${version}" || "${lock_version}" != "${version}" ]]; then
+            echo "::error::Version mismatch: package.json=${version}, Cargo.toml=${cargo_version}, Cargo.lock=${lock_version}."
             exit 1
           fi
 
           git fetch --force --tags
-          if ! git rev-parse --verify --quiet "refs/tags/${tag_name}" >/dev/null; then
-            echo "::error::Tag '${tag_name}' does not exist."
+          tag_name="v${version}"
+          existing_tag_sha="$(git rev-list -n 1 "${tag_name}" 2>/dev/null || true)"
+
+          if [[ -n "${existing_tag_sha}" && "${existing_tag_sha}" != "${target_sha}" ]]; then
+            echo "::error::Tag '${tag_name}' already points to ${existing_tag_sha}; bump the project version."
             exit 1
           fi
 
-          git checkout --detach "refs/tags/${tag_name}"
-
-          if [[ ! -f CHANGELOG.md ]]; then
-            echo "::error::CHANGELOG.md is required. Run release-it before pushing the release tag."
-            exit 1
+          if [[ -z "${existing_tag_sha}" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag --annotate "${tag_name}" "${target_sha}" --message "Release ${tag_name}"
+            git push origin "refs/tags/${tag_name}"
           fi
-          if [[ ! -f CHANGELOG.zh-CN.md ]]; then
-            echo "::error::CHANGELOG.zh-CN.md is required. Run release-it before pushing the release tag."
-            exit 1
-          fi
-
-          version="${tag_name#v}"
-          extract_changelog_section() {
-            local file="$1"
-            local output="$2"
-
-            awk -v version="${version}" '
-            function is_target_heading(line) {
-              return line ~ "^##[[:space:]]+\\[?" version "\\]?"
-            }
-
-            /^##[[:space:]]+/ {
-              if (capture) {
-                exit
-              }
-
-              if (is_target_heading($0)) {
-                capture = 1
-                next
-              }
-            }
-
-            capture {
-              print
-            }
-            ' "${file}" | sed '/./,$!d' > "${output}"
-          }
-
-          extract_changelog_section CHANGELOG.md release-body-en.md
-          extract_changelog_section CHANGELOG.zh-CN.md release-body-zh.md
-
-          if [[ ! -s release-body-en.md ]]; then
-            echo "::error::CHANGELOG.md does not contain a release section for ${version}."
-            exit 1
-          fi
-          if [[ ! -s release-body-zh.md ]]; then
-            echo "::error::CHANGELOG.zh-CN.md does not contain a release section for ${version}."
-            exit 1
-          fi
-
-          {
-            cat release-body-en.md
-            printf '\n\n<hr>\n\n'
-            cat release-body-zh.md
-          } > release-body.md
 
           prerelease=false
           if [[ "${version}" == *-* ]]; then
             prerelease=true
           fi
 
-          title="${tag_name}"
           if gh release view "${tag_name}" >/dev/null 2>&1; then
-            if [[ "${prerelease}" == "true" ]]; then
-              gh release edit "${tag_name}" --draft --prerelease --title "${title}" --notes-file release-body.md
-            else
-              gh release edit "${tag_name}" --draft --title "${title}" --notes-file release-body.md
+            is_draft="$(gh release view "${tag_name}" --json isDraft --jq .isDraft)"
+            if [[ "${is_draft}" != "true" ]]; then
+              echo "::error::Release '${tag_name}' is already published. Bump the project version for a new commit."
+              exit 1
             fi
           else
+            release_args=(
+              "${tag_name}"
+              --draft
+              --generate-notes
+              --target "${target_sha}"
+              --title "${tag_name}"
+              --verify-tag
+            )
             if [[ "${prerelease}" == "true" ]]; then
-              gh release create "${tag_name}" --draft --prerelease --title "${title}" --notes-file release-body.md --verify-tag
-            else
-              gh release create "${tag_name}" --draft --title "${title}" --notes-file release-body.md --verify-tag
+              release_args+=(--prerelease)
             fi
+            gh release create "${release_args[@]}"
           fi
 
           release_id="$(gh release view "${tag_name}" --json databaseId --jq .databaseId)"
-
           {
             echo "prerelease=${prerelease}"
             echo "release_id=${release_id}"
             echo "tag_name=${tag_name}"
+            echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
 
-  build-app:
+  build-desktop:
     name: Build ${{ matrix.label }}
     needs: release-metadata
     permissions:
@@ -164,10 +141,10 @@ jobs:
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
+      - name: Checkout release
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref }}
+          ref: ${{ needs.release-metadata.outputs.tag_name }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.96.0
@@ -196,78 +173,111 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Extract changelog body
-        id: changelog
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          tag_name="${{ needs.release-metadata.outputs.tag_name }}"
-          version="${tag_name#v}"
-
-          extract_changelog_section() {
-            local file="$1"
-            local output="$2"
-
-            awk -v version="${version}" '
-            function is_target_heading(line) {
-              return line ~ "^##[[:space:]]+\\[?" version "\\]?"
-            }
-
-            /^##[[:space:]]+/ {
-              if (capture) {
-                exit
-              }
-
-              if (is_target_heading($0)) {
-                capture = 1
-                next
-              }
-            }
-
-            capture {
-              print
-            }
-            ' "${file}" | sed '/./,$!d' > "${output}"
-          }
-
-          extract_changelog_section CHANGELOG.md release-body-en.md
-          extract_changelog_section CHANGELOG.zh-CN.md release-body-zh.md
-
-          if [[ ! -s release-body-en.md ]]; then
-            echo "::error::CHANGELOG.md does not contain a release section for ${version}."
-            exit 1
-          fi
-          if [[ ! -s release-body-zh.md ]]; then
-            echo "::error::CHANGELOG.zh-CN.md does not contain a release section for ${version}."
-            exit 1
-          fi
-
-          {
-            cat release-body-en.md
-            printf '\n\n<hr>\n\n'
-            cat release-body-zh.md
-          } > release-body.md
-
-          delimiter="CHANGELOG_BODY_${RANDOM}_${RANDOM}"
-          {
-            echo "body<<${delimiter}"
-            cat release-body.md
-            echo "${delimiter}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Build and upload app
+      - name: Build and upload desktop app
         uses: tauri-apps/tauri-action@v1
         env:
           CI: false
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           PLATFORM: ${{ matrix.os }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: --target ${{ matrix.target }}
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
-          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: true
           releaseId: ${{ needs.release-metadata.outputs.release_id }}
           retryAttempts: 3
           tagName: ${{ needs.release-metadata.outputs.tag_name }}
+
+  build-android:
+    name: Build Android universal APK
+    needs: release-metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-metadata.outputs.tag_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          link-to-sdk: true
+          ndk-version: r29
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build and upload Android app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          CI: false
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        with:
+          args: --apk true
+          mobile: android
+          prerelease: ${{ needs.release-metadata.outputs.prerelease }}
+          releaseDraft: true
+          releaseId: ${{ needs.release-metadata.outputs.release_id }}
+          retryAttempts: 3
+          tagName: ${{ needs.release-metadata.outputs.tag_name }}
+
+  publish-release:
+    name: Publish Release
+    needs:
+      - release-metadata
+      - build-desktop
+      - build-android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish completed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          args=("${TAG_NAME}" --draft=false)
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          else
+            args+=(--prerelease=false)
+          fi
+          gh release edit "${args[@]}"

@@ -15,6 +15,8 @@
 //! 纯文本模式（`plain = true`）：忽略 `sub_kind`，写 `search_text`（OS 提供的纯文本表示），
 //! 缺失时退回 `content`。供「纯文本粘贴」快捷路径使用。
 
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
+use clipboard_rs::common::RustImage;
 #[cfg(not(target_os = "android"))]
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
@@ -128,7 +130,7 @@ fn write_text(
 
 #[cfg(not(target_os = "android"))]
 fn write_image(
-    _ctx: &ClipboardContext,
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] ctx: &ClipboardContext,
     store: &ImageStore,
     guard: &WritebackGuard,
     item: &ClipboardItem,
@@ -165,7 +167,7 @@ fn write_image(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let image = RustImageData::from_bytes(&bytes).map_err(clip_err)?;
+        let image = clipboard_rs::RustImageData::from_bytes(&bytes).map_err(clip_err)?;
         ctx.set_image(image).map_err(clip_err)?;
     }
 

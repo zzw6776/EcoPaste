@@ -4,7 +4,7 @@ import { resizeClipboardWindow } from "@/commands";
 import { minimizeAndroidApp } from "@/commands/android";
 import { useClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
 import { cn } from "@/utils/cn";
-import { isAndroid, isMobile, isTauri } from "@/utils/is";
+import { isAndroid, isMobile, isTauri, isWin } from "@/utils/is";
 import Header from "./components/Header";
 import List from "./components/List";
 
@@ -113,7 +113,11 @@ const Clipboard = () => {
               "bg-[#F2F2F7] dark:bg-[#121212]",
               androidPopupMode ? "rounded-t-4" : "mobile-safe-area-top",
             )
-          : "rounded-[26px] border border-white/50 bg-white/70 dark:border-white/15 dark:bg-black/60",
+          : cn({
+              "bg-white/0 dark:bg-black/0": isWin,
+              "rounded-[26px] border border-white/50 bg-white/70 dark:border-white/15 dark:bg-black/60":
+                !isWin,
+            }),
       )}
       data-tauri-drag-region
     >
@@ -146,6 +150,13 @@ const Clipboard = () => {
       <div className="min-h-0 w-full flex-1 overflow-hidden">
         <List />
       </div>
+
+      {isWin && !mobileMode ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-50 border border-black/15 dark:border-white/18"
+        />
+      ) : null}
     </div>
   );
 
