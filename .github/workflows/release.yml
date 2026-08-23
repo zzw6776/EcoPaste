@@ -269,6 +269,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
           PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
         run: |
