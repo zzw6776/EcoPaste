@@ -5,13 +5,15 @@
 //! 新开一条短命线程：建流 → 解码 → 播放 → sink 空了即释放。剪贴板事件频率
 //! 远低于音频开销（建流 ~ms 级），不必维护常驻 worker。
 
-use std::io::Cursor;
-
+#[cfg(not(target_os = "android"))]
 use rodio::{Decoder, OutputStream, Sink};
+#[cfg(not(target_os = "android"))]
+use std::io::Cursor;
 use tauri::{AppHandle, Manager};
 
 use crate::settings::SettingsStore;
 
+#[allow(dead_code)]
 const COPY_SOUND_BYTES: &[u8] = include_bytes!("../../assets/sounds/copy.mp3");
 
 /// 若设置启用了 `feedback.copy_sound`，异步播放一次提示音。
@@ -43,11 +45,17 @@ fn spawn_play() {
         .ok();
 }
 
+#[cfg(not(target_os = "android"))]
 fn play_blocking() -> Result<(), String> {
     let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
     let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
     let source = Decoder::new(Cursor::new(COPY_SOUND_BYTES)).map_err(|e| e.to_string())?;
     sink.append(source);
     sink.sleep_until_end();
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn play_blocking() -> Result<(), String> {
     Ok(())
 }

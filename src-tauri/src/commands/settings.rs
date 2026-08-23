@@ -50,6 +50,9 @@ pub async fn update_settings(app: AppHandle, patch: serde_json::Value) -> Result
                 .is_some_and(|g| g.contains_key("runAsAdmin"))
         })
         .unwrap_or(false);
+    let touches_android = patch_obj
+        .map(|map| map.contains_key("android"))
+        .unwrap_or(false);
 
     let next = app.state::<SettingsStore>().update(patch)?;
 
@@ -67,6 +70,14 @@ pub async fn update_settings(app: AppHandle, patch: serde_json::Value) -> Result
 
     if touches_run_as_admin {
         admin::sync_scheduled_task(next.general.run_as_admin);
+    }
+
+    if touches_android {
+        if let Err(err) =
+            crate::commands::android::apply_android_gesture_settings(&next.android.gesture)
+        {
+            log::warn!("apply Android gesture settings failed: {err}");
+        }
     }
 
     emit_settings_updated(&app, &next);
@@ -104,6 +115,12 @@ fn apply_reset_side_effects(app: &AppHandle, settings: &Settings) {
     }
 
     admin::sync_scheduled_task(settings.general.run_as_admin);
+
+    if let Err(err) =
+        crate::commands::android::apply_android_gesture_settings(&settings.android.gesture)
+    {
+        log::warn!("reset Android gesture settings failed: {err}");
+    }
 }
 
 /// 广播最新设置快照给所有前端窗口。

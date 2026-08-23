@@ -29,6 +29,7 @@ pub enum ClipboardSubKind {
 pub enum Platform {
     Macos,
     Windows,
+    Android,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

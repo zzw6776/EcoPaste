@@ -12,6 +12,7 @@ import {
 } from "@/utils/appIcons";
 import { cn } from "@/utils/cn";
 import { useDynamicHeaderBg } from "@/utils/dominantColor";
+import { isMobile } from "@/utils/is";
 import ClipboardQuickActions from "./ClipboardQuickActions";
 import FilesCard from "./FilesCard";
 import ImageCard from "./ImageCard";
@@ -129,6 +130,27 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     onPointerMove?.(event);
   };
 
+  const handleMobileActionMouseDown = (
+    event: MouseEvent<HTMLButtonElement>,
+  ) => {
+    event.stopPropagation();
+  };
+
+  const handleMobileFavorite = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    void onQuickAction?.("star");
+  };
+
+  const handleMobileCopy = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    void onQuickAction?.("copy");
+  };
+
+  const handleMobileDelete = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    void onQuickAction?.("delete");
+  };
+
   const isImageCard = kind === "image";
   const isUrlCard = subKind === "url";
   const urlInfo = isUrlCard ? parseUrlInfo(summary || item.content) : null;
@@ -142,14 +164,17 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       ? urlInfo?.name || "网页"
       : `${summary?.length ?? size ?? 0} 个字符`;
 
+  const isMob = isMobile();
+
   return (
     <div
       aria-selected={isSelected}
       className={cn(
-        "relative flex h-full w-full min-w-0 cursor-pointer select-none flex-col overflow-hidden rounded-[16px] border-0 bg-white transition-all duration-150",
-        isSelected
-          ? "z-10"
-          : "shadow-[0_2px_8px_rgba(0,0,0,0.06)] hover:shadow-md",
+        "relative flex w-full min-w-0 cursor-pointer select-none flex-col overflow-hidden rounded-[16px] border-0 bg-white transition-all duration-150 dark:bg-neutral-800",
+        isMob
+          ? "mb-1 min-h-[105px] shadow-[0_2px_8px_rgba(0,0,0,0.04)] active:scale-[0.985]"
+          : "h-full",
+        isSelected && !isMob ? "z-10" : "hover:shadow-md",
       )}
       draggable
       onAuxClick={onAuxClick}
@@ -163,7 +188,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       ref={rootRef}
       role="option"
       style={
-        isSelected
+        isSelected && !isMob
           ? {
               boxShadow:
                 "0 0 0 2.5px #007AFF, 0 4px 16px rgba(0, 122, 255, 0.25)",
@@ -172,9 +197,12 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       }
       tabIndex={0}
     >
-      {/* 1. 顶部色块横幅 (46px，Flex 左右两端对齐，与 Paste 官方 1:1 一致) */}
+      {/* 1. 顶部色块横幅 */}
       <div
-        className="relative flex h-[46px] w-full shrink-0 select-none items-center justify-between overflow-hidden pr-2.5 pl-3.5 text-white"
+        className={cn(
+          "relative flex w-full shrink-0 select-none items-center justify-between overflow-hidden pr-2.5 pl-3.5 text-white",
+          isMob ? "h-[36px]" : "h-[46px]",
+        )}
         style={{ background: headerBg }}
       >
         {/* 左侧：类型标签 + 时间 / 置顶 / 收藏 */}
@@ -196,13 +224,18 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
               />
             )}
           </div>
-          <span className="mt-1.5 truncate font-medium text-[10.5px] text-white/85 leading-none">
+          <span className="mt-1 truncate font-medium text-[10px] text-white/85 leading-none">
             {timeText}
           </span>
         </div>
 
-        {/* 右侧：占满顶栏整行的 App 图标 (38px, 饱满贴合，无多余外浮白圈与弧线阴影) */}
-        <div className="flex size-[38px] shrink-0 items-center justify-center">
+        {/* 右侧：App 图标 */}
+        <div
+          className={cn(
+            "flex shrink-0 items-center justify-center",
+            isMob ? "size-[28px]" : "size-[38px]",
+          )}
+        >
           <AssetImage
             alt={sourceAppName ?? "app"}
             className="pointer-events-none size-full object-contain"
@@ -214,7 +247,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 
       {/* 2. 下半段内容区 */}
       <div
-        className="relative flex min-w-0 flex-1 flex-col justify-between overflow-hidden bg-white"
+        className="relative flex min-w-0 flex-1 flex-col justify-between overflow-hidden bg-white dark:bg-neutral-800"
         style={
           isImageCard
             ? {
@@ -226,7 +259,12 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         }
       >
         {/* 内容主体 */}
-        <div className="relative min-w-0 flex-1 overflow-hidden p-2.5">
+        <div
+          className={cn(
+            "relative min-w-0 flex-1 overflow-hidden",
+            isMob ? "min-h-[44px] p-2.5" : "p-2.5",
+          )}
+        >
           {isUrlCard && urlInfo ? (
             <div className="flex size-full flex-col justify-between">
               <div className="flex flex-1 items-center justify-center">
@@ -237,7 +275,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                 />
               </div>
               <div className="flex flex-col gap-0.5">
-                <span className="line-clamp-1 font-bold text-[11.5px] text-neutral-800">
+                <span className="line-clamp-1 font-bold text-[11.5px] text-neutral-800 dark:text-neutral-100">
                   {urlInfo.name}
                 </span>
                 <span className="line-clamp-1 font-mono text-[9.5px] text-neutral-400">
@@ -275,13 +313,51 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
           )}
         </div>
 
-        {/* 3. 底部极简元信息与快捷键序号 / 悬停操作 */}
-        <div className="flex h-6 shrink-0 select-none items-center justify-between px-3 pt-0 pb-1.5 font-medium text-[10.5px] text-neutral-400">
+        {/* 3. 底部极简元信息与快捷操作 */}
+        <div className="flex h-7 shrink-0 select-none items-center justify-between px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400">
           <span className="truncate">{metaText}</span>
 
-          {/* 右侧：未 hover 时显示序号，hover 时平滑展示快捷操作 */}
+          {/* 右侧：移动端常驻操作按钮，桌面端 hover 时展示 */}
           <div className="flex items-center">
-            {hovered && quickActions.length > 0 ? (
+            {isMob ? (
+              <div className="flex items-center gap-1">
+                <button
+                  className={cn(
+                    "flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700",
+                    item.isFavorite && "text-amber-500",
+                  )}
+                  onClick={handleMobileFavorite}
+                  onMouseDown={handleMobileActionMouseDown}
+                  title="收藏"
+                  type="button"
+                >
+                  <i
+                    className={cn(
+                      "i-lucide:star size-3.5",
+                      item.isFavorite && "fill-current",
+                    )}
+                  />
+                </button>
+                <button
+                  className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
+                  onClick={handleMobileCopy}
+                  onMouseDown={handleMobileActionMouseDown}
+                  title="复制"
+                  type="button"
+                >
+                  <i className="i-lucide:copy size-3.5" />
+                </button>
+                <button
+                  className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors hover:text-red-500 active:bg-neutral-100 dark:active:bg-neutral-700"
+                  onClick={handleMobileDelete}
+                  onMouseDown={handleMobileActionMouseDown}
+                  title="删除"
+                  type="button"
+                >
+                  <i className="i-lucide:trash-2 size-3.5" />
+                </button>
+              </div>
+            ) : hovered && quickActions.length > 0 ? (
               <ClipboardQuickActions
                 item={item}
                 labels={quickActionLabels}

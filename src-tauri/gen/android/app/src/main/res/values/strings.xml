@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">"EcoPaste"</string>
+    <string name="main_activity_title">"EcoPaste"</string>
+    <string name="accessibility_service_description">EcoPaste 需要此无障碍服务来监听剪贴板内容变化，并在您选择历史记录后自动粘贴到当前应用的输入框。</string>
+    <string name="overlay_service_channel_name">EcoPaste 手势唤醒服务</string>
+    <string name="overlay_service_channel_desc">保持 EcoPaste 屏幕底部上滑呼出手势在后台运行</string>
+    <string name="overlay_service_notification_title">EcoPaste 正在后台运行</string>
+    <string name="overlay_service_notification_text">屏幕底角上滑手势服务已开启</string>
+    <string name="overlay_panel_title">剪贴板历史</string>
+    <string name="overlay_panel_loading">正在加载…</string>
+    <string name="overlay_panel_empty">暂无剪贴板记录</string>
+    <string name="overlay_panel_kind_text">文本</string>
+    <string name="overlay_panel_kind_image">图片</string>
+    <string name="overlay_panel_kind_files">文件</string>
+    <string name="overlay_panel_pinned">置顶</string>
+    <string name="overlay_panel_favorite">收藏</string>
+    <string name="overlay_panel_paste_failed">粘贴失败，请检查 Root 引擎状态</string>
+</resources>

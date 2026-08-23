@@ -57,6 +57,12 @@ pub fn start_drag_files(
     {
         windows::start_drag_files(window, paths, preview_png)
     }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (window, paths, preview_png);
+        Ok(())
+    }
 }
 
 /// 启动一次文本 drag-out。
@@ -87,5 +93,11 @@ pub fn start_drag_text(
     #[cfg(target_os = "windows")]
     {
         windows::start_drag_text(window, &plain, html.as_deref(), rtf.as_deref(), preview_png)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (window, html, rtf, preview_png);
+        Ok(())
     }
 }

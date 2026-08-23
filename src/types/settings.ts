@@ -76,6 +76,20 @@ export interface General {
   dockIcon: boolean;
 }
 
+export interface AndroidGesture {
+  enabled: boolean;
+  hideOverlay: boolean;
+  popupHeightPercent: number;
+  leftWidthDp: number;
+  leftHeightDp: number;
+  rightWidthDp: number;
+  rightHeightDp: number;
+}
+
+export interface AndroidSettings {
+  gesture: AndroidGesture;
+}
+
 export interface Appearance {
   theme: Theme;
   language: Language;
@@ -207,6 +221,7 @@ export interface Update {
 
 export interface Settings {
   general: General;
+  android: AndroidSettings;
   appearance: Appearance;
   shortcuts: Shortcuts;
   clipboard: Clipboard;

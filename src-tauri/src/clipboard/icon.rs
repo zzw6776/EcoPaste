@@ -49,6 +49,7 @@ pub fn get_icon_cache_key(path: &Path) -> String {
 
 /// 抽取指定路径的图标 PNG 字节。`size` 为 `None` 时用内置默认值。
 /// 失败一律返回 `None`，由调用方决定回退。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn icon_png(path: &Path, size: Option<u32>) -> Option<Vec<u8>> {
     let size = size.unwrap_or(DEFAULT_ICON_PIXEL_SIZE);
     let icon = match file_icon_provider::get_file_icon(path, size as u16) {
@@ -73,6 +74,11 @@ pub fn icon_png(path: &Path, size: Option<u32>) -> Option<Vec<u8>> {
         return None;
     }
     Some(out)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn icon_png(_path: &Path, _size: Option<u32>) -> Option<Vec<u8>> {
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]

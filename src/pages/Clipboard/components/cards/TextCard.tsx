@@ -3,6 +3,8 @@ import { useSnapshot } from "valtio";
 import Highlight from "@/components/Highlight";
 import { clipboardViewState } from "@/stores/clipboardView";
 import type { ClipboardItem } from "@/types/clipboard";
+import { cn } from "@/utils/cn";
+import { isMobile } from "@/utils/is";
 
 interface TextCardProps extends ClipboardItem {
   /**
@@ -58,7 +60,10 @@ const TextCard: FC<TextCardProps> = (props) => {
   if (isOpenableLink) {
     return (
       <button
-        className="line-clamp-[20] block w-full min-w-0 cursor-pointer whitespace-pre-wrap break-all border-0 bg-transparent p-0 text-left text-[#007AFF] text-[15px] leading-[1.4] tracking-tight underline underline-offset-2"
+        className={cn(
+          "block w-full min-w-0 cursor-pointer whitespace-pre-wrap break-all border-0 bg-transparent p-0 text-left text-[#007AFF] text-[15px] leading-[1.4] tracking-tight underline underline-offset-2",
+          isMobile() ? "line-clamp-6" : "line-clamp-[20]",
+        )}
         onClick={handleLinkClick}
         onMouseDown={handleLinkMouseDown}
         type="button"
@@ -69,7 +74,12 @@ const TextCard: FC<TextCardProps> = (props) => {
   }
 
   return (
-    <div className="line-clamp-[20] w-full min-w-0 whitespace-pre-wrap break-all font-sans text-[15px] text-neutral-900 leading-[1.4] tracking-tight dark:text-neutral-100">
+    <div
+      className={cn(
+        "w-full min-w-0 whitespace-pre-wrap break-all font-sans text-[15px] text-neutral-900 leading-[1.4] tracking-tight dark:text-neutral-100",
+        isMobile() ? "line-clamp-6" : "line-clamp-[20]",
+      )}
+    >
       <Highlight keyword={keyword} text={summary ?? ""} />
     </div>
   );

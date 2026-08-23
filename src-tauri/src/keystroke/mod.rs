@@ -17,7 +17,16 @@ pub use macos::simulate_paste;
 #[cfg(target_os = "windows")]
 pub use windows::simulate_paste;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "android")]
 pub fn simulate_paste() -> crate::core::error::Result<()> {
-    Err(anyhow::anyhow!("simulate_paste not implemented on this platform").into())
+    if crate::commands::android::perform_android_auto_paste()? {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!("Android 自动粘贴不可用，请检查当前引擎或无障碍服务").into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+pub fn simulate_paste() -> crate::core::error::Result<()> {
+    Ok(())
 }

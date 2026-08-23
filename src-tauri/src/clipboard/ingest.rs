@@ -44,9 +44,13 @@ fn current_platform() -> Platform {
     {
         Platform::Windows
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
     {
-        compile_error!("EcoPaste only supports macOS and Windows")
+        Platform::Android
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+    {
+        Platform::Macos
     }
 }
 

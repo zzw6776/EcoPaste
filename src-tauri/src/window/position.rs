@@ -3,11 +3,23 @@ use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
 use crate::core::Result;
 use crate::settings::WindowPosition;
 
+#[cfg(target_os = "android")]
+pub fn position_window(_window: &WebviewWindow, _position: WindowPosition) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn set_clipboard_height(_window: &WebviewWindow, _height: f64) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 struct MonitorInfo {
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_from_cursor(
     window: &WebviewWindow,
 ) -> Result<Option<(MonitorInfo, PhysicalPosition<f64>)>> {
@@ -33,6 +45,7 @@ fn monitor_from_cursor(
     )))
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn position_window(window: &WebviewWindow, position: WindowPosition) -> Result<()> {
     let Some((monitor, _cursor)) = monitor_from_cursor(window)? else {
         return Ok(());
@@ -47,6 +60,12 @@ pub fn position_window(window: &WebviewWindow, position: WindowPosition) -> Resu
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub(super) fn center_on_cursor_monitor(_window: &WebviewWindow) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 #[allow(dead_code)]
 fn apply_follow(
     window: &WebviewWindow,
@@ -68,6 +87,7 @@ fn apply_follow(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 将窗口停靠到当前光标所在显示器底部居中。
 pub(super) fn center_on_cursor_monitor(window: &WebviewWindow) -> Result<()> {
     let Some((monitor, _)) = monitor_from_cursor(window)? else {
@@ -76,6 +96,7 @@ pub(super) fn center_on_cursor_monitor(window: &WebviewWindow) -> Result<()> {
     apply_bottom(window, &monitor)
 }
 
+#[cfg(not(target_os = "android"))]
 #[allow(dead_code)]
 fn apply_center(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
     apply_bottom(window, monitor)
@@ -95,6 +116,7 @@ pub fn set_cached_clipboard_height(height_logical: f64) {
     CLIPBOARD_HEIGHT.store(clamped.round() as u32, Ordering::Relaxed);
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn set_clipboard_height(window: &WebviewWindow, height_logical: f64) -> Result<()> {
     let scale = window.scale_factor().map_err(|e| anyhow::anyhow!(e))?;
     let height_clamped = height_logical.clamp(200.0, 750.0);
@@ -143,6 +165,7 @@ pub fn set_clipboard_height(window: &WebviewWindow, height_logical: f64) -> Resu
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn apply_bottom(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
     let scale = window.scale_factor().map_err(|e| anyhow::anyhow!(e))?;
     let mon_x = monitor.position.x as f64;

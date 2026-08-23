@@ -58,12 +58,14 @@
       "text": "纯文本"
     },
     "numberSuffixes": {
+      "dp": "dp",
       "files": "个",
       "gb": "GB",
       "hours": "小时",
       "items": "条",
       "lines": "行",
       "mb": "MB",
+      "percent": "%",
       "px": "px",
       "seconds": "秒"
     },
@@ -79,6 +81,10 @@
       },
       "actions": {
         "title": "快捷动作"
+      },
+      "androidGesture": {
+        "description": "仅在 Root 环境中监听屏幕底角上滑。",
+        "title": "Android 上滑唤起"
       },
       "appearance": {
         "title": "外观与语言"
@@ -184,6 +190,36 @@
           "controlLabel": "管理",
           "description": "选择鼠标悬停在记录上时显示的操作按钮。",
           "title": "显示的快捷动作"
+        }
+      },
+      "androidGesture": {
+        "enabled": {
+          "description": "仅在 Root 可用、屏幕已解锁时监听底角上滑；锁屏期间自动暂停。",
+          "title": "启用上滑唤起"
+        },
+        "hideOverlay": {
+          "description": "隐藏左右蓝色提示框，但保留对应区域的上滑监听。",
+          "title": "隐藏悬浮区提示"
+        },
+        "leftHeightDp": {
+          "description": "调整左下角手势区域从屏幕底部向上的高度。",
+          "title": "左侧区域高度"
+        },
+        "leftWidthDp": {
+          "description": "调整左下角手势区域沿屏幕底部占用的宽度。",
+          "title": "左侧区域宽度"
+        },
+        "popupHeightPercent": {
+          "description": "调整上滑唤出的底部弹窗占屏幕高度的比例。",
+          "title": "弹窗高度占比"
+        },
+        "rightHeightDp": {
+          "description": "调整右下角手势区域从屏幕底部向上的高度。",
+          "title": "右侧区域高度"
+        },
+        "rightWidthDp": {
+          "description": "调整右下角手势区域沿屏幕底部占用的宽度。",
+          "title": "右侧区域宽度"
         }
       },
       "appearance": {
