@@ -49,6 +49,12 @@ pub fn run() {
         .build();
 
     let builder = tauri::Builder::default()
+        .plugin(log_plugin)
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_clipboard_manager::init());
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .plugin(tauri_plugin_single_instance::init(
             |app_handle, argv, _cwd| {
                 if let Some(path) = backup::backup_path_from_args(&argv) {
@@ -73,26 +79,27 @@ pub fn run() {
                 }
             },
         ))
-        .plugin(log_plugin)
-        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_plugin_macos_permissions::init());
 
-    let updater_plugin = match std::env::var("TAURI_UPDATER_PUBLIC_KEY")
-        .or_else(|_| std::env::var("TAURI_SIGNING_PUBLIC_KEY"))
-    {
-        Ok(pubkey) if !pubkey.trim().is_empty() => {
-            tauri_plugin_updater::Builder::new().pubkey(pubkey).build()
-        }
-        _ => tauri_plugin_updater::Builder::new().build(),
+    #[cfg(not(target_os = "android"))]
+    let builder = {
+        let updater_plugin = match std::env::var("TAURI_UPDATER_PUBLIC_KEY")
+            .or_else(|_| std::env::var("TAURI_SIGNING_PUBLIC_KEY"))
+        {
+            Ok(pubkey) if !pubkey.trim().is_empty() => {
+                tauri_plugin_updater::Builder::new().pubkey(pubkey).build()
+            }
+            _ => tauri_plugin_updater::Builder::new().build(),
+        };
+        builder.plugin(updater_plugin)
     };
 
-    builder
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(updater_plugin)
         .plugin(core::prevent_default::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_run_as_admin_status,
@@ -181,11 +188,20 @@ pub fn run() {
             commands::download_update,
             commands::install_update,
             commands::skip_update_version,
+            commands::get_android_permissions_status,
+            commands::request_android_permission,
+            commands::toggle_android_overlay_service,
+            commands::minimize_android_app,
+            commands::set_android_engine_mode,
             menu::clipboard_item::popup_clipboard_item_menu,
-        ])
-        .on_menu_event(|app, event| {
-            menu::clipboard_item::handle_menu_event(app, event.id().as_ref());
-        })
+        ]);
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.on_menu_event(|app, event| {
+        menu::clipboard_item::handle_menu_event(app, event.id().as_ref());
+    });
+
+    builder
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -215,24 +231,36 @@ pub fn run() {
                 })?;
                 handle_db.manage(db::DatabaseState::new(pool));
                 clipboard::init(&handle_db)?;
+                #[cfg(target_os = "android")]
+                {
+                    commands::android::set_app_handle(handle_db.clone());
+                    if let Err(err) =
+                        commands::android::apply_android_gesture_settings(&settings.android.gesture)
+                    {
+                        log::warn!("sync initial Android gesture settings failed: {err}");
+                    }
+                }
                 Ok::<_, anyhow::Error>(())
             })?;
 
-            shortcut::init(&handle, &settings.shortcuts).map_err(|err| {
-                log::error!("global shortcut initialization failed: {err:?}");
-                err
-            })?;
+            #[cfg(not(target_os = "android"))]
+            {
+                shortcut::init(&handle, &settings.shortcuts).map_err(|err| {
+                    log::error!("global shortcut initialization failed: {err:?}");
+                    err
+                })?;
 
-            autostart::init(&handle).map_err(|err| {
-                log::error!("autostart initialization failed: {err:?}");
-                err
-            })?;
-            if let Err(err) = autostart::sync_enabled(&handle, settings.general.auto_start) {
-                log::warn!("autostart setting sync failed: {err}");
-            }
+                autostart::init(&handle).map_err(|err| {
+                    log::error!("autostart initialization failed: {err:?}");
+                    err
+                })?;
+                if let Err(err) = autostart::sync_enabled(&handle, settings.general.auto_start) {
+                    log::warn!("autostart setting sync failed: {err}");
+                }
 
-            if let Err(err) = tray::init(&handle, &settings) {
-                log::error!("tray initialization failed: {err:?}");
+                if let Err(err) = tray::init(&handle, &settings) {
+                    log::error!("tray initialization failed: {err:?}");
+                }
             }
 
             // 平台剪贴板窗口初始化：macOS 转 NSPanel
@@ -241,17 +269,20 @@ pub fn run() {
                 log::error!("setup clipboard NSPanel failed: {err:?}");
             }
 
+            #[cfg(not(target_os = "android"))]
             menu::clipboard_item::init(&handle);
 
             #[cfg(target_os = "windows")]
             menu::context_window::init(&handle);
 
+            #[cfg(not(target_os = "android"))]
             if !settings.onboarding.completed {
                 if let Err(err) = window::open_onboarding(&handle) {
                     log::error!("open onboarding window failed: {err:?}");
                 }
             }
 
+            #[cfg(not(target_os = "android"))]
             update::schedule_auto_check(&handle);
 
             // Windows 冷启动文件关联：第一个实例从自身启动参数里取 `.ecopastebak` 路径。

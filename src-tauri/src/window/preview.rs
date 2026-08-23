@@ -129,7 +129,38 @@ pub struct ClipboardPreviewState {
     pub layout: PreviewLayout,
 }
 
+#[cfg(target_os = "android")]
+pub fn show_clipboard_preview(
+    _app: &AppHandle,
+    _item_id: String,
+    _anchor: PreviewAnchorRect,
+) -> Result<Option<ClipboardPreviewState>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "android")]
+pub fn close_clipboard_preview(_app: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn close_clipboard_preview_now(_app: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn suppress_for_clipboard_hide(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+pub fn resume_after_clipboard_show(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
+    Ok(None)
+}
+
 /// 打开或重定向预览窗口，并把最新预览状态广播到预览 webview。
+#[cfg(not(target_os = "android"))]
 pub fn show_clipboard_preview(
     app: &AppHandle,
     item_id: String,
@@ -178,6 +209,7 @@ pub fn show_clipboard_preview(
     Ok(Some(state))
 }
 
+#[cfg(not(target_os = "android"))]
 /// 隐藏预览窗口并清空当前预览状态。
 pub fn close_clipboard_preview(app: &AppHandle) -> Result<()> {
     let request_id = PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
@@ -193,6 +225,7 @@ pub fn close_clipboard_preview(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 立即隐藏预览窗口并清空状态；用于剪贴板窗口隐藏等不需要退出动画的路径。
 pub fn close_clipboard_preview_now(app: &AppHandle) -> Result<()> {
     PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
@@ -208,6 +241,7 @@ pub fn close_clipboard_preview_now(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 剪贴板窗口开始隐藏时压制后续过期 show 请求，并立即收起预览窗口。
 pub fn suppress_for_clipboard_hide(app: &AppHandle) {
     PREVIEW_SUPPRESSED.store(true, Ordering::SeqCst);
@@ -216,6 +250,7 @@ pub fn suppress_for_clipboard_hide(app: &AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 /// 剪贴板窗口重新显示后允许新的预览请求进入，并在后台静默预热预览窗口，
 /// 确保用户按下空格键时能够 0 延迟秒开预览。
 pub fn resume_after_clipboard_show(app: &AppHandle) {
@@ -226,6 +261,7 @@ pub fn resume_after_clipboard_show(app: &AppHandle) {
     });
 }
 
+#[cfg(not(target_os = "android"))]
 /// 返回预览窗口最近一次收到的状态，供预览页首屏补拉。
 pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
     let guard = PREVIEW_STATE.lock().unwrap_or_else(|poisoned| {
@@ -236,6 +272,12 @@ pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
     Ok(guard.clone())
 }
 
+#[cfg(target_os = "android")]
+pub fn build_clipboard_preview_window(_app: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 /// 按需重建预览窗口。预览窗口不再由 Tauri 配置预创建（改为空闲销毁 + 按需重建），
 /// 所有选项必须在此用 builder 完整复刻原 `tauri.conf.json` 声明，否则重建后行为漂移。
 ///
@@ -279,6 +321,7 @@ pub fn build_clipboard_preview_window(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn set_preview_state(state: Option<ClipboardPreviewState>) {
     let mut guard = PREVIEW_STATE.lock().unwrap_or_else(|poisoned| {
         log::error!("preview state mutex poisoned on set, recovering");
@@ -287,6 +330,7 @@ fn set_preview_state(state: Option<ClipboardPreviewState>) {
     *guard = state;
 }
 
+#[cfg(not(target_os = "android"))]
 /// 判断剪贴板窗口是否仍处于可见状态，防止过期 hover 请求在剪贴板窗口隐藏后唤起预览。
 fn is_clipboard_window_visible(app: &AppHandle) -> bool {
     app.get_webview_window(CLIPBOARD_WINDOW_LABEL)
@@ -294,6 +338,7 @@ fn is_clipboard_window_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "android"))]
 /// 延迟隐藏真实窗口，为前端退出动画留出一小段可见时间。
 fn schedule_preview_window_hide(app: AppHandle, window: WebviewWindow, request_id: u64) {
     thread::spawn(move || {
@@ -312,6 +357,7 @@ fn schedule_preview_window_hide(app: AppHandle, window: WebviewWindow, request_i
     });
 }
 
+#[cfg(not(target_os = "android"))]
 /// 返回本次 show 所属的可见会话 id；隐藏后再次 show 会开启新会话。
 fn preview_session_id_for_show() -> u64 {
     let guard = PREVIEW_STATE.lock().unwrap_or_else(|poisoned| {
@@ -341,6 +387,7 @@ fn validate_anchor(anchor: &PreviewAnchorRect) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 取预览窗口；已被空闲销毁（或尚未创建）时按需重建。
 /// macOS 下每次都兜底确保 NSPanel 转换完成，覆盖重建后的全新窗口。
 fn ensure_preview_window(app: &AppHandle) -> Result<WebviewWindow> {
@@ -359,6 +406,7 @@ fn ensure_preview_window(app: &AppHandle) -> Result<WebviewWindow> {
     Ok(window)
 }
 
+#[cfg(not(target_os = "android"))]
 fn raise_preview_window(app: &AppHandle, window: &WebviewWindow) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -378,6 +426,7 @@ fn raise_preview_window(app: &AppHandle, window: &WebviewWindow) -> Result<()> {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn prepare_preview_window_for_show(
     app: &AppHandle,
     window: &WebviewWindow,
@@ -390,6 +439,7 @@ fn prepare_preview_window_for_show(
     raise_preview_window(app, window)
 }
 
+#[cfg(not(target_os = "android"))]
 /// 平台 show 收口点；成功后推进生命周期到 `Visible`，使未触发的空闲销毁计时器过期。
 fn show_preview_window(
     app: &AppHandle,
@@ -414,6 +464,7 @@ fn show_preview_window(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 平台 hide 收口点；成功后推进生命周期到 `HiddenWarm`，启动空闲销毁计时。
 /// 对已隐藏窗口的重复 hide（如剪贴板窗口隐藏时的压制路径）也会走到这里，
 /// 由生命周期管理器对重复进入 `HiddenWarm` 去重计时。
@@ -537,6 +588,7 @@ fn raise_windows_preview_window(window: &WebviewWindow, show: bool) -> Result<()
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn resolve_preview_monitor(app: &AppHandle) -> Result<tauri::Monitor> {
     let clipboard_window = get_window(app, CLIPBOARD_WINDOW_LABEL)?;
     if let Some(monitor) = clipboard_window
@@ -552,6 +604,7 @@ fn resolve_preview_monitor(app: &AppHandle) -> Result<tauri::Monitor> {
         .ok_or_else(|| anyhow::anyhow!("primary monitor not found").into())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 用完整显示器区域作为预览 overlay 边界，避免 macOS Dock 压缩 `work_area` 后截断连线。
 fn preview_overlay_bounds(monitor: &tauri::Monitor) -> PhysicalRect<i32, u32> {
     PhysicalRect {
@@ -560,6 +613,7 @@ fn preview_overlay_bounds(monitor: &tauri::Monitor) -> PhysicalRect<i32, u32> {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn apply_preview_window_bounds(
     window: &WebviewWindow,
     work_area: &PhysicalRect<i32, u32>,
@@ -576,6 +630,7 @@ fn apply_preview_window_bounds(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 返回实际预览窗口尺寸；Windows 避免精确全屏触发系统勿扰模式。
 fn preview_window_size(work_area: &PhysicalRect<i32, u32>) -> PhysicalSize<u32> {
     #[cfg(target_os = "windows")]
@@ -587,6 +642,11 @@ fn preview_window_size(work_area: &PhysicalRect<i32, u32>) -> PhysicalSize<u32> 
     }
 
     #[cfg(target_os = "macos")]
+    {
+        PhysicalSize::new(work_area.size.width, work_area.size.height)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         PhysicalSize::new(work_area.size.width, work_area.size.height)
     }

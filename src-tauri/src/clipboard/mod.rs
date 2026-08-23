@@ -33,6 +33,8 @@ pub use source::detect_frontmost;
 pub use storage::ImageStore;
 pub use watcher::{init, materialize_source, persist_and_notify, WatcherPause};
 pub use write::write_to_clipboard;
+#[cfg(target_os = "android")]
+pub use write::write_to_clipboard_app;
 
 #[cfg(test)]
 pub(crate) mod test_lock {

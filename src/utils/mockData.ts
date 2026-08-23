@@ -6,6 +6,17 @@ import type {
 import type { Settings } from "@/types/settings";
 
 export const DEFAULT_MOCK_SETTINGS: Settings = {
+  android: {
+    gesture: {
+      enabled: true,
+      hideOverlay: false,
+      leftHeightDp: 56,
+      leftWidthDp: 144,
+      popupHeightPercent: 60,
+      rightHeightDp: 56,
+      rightWidthDp: 144,
+    },
+  },
   appearance: {
     language: "zh-CN",
     theme: "light",

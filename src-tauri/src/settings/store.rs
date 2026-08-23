@@ -184,6 +184,7 @@ fn write_atomic(path: &Path, settings: &Settings) -> Result<()> {
 /// 校验设置之间的跨字段约束，避免非法配置写入磁盘。
 fn validate_settings(settings: &Settings) -> Result<()> {
     validate_window_open_group(&settings.clipboard.window.select_group_on_open)?;
+    validate_android_gesture(&settings.android.gesture)?;
 
     let open_clipboard = normalize_shortcut_value(&settings.shortcuts.open_clipboard);
     let open_preference = normalize_shortcut_value(&settings.shortcuts.open_preference);
@@ -195,6 +196,31 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     if open_clipboard == open_preference {
         return Err(AppError::Other(anyhow::anyhow!(
             "global shortcuts must be unique"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_android_gesture(gesture: &super::model::AndroidGesture) -> Result<()> {
+    let widths = [gesture.left_width_dp, gesture.right_width_dp];
+    let heights = [gesture.left_height_dp, gesture.right_height_dp];
+
+    if widths.iter().any(|value| !(0..=180).contains(value)) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "Android gesture width must be between 0dp and 180dp"
+        )));
+    }
+
+    if heights.iter().any(|value| !(0..=96).contains(value)) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "Android gesture height must be between 0dp and 96dp"
+        )));
+    }
+
+    if !(30..=90).contains(&gesture.popup_height_percent) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "Android gesture popup height must be between 30% and 90%"
         )));
     }
 

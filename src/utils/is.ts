@@ -37,12 +37,14 @@ export const isWin = currentPlatform === "windows";
 export const isAndroid = currentPlatform === "android";
 
 /**
- * 当前是否为移动端环境（Android、iOS 或移动视口宽度）。
+ * 当前是否为移动端环境（Android、iOS 或浏览器移动视口宽度）。
  */
 export const isMobile = () => {
   if (typeof window === "undefined") return false;
+  if (isTauri) {
+    return isAndroid;
+  }
   return (
-    isAndroid ||
     window.innerWidth < 640 ||
     /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
   );

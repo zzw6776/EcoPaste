@@ -8,6 +8,8 @@ body,
 
 html {
   --uno: scheme-light select-none overscroll-none antialiased;
+  --mobile-safe-area-top: max(env(safe-area-inset-top, 0px), 2rem);
+  --mobile-safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 0.75rem);
 
   &.dark {
     --uno: scheme-dark;
@@ -24,6 +26,14 @@ html {
       outline: none;
     }
   }
+}
+
+.mobile-safe-area-top {
+  padding-top: var(--mobile-safe-area-top) !important;
+}
+
+.mobile-safe-area-bottom {
+  padding-bottom: var(--mobile-safe-area-bottom) !important;
 }
 
 /* 彻底隐藏所有滚动条（对标 Paste 原生极简视觉，手势/触摸板/鼠标滚轮/键盘滚动依然完美生效） */

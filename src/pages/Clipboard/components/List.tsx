@@ -45,7 +45,8 @@ import type {
   ClipboardRange,
 } from "@/types/clipboard";
 import type { ItemAction } from "@/types/settings";
-import { isMac } from "@/utils/is";
+import { cn } from "@/utils/cn";
+import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
 import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
   isSpaceKey,
@@ -93,7 +94,8 @@ const List: FC = () => {
   const deferredReloadRef = useRef(false);
   // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
   // dormant（隐藏）期间到达的剪贴板更新一律延后，不 reload 隐藏窗口。
-  const clipboardWindowVisibleRef = useRef(false);
+  // Android 移动端与 Web 预览模式下首屏直接处于激活态，初值置为 true。
+  const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
 
   useEventListener(
     "wheel",
@@ -210,6 +212,20 @@ const List: FC = () => {
    */
   useMount(() => {
     void loadGroups();
+
+    if (isAndroid) {
+      clipboardWindowVisibleRef.current = true;
+      const handleMobileFocus = () => {
+        clipboardWindowVisibleRef.current = true;
+        requestReloadAtTop();
+      };
+      window.addEventListener("focus", handleMobileFocus);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          handleMobileFocus();
+        }
+      });
+    }
   });
 
   /**
@@ -859,14 +875,15 @@ const List: FC = () => {
         atTopStateChange={handleAtTopStateChange}
         className="no-scrollbar"
         computeItemKey={computeItemKey}
-        horizontalDirection={true}
+        horizontalDirection={!isMobile()}
         itemContent={renderItemContent}
         rangeChanged={handleRangeChanged}
         ref={virtuosoRef}
         style={{
           height: "100%",
-          paddingLeft: 16,
-          paddingRight: 16,
+          paddingBottom: isMobile() ? "var(--mobile-safe-area-bottom)" : 0,
+          paddingLeft: isMobile() ? 0 : 16,
+          paddingRight: isMobile() ? 0 : 16,
           width: "100%",
         }}
         totalCount={total}
@@ -1011,6 +1028,12 @@ const List: FC = () => {
 
       setSelectedId(item.id);
 
+      if (isMobile()) {
+        closePreview("mobileSingleClickPaste");
+        pasteClipboardItem(item.id, false);
+        return;
+      }
+
       if (autoPaste === "singleClickPaste") {
         closePreview("singleClickPaste");
         pasteClipboardItem(item.id, false);
@@ -1054,7 +1077,13 @@ const List: FC = () => {
     );
 
     return (
-      <div className="flex aspect-square h-full min-w-0 shrink-0 items-center px-[6px] py-2.5">
+      <div
+        className={cn(
+          isMobile()
+            ? "w-full px-3 py-1"
+            : "flex aspect-square h-full min-w-0 shrink-0 items-center px-[6px] py-2.5",
+        )}
+      >
         <ClipboardCard
           availableActions={availableActions}
           hintKey={hintKey}

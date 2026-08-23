@@ -25,7 +25,10 @@ const OnboardingCard: FC<OnboardingCardProps> = (props) => {
   const control = action ?? children;
 
   return (
-    <Card className={className} classNames={{ body: cn({ "!p-4": compact }) }}>
+    <Card
+      className={className}
+      classNames={{ body: cn("!p-3 sm:!p-5", { "!p-3": compact }) }}
+    >
       <div className="flex h-full">
         <div className="min-w-0 flex-1">
           <div

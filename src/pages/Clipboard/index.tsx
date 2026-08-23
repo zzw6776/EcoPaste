@@ -1,9 +1,10 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { resizeClipboardWindow } from "@/commands";
+import { minimizeAndroidApp } from "@/commands/android";
 import { useClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
 import { cn } from "@/utils/cn";
-import { isMobile, isTauri } from "@/utils/is";
+import { isAndroid, isMobile, isTauri } from "@/utils/is";
 import Header from "./components/Header";
 import List from "./components/List";
 
@@ -18,10 +19,14 @@ const Clipboard = () => {
   const isDraggingRef = useRef(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(340);
+  const popupDragStartYRef = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // 移动端/桌面端视口自适应与预览状态
   const [mobileMode, setMobileMode] = useState(() => isMobile());
+  const [androidPopupMode, setAndroidPopupMode] = useState(() => {
+    return isAndroid && window.innerHeight < window.screen.height * 0.95;
+  });
   const [sheetOpen, setSheetOpen] = useState(true);
 
   useEffect(() => {
@@ -29,7 +34,11 @@ const Clipboard = () => {
       if (!isTauri) {
         setMobileMode(window.innerWidth < 768);
       }
+      if (isAndroid) {
+        setAndroidPopupMode(window.innerHeight < window.screen.height * 0.95);
+      }
     };
+    handleResize();
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
@@ -66,20 +75,49 @@ const Clipboard = () => {
     }
   };
 
+  const handlePopupDragStart = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) => {
+    popupDragStartYRef.current = event.screenY;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePopupDragEnd = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const delta = event.screenY - popupDragStartYRef.current;
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // 指针已被系统取消时无需重复释放。
+    }
+    if (delta < 64) return;
+
+    void minimizeAndroidApp();
+  };
+
+  const handlePopupDragCancel = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) => {
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // 系统取消手势时指针可能已经释放。
+    }
+  };
+
   const content = (
     <div
       className={cn(
-        "relative flex h-full w-full select-none flex-col overflow-hidden border border-white/50 bg-white/75 text-neutral-800 shadow-[0_20px_50px_rgba(0,0,0,0.2)] backdrop-blur-3xl transition-all duration-300 dark:border-white/15 dark:bg-black/65 dark:text-white",
-        mobileMode ? "rounded-t-[32px] rounded-b-none pb-2" : "rounded-[26px]",
+        "relative flex h-full w-full select-none flex-col overflow-hidden text-neutral-800 dark:text-white",
+        mobileMode
+          ? cn(
+              "bg-[#F2F2F7] dark:bg-[#121212]",
+              androidPopupMode ? "rounded-t-4" : "mobile-safe-area-top",
+            )
+          : "rounded-[26px] border border-white/50 bg-white/70 dark:border-white/15 dark:bg-black/60",
       )}
       data-tauri-drag-region
     >
-      {/* 移动端顶部药丸拖动手柄 */}
-      {mobileMode ? (
-        <div className="flex w-full justify-center pt-2.5 pb-1">
-          <div className="h-1.2 w-10 rounded-full bg-neutral-300 dark:bg-neutral-600" />
-        </div>
-      ) : (
+      {!mobileMode ? (
         /* 桌面端顶部上下拉伸调节隐形热区 */
         <div
           className="absolute top-0 right-0 left-0 z-50 h-2.5 cursor-ns-resize touch-none"
@@ -88,7 +126,20 @@ const Clipboard = () => {
           onPointerMove={handleResizeMove}
           onPointerUp={handleResizeEnd}
         />
-      )}
+      ) : null}
+
+      {androidPopupMode ? (
+        <button
+          aria-label="下滑收起剪贴板"
+          className="flex h-5 shrink-0 cursor-ns-resize touch-none items-center justify-center border-0 bg-transparent p-0"
+          onPointerCancel={handlePopupDragCancel}
+          onPointerDown={handlePopupDragStart}
+          onPointerUp={handlePopupDragEnd}
+          type="button"
+        >
+          <span className="h-1 w-10 rounded-full bg-black/20 dark:bg-white/25" />
+        </button>
+      ) : null}
 
       <Header />
 

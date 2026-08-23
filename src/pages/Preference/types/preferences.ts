@@ -61,6 +61,13 @@ export type PreferenceControl =
       min?: number;
       suffixKey?: string;
     }
+  | {
+      type: "slider";
+      max: number;
+      min: number;
+      step?: number;
+      suffixKey?: string;
+    }
   | { type: "retention" }
   | { type: "text" }
   | { type: "shortcutRecorder" }

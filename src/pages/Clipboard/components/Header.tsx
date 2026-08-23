@@ -23,6 +23,8 @@ import Dropdown, {
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { router } from "@/router";
+import { openAndroidPermissionsModal } from "@/stores/android";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
 import type {
@@ -31,6 +33,7 @@ import type {
 } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
 import { getModalApi } from "@/utils/feedback";
+import { isAndroid, isMobile } from "@/utils/is";
 import { formatShortcutDisplay } from "@/utils/shortcut";
 import SearchInput from "./SearchInput";
 
@@ -39,7 +42,7 @@ interface WindowVisibilityPayload {
   visible: boolean;
 }
 
-type HeaderMoreMenuKey = "clear" | "preference";
+type HeaderMoreMenuKey = "clear" | "preference" | "android_permissions";
 
 const MORE_ACTION_TRIGGER: AppDropdownProps["trigger"] = ["click"];
 const PREFERENCE_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+,", " ");
@@ -80,6 +83,10 @@ const Header: FC = () => {
   });
 
   const handleOpenPreference = () => {
+    if (isAndroid) {
+      void router.navigate("/preference");
+      return Promise.resolve();
+    }
     return showWindow(WINDOW_LABEL.PREFERENCE);
   };
 
@@ -91,6 +98,10 @@ const Header: FC = () => {
     const key = info.key as HeaderMoreMenuKey;
     if (key === "clear") {
       await handleClearClipboardItems();
+      return;
+    }
+    if (key === "android_permissions") {
+      openAndroidPermissionsModal();
       return;
     }
     await handleOpenPreference();
@@ -255,6 +266,15 @@ const Header: FC = () => {
   };
 
   const moreMenuItems: DropdownMenuItems = [
+    ...(isAndroid
+      ? [
+          {
+            icon: "i-lucide:smartphone",
+            key: "android_permissions",
+            label: "Android 权限与引擎配置",
+          },
+        ]
+      : []),
     {
       extra: PREFERENCE_SHORTCUT,
       icon: "i-lucide:settings",
@@ -271,6 +291,164 @@ const Header: FC = () => {
 
   const isAllActive = range === "all" && groupId === null;
   const isFavoriteActive = range === "favorite" && groupId === null;
+
+  if (isMobile()) {
+    return (
+      <div className="flex shrink-0 select-none flex-col gap-2 px-3 pt-1 pb-2">
+        {/* 顶部栏：搜索框 + 更多操作 */}
+        <div className="flex items-center gap-2">
+          <div className="flex-1">
+            <SearchInput
+              allowClear
+              blurToken={searchBlurToken}
+              className="w-full"
+              clearToken={searchClearToken}
+              focusToken={searchFocusToken}
+              onChange={handleKeywordChange}
+              placeholder="搜索剪贴板历史..."
+              size="middle"
+              value={searchValue}
+            />
+          </div>
+
+          <Dropdown
+            menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
+            trigger={MORE_ACTION_TRIGGER}
+          >
+            <button
+              className="flex size-9 cursor-pointer items-center justify-center rounded-xl bg-white text-neutral-700 shadow-xs transition-colors hover:bg-neutral-100 dark:bg-neutral-800 dark:text-neutral-200"
+              type="button"
+            >
+              <i className="i-lucide:more-vertical size-4" />
+            </button>
+          </Dropdown>
+        </div>
+
+        {/* 分类与画板横向滑块 */}
+        <div className="no-scrollbar -mx-3 flex items-center gap-1.5 overflow-x-auto px-3 py-0.5">
+          {/* 全部 */}
+          <button
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+              isAllActive && !snapshot.category
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+            onClick={selectAllHistory}
+            type="button"
+          >
+            <i className="i-lucide:clock size-3.5" />
+            <span>全部</span>
+          </button>
+
+          {/* 收藏 */}
+          <button
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+              isFavoriteActive
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+            onClick={selectFavoriteHistory}
+            type="button"
+          >
+            <i className="i-lucide:star size-3.5 fill-current" />
+            <span>收藏</span>
+          </button>
+
+          {/* 文本 */}
+          <button
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+              snapshot.category === "text" && !groupId
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+            onClick={() => {
+              clipboardViewState.range = "all";
+              clipboardViewState.groupId = null;
+              clipboardViewState.category = "text";
+            }}
+            type="button"
+          >
+            <i className="i-lucide:type size-3.5" />
+            <span>文本</span>
+          </button>
+
+          {/* 图片 */}
+          <button
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+              snapshot.category === "image" && !groupId
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+            onClick={() => {
+              clipboardViewState.range = "all";
+              clipboardViewState.groupId = null;
+              clipboardViewState.category = "image";
+            }}
+            type="button"
+          >
+            <i className="i-lucide:image size-3.5" />
+            <span>图片</span>
+          </button>
+
+          {/* 文件 */}
+          <button
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+              snapshot.category === "files" && !groupId
+                ? "bg-[#007AFF] text-white shadow-xs"
+                : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+            onClick={() => {
+              clipboardViewState.range = "all";
+              clipboardViewState.groupId = null;
+              clipboardViewState.category = "files";
+            }}
+            type="button"
+          >
+            <i className="i-lucide:folder size-3.5" />
+            <span>文件</span>
+          </button>
+
+          {/* 自定义画板 */}
+          {customGroups.map((group) => {
+            const isCurrent = groupId === group.id;
+            const { color, icon } = parseGroupIcon(group.icon);
+            return (
+              <button
+                className={cn(
+                  "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
+                  isCurrent
+                    ? "bg-[#007AFF] text-white shadow-xs"
+                    : "bg-white text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300",
+                )}
+                key={group.id}
+                onClick={() => selectCustomGroup(group.id)}
+                type="button"
+              >
+                {color ? (
+                  <span
+                    className="size-2 shrink-0 rounded-full"
+                    style={{ backgroundColor: color }}
+                  />
+                ) : null}
+                {icon ? (
+                  <ClipboardGroupIcon
+                    className="size-3.5 shrink-0 text-current"
+                    icon={icon}
+                  />
+                ) : null}
+                <span>{group.name}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

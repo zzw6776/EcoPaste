@@ -521,6 +521,12 @@ pub async fn popup_clipboard_item_menu(
     {
         super::context_window::show_for_clipboard_item(&app, &request)
     }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (app, request);
+        Ok(())
+    }
 }
 
 /// 全局菜单事件分发入口（注册在 `on_menu_event` 上）。Windows 不经此路径。

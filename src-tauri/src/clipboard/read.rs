@@ -6,7 +6,9 @@
 //! 图片读取走「PNG 直通优先」：源本身是 PNG 时直取原始字节、从头部解析尺寸（零解码/编码）；
 //! 仅当源是 TIFF/DIB 等非 PNG 时才回退到库的解码 + 重编码 PNG。
 
+#[cfg(not(target_os = "android"))]
 use clipboard_rs::common::RustImage;
+#[cfg(not(target_os = "android"))]
 use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
 
 use super::payload::{ClipboardPayload, ImagePayload, TextPayload};
@@ -15,10 +17,42 @@ use crate::settings::{Capture, CaptureKind};
 
 /// 持有一个 [`ClipboardContext`] 的读取器。轻量，可按需创建；
 /// 监听线程（2.2）会持有一个长生命周期实例复用。
+#[cfg(not(target_os = "android"))]
 pub struct ClipboardReader {
     ctx: ClipboardContext,
 }
 
+#[cfg(target_os = "android")]
+pub struct ClipboardReader;
+
+#[cfg(target_os = "android")]
+impl ClipboardReader {
+    pub fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    pub fn read_with_capture(&self, _capture: &Capture) -> Result<Option<ClipboardPayload>> {
+        Ok(None)
+    }
+
+    pub fn read_with_app(
+        &self,
+        app: &tauri::AppHandle,
+        _capture: &Capture,
+    ) -> Result<Option<ClipboardPayload>> {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        match app.clipboard().read_text() {
+            Ok(text) if !text.trim().is_empty() => Ok(Some(ClipboardPayload::Text(TextPayload {
+                text,
+                html: None,
+                rtf: None,
+            }))),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 impl ClipboardReader {
     pub fn new() -> Result<Self> {
         let ctx = ClipboardContext::new().map_err(clip_err)?;
@@ -174,6 +208,7 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+#[cfg(not(target_os = "android"))]
 /// 仅当 `available` 时读取，读取失败或空串都归并为 `None`，
 /// 让「格式存在但内容为空」与「格式不存在」对下游表现一致。
 fn read_optional(
@@ -206,11 +241,12 @@ fn text_contains_kind(text: &TextPayload, kind: CaptureKind) -> bool {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn clip_err<E: std::fmt::Display>(err: E) -> AppError {
     AppError::Clipboard(err.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 
