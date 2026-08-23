@@ -8,16 +8,19 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
 use crate::core::{AppError, Result};
 use crate::settings::{SettingsStore, Shortcuts};
+#[cfg(not(target_os = "android"))]
 use crate::window::{self, CLIPBOARD_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
 
 #[cfg(target_os = "windows")]
 mod win_v;
 
 pub const CONFLICT_EVENT: &str = "shortcut://conflict";
+#[cfg(not(target_os = "android"))]
 const RESUME_DEBOUNCE: Duration = Duration::from_millis(160);
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +30,27 @@ pub struct ShortcutConflict {
     pub reason: String,
 }
 
+#[cfg(target_os = "android")]
+pub fn init(_app: &AppHandle, _shortcuts: &Shortcuts) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn suspend(_app: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn resume(_app: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn apply(_app: &AppHandle, _shortcuts: &Shortcuts) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 #[derive(Default)]
 pub struct ShortcutManager {
     active: Mutex<Vec<(&'static str, Shortcut)>>,
@@ -76,12 +100,14 @@ impl ShortcutPause {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn init(app: &AppHandle, shortcuts: &Shortcuts) -> Result<()> {
     app.manage(ShortcutManager::default());
     apply(app, shortcuts)
 }
 
 /// 暂停所有已注册的全局快捷键；用于前端录入快捷键期间避免旧绑定被触发。
+#[cfg(not(target_os = "android"))]
 pub fn suspend(app: &AppHandle) -> Result<()> {
     let manager = app.state::<ShortcutManager>();
     let should_unregister = {
@@ -97,6 +123,7 @@ pub fn suspend(app: &AppHandle) -> Result<()> {
 }
 
 /// 释放一次全局快捷键暂停；只有所有录入器都结束后才按最新设置恢复注册。
+#[cfg(not(target_os = "android"))]
 pub fn resume(app: &AppHandle) -> Result<()> {
     let manager = app.state::<ShortcutManager>();
     let should_schedule = {
@@ -120,6 +147,7 @@ pub fn resume(app: &AppHandle) -> Result<()> {
 }
 
 /// 全量替换：先取消上一轮注册，再逐个注册新项。注册失败仅 emit 不中断其它项。
+#[cfg(not(target_os = "android"))]
 pub fn apply(app: &AppHandle, shortcuts: &Shortcuts) -> Result<()> {
     unregister_active(app)?;
 
@@ -163,6 +191,7 @@ pub fn apply(app: &AppHandle, shortcuts: &Shortcuts) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 判断是否仍有录入器持有全局快捷键暂停。
 fn is_suspended(app: &AppHandle) -> bool {
     app.state::<ShortcutManager>()
@@ -172,6 +201,7 @@ fn is_suspended(app: &AppHandle) -> bool {
         .suspended()
 }
 
+#[cfg(not(target_os = "android"))]
 /// 延迟恢复全局快捷键；若用户立即切到另一个录入器，新 suspend 会让本次恢复失效。
 fn schedule_resume(app: &AppHandle) {
     let app = app.clone();
@@ -195,6 +225,7 @@ fn schedule_resume(app: &AppHandle) {
     });
 }
 
+#[cfg(not(target_os = "android"))]
 /// 只有仍处于同一恢复世代且暂停计数为 0 时，延迟恢复任务才允许执行。
 fn should_run_scheduled_resume(app: &AppHandle, epoch: u64) -> bool {
     let manager = app.state::<ShortcutManager>();
@@ -203,6 +234,7 @@ fn should_run_scheduled_resume(app: &AppHandle, epoch: u64) -> bool {
     pause.allows_resume(epoch)
 }
 
+#[cfg(not(target_os = "android"))]
 /// 取消当前轮所有已注册快捷键，并清空内部 active 状态。
 fn unregister_active(app: &AppHandle) -> Result<()> {
     let plugin = app.global_shortcut();
@@ -221,6 +253,7 @@ fn unregister_active(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn register_one(app: &AppHandle, action: &'static str, binding: &str) -> Result<Shortcut> {
     let plugin = app.global_shortcut();
     let shortcut: Shortcut = binding
@@ -241,6 +274,7 @@ fn register_one(app: &AppHandle, action: &'static str, binding: &str) -> Result<
     Ok(shortcut)
 }
 
+#[cfg(not(target_os = "android"))]
 fn handle_event(app: &AppHandle, action: &'static str, event: ShortcutEvent) {
     // Pressed 触发一次即可（Released 是按键松开），避免 toggle 在按下/松开各执行一次回弹。
     if !matches!(event.state(), ShortcutState::Pressed) {

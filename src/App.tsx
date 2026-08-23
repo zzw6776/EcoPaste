@@ -14,9 +14,9 @@ import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
 import { router } from "./router";
 import { settingsReady, settingsState } from "./stores/settings";
-import "./stores/windowLifecycle";
 import type { Language } from "./types/settings";
 import { setMessageApi, setModalApi } from "./utils/feedback";
+import { isAndroid, isTauri } from "./utils/is";
 import { log } from "./utils/log";
 
 const ANTD_MODAL_CONFIG = {
@@ -32,15 +32,33 @@ const resolveAntdLocale = (language: Language) => {
   return zhCN;
 };
 
+import { AndroidPermissionsModal } from "@/components/AndroidPermissionsModal";
+import {
+  androidState,
+  checkAndAutoPromptAndroidPermissions,
+  closeAndroidPermissionsModal,
+} from "@/stores/android";
+
 const AppContent: FC = () => {
   const { message, modal } = AntdApp.useApp();
+  const androidSnapshot = useSnapshot(androidState);
 
   useEffect(() => {
     setMessageApi(message);
     setModalApi(modal);
   }, [message, modal]);
 
-  return <RouterProvider router={router} />;
+  return (
+    <>
+      <RouterProvider router={router} />
+      {isAndroid && (
+        <AndroidPermissionsModal
+          onClose={closeAndroidPermissionsModal}
+          open={androidSnapshot.permissionsModalOpen}
+        />
+      )}
+    </>
+  );
 };
 
 /**
@@ -52,7 +70,9 @@ const App: FC = () => {
 
   const { i18n } = useTranslation();
   const settings = useSnapshot(settingsState);
-  const windowLabel = getCurrentWebviewWindow().label;
+  const windowLabel = isTauri
+    ? getCurrentWebviewWindow().label
+    : WINDOW_LABEL.CLIPBOARD;
   const mode =
     windowLabel === WINDOW_LABEL.ONBOARDING
       ? "dark"
@@ -73,6 +93,12 @@ const App: FC = () => {
   // notifyWindowReady 内部已吞掉并记录失败，这里无需再 try/catch。
   useMount(async () => {
     await notifyWindowReady(getCurrentWebviewWindow().label);
+    if (isAndroid) {
+      if (!settings.onboarding.completed) {
+        void router.navigate("/onboarding");
+      }
+      void checkAndAutoPromptAndroidPermissions();
+    }
   });
 
   // 兜底未捕获的 Promise rejection：统一进日志通道，避免只在 devtools 红字闪过、生产环境完全无痕。
@@ -94,7 +120,7 @@ const App: FC = () => {
 
   return (
     <ConfigProvider locale={locale} modal={ANTD_MODAL_CONFIG} theme={antdTheme}>
-      <AntdApp>
+      <AntdApp message={{ duration: 1.5, maxCount: 2, top: 56 }}>
         <AppContent />
       </AntdApp>
     </ConfigProvider>

@@ -1,3 +1,4 @@
+import { isAndroid } from "@/utils/is";
 import DoneStep from "./components/DoneStep";
 import IgnoreAppsStep from "./components/IgnoreAppsStep";
 import LegacyImportStep from "./components/LegacyImportStep";
@@ -6,7 +7,7 @@ import ShortcutsStep from "./components/ShortcutsStep";
 import WelcomeStep from "./components/WelcomeStep";
 import type { OnboardingStepDefinition } from "./types";
 
-export const ONBOARDING_STEPS: OnboardingStepDefinition[] = [
+const ALL_STEPS: OnboardingStepDefinition[] = [
   {
     component: WelcomeStep,
     icon: "i-lucide:sparkles",
@@ -38,3 +39,9 @@ export const ONBOARDING_STEPS: OnboardingStepDefinition[] = [
     id: "done",
   },
 ];
+
+export const ONBOARDING_STEPS: OnboardingStepDefinition[] = isAndroid
+  ? ALL_STEPS.filter((step) => {
+      return ["welcome", "permissions", "done"].includes(step.id);
+    })
+  : ALL_STEPS;

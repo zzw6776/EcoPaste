@@ -5,7 +5,6 @@ import { useSnapshot } from "valtio";
 import { showClipboardPreview } from "@/commands";
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
-import { useKeyboardEvent } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { settingsState } from "@/stores/settings";
 import type { ClipboardItem } from "@/types/clipboard";
@@ -15,15 +14,14 @@ import {
   closeClipboardPreviewSilently,
   HOVER_DELAY_MS,
   HOVER_HIDE_BUFFER_MS,
-  isSpaceKey,
   type PreviewSession,
   type PreviewTrigger,
   type UseClipboardPreviewControllerOptions,
   type WindowVisibilityPayload,
 } from "./previewController";
 
-const KEYBOARD_PREVIEW_MAX_FRAMES = 36;
-const KEYBOARD_PREVIEW_STABLE_FRAMES = 2;
+const KEYBOARD_PREVIEW_MAX_FRAMES = 6;
+const KEYBOARD_PREVIEW_STABLE_FRAMES = 1;
 const KEYBOARD_PREVIEW_RECT_EPSILON = 0.5;
 
 interface PreviewRectSnapshot {
@@ -140,6 +138,22 @@ export function useClipboardPreviewController(
 
   useEventListener("resize", handleWindowResize, { target: window });
 
+  const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
+
+  const isRealPointerMove = (x: number, y: number) => {
+    if (!lastPointerPosRef.current) {
+      lastPointerPosRef.current = { x, y };
+      return true;
+    }
+    const dx = Math.abs(x - lastPointerPosRef.current.x);
+    const dy = Math.abs(y - lastPointerPosRef.current.y);
+    if (dx > 3 || dy > 3) {
+      lastPointerPosRef.current = { x, y };
+      return true;
+    }
+    return false;
+  };
+
   /**
    * 关闭预览窗口并清理本地预览会话。
    */
@@ -160,23 +174,23 @@ export function useClipboardPreviewController(
     item: ClipboardItem,
     event: ReactPointerEvent<HTMLDivElement>,
   ) => {
+    const pointerX = event.clientX;
     const pointerY = event.clientY;
+
+    // 鼠标未发生实际物理位移（只是列表滚动让卡片滑过静止鼠标），直接忽略
+    if (!isRealPointerMove(pointerX, pointerY)) {
+      return;
+    }
 
     onHoverSelect(item.id);
 
     if (!clipboardWindowVisibleRef.current) return;
+
+    // 如果当前处于键盘预览模式，静止或划过的鼠标绝不劫持当前键盘选中的预览
     if (previewSessionRef.current?.trigger === "keyboard") {
-      cancelHoverPreview();
-      cancelHoverHide();
-
-      if (previewSessionRef.current.itemId === item.id) {
-        cancelKeyboardPreviewFrame();
-        return;
-      }
-
-      scheduleKeyboardPreviewMove(item);
       return;
     }
+
     if (!previewSettings.hoverEnabled) return;
 
     cancelHoverPreview();
@@ -211,7 +225,12 @@ export function useClipboardPreviewController(
     item: ClipboardItem,
     event: ReactPointerEvent<HTMLDivElement>,
   ) => {
+    const pointerX = event.clientX;
     const pointerY = event.clientY;
+
+    if (!isRealPointerMove(pointerX, pointerY)) {
+      return;
+    }
 
     if (hoverTimerRef.current !== null) {
       pendingHoverTargetRef.current = { item, pointerY };
@@ -280,16 +299,22 @@ export function useClipboardPreviewController(
   });
 
   /**
-   * Space 按下打开当前 active item；忽略重复 keydown，避免重复 IPC。
+   * Space 单次按切换（Toggle）打开或关闭当前 active item 的预览。
    */
   const handlePreviewSpaceDown = (event: KeyboardEvent) => {
     event.preventDefault();
 
     if (!previewSettings.spaceEnabled) return;
-    if (event.repeat && previewSession?.trigger === "keyboard") return;
+    if (event.repeat) return;
 
     cancelHoverPreview();
     cancelHoverHide();
+
+    // 如果当前已经是预览状态，按空格键直接关闭（Toggle 模式）
+    if (previewSessionRef.current) {
+      closePreview("spaceToggle");
+      return;
+    }
 
     const activeItem = getActiveItem();
 
@@ -299,26 +324,19 @@ export function useClipboardPreviewController(
   };
 
   /**
-   * Space 松开关闭 keyboard preview。
-   */
-  const handlePreviewSpaceUp = (event: KeyboardEvent) => {
-    if (!isSpaceKey(event)) return;
-
-    event.preventDefault();
-
-    if (previewSession?.trigger !== "keyboard") return;
-
-    closePreview("spaceUp");
-  };
-
-  useKeyboardEvent("keyup", handlePreviewSpaceUp);
-
-  /**
    * 方向键移动到新 active item 时同步 keyboard preview。
    */
   const handleKeyboardPreviewMove = (item: ClipboardItem) => {
-    if (previewSessionRef.current?.trigger !== "keyboard") return;
+    if (!previewSessionRef.current) return;
 
+    cancelHoverPreview();
+    cancelHoverHide();
+    cancelPreviewMoveFrame();
+
+    // 0 延迟即刻触发预览内容切换
+    void openPreviewForItem(item, "keyboard");
+
+    // 随后的短帧采样做精确坐标校正
     scheduleKeyboardPreviewMove(item);
   };
 
@@ -442,6 +460,7 @@ export function useClipboardPreviewController(
       lastRect: null,
       stableFrames: 0,
     };
+    commitPreviewSession({ itemId: item.id, trigger: "keyboard" });
     requestKeyboardPreviewFrame();
   }
 

@@ -3,6 +3,8 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { proxy } from "valtio";
 
 import { TAURI_EVENT } from "@/constants/events";
+import { WINDOW_LABEL } from "@/constants/windows";
+import { isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
 
 /**
@@ -45,22 +47,28 @@ export const windowLifecycleState = proxy<{
   visible: false,
 });
 
-const currentLabel = getCurrentWebviewWindow().label;
+const currentLabel = isTauri
+  ? getCurrentWebviewWindow().label
+  : WINDOW_LABEL.CLIPBOARD;
 
 /**
  * 启动期一次性订阅 `window://lifecycle`，只接收当前窗口的阶段更新。
  * 模块导入即开跑，单 WebView 内天然单例。
  */
 export const windowLifecycleReady: Promise<void> = (async () => {
+  if (!isTauri) return;
+
   try {
     await listen<LifecyclePayload>(TAURI_EVENT.WINDOW_LIFECYCLE, (event) => {
       const { generation, label, phase, visible } = event.payload;
 
       if (label !== currentLabel) return;
 
-      windowLifecycleState.generation = generation;
-      windowLifecycleState.phase = phase;
-      windowLifecycleState.visible = visible;
+      Object.assign(windowLifecycleState, {
+        generation,
+        phase,
+        visible,
+      });
     });
   } catch (error) {
     log.error("Failed to listen window lifecycle event", error);

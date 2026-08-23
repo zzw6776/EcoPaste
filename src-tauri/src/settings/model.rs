@@ -14,11 +14,44 @@ pub const WINDOW_OPEN_GROUP_PREFIX: &str = "group:";
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub general: General,
+    pub android: AndroidSettings,
     pub appearance: Appearance,
     pub shortcuts: Shortcuts,
     pub clipboard: Clipboard,
     pub onboarding: Onboarding,
     pub update: Update,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AndroidSettings {
+    pub gesture: AndroidGesture,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AndroidGesture {
+    pub enabled: bool,
+    pub hide_overlay: bool,
+    pub popup_height_percent: u32,
+    pub left_width_dp: u32,
+    pub left_height_dp: u32,
+    pub right_width_dp: u32,
+    pub right_height_dp: u32,
+}
+
+impl Default for AndroidGesture {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hide_overlay: false,
+            popup_height_percent: 60,
+            left_width_dp: 144,
+            left_height_dp: 56,
+            right_width_dp: 144,
+            right_height_dp: 56,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

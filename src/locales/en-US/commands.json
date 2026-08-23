@@ -57,6 +57,7 @@
     "playCopySound": "Play sound",
     "resetSettings": "Reset preferences",
     "resetStorageLocation": "Reset data directory",
+    "resizeClipboardWindow": "Resize window height",
     "restartAsAdmin": "Restart as administrator",
     "resumeGlobalShortcuts": "Resume global shortcuts",
     "reveal": "Reveal location",

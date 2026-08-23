@@ -25,6 +25,7 @@ import { settingsState } from "@/stores/settings";
 import { preloadSourceApps, reloadSourceApps } from "@/stores/sourceApps";
 import type { Settings } from "@/types/settings";
 import { cn } from "@/utils/cn";
+import { isMobile } from "@/utils/is";
 import { log } from "@/utils/log";
 import BackupImportModal from "./components/BackupImportModal";
 import PreferenceHeader from "./components/PreferenceHeader";
@@ -72,6 +73,7 @@ const Preference: FC = () => {
   const settings = useSnapshot(settingsState) as Settings;
   const shouldReduceMotion = useReducedMotion();
   const reduceMotion = shouldReduceMotion === true;
+  const mobile = isMobile();
   const contentRef = useRef<HTMLDivElement | null>(null);
   const [activeTabId, setActiveTabId] = useState<PreferenceTabId>("record");
   const [activeSectionId, setActiveSectionId] = useState("capture");
@@ -345,14 +347,16 @@ const Preference: FC = () => {
         initial={{ opacity: 0, y: reduceMotion ? 0 : 6 }}
         transition={{ duration: reduceMotion ? 0 : 0.18, ease: "easeOut" }}
       >
-        <PreferenceSidebar
-          activeTabId={activeTabId}
-          appName={appMetadata.name}
-          appVersion={appMetadata.version}
-          onTabSelect={handleTabSelect}
-          storageState={storageState}
-          storageUsage={storageUsage}
-        />
+        {!mobile ? (
+          <PreferenceSidebar
+            activeTabId={activeTabId}
+            appName={appMetadata.name}
+            appVersion={appMetadata.version}
+            onTabSelect={handleTabSelect}
+            storageState={storageState}
+            storageUsage={storageUsage}
+          />
+        ) : null}
 
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-ant-layout">
           <PreferenceHeader
@@ -361,6 +365,7 @@ const Preference: FC = () => {
             onPickSearchResult={handlePickSearchResult}
             onSearchChange={handleSearchChange}
             onSectionSelect={handleSectionSelect}
+            onTabSelect={handleTabSelect}
             searchQuery={searchQuery}
             searchResults={searchResults}
             shouldReduceMotion={reduceMotion}
@@ -369,7 +374,9 @@ const Preference: FC = () => {
 
           <ScrollArea
             className="min-h-0 flex-1"
-            contentClassName="p-6"
+            contentClassName={cn(
+              mobile ? "mobile-safe-area-bottom p-3" : "p-6",
+            )}
             data-tauri-drag-region
             ref={contentRef}
           >
@@ -379,7 +386,11 @@ const Preference: FC = () => {
                   animate={{ opacity: 1 }}
                   className={cn(
                     "flex flex-col",
-                    isSourceSection ? "h-full max-w-none" : "max-w-228",
+                    mobile
+                      ? "w-full max-w-none"
+                      : isSourceSection
+                        ? "h-full max-w-none"
+                        : "max-w-228",
                   )}
                   exit={{ opacity: 0 }}
                   initial={{ opacity: 0 }}

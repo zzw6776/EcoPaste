@@ -58,12 +58,14 @@
       "text": "Plain Text"
     },
     "numberSuffixes": {
+      "dp": "dp",
       "files": "files",
       "gb": "GB",
       "hours": "hours",
       "items": "items",
       "lines": "lines",
       "mb": "MB",
+      "percent": "%",
       "px": "px",
       "seconds": "seconds"
     },
@@ -79,6 +81,10 @@
       },
       "actions": {
         "title": "Quick Actions"
+      },
+      "androidGesture": {
+        "description": "Listen for bottom-corner swipe gestures on rooted Android devices only.",
+        "title": "Android Swipe Summon"
       },
       "appearance": {
         "title": "Appearance & Language"
@@ -184,6 +190,36 @@
           "controlLabel": "Manage",
           "description": "Choose which action buttons appear when hovering over a record.",
           "title": "Visible Quick Actions"
+        }
+      },
+      "androidGesture": {
+        "enabled": {
+          "description": "Listen only while Root is available and the device is unlocked; automatically suspend on the lock screen.",
+          "title": "Enable Swipe Summon"
+        },
+        "hideOverlay": {
+          "description": "Hide the blue left and right indicators while keeping their swipe regions active.",
+          "title": "Hide Gesture Indicators"
+        },
+        "leftHeightDp": {
+          "description": "Adjust how far the bottom-left gesture region extends upward.",
+          "title": "Left Region Height"
+        },
+        "leftWidthDp": {
+          "description": "Adjust the width of the bottom-left gesture region.",
+          "title": "Left Region Width"
+        },
+        "popupHeightPercent": {
+          "description": "Adjust how much of the screen height the swipe-summoned bottom popup occupies.",
+          "title": "Popup Height"
+        },
+        "rightHeightDp": {
+          "description": "Adjust how far the bottom-right gesture region extends upward.",
+          "title": "Right Region Height"
+        },
+        "rightWidthDp": {
+          "description": "Adjust the width of the bottom-right gesture region.",
+          "title": "Right Region Width"
         }
       },
       "appearance": {

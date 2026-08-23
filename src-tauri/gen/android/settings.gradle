@@ -1,0 +1,4 @@
+include ':app'
+include ':hidden-api-stubs'
+
+apply from: 'tauri.settings.gradle'

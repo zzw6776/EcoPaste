@@ -126,6 +126,12 @@ pub fn save_window_state(app: &AppHandle, label: &str) -> Result<()> {
     let pos = window.outer_position().map_err(|e| anyhow::anyhow!(e))?;
     let size = window.inner_size().map_err(|e| anyhow::anyhow!(e))?;
 
+    if size.height > 0 && label == super::CLIPBOARD_WINDOW_LABEL {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let h = (size.height as f64 / scale).clamp(200.0, 750.0);
+        super::position::set_cached_clipboard_height(h);
+    }
+
     let store = app.state::<WindowStateStore>();
     store.save(
         label,

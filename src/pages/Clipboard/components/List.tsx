@@ -1,4 +1,4 @@
-import { useMount } from "ahooks";
+import { useEventListener, useMount } from "ahooks";
 import { Empty, Spin } from "antd";
 import type { TFunction } from "i18next";
 import type {
@@ -8,11 +8,7 @@ import type {
 } from "react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  type TopItemListProps,
-  Virtuoso,
-  type VirtuosoHandle,
-} from "react-virtuoso";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
@@ -27,9 +23,6 @@ import {
   updateClipboardItemGroup,
   writeToClipboard,
 } from "@/commands";
-import VirtuosoScroller, {
-  type VirtuosoScrollerChildrenProps,
-} from "@/components/VirtuosoScroller";
 import { TAURI_EVENT } from "@/constants/events";
 import { buildItemActionLabels } from "@/constants/itemActions";
 import {
@@ -53,7 +46,7 @@ import type {
 } from "@/types/clipboard";
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
-import { isMac } from "@/utils/is";
+import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
 import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
   isSpaceKey,
@@ -90,6 +83,7 @@ const List: FC = () => {
   const [isModifierPressed, setIsModifierPressed] = useState(false);
   const [customGroups, setCustomGroups] = useState<ClipboardGroupRecord[]>([]);
   const [noteTarget, setNoteTarget] = useState<ClipboardItem | null>(null);
+  const listContainerRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const isAtTopRef = useRef(true);
   const itemElementMapRef = useRef(new Map<string, HTMLDivElement>());
@@ -100,7 +94,30 @@ const List: FC = () => {
   const deferredReloadRef = useRef(false);
   // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
   // dormant（隐藏）期间到达的剪贴板更新一律延后，不 reload 隐藏窗口。
-  const clipboardWindowVisibleRef = useRef(false);
+  // Android 移动端与 Web 预览模式下首屏直接处于激活态，初值置为 true。
+  const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
+
+  useEventListener(
+    "wheel",
+    (event: WheelEvent) => {
+      // 鼠标滚轮垂直滚动（deltaY）自动转换为横向卡片列表平滑滚动
+      if (Math.abs(event.deltaY) > 0 && Math.abs(event.deltaX) === 0) {
+        event.preventDefault();
+        const scroller = listContainerRef.current?.querySelector(
+          '[data-virtuoso-scroller="true"]',
+        ) as HTMLElement | null;
+        if (scroller) {
+          scroller.scrollLeft += event.deltaY;
+        } else if (virtuosoRef.current) {
+          virtuosoRef.current.scrollBy({ left: event.deltaY });
+        }
+      }
+    },
+    {
+      passive: false,
+      target: listContainerRef,
+    },
+  );
 
   const snapshot = useSnapshot(clipboardViewState);
   const settings = useSnapshot(settingsState);
@@ -139,7 +156,6 @@ const List: FC = () => {
     kind: category ?? void 0,
     sort,
   });
-  const topItemCount = countLeadingPinnedItems(getItem);
   const {
     closeHoverPreviewForScroll,
     closePreview,
@@ -153,7 +169,7 @@ const List: FC = () => {
   } = useClipboardPreviewController({
     getActiveItem,
     itemElementMapRef,
-    onHoverSelect: setSelectedId,
+    onHoverSelect: () => {},
   });
   closePreviewRef.current = closePreview;
   reloadCurrentRangeRef.current = reloadCurrentRange;
@@ -196,6 +212,20 @@ const List: FC = () => {
    */
   useMount(() => {
     void loadGroups();
+
+    if (isAndroid) {
+      clipboardWindowVisibleRef.current = true;
+      const handleMobileFocus = () => {
+        clipboardWindowVisibleRef.current = true;
+        requestReloadAtTop();
+      };
+      window.addEventListener("focus", handleMobileFocus);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          handleMobileFocus();
+        }
+      });
+    }
   });
 
   /**
@@ -585,6 +615,21 @@ const List: FC = () => {
   useTauriListen(TAURI_EVENT.CLIPBOARD_MENU_ACTION, handleMenuActionEvent);
 
   const handleKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null;
+    const isInputActive =
+      target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable);
+
+    if (isInputActive) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeTopEscapeLayer();
+      }
+      return;
+    }
+
     const eventModifierPressed = isMac ? event.metaKey : event.ctrlKey;
 
     setIsModifierPressed(eventModifierPressed);
@@ -701,7 +746,27 @@ const List: FC = () => {
       return;
     }
 
-    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    if (
+      event.key !== "ArrowUp" &&
+      event.key !== "ArrowDown" &&
+      event.key !== "ArrowLeft" &&
+      event.key !== "ArrowRight"
+    ) {
+      if (
+        !eventModifierPressed &&
+        !event.altKey &&
+        event.key.length === 1 &&
+        ![" ", "Enter", "Tab", "Escape"].includes(event.key)
+      ) {
+        window.dispatchEvent(
+          new CustomEvent("ecopaste:type-to-search", {
+            detail: { key: event.key },
+          }),
+        );
+      }
+
+      return;
+    }
 
     event.preventDefault();
 
@@ -711,7 +776,7 @@ const List: FC = () => {
 
     setSelectedId(next.item.id);
     virtuosoRef.current?.scrollIntoView({
-      behavior: "smooth",
+      behavior: "auto",
       index: next.index,
     });
 
@@ -801,11 +866,28 @@ const List: FC = () => {
 
   return (
     <div
-      className="relative flex-1 overflow-hidden"
+      className="relative size-full overflow-hidden"
       onPointerLeave={handlePreviewAreaPointerLeave}
+      ref={listContainerRef}
       role="listbox"
     >
-      <VirtuosoScroller>{renderVirtuoso}</VirtuosoScroller>
+      <Virtuoso
+        atTopStateChange={handleAtTopStateChange}
+        className="no-scrollbar"
+        computeItemKey={computeItemKey}
+        horizontalDirection={!isMobile()}
+        itemContent={renderItemContent}
+        rangeChanged={handleRangeChanged}
+        ref={virtuosoRef}
+        style={{
+          height: "100%",
+          paddingBottom: isMobile() ? "var(--mobile-safe-area-bottom)" : 0,
+          paddingLeft: isMobile() ? 0 : 16,
+          paddingRight: isMobile() ? 0 : 16,
+          width: "100%",
+        }}
+        totalCount={total}
+      />
 
       <NoteModal
         item={noteTarget}
@@ -814,24 +896,6 @@ const List: FC = () => {
       />
     </div>
   );
-
-  function renderVirtuoso(props: VirtuosoScrollerChildrenProps) {
-    const { scrollerRef } = props;
-
-    return (
-      <Virtuoso
-        atTopStateChange={handleAtTopStateChange}
-        components={{ TopItemList }}
-        computeItemKey={computeItemKey}
-        itemContent={renderItemContent}
-        rangeChanged={handleRangeChanged}
-        ref={virtuosoRef}
-        scrollerRef={scrollerRef}
-        topItemCount={topItemCount}
-        totalCount={total}
-      />
-    );
-  }
 
   function renderItemContent(index: number) {
     const item = getItem(index);
@@ -964,6 +1028,12 @@ const List: FC = () => {
 
       setSelectedId(item.id);
 
+      if (isMobile()) {
+        closePreview("mobileSingleClickPaste");
+        pasteClipboardItem(item.id, false);
+        return;
+      }
+
       if (autoPaste === "singleClickPaste") {
         closePreview("singleClickPaste");
         pasteClipboardItem(item.id, false);
@@ -1007,7 +1077,13 @@ const List: FC = () => {
     );
 
     return (
-      <div className={cn("px-3", { "pt-3": index !== 0 })}>
+      <div
+        className={cn(
+          isMobile()
+            ? "w-full px-3 py-1"
+            : "flex aspect-square h-full min-w-0 shrink-0 items-center px-[6px] py-2.5",
+        )}
+      >
         <ClipboardCard
           availableActions={availableActions}
           hintKey={hintKey}
@@ -1036,17 +1112,17 @@ const List: FC = () => {
     );
   }
 
-  function renderPlaceholderItem(index: number) {
+  function renderPlaceholderItem(_index: number) {
     return (
-      <div aria-hidden="true" className={cn("px-3", { "pt-3": index !== 0 })}>
-        <div className="min-h-24 rounded-2 border border-ant-border-secondary bg-ant-fill-quaternary p-2">
-          <div className="flex items-center gap-1 text-ant-secondary text-xs">
-            <span className="size-4 rounded-1 bg-ant-fill-secondary" />
-            <span className="h-3 w-16 rounded-1 bg-ant-fill-secondary" />
-          </div>
-          <div className="mt-3 flex flex-col gap-2">
-            <span className="h-3 w-9/12 rounded-1 bg-ant-fill-secondary" />
-            <span className="h-3 w-6/12 rounded-1 bg-ant-fill-secondary" />
+      <div
+        aria-hidden="true"
+        className="flex aspect-square h-full shrink-0 items-center px-[6px] py-2.5"
+      >
+        <div className="flex size-full animate-pulse flex-col justify-between rounded-[16px] bg-white/70 p-3.5 shadow-xs">
+          <div className="h-[60px] w-full rounded-xl bg-slate-200/60" />
+          <div className="mt-3 flex flex-1 flex-col gap-2">
+            <span className="h-3 w-9/12 rounded-xs bg-slate-200/60" />
+            <span className="h-3 w-6/12 rounded-xs bg-slate-200/60" />
           </div>
         </div>
       </div>
@@ -1260,7 +1336,7 @@ function getNextKeyboardIndex(
     selectedId === null ? null : getItemIndexById(selectedId);
   const currentIndex = selectedIndex ?? firstVisibleIndex;
 
-  if (key === "ArrowUp") {
+  if (key === "ArrowUp" || key === "ArrowLeft") {
     return Math.max(0, currentIndex - 1);
   }
 
@@ -1356,37 +1432,6 @@ function shouldUseNativeCopy(event: KeyboardEvent) {
 const computeItemKey = (index: number, item?: ClipboardItem) => {
   return item?.id ?? `placeholder-${index}`;
 };
-
-/**
- * Virtuoso 的置顶项会 sticky 覆盖滚动内容；这里补实底色避免下方条目透出。
- */
-const TopItemList: FC<TopItemListProps> = (props) => {
-  const { children, style } = props;
-
-  return (
-    <div className="relative z-10 bg-ant-container" style={style}>
-      {children}
-    </div>
-  );
-};
-
-/**
- * 统计当前已加载页开头连续置顶条目数，供 Virtuoso sticky top items 使用。
- */
-function countLeadingPinnedItems(
-  getItem: (index: number) => ClipboardItem | null,
-) {
-  let count = 0;
-
-  while (true) {
-    const item = getItem(count);
-    if (!item?.isPinned) break;
-
-    count += 1;
-  }
-
-  return count;
-}
 
 /**
  * 判断普通剪贴板更新是否会出现在当前分组列表中。

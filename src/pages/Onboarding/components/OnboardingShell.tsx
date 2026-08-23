@@ -51,11 +51,11 @@ const OnboardingShell: FC<OnboardingShellProps> = (props) => {
       >
         <div className="absolute inset-x-0 top-0 h-12" data-tauri-drag-region />
 
-        <div className="relative z-1 flex shrink-0 items-center justify-between px-5 pt-4">
+        <div className="relative z-1 flex shrink-0 items-center justify-between px-4 pt-8 sm:px-5 sm:pt-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="relative overflow-hidden rounded-full">
               <Progress
-                className="w-48"
+                className="w-32 sm:w-48"
                 percent={progress}
                 showInfo={false}
                 size="small"
@@ -84,7 +84,7 @@ const OnboardingShell: FC<OnboardingShellProps> = (props) => {
           <LanguageSwitcher />
         </div>
 
-        <div className="relative z-1 flex min-h-0 flex-1 flex-col overflow-hidden px-10 pb-24">
+        <div className="relative z-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pt-2 pb-20 sm:px-10 sm:pb-24">
           <AnimatePresence initial={false} mode="wait">
             <motion.div
               animate={contentVariants.animate}

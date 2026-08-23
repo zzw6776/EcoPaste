@@ -1,8 +1,11 @@
-use std::{sync::Mutex, time::Duration};
+#[cfg(not(target_os = "android"))]
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_updater::{Update as TauriUpdate, UpdaterExt};
 use url::Url;
 
@@ -20,14 +23,60 @@ const AUTO_CHECK_INITIAL_DELAY_SECONDS: u64 = 8;
 const AUTO_CHECK_SETTINGS_REFRESH_SECONDS: u64 = 60 * 60;
 const AUTO_CHECK_FAILURE_RETRY_SECONDS: u64 = 60 * 60;
 
+#[cfg(target_os = "android")]
+pub struct UpdateState;
+
+#[cfg(not(target_os = "android"))]
 pub struct UpdateState {
     current: Mutex<Option<PendingUpdate>>,
 }
 
+#[cfg(not(target_os = "android"))]
 struct PendingUpdate {
     update: TauriUpdate,
     metadata: UpdateMetadata,
     bytes: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "android")]
+pub fn init(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+pub fn schedule_auto_check(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+pub async fn status(app: &AppHandle) -> AppUpdateStatus {
+    AppUpdateStatus {
+        current_version: app.package_info().version.to_string(),
+        update: None,
+    }
+}
+
+#[cfg(target_os = "android")]
+pub async fn check(app: &AppHandle, _mode: CheckMode) -> Result<AppUpdateStatus> {
+    Ok(status(app).await)
+}
+
+#[cfg(target_os = "android")]
+pub async fn download(_app: &AppHandle, _version: String) -> Result<UpdateMetadata> {
+    Err(AppError::Other(anyhow::anyhow!(
+        "updates not supported on Android"
+    )))
+}
+
+#[cfg(target_os = "android")]
+pub fn install(_app: &AppHandle, _version: String) -> Result<()> {
+    Err(AppError::Other(anyhow::anyhow!(
+        "updates not supported on Android"
+    )))
+}
+
+#[cfg(target_os = "android")]
+pub fn skip(app: &AppHandle, _version: String) -> Result<AppUpdateStatus> {
+    Ok(AppUpdateStatus {
+        current_version: app.package_info().version.to_string(),
+        update: None,
+    })
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -63,6 +112,7 @@ pub enum CheckMode {
     Auto,
 }
 
+#[cfg(not(target_os = "android"))]
 impl UpdateState {
     pub fn new() -> Self {
         Self {
@@ -145,15 +195,18 @@ impl UpdateState {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn init(app: &AppHandle) {
     app.manage(UpdateState::new());
 }
 
+#[cfg(not(target_os = "android"))]
 pub async fn status(app: &AppHandle) -> AppUpdateStatus {
     app.state::<UpdateState>()
         .snapshot(app.package_info().version.to_string())
 }
 
+#[cfg(not(target_os = "android"))]
 pub async fn check(app: &AppHandle, mode: CheckMode) -> Result<AppUpdateStatus> {
     if matches!(mode, CheckMode::Auto) && !should_auto_check(app) {
         return Ok(status(app).await);
@@ -203,6 +256,7 @@ pub async fn check(app: &AppHandle, mode: CheckMode) -> Result<AppUpdateStatus> 
     Ok(status(app).await)
 }
 
+#[cfg(not(target_os = "android"))]
 pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata> {
     let update = {
         let state = app.state::<UpdateState>();
@@ -237,6 +291,7 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
     app.state::<UpdateState>().mark_downloaded(&version, bytes)
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn install(app: &AppHandle, version: String) -> Result<()> {
     log::info!("installing downloaded update {version}");
     app.state::<UpdateState>().install_downloaded(&version)?;
@@ -246,6 +301,7 @@ pub fn install(app: &AppHandle, version: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn skip(app: &AppHandle, version: String) -> Result<AppUpdateStatus> {
     let patch = serde_json::json!({
         "update": {
@@ -261,6 +317,7 @@ pub fn skip(app: &AppHandle, version: String) -> Result<AppUpdateStatus> {
         .snapshot(app.package_info().version.to_string()))
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn schedule_auto_check(app: &AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -279,6 +336,7 @@ pub fn schedule_auto_check(app: &AppHandle) {
     });
 }
 
+#[cfg(not(target_os = "android"))]
 async fn run_auto_check(app: &AppHandle) {
     match check(app, CheckMode::Auto).await {
         Ok(status) if status.update.is_some() => {
@@ -293,6 +351,7 @@ async fn run_auto_check(app: &AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn metadata_from_update(update: &TauriUpdate) -> UpdateMetadata {
     UpdateMetadata {
         body: update.body.clone(),
@@ -424,7 +483,7 @@ fn emit_progress(app: &AppHandle, downloaded: u64, total: Option<u64>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 

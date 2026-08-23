@@ -4,35 +4,68 @@
 //! - 菜单文案做 i18n，跟随 `Appearance.language` 即时切换（见 [`crate::i18n::tray`]）。
 //! - 显隐跟随 `General.tray_icon`；语言或显隐变更后由 `commands/settings.rs` 调用 [`apply`] 同步。
 
+#[cfg(not(target_os = "android"))]
 use anyhow::Context;
+#[cfg(not(target_os = "android"))]
 use tauri::image::Image;
+#[cfg(not(target_os = "android"))]
 use tauri::menu::{Menu, MenuBuilder, MenuItem, PredefinedMenuItem};
+#[cfg(not(target_os = "android"))]
 use tauri::path::BaseDirectory;
+#[cfg(not(target_os = "android"))]
 use tauri::tray::TrayIconBuilder;
 #[cfg(target_os = "windows")]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
 
+#[cfg(not(target_os = "android"))]
 use crate::clipboard::WatcherPause;
 use crate::core::Result;
+#[cfg(not(target_os = "android"))]
 use crate::i18n::tray as tray_i18n;
+#[cfg(not(target_os = "android"))]
 use crate::i18n::tray::Key;
-use crate::settings::{Language, Settings};
+#[cfg(not(target_os = "android"))]
+use crate::settings::Language;
+use crate::settings::Settings;
 #[cfg(target_os = "windows")]
 use crate::window::CLIPBOARD_WINDOW_LABEL;
+#[cfg(not(target_os = "android"))]
 use crate::window::{self, PREFERENCE_WINDOW_LABEL};
 
+#[cfg(not(target_os = "android"))]
 const TRAY_ID: &str = "app-tray";
+#[cfg(not(target_os = "android"))]
 const GITHUB_URL: &str = "https://github.com/EcoPasteHub/EcoPaste";
 
+#[cfg(not(target_os = "android"))]
 const MENU_PREFERENCE: &str = "tray::preference";
+#[cfg(not(target_os = "android"))]
 const MENU_TOGGLE_LISTEN: &str = "tray::toggle_listen";
+#[cfg(not(target_os = "android"))]
 const MENU_OPEN_SOURCE: &str = "tray::open_source";
+#[cfg(not(target_os = "android"))]
 const MENU_CHECK_FOR_UPDATES: &str = "tray::check_for_updates";
+#[cfg(not(target_os = "android"))]
 const MENU_RELAUNCH: &str = "tray::relaunch";
+#[cfg(not(target_os = "android"))]
 const MENU_EXIT: &str = "tray::exit";
 
+#[cfg(target_os = "android")]
+pub fn init(_app: &AppHandle, _settings: &Settings) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn apply(_app: &AppHandle, _settings: &Settings) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn init(app: &AppHandle, settings: &Settings) -> Result<()> {
     let lang = settings.appearance.language;
     let version = app.package_info().version.to_string();
@@ -79,6 +112,7 @@ pub fn init(app: &AppHandle, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 根据最新 settings 更新菜单和可见性。语言变了就重建菜单；显隐位变了就 set_visible。
 pub fn apply(app: &AppHandle, settings: &Settings) -> Result<()> {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -96,6 +130,7 @@ pub fn apply(app: &AppHandle, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 重建菜单但不动可见性，用于「停止/开启监听」翻转后只刷文案。
 fn rebuild_menu(app: &AppHandle) -> Result<()> {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -115,6 +150,7 @@ fn rebuild_menu(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn load_icon(app: &AppHandle) -> Result<Image<'static>> {
     let relative = if cfg!(target_os = "macos") {
         "assets/tray-mac.ico"
@@ -128,6 +164,7 @@ fn load_icon(app: &AppHandle) -> Result<Image<'static>> {
     Ok(Image::from_path(&path).with_context(|| format!("load tray icon from {path:?}"))?)
 }
 
+#[cfg(not(target_os = "android"))]
 fn build_menu(
     app: &AppHandle,
     lang: Language,
@@ -217,6 +254,7 @@ fn build_menu(
         .map_err(Into::into)
 }
 
+#[cfg(not(target_os = "android"))]
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         MENU_PREFERENCE => {

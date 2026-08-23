@@ -48,28 +48,9 @@ const ClipboardQuickActions: FC<ClipboardQuickActionsProps> = (props) => {
   } as const;
 
   return (
-    <div className="grid h-6 shrink-0 items-center justify-items-end overflow-hidden">
-      <span
-        className={cn(
-          "col-start-1 row-start-1 transition-all duration-150 ease-out motion-reduce:transition-none",
-          {
-            "-translate-x-1 opacity-0": actionsVisible,
-          },
-        )}
-      >
-        {item.displayCreatedAt ?? item.createdAt}
-      </span>
-
+    <div className="flex items-center justify-end overflow-hidden">
       {enabled && onQuickAction && labels ? (
-        <div
-          aria-hidden={!actionsVisible}
-          className={cn(
-            "pointer-events-none col-start-1 row-start-1 flex translate-x-1 items-center gap-0.5 opacity-0 transition-all duration-150 ease-out motion-reduce:transition-none",
-            {
-              "pointer-events-auto translate-x-0 opacity-100": actionsVisible,
-            },
-          )}
-        >
+        <div aria-hidden={!actionsVisible} className="flex items-center gap-1">
           <AnimatePresence initial={false} mode="popLayout">
             {availableActions.map((action) => {
               return (

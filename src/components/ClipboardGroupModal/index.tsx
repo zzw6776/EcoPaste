@@ -16,9 +16,22 @@ import type {
 import { cn } from "@/utils/cn";
 import ClipboardGroupIcon from "../ClipboardGroupIcon";
 
-const DEFAULT_GROUP_ICON = "i-lets-icons:folder";
+export const DEFAULT_GROUP_ICON = "i-lets-icons:folder";
+export const DEFAULT_GROUP_COLOR = "#8B5CF6";
 
-const PRESET_GROUP_ICONS: ClipboardGroupIconValue[] = [
+export const PRESET_GROUP_COLORS = [
+  "#8B5CF6", // 紫 (默认)
+  "#EC4899", // 粉
+  "#EF4444", // 红
+  "#F97316", // 橙
+  "#F59E0B", // 黄
+  "#10B981", // 绿
+  "#06B6D4", // 青
+  "#3B82F6", // 蓝
+  "#64748B", // 灰
+];
+
+export const PRESET_GROUP_ICONS: ClipboardGroupIconValue[] = [
   DEFAULT_GROUP_ICON,
   "i-lets-icons:star",
   "i-lets-icons:book",
@@ -33,10 +46,39 @@ const PRESET_GROUP_ICONS: ClipboardGroupIconValue[] = [
   "i-lets-icons:setting-line",
 ];
 
+export interface ParsedGroupIcon {
+  color: string;
+  icon: string;
+}
+
+export function parseGroupIcon(rawIcon?: string): ParsedGroupIcon {
+  if (!rawIcon) {
+    return { color: DEFAULT_GROUP_COLOR, icon: DEFAULT_GROUP_ICON };
+  }
+
+  if (rawIcon.startsWith("#")) {
+    const splitIndex = rawIcon.indexOf(":");
+    if (splitIndex > 0) {
+      return {
+        color: rawIcon.slice(0, splitIndex),
+        icon: rawIcon.slice(splitIndex + 1) || DEFAULT_GROUP_ICON,
+      };
+    }
+    return { color: rawIcon, icon: DEFAULT_GROUP_ICON };
+  }
+
+  return { color: DEFAULT_GROUP_COLOR, icon: rawIcon };
+}
+
+export function encodeGroupIcon(color: string, icon: string): string {
+  return `${color}:${icon}`;
+}
+
 type GroupModalMode = "create" | "edit";
 type InputRef = GetRef<typeof Input>;
 
 interface ClipboardGroupFormValues {
+  color: string;
   icon: ClipboardGroupIconValue;
   name: string;
 }
@@ -62,14 +104,16 @@ const isCustomSvgIcon = (icon: ClipboardGroupIconValue) => {
 const buildInitialValues = (
   group: ClipboardGroupRecord | null,
 ): ClipboardGroupFormValues => {
+  const parsed = parseGroupIcon(group?.icon);
   return {
-    icon: group?.icon ?? DEFAULT_GROUP_ICON,
+    color: parsed.color,
+    icon: parsed.icon,
     name: group?.name ?? "",
   };
 };
 
 /**
- * 自定义分组新增 / 编辑共享弹框。
+ * 自定义画板新增 / 编辑共享弹框。
  */
 const ClipboardGroupModal: FC<ClipboardGroupModalProps> = (props) => {
   const { group, mode, onCancel, onSubmit, open } = props;
@@ -78,6 +122,8 @@ const ClipboardGroupModal: FC<ClipboardGroupModalProps> = (props) => {
 
   const [submitting, setSubmitting] = useState(false);
   const nameInputRef = useRef<InputRef>(null);
+  const name = Form.useWatch("name", form) ?? "";
+  const color = Form.useWatch("color", form) ?? DEFAULT_GROUP_COLOR;
   const icon = Form.useWatch("icon", form) ?? DEFAULT_GROUP_ICON;
 
   useEffect(() => {
@@ -107,13 +153,20 @@ const ClipboardGroupModal: FC<ClipboardGroupModalProps> = (props) => {
 
     try {
       await onSubmit({
-        icon: values.icon,
+        icon: encodeGroupIcon(values.color, values.icon),
         isHidden: group?.isHidden ?? false,
         name: values.name,
       });
     } finally {
       setSubmitting(false);
     }
+  };
+
+  /**
+   * 选择颜色。
+   */
+  const handleColorClick = (selectedColor: string) => {
+    form.setFieldValue("color", selectedColor);
   };
 
   /**
@@ -174,6 +227,21 @@ const ClipboardGroupModal: FC<ClipboardGroupModalProps> = (props) => {
         initialValues={buildInitialValues(group)}
         layout="vertical"
       >
+        {/* 顶部实时预览胶囊 */}
+        <div className="my-2 flex select-none items-center justify-center rounded-2xl bg-neutral-100/80 p-3.5 dark:bg-white/5">
+          <div className="flex items-center gap-2 rounded-full bg-white px-4 py-1.5 font-medium text-[13px] text-neutral-800 shadow-xs dark:bg-[#2A2A2A] dark:text-neutral-100">
+            <span
+              className="size-2.5 shrink-0 rounded-full transition-colors"
+              style={{ backgroundColor: color }}
+            />
+            <ClipboardGroupIcon
+              className="size-4 shrink-0 text-current"
+              icon={icon}
+            />
+            <span className="max-w-[180px] truncate">{name || "画板名称"}</span>
+          </div>
+        </div>
+
         <Form.Item
           label={t("clipboard:groups.name")}
           name="name"
@@ -186,10 +254,41 @@ const ClipboardGroupModal: FC<ClipboardGroupModalProps> = (props) => {
           />
         </Form.Item>
 
+        <Form.Item hidden name="color">
+          <Input />
+        </Form.Item>
+
         <Form.Item hidden name="icon">
           <Input />
         </Form.Item>
 
+        {/* 颜色选择 */}
+        <Form.Item label="标识颜色">
+          <div className="flex items-center gap-2.5 py-1">
+            {PRESET_GROUP_COLORS.map((presetColor) => {
+              const selected = color === presetColor;
+              return (
+                <button
+                  aria-label={presetColor}
+                  className={cn(
+                    "relative flex size-7 cursor-pointer items-center justify-center rounded-full shadow-2xs transition-transform hover:scale-110",
+                    selected && "scale-105 ring-2 ring-[#007AFF] ring-offset-2",
+                  )}
+                  key={presetColor}
+                  onClick={() => handleColorClick(presetColor)}
+                  style={{ backgroundColor: presetColor }}
+                  type="button"
+                >
+                  {selected && (
+                    <i className="i-lucide:check size-3.5 stroke-[2.5] text-white" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </Form.Item>
+
+        {/* 图标选择 */}
         <Form.Item label={t("clipboard:groups.icon")}>
           <div className="flex flex-col gap-3">
             <div className="grid grid-cols-6 gap-2">

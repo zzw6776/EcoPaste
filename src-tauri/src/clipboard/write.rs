@@ -15,16 +15,22 @@
 //! 纯文本模式（`plain = true`）：忽略 `sub_kind`，写 `search_text`（OS 提供的纯文本表示），
 //! 缺失时退回 `content`。供「纯文本粘贴」快捷路径使用。
 
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
 use clipboard_rs::common::RustImage;
-use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, RustImageData};
+#[cfg(not(target_os = "android"))]
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 use super::guard::WritebackGuard;
 use super::storage::ImageStore;
 use crate::core::{AppError, Result};
+#[cfg(not(target_os = "android"))]
 use crate::db::items::content_hash;
-use crate::db::models::{ClipboardItem, ClipboardKind, ClipboardSubKind};
+#[cfg(not(target_os = "android"))]
+use crate::db::models::ClipboardSubKind;
+use crate::db::models::{ClipboardItem, ClipboardKind};
 
 /// 把 `item` 写回系统剪贴板；`plain = true` 强制只写纯文本（剥离 HTML/RTF）。
+#[cfg(not(target_os = "android"))]
 pub fn write_to_clipboard(
     store: &ImageStore,
     guard: &WritebackGuard,
@@ -43,6 +49,34 @@ pub fn write_to_clipboard(
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn write_to_clipboard(
+    _store: &ImageStore,
+    _guard: &WritebackGuard,
+    _item: &ClipboardItem,
+    _plain: bool,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn write_to_clipboard_app(
+    app: &tauri::AppHandle,
+    guard: &WritebackGuard,
+    item: &ClipboardItem,
+) -> Result<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let text = item.search_text.as_deref().unwrap_or(&item.content);
+    if !text.is_empty() {
+        guard.suppress(item.content_hash.clone());
+        app.clipboard()
+            .write_text(text)
+            .map_err(|e| AppError::Clipboard(e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 fn write_text(
     ctx: &ClipboardContext,
     guard: &WritebackGuard,
@@ -94,8 +128,9 @@ fn write_text(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn write_image(
-    ctx: &ClipboardContext,
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] ctx: &ClipboardContext,
     store: &ImageStore,
     guard: &WritebackGuard,
     item: &ClipboardItem,
@@ -105,13 +140,41 @@ fn write_image(
         log::error!("read image {path:?} failed: {err}");
         AppError::Clipboard(err.to_string())
     })?;
-    let image = RustImageData::from_bytes(&bytes).map_err(clip_err)?;
 
     guard.suppress(item.content_hash.clone());
-    ctx.set_image(image).map_err(clip_err)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::runtime::ProtocolObject;
+        use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypePNG};
+        use objc2_foundation::{NSArray, NSData};
+
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let ns_data = unsafe {
+            NSData::dataWithBytes_length(bytes.as_ptr() as *const std::ffi::c_void, bytes.len())
+        };
+        let item_obj = NSPasteboardItem::new();
+        unsafe {
+            item_obj.setData_forType(&ns_data, NSPasteboardTypePNG);
+            let write_objects =
+                NSArray::from_retained_slice(&[ProtocolObject::from_retained(item_obj)]);
+            if !pasteboard.writeObjects(&write_objects) {
+                return Err(AppError::Clipboard("writeObjects failed".to_owned()));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let image = clipboard_rs::RustImageData::from_bytes(&bytes).map_err(clip_err)?;
+        ctx.set_image(image).map_err(clip_err)?;
+    }
+
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn write_files(ctx: &ClipboardContext, guard: &WritebackGuard, item: &ClipboardItem) -> Result<()> {
     let paths: Vec<String> = item
         .content
@@ -128,6 +191,7 @@ fn write_files(ctx: &ClipboardContext, guard: &WritebackGuard, item: &ClipboardI
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 把 files 条目的路径列表当文本写回（换行分隔，多文件按行展开）。
 /// 与 `write_files` 共用 `content_hash` 抑制——OS 监听不会拿到与原文本完全一致的回环。
 fn write_files_as_text(
@@ -142,11 +206,12 @@ fn write_files_as_text(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn clip_err<E: std::fmt::Display>(err: E) -> AppError {
     AppError::Clipboard(err.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::super::payload::ImagePayload;
     use super::super::read::ClipboardReader;

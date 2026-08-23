@@ -74,11 +74,9 @@ pub fn set_clipboard_window_editing(app_handle: &AppHandle, editing: bool) -> Re
     #[cfg(target_os = "windows")]
     return windows::set_clipboard_window_editing(app_handle, editing);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        let _ = app_handle;
-        let _ = editing;
-
+        let _ = (app_handle, editing);
         Ok(())
     }
 }
@@ -142,9 +140,19 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     let result = macos::show_window(app_handle, label);
     #[cfg(target_os = "windows")]
     let result = windows::show_window(app_handle, label);
+    #[cfg(target_os = "android")]
+    let result = if let Some(w) = app_handle.get_webview_window(label) {
+        w.show().map_err(|e| anyhow::anyhow!(e).into())
+    } else {
+        Ok(())
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+    let result =
+        get_window(app_handle, label).and_then(|w| w.show().map_err(|e| anyhow::anyhow!(e).into()));
+
     if result.is_ok() && !delays_clipboard_visibility_event(label) {
         if label == CLIPBOARD_WINDOW_LABEL {
-            preview::resume_after_clipboard_show();
+            preview::resume_after_clipboard_show(app_handle);
         }
         emit_visibility(app_handle, label, true);
         lifecycle::on_shown(app_handle, label);
@@ -171,6 +179,16 @@ pub fn hide_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     let result = macos::hide_window(app_handle, label);
     #[cfg(target_os = "windows")]
     let result = windows::hide_window(app_handle, label);
+    #[cfg(target_os = "android")]
+    let result = if let Some(w) = app_handle.get_webview_window(label) {
+        w.hide().map_err(|e| anyhow::anyhow!(e).into())
+    } else {
+        Ok(())
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+    let result =
+        get_window(app_handle, label).and_then(|w| w.hide().map_err(|e| anyhow::anyhow!(e).into()));
+
     if result.is_ok() {
         emit_visibility(app_handle, label, false);
         lifecycle::on_hidden(app_handle, label, "hide");
@@ -196,11 +214,21 @@ pub fn show_taskbar_icon(app_handle: &AppHandle, visible: bool) -> Result<()> {
     return macos::show_taskbar_icon(app_handle, visible);
     #[cfg(target_os = "windows")]
     return windows::show_taskbar_icon(app_handle, visible);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (app_handle, visible);
+        Ok(())
+    }
 }
 
 pub fn position_window(app_handle: &AppHandle, label: &str, pos: WindowPosition) -> Result<()> {
     let window = get_window(app_handle, label)?;
     position::position_window(&window, pos)
+}
+
+pub fn resize_clipboard_window(app_handle: &AppHandle, height: f64) -> Result<()> {
+    let window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
+    position::set_clipboard_height(&window, height)
 }
 
 /// 剪贴板窗口显示前按设置应用窗口定位策略。
@@ -262,6 +290,22 @@ pub fn intercept_close_request(window: &Window) -> bool {
     true
 }
 
+#[cfg(target_os = "android")]
+pub fn build_preference_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn build_update_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn build_onboarding_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 /// 按需重建 preference 窗口。preference 不再由 Tauri 配置预创建（改为 `DestroyWhenIdle`），
 /// 故所有选项必须在此用 builder 完整复刻原 `tauri.conf.json` 声明，否则重建后行为漂移。
 ///
@@ -302,6 +346,7 @@ pub fn build_preference_window(app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 按需创建软件更新窗口。更新流程由 Rust updater 命令驱动，窗口只负责渲染状态。
 pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
     if app_handle.get_webview_window(UPDATE_WINDOW_LABEL).is_some() {
@@ -338,6 +383,7 @@ pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 /// 按需创建首次启动引导窗口。引导窗口始终无边框、深色 UI、打开时居中。
 pub fn build_onboarding_window(app_handle: &AppHandle) -> Result<()> {
     if app_handle

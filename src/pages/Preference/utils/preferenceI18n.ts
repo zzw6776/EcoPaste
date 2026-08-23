@@ -130,7 +130,9 @@ export function translatePreferenceNumberSuffix(
   t: PreferenceTranslator,
   setting: PreferenceSetting,
 ) {
-  if (setting.control.type !== "number") return "";
+  if (setting.control.type !== "number" && setting.control.type !== "slider") {
+    return "";
+  }
 
   if (setting.control.suffixKey) {
     return t(`schema.numberSuffixes.${setting.control.suffixKey}`);

@@ -246,4 +246,12 @@ fn current_platform() -> Platform {
     {
         Platform::Windows
     }
+    #[cfg(target_os = "android")]
+    {
+        Platform::Android
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+    {
+        Platform::Macos
+    }
 }
