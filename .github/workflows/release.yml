@@ -180,15 +180,14 @@ jobs:
           CI: false
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           PLATFORM: ${{ matrix.os }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true
           releaseId: ${{ needs.release-metadata.outputs.release_id }}
           retryAttempts: 3
           tagName: ${{ needs.release-metadata.outputs.tag_name }}
+          uploadUpdaterJson: false
 
   build-android:
     name: Build Android universal APK
@@ -248,7 +247,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         with:
-          args: --apk true
+          args: --apk --config src-tauri/tauri.release.conf.json
           mobile: android
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true
