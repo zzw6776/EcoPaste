@@ -2,9 +2,9 @@ import type { CSSProperties, FC, MouseEvent } from "react";
 import { useSnapshot } from "valtio";
 import Highlight from "@/components/Highlight";
 import { clipboardViewState } from "@/stores/clipboardView";
-import { settingsState } from "@/stores/settings";
 import type { ClipboardItem } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
+import { isMobile } from "@/utils/is";
 
 interface TextCardProps extends ClipboardItem {
   /**
@@ -24,24 +24,23 @@ interface TextCardProps extends ClipboardItem {
 const TextCard: FC<TextCardProps> = (props) => {
   const { summary, subKind, colorPreview, isLinkActive, onOpenLink } = props;
   const { keyword } = useSnapshot(clipboardViewState);
-  const { clipboard } = useSnapshot(settingsState);
-  const textMaxLines = clipboard.display.textMaxLines;
-  const lineClampClass = textLineClampClass(textMaxLines);
   const isOpenableLink =
     isLinkActive && (subKind === "url" || subKind === "email");
 
   if (subKind === "color" && colorPreview) {
     const style: CSSProperties = {
-      background: colorPreview,
+      backgroundColor: colorPreview,
     };
 
     return (
-      <div className="flex items-center gap-2 text-sm">
-        <span
-          className="size-4.5 shrink-0 rounded-1 border border-ant-border-secondary"
+      <div className="flex h-full flex-col justify-between py-1">
+        <div
+          className="h-20 w-full rounded-xl border border-black/10 shadow-xs"
           style={style}
         />
-        <span className="font-mono leading-5">{colorPreview}</span>
+        <span className="font-bold font-mono text-neutral-800 text-xs">
+          {colorPreview}
+        </span>
       </div>
     );
   }
@@ -62,8 +61,8 @@ const TextCard: FC<TextCardProps> = (props) => {
     return (
       <button
         className={cn(
-          "block w-full cursor-pointer whitespace-pre-wrap border-0 bg-transparent p-0 text-left text-ant-primary underline underline-offset-2",
-          lineClampClass,
+          "block w-full min-w-0 cursor-pointer whitespace-pre-wrap break-all border-0 bg-transparent p-0 text-left text-[#007AFF] text-[15px] leading-[1.4] tracking-tight underline underline-offset-2",
+          isMobile() ? "line-clamp-6" : "line-clamp-[20]",
         )}
         onClick={handleLinkClick}
         onMouseDown={handleLinkMouseDown}
@@ -75,22 +74,15 @@ const TextCard: FC<TextCardProps> = (props) => {
   }
 
   return (
-    <div className={cn("whitespace-pre-wrap", lineClampClass)}>
+    <div
+      className={cn(
+        "w-full min-w-0 whitespace-pre-wrap break-all font-sans text-[15px] text-neutral-900 leading-[1.4] tracking-tight dark:text-neutral-100",
+        isMobile() ? "line-clamp-6" : "line-clamp-[20]",
+      )}
+    >
       <Highlight keyword={keyword} text={summary ?? ""} />
     </div>
   );
 };
 
 export default TextCard;
-
-/**
- * 把用户设置夹到 UnoCSS safelist 覆盖的 line-clamp 类。
- */
-function textLineClampClass(lines: number): string {
-  if (lines <= 1) return "line-clamp-1";
-  if (lines === 2) return "line-clamp-2";
-  if (lines === 3) return "line-clamp-3";
-  if (lines === 4) return "line-clamp-4";
-
-  return "line-clamp-5";
-}

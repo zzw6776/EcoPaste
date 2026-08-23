@@ -88,7 +88,10 @@ pub async fn read_clipboard(
         let source = detect_frontmost();
         let reader = ClipboardReader::new()?;
         let settings = app.state::<SettingsStore>().snapshot();
+        #[cfg(not(target_os = "android"))]
         let payload = reader.read_with_capture(&settings.clipboard.capture)?;
+        #[cfg(target_os = "android")]
+        let payload = reader.read_with_app(&app, &settings.clipboard.capture)?;
         let item = match payload {
             Some(payload) => build_item_with_settings(
                 &store,
@@ -272,6 +275,8 @@ pub struct ClipboardPreviewPayload {
     pub kind: ClipboardKind,
     pub sub_kind: Option<ClipboardSubKind>,
     pub updated_at: DateTime<Utc>,
+    pub source_app_name: Option<String>,
+    pub source_app_icon_path: Option<String>,
     /// 预览窗口展示用纯文本。HTML / RTF 条目返回 `search_text`，不返回富文本源。
     pub text: Option<String>,
     pub image_path: Option<String>,
@@ -327,6 +332,7 @@ pub async fn get_clipboard_preview_payload(
     db: State<'_, DatabaseState>,
     image_store: State<'_, ImageStore>,
     file_icon_store: State<'_, FileIconStore>,
+    app_icon_store: State<'_, AppIconStore>,
     item_id: String,
 ) -> Result<Option<ClipboardPreviewPayload>> {
     let pool = db.pool().await;
@@ -344,6 +350,7 @@ pub async fn get_clipboard_preview_payload(
         &pool,
         &image_store,
         &file_icon_store,
+        &app_icon_store,
         item,
         redact_sensitive,
     )
@@ -381,7 +388,10 @@ pub async fn write_to_clipboard(
         should_write_plain_for_copy(plain, item.kind, settings.clipboard.content.copy_plain);
     let hide_after_copy = settings.clipboard.content.copy_then_hide_window;
 
+    #[cfg(not(target_os = "android"))]
     crate::clipboard::write_to_clipboard(&store, guard.inner().as_ref(), &item, write_plain)?;
+    #[cfg(target_os = "android")]
+    crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
     if hide_after_copy {
@@ -420,23 +430,34 @@ pub async fn paste_clipboard_item(
         settings.clipboard.content.paste_files_as_path,
     );
 
+    #[cfg(not(target_os = "android"))]
     crate::clipboard::write_to_clipboard(&store, guard.inner().as_ref(), &item, write_plain)?;
+    #[cfg(target_os = "android")]
+    crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
-    if window::is_clipboard_window_pinned() {
-        // 固定时窗口保持可见：macOS 上 panel 仍是 key window 会吞掉 ⌘V，需先 resign key
-        // 让键焦点回到前台 App 的窗口；Windows 剪贴板窗口 focusable=false，无需处理。
-        #[cfg(target_os = "macos")]
-        if let Err(err) = window::macos::resign_clipboard_panel_key(&app) {
-            log::warn!("resign clipboard panel key before paste failed: {err:?}");
-        }
-    } else if let Err(err) = window::hide_window(&app, CLIPBOARD_WINDOW_LABEL) {
-        log::warn!("hide clipboard window before paste failed: {err:?}");
+    #[cfg(target_os = "android")]
+    {
+        let _ = crate::commands::android::minimize_android_app().await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        if window::is_clipboard_window_pinned() {
+            // 固定时窗口保持可见：macOS 上 panel 仍是 key window 会吞掉 ⌘V，需先 resign key
+            // 让键焦点回到前台 App 的窗口；Windows 剪贴板窗口 focusable=false，无需处理。
+            #[cfg(target_os = "macos")]
+            if let Err(err) = window::macos::resign_clipboard_panel_key(&app) {
+                log::warn!("resign clipboard panel key before paste failed: {err:?}");
+            }
+        } else if let Err(err) = window::hide_window(&app, CLIPBOARD_WINDOW_LABEL) {
+            log::warn!("hide clipboard window before paste failed: {err:?}");
+        }
 
-    // hide / resign 都是 run_on_main_thread 异步派发；不等一拍，simulate_paste 的 ⌘V
-    // 会赶在 panel 真正 order_out / 让出 key 前命中 panel 自己（webview 吞掉）。
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // hide / resign 都是 run_on_main_thread 异步派发；不等一拍，simulate_paste 的 ⌘V
+        // 会赶在 panel 真正 order_out / 让出 key 前命中 panel 自己（webview 吞掉）。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     crate::keystroke::simulate_paste()?;
 
@@ -501,12 +522,22 @@ async fn mark_item_reused_if_enabled(
 
 /// 从历史复制后按设置隐藏剪贴板窗口；固定状态下尊重用户显式 pin。
 fn hide_clipboard_window_after_copy(app: &AppHandle) {
-    if window::is_clipboard_window_pinned() {
-        return;
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let _ = tauri::async_runtime::spawn(async {
+            let _ = crate::commands::android::minimize_android_app().await;
+        });
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        if window::is_clipboard_window_pinned() {
+            return;
+        }
 
-    if let Err(err) = window::hide_window(app, CLIPBOARD_WINDOW_LABEL) {
-        log::warn!("hide clipboard window after copy failed: {err:?}");
+        if let Err(err) = window::hide_window(app, CLIPBOARD_WINDOW_LABEL) {
+            log::warn!("hide clipboard window after copy failed: {err:?}");
+        }
     }
 }
 
@@ -871,9 +902,11 @@ async fn build_clipboard_preview_payload(
     pool: &SqlitePool,
     image_store: &ImageStore,
     file_icon_store: &FileIconStore,
-    item: ClipboardItem,
+    app_icon_store: &AppIconStore,
+    mut item: ClipboardItem,
     redact_sensitive: bool,
 ) -> Result<ClipboardPreviewPayload> {
+    attach_source_app_icon_path(app_icon_store, &mut item);
     let mut text = None;
     let mut image_path = None;
     let mut image_exists = false;
@@ -902,6 +935,8 @@ async fn build_clipboard_preview_payload(
         kind: item.kind,
         sub_kind: preview_sub_kind,
         updated_at: item.updated_at,
+        source_app_name: item.source_app_name,
+        source_app_icon_path: item.source_app_icon_path,
         text,
         image_path,
         image_width: item.width,

@@ -18,7 +18,6 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use blake3::Hasher;
-use clipboard_rs::common::{RustImage, RustImageData};
 use tauri::AppHandle;
 
 use super::payload::ImagePayload;
@@ -213,15 +212,16 @@ fn remove_dir_if_empty(dir: Option<&Path>) {
 
 /// 把原图 PNG 字节解码 → 生成缩略图（最长边 <= [`THUMBNAIL_MAX`]，保持比例）→ 重新编码 PNG。
 fn encode_thumbnail(png_bytes: &[u8]) -> Result<Vec<u8>> {
-    let image = RustImageData::from_bytes(png_bytes).map_err(clip_err)?;
-    let thumb = image
-        .thumbnail(THUMBNAIL_MAX, THUMBNAIL_MAX)
-        .map_err(clip_err)?;
-    Ok(thumb.to_png().map_err(clip_err)?.get_bytes().to_vec())
-}
+    use std::io::Cursor;
 
-fn clip_err<E: std::fmt::Display>(err: E) -> AppError {
-    AppError::Clipboard(err.to_string())
+    let img =
+        image::load_from_memory(png_bytes).map_err(|err| AppError::Clipboard(err.to_string()))?;
+    let thumb = img.thumbnail(THUMBNAIL_MAX, THUMBNAIL_MAX);
+    let mut out = Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|err| AppError::Clipboard(err.to_string()))?;
+    Ok(out.into_inner())
 }
 
 #[cfg(test)]

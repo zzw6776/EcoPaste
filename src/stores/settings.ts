@@ -21,6 +21,9 @@ import type { Settings, SettingsPatch } from "@/types/settings";
  *
  * 字面量初值仅为占位；组件层通过 `use(settingsReady)` 挂起到首屏快照灌入后才会读取。
  */
+import { isTauri } from "@/utils/is";
+import { DEFAULT_MOCK_SETTINGS } from "@/utils/mockData";
+
 export const settingsState = proxy<Settings>({} as Settings);
 
 /**
@@ -29,13 +32,21 @@ export const settingsState = proxy<Settings>({} as Settings);
  * 每个 webview 加载本模块一次，因此事件订阅天然单例。
  */
 export const settingsReady: Promise<void> = (async () => {
-  await listen<Settings>(TAURI_EVENT.SETTINGS_UPDATED, (event) => {
-    Object.assign(settingsState, event.payload);
-  });
+  if (!isTauri) {
+    Object.assign(settingsState, DEFAULT_MOCK_SETTINGS);
+    return;
+  }
 
-  const initial = await getSettings();
+  try {
+    await listen<Settings>(TAURI_EVENT.SETTINGS_UPDATED, (event) => {
+      Object.assign(settingsState, event.payload);
+    });
 
-  Object.assign(settingsState, initial);
+    const initial = await getSettings();
+    Object.assign(settingsState, initial);
+  } catch {
+    Object.assign(settingsState, DEFAULT_MOCK_SETTINGS);
+  }
 })();
 
 /**

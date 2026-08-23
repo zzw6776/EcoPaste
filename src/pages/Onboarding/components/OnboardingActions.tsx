@@ -68,19 +68,19 @@ const OnboardingActions: FC<OnboardingActionsProps> = (props) => {
   };
 
   return (
-    <footer className="absolute inset-x-0 bottom-0 z-10 flex h-18 items-center justify-between px-10">
+    <footer className="absolute inset-x-0 bottom-0 z-10 flex h-16 items-center justify-between border-ant-border-secondary border-t bg-ant-bg-layout/95 px-4 backdrop-blur-md sm:h-18 sm:px-10">
       <div>
         {showBack && (
-          <Button disabled={busy} onClick={handleBackClick} size="large">
+          <Button disabled={busy} onClick={handleBackClick} size="middle">
             {backText}
           </Button>
         )}
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2 sm:gap-3">
         {extra}
         {onExtra && (
-          <Button disabled={busy} onClick={handleExtraClick} size="large">
+          <Button disabled={busy} onClick={handleExtraClick} size="middle">
             {extraText}
           </Button>
         )}
@@ -88,7 +88,7 @@ const OnboardingActions: FC<OnboardingActionsProps> = (props) => {
           disabled={nextDisabled}
           loading={busy}
           onClick={handleNextClick}
-          size="large"
+          size="middle"
           type="primary"
         >
           {nextText}

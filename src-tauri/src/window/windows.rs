@@ -18,6 +18,9 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
         window
             .set_focusable(false)
             .map_err(|e| anyhow::anyhow!(e))?;
+        if let Err(err) = window.set_shadow(false) {
+            log::warn!("disable clipboard window shadow failed: {err}");
+        }
         clear_pre_edit_foreground();
     }
 
@@ -25,6 +28,9 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     window.unminimize().map_err(|e| anyhow::anyhow!(e))?;
 
     if label == CLIPBOARD_WINDOW_LABEL {
+        if let Err(err) = window_vibrancy::apply_blur(&window, None) {
+            log::warn!("apply clipboard blur effect failed: {err}");
+        }
         keyboard::enable_navigation_keys(app_handle);
         mouse::enable_outside_click_hide(app_handle);
     } else {

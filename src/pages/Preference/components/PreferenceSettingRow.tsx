@@ -2,14 +2,17 @@ import type { TFunction } from "i18next";
 import { motion } from "motion/react";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
+import { useSnapshot } from "valtio";
 import type {
   ChangeStorageLocationResult,
   CleanCacheResult,
   ExportHistoryBackupResult,
   StorageLocation,
 } from "@/commands";
+import { androidState } from "@/stores/android";
 import type { Settings } from "@/types/settings";
 import { cn } from "@/utils/cn";
+import { isAndroid, isMobile } from "@/utils/is";
 import type {
   PreferenceSetting,
   PreferenceSettingChangeHandler,
@@ -51,12 +54,19 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
     onActionComplete,
     onChange,
   } = props;
+  const androidSnapshot = useSnapshot(androidState);
   const value = setting.value?.(settings);
   const parentDisabled = setting.disabledWhen?.(settings) === true;
-  const disabled = setting.disabled === true || parentDisabled;
+  const rootUnavailable =
+    isAndroid &&
+    setting.id.startsWith("androidGesture.") &&
+    androidSnapshot.status?.rootAvailable === false;
+  const disabled =
+    setting.disabled === true || parentDisabled || rootUnavailable;
   const childSetting = setting.parentId !== void 0;
   const collapsed = childSetting && parentDisabled;
   const visual = resolveSettingVisual(setting.id);
+  const mobile = isAndroid || isMobile();
   const highlightOpacity = shouldReduceMotion
     ? 0.08
     : [0, 0.1, 0.055, 0.085, 0.045, 0.07, 0.025, 0];
@@ -76,8 +86,15 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
         paddingTop: collapsed ? 0 : "0.6875rem",
       }}
       className={cn(
-        "group relative flex items-center gap-5 overflow-hidden border-ant-split border-b px-4 transition-colors last:border-b-0 hover:bg-ant-fill-quaternary motion-reduce:transition-none",
-        { "pl-12": childSetting, "pointer-events-none": collapsed },
+        "group relative flex overflow-hidden border-ant-split border-b transition-colors last:border-b-0 hover:bg-ant-fill-quaternary motion-reduce:transition-none",
+        mobile
+          ? "flex-col items-stretch gap-0 px-3"
+          : "items-center gap-5 px-4",
+        {
+          "pl-6": childSetting && mobile,
+          "pl-12": childSetting && !mobile,
+          "pointer-events-none": collapsed,
+        },
       )}
       data-preference-setting-id={setting.id}
       initial={false}
@@ -108,43 +125,56 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
         )}
       />
 
-      <span
+      <div
         className={cn(
-          "relative flex size-7.5 shrink-0 items-center justify-center text-xl transition-colors motion-reduce:transition-none",
-          disabled ? "text-ant-disabled" : visual.tone,
+          "relative flex min-w-0 items-start",
+          mobile ? "w-full gap-3" : "flex-1 gap-5",
         )}
       >
-        <i aria-hidden="true" className={visual.icon} />
-      </span>
-
-      <div className="relative min-w-0 flex-1">
-        <div
-          className={cn("flex min-w-0 items-center gap-2", {
-            "opacity-65": disabled,
-          })}
-        >
-          <span
-            className={cn(
-              "truncate font-medium text-sm leading-snug",
-              disabled ? "text-ant-secondary" : "text-ant-text",
-            )}
-          >
-            {translatePreferenceSetting(t, setting, "title")}
-          </span>
-          <PreferenceStatusBadge compact status={setting.status} />
-        </div>
-        <div
+        <span
           className={cn(
-            "mt-0.5 text-xs leading-snug",
-            disabled ? "text-ant-disabled" : "text-ant-tertiary",
-            { "break-all": setting.id === "localData.dataDirectory" },
+            "relative flex size-7.5 shrink-0 items-center justify-center text-xl transition-colors motion-reduce:transition-none",
+            disabled ? "text-ant-disabled" : visual.tone,
           )}
         >
-          {resolveSettingDescription(t, setting, storageLocation)}
+          <i aria-hidden="true" className={visual.icon} />
+        </span>
+
+        <div className="relative min-w-0 flex-1">
+          <div
+            className={cn("flex min-w-0 items-center gap-2", {
+              "opacity-65": disabled,
+            })}
+          >
+            <span
+              className={cn(
+                "font-medium text-sm leading-snug",
+                mobile ? "break-words" : "truncate",
+                disabled ? "text-ant-secondary" : "text-ant-text",
+              )}
+            >
+              {translatePreferenceSetting(t, setting, "title")}
+            </span>
+            <PreferenceStatusBadge compact status={setting.status} />
+          </div>
+          <div
+            className={cn(
+              "mt-0.5 break-words text-xs leading-snug",
+              disabled ? "text-ant-disabled" : "text-ant-tertiary",
+              { "break-all": setting.id === "localData.dataDirectory" },
+            )}
+          >
+            {resolveSettingDescription(t, setting, storageLocation)}
+          </div>
         </div>
       </div>
 
-      <div className="relative flex shrink-0 justify-end opacity-90 transition-opacity group-hover:opacity-100 motion-reduce:transition-none">
+      <div
+        className={cn(
+          "relative flex justify-end opacity-90 transition-opacity group-hover:opacity-100 motion-reduce:transition-none",
+          mobile ? "mt-2 w-full pl-10" : "shrink-0",
+        )}
+      >
         <PreferenceSettingControl
           disabled={disabled}
           onActionComplete={onActionComplete}

@@ -6,7 +6,7 @@ import {
   WINDOW_OPEN_RANGE_OPTIONS,
 } from "@/constants/windowOpenSelection";
 import type { Settings } from "@/types/settings";
-import { isMac, isWin } from "@/utils/is";
+import { isAndroid, isMac, isWin } from "@/utils/is";
 import type { PreferenceSetting, PreferenceTab } from "../types/preferences";
 
 const CLICK_ACTION_OPTIONS = [
@@ -657,6 +657,84 @@ export const preferenceTabs: PreferenceTab[] = [
           },
         ],
       },
+      ...(isAndroid
+        ? [
+            {
+              id: "androidGesture",
+              settings: [
+                {
+                  control: { type: "switch" } as const,
+                  id: "androidGesture.enabled",
+                  keywords: ["android", "root", "gesture", "swipe"],
+                  path: ["android", "gesture", "enabled"] as const,
+                  value: (settings: Settings) => {
+                    return settings.android.gesture.enabled;
+                  },
+                },
+                {
+                  control: { type: "switch" } as const,
+                  disabledWhen: (settings: Settings) => {
+                    return !settings.android.gesture.enabled;
+                  },
+                  id: "androidGesture.hideOverlay",
+                  keywords: ["android", "gesture", "overlay", "hide"],
+                  parentId: "androidGesture.enabled",
+                  path: ["android", "gesture", "hideOverlay"] as const,
+                  value: (settings: Settings) => {
+                    return settings.android.gesture.hideOverlay;
+                  },
+                },
+                {
+                  control: {
+                    max: 90,
+                    min: 30,
+                    step: 1,
+                    suffixKey: "percent",
+                    type: "slider" as const,
+                  },
+                  disabledWhen: (settings: Settings) => {
+                    return !settings.android.gesture.enabled;
+                  },
+                  id: "androidGesture.popupHeightPercent",
+                  keywords: ["android", "gesture", "popup", "height"],
+                  parentId: "androidGesture.enabled",
+                  path: ["android", "gesture", "popupHeightPercent"] as const,
+                  value: (settings: Settings) => {
+                    return settings.android.gesture.popupHeightPercent;
+                  },
+                },
+                ...(
+                  [
+                    ["leftWidthDp", 0, 180],
+                    ["leftHeightDp", 0, 96],
+                    ["rightWidthDp", 0, 180],
+                    ["rightHeightDp", 0, 96],
+                  ] as const
+                ).map(([field, min, max]) => {
+                  return {
+                    control: {
+                      max,
+                      min,
+                      step: 1,
+                      suffixKey: "dp",
+                      type: "slider" as const,
+                    },
+                    disabledWhen: (settings: Settings) => {
+                      return !settings.android.gesture.enabled;
+                    },
+                    id: `androidGesture.${field}`,
+                    keywords: ["android", "gesture", "size", field],
+                    parentId: "androidGesture.enabled",
+                    path: ["android", "gesture", field] as const,
+                    value: (settings: Settings) => {
+                      return settings.android.gesture[field];
+                    },
+                  };
+                }),
+              ],
+            },
+          ]
+        : []),
       ...(isMac || isWin
         ? [
             {

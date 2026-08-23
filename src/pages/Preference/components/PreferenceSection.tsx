@@ -8,6 +8,8 @@ import type {
   StorageLocation,
 } from "@/commands";
 import type { Settings } from "@/types/settings";
+import { cn } from "@/utils/cn";
+import { isMobile } from "@/utils/is";
 import type {
   PreferenceSection as PreferenceSectionModel,
   PreferenceSetting,
@@ -55,13 +57,17 @@ const PreferenceSection: FC<PreferenceSectionProps> = (props) => {
     onChange,
   } = props;
   const visual = resolveSectionVisual(section.id);
+  const mobile = isMobile();
   const sourceAppsSettings = resolveSourceAppsSettings(section.settings);
 
   if (sourceAppsSettings) {
     return (
       <motion.section
         animate={{ opacity: 1 }}
-        className="relative flex min-h-0 flex-1 scroll-mt-5 flex-col rounded-2 border border-ant-border-secondary bg-ant-container p-4"
+        className={cn(
+          "relative flex min-h-0 flex-1 scroll-mt-5 flex-col rounded-2 border border-ant-border-secondary bg-ant-container",
+          mobile ? "p-3" : "p-4",
+        )}
         id={section.id}
         initial={{ opacity: 0 }}
         transition={{
@@ -89,7 +95,12 @@ const PreferenceSection: FC<PreferenceSectionProps> = (props) => {
         ease: "easeOut",
       }}
     >
-      <div className="relative flex items-center justify-between gap-4 border-ant-split border-b bg-ant-container px-4 py-3.5">
+      <div
+        className={cn(
+          "relative flex items-center justify-between gap-4 border-ant-split border-b bg-ant-container",
+          mobile ? "px-3 py-3" : "px-4 py-3.5",
+        )}
+      >
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex size-9 shrink-0 items-center justify-center text-ant-primary text-xl">
             <i aria-hidden="true" className={visual.icon} />
@@ -102,9 +113,11 @@ const PreferenceSection: FC<PreferenceSectionProps> = (props) => {
           </div>
         </div>
 
-        <PreferenceCountTag>
-          {t("common:units.items", { count: section.settings.length })}
-        </PreferenceCountTag>
+        {!mobile ? (
+          <PreferenceCountTag>
+            {t("common:units.items", { count: section.settings.length })}
+          </PreferenceCountTag>
+        ) : null}
       </div>
 
       <div>
@@ -139,6 +152,12 @@ function resolveSectionVisual(id: string): SectionVisual {
   if (normalizedId.includes("about")) {
     return {
       icon: "i-lucide:info",
+    };
+  }
+
+  if (normalizedId.includes("androidgesture")) {
+    return {
+      icon: "i-lucide:hand",
     };
   }
 

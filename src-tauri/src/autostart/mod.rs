@@ -19,6 +19,22 @@ use macos::PlatformAutostart;
 #[cfg(target_os = "windows")]
 use windows::PlatformAutostart;
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+struct PlatformAutostart;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+impl PlatformAutostart {
+    fn new(_name: &str, _path: &str) -> Result<Self> {
+        Ok(Self)
+    }
+    fn is_enabled(&self) -> Result<bool> {
+        Ok(false)
+    }
+    fn set_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) const AUTO_LAUNCH_ARG: &str = "--auto-launch";
 
 pub struct AutostartManager {

@@ -1,9 +1,17 @@
 import { Input } from "antd";
 import type { ChangeEvent, FC } from "react";
 import { useTranslation } from "react-i18next";
+import { router } from "@/router";
+import { openAndroidPermissionsModal } from "@/stores/android";
 import { cn } from "@/utils/cn";
+import { isAndroid, isMobile } from "@/utils/is";
+import { preferenceTabs } from "../config/preferenceSchema";
 import { PREFERENCE_TAB_META } from "../constants";
-import type { PreferenceSection, PreferenceTab } from "../types/preferences";
+import type {
+  PreferenceSection,
+  PreferenceTab,
+  PreferenceTabId,
+} from "../types/preferences";
 import {
   translatePreferenceSection,
   translatePreferenceTab,
@@ -22,6 +30,7 @@ interface PreferenceHeaderProps {
   onPickSearchResult: (result: PreferenceSearchResult) => void;
   onSearchChange: (event: ChangeEvent<HTMLInputElement>) => void;
   onSectionSelect: (sectionId: string) => void;
+  onTabSelect: (tabId: PreferenceTabId) => void;
 }
 
 /**
@@ -39,18 +48,65 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
     onPickSearchResult,
     onSearchChange,
     onSectionSelect,
+    onTabSelect,
   } = props;
+  const mobile = isAndroid || isMobile();
+
+  const handleBack = () => {
+    void router.navigate("/");
+  };
+
+  const searchInput = (
+    <div className="relative z-3 w-full">
+      <Input
+        allowClear
+        autoCapitalize="off"
+        autoCorrect="off"
+        className="border-ant-border-secondary bg-ant-fill-quaternary text-ant-text"
+        onChange={onSearchChange}
+        placeholder={t("preferences:search.placeholder")}
+        prefix={
+          <i
+            aria-hidden="true"
+            className="i-lucide:search text-ant-secondary text-base"
+          />
+        }
+        spellCheck={false}
+        value={searchQuery}
+      />
+
+      <PreferenceSearchResults
+        onPick={onPickSearchResult}
+        query={searchQuery.trim()}
+        results={searchResults}
+        shouldReduceMotion={shouldReduceMotion}
+      />
+    </div>
+  );
 
   return (
     <header
-      className="shrink-0 border-ant-border-secondary border-b bg-ant-container px-6 pt-4 pb-2"
+      className={cn(
+        "shrink-0 border-ant-border-secondary border-b bg-ant-container",
+        mobile ? "mobile-safe-area-top px-3 pb-2" : "px-6 pt-4 pb-2",
+      )}
       data-tauri-drag-region
     >
       <div
         className="flex items-center justify-between gap-5"
         data-tauri-drag-region
       >
-        <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          {mobile ? (
+            <button
+              aria-label={t("common:actions.back", { defaultValue: "返回" })}
+              className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-ant-border-secondary bg-ant-fill-quaternary text-ant-text transition-colors hover:bg-ant-fill"
+              onClick={handleBack}
+              type="button"
+            >
+              <i aria-hidden="true" className="i-lucide:arrow-left text-sm" />
+            </button>
+          ) : null}
           <h1 className="m-0 flex items-center gap-2 font-semibold text-ant-text text-lg leading-snug">
             <i
               aria-hidden="true"
@@ -65,37 +121,58 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
           </h1>
         </div>
 
-        <div className="flex shrink-0 items-center">
-          <div className="relative z-3 w-64">
-            <Input
-              allowClear
-              autoCapitalize="off"
-              autoCorrect="off"
-              className="border-ant-border-secondary bg-ant-fill-quaternary text-ant-text"
-              onChange={onSearchChange}
-              placeholder={t("preferences:search.placeholder")}
-              prefix={
+        {!mobile ? (
+          <div className="flex w-64 shrink-0 items-center">{searchInput}</div>
+        ) : null}
+      </div>
+
+      {mobile ? <div className="mt-2">{searchInput}</div> : null}
+
+      {mobile ? (
+        <div className="no-scrollbar -mx-3 mt-2 flex gap-1 overflow-x-auto px-3">
+          {preferenceTabs.map((tab) => {
+            const selected = tab.id === activeTab.id;
+            const handleClick = () => {
+              onTabSelect(tab.id);
+            };
+
+            return (
+              <button
+                className={cn(
+                  "flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border-0 px-2.5 font-medium text-xs transition-colors",
+                  selected
+                    ? "bg-ant-primary text-ant-light-solid"
+                    : "bg-ant-fill-quaternary text-ant-secondary",
+                )}
+                key={tab.id}
+                onClick={handleClick}
+                type="button"
+              >
                 <i
                   aria-hidden="true"
-                  className="i-lucide:search text-ant-secondary text-base"
+                  className={PREFERENCE_TAB_META[tab.id].icon}
                 />
-              }
-              spellCheck={false}
-              value={searchQuery}
-            />
+                <span>{translatePreferenceTab(t, tab)}</span>
+              </button>
+            );
+          })}
 
-            <PreferenceSearchResults
-              onPick={onPickSearchResult}
-              query={searchQuery.trim()}
-              results={searchResults}
-              shouldReduceMotion={shouldReduceMotion}
-            />
-          </div>
+          {isAndroid ? (
+            <button
+              className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-ant-border-secondary bg-ant-fill-quaternary px-2.5 font-medium text-ant-primary text-xs"
+              onClick={openAndroidPermissionsModal}
+              type="button"
+            >
+              <i aria-hidden="true" className="i-lucide:shield-check" />
+              <span>权限与引擎</span>
+            </button>
+          ) : null}
         </div>
-      </div>
+      ) : null}
 
       <SectionTabs
         activeSectionId={activeSectionId}
+        mobile={mobile}
         onSectionSelect={onSectionSelect}
         sections={activeTab.sections}
         totalSettings={totalSettings}
@@ -106,6 +183,7 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
 
 interface SectionTabsProps {
   activeSectionId: string;
+  mobile: boolean;
   sections: PreferenceSection[];
   totalSettings: number;
   onSectionSelect: (sectionId: string) => void;
@@ -116,10 +194,17 @@ interface SectionTabsProps {
  */
 const SectionTabs: FC<SectionTabsProps> = (props) => {
   const { t } = useTranslation(["preferences", "common"]);
-  const { activeSectionId, sections, totalSettings, onSectionSelect } = props;
+  const { activeSectionId, mobile, sections, totalSettings, onSectionSelect } =
+    props;
 
   return (
-    <div className="mt-3 flex items-center gap-3" data-tauri-drag-region>
+    <div
+      className={cn(
+        "mt-2 flex items-center gap-3",
+        mobile && "no-scrollbar -mx-3 overflow-x-auto px-3",
+      )}
+      data-tauri-drag-region
+    >
       {sections.map((section) => {
         const selected = section.id === activeSectionId;
         const handleClick = () => {
@@ -149,9 +234,11 @@ const SectionTabs: FC<SectionTabsProps> = (props) => {
         );
       })}
 
-      <PreferenceCountTag className="ml-auto">
-        {t("common:units.settings", { count: totalSettings })}
-      </PreferenceCountTag>
+      {!mobile ? (
+        <PreferenceCountTag className="ml-auto">
+          {t("common:units.settings", { count: totalSettings })}
+        </PreferenceCountTag>
+      ) : null}
     </div>
   );
 };

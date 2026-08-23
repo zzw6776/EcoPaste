@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+#[cfg(not(target_os = "android"))]
 use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -197,10 +198,79 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     }
 
     super::cleanup::spawn(app.clone());
+    #[cfg(not(target_os = "android"))]
     spawn_watch_thread(app.clone(), guard, store, app_icon_store, registry, pause);
+    #[cfg(target_os = "android")]
+    spawn_android_watcher(app.clone(), guard, store, pause);
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+fn spawn_android_watcher(
+    app: AppHandle,
+    guard: Arc<WritebackGuard>,
+    store: ImageStore,
+    pause: WatcherPause,
+) {
+    use super::payload::{ClipboardPayload, TextPayload};
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    tauri::async_runtime::spawn(async move {
+        log::info!("android clipboard watcher task started");
+        let mut last_text: Option<String> = None;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            if pause.is_paused() {
+                continue;
+            }
+
+            let text = match app.clipboard().read_text() {
+                Ok(t) if !t.trim().is_empty() => t,
+                _ => continue,
+            };
+
+            if last_text.as_deref() == Some(&text) {
+                continue;
+            }
+            last_text = Some(text.clone());
+
+            let settings = app
+                .try_state::<SettingsStore>()
+                .map(|s| s.snapshot())
+                .unwrap_or_default();
+
+            let payload = ClipboardPayload::Text(TextPayload {
+                text: text.clone(),
+                html: None,
+                rtf: None,
+            });
+
+            let item = match build_item_with_settings(
+                &store,
+                &payload,
+                &settings.clipboard.capture,
+                &settings.clipboard.sensitive,
+                settings.clipboard.content.copy_plain,
+            ) {
+                Ok(Some(item)) => item,
+                _ => continue,
+            };
+
+            if guard.should_skip(&item.content_hash) {
+                continue;
+            }
+
+            let pool = app.state::<crate::db::DatabaseState>().pool().await;
+            if let Err(err) = persist_and_notify(&app, &pool, &item, None).await {
+                log::error!("android clipboard watcher: persist failed: {err}");
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "android"))]
 fn spawn_watch_thread(
     app: AppHandle,
     guard: Arc<WritebackGuard>,
@@ -247,6 +317,7 @@ fn spawn_watch_thread(
         .expect("failed to spawn clipboard watcher thread");
 }
 
+#[cfg(not(target_os = "android"))]
 struct ClipboardChangeHandler {
     reader: ClipboardReader,
     app: AppHandle,
@@ -257,6 +328,7 @@ struct ClipboardChangeHandler {
     pause: WatcherPause,
 }
 
+#[cfg(not(target_os = "android"))]
 impl ClipboardHandler for ClipboardChangeHandler {
     fn on_clipboard_change(&mut self) {
         // 用户从托盘关掉「监听」时直接早退，不读取、不入库、不 emit。

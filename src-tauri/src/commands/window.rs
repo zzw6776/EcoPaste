@@ -22,6 +22,11 @@ pub async fn toggle_window(app: AppHandle, label: String) -> Result<()> {
     window::toggle_window(&app, &label)
 }
 
+#[tauri::command]
+pub async fn resize_clipboard_window(app: AppHandle, height: f64) -> Result<()> {
+    window::resize_clipboard_window(&app, height)
+}
+
 /// 前端 WebView 完成基础初始化后回报 ready，由生命周期管理器把窗口推进到 `Ready` 阶段。
 /// label 由前端取自身窗口传入，避免硬编码。
 #[tauri::command]

@@ -3,7 +3,9 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import { finishOnboarding, setOnboardingStep } from "@/commands";
+import { router } from "@/router";
 import { settingsState } from "@/stores/settings";
+import { isAndroid } from "@/utils/is";
 import OnboardingActions from "./components/OnboardingActions";
 import OnboardingShell from "./components/OnboardingShell";
 import { ONBOARDING_STEPS } from "./steps";
@@ -61,6 +63,9 @@ const Onboarding: FC = () => {
 
     try {
       await finishOnboarding();
+      if (isAndroid) {
+        void router.navigate("/");
+      }
     } finally {
       setFinishLoading(false);
     }
