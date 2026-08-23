@@ -54,7 +54,7 @@ pub fn position_window(window: &WebviewWindow, position: WindowPosition) -> Resu
     match position {
         WindowPosition::Remember => {}
         WindowPosition::FollowCursor => apply_bottom(window, &monitor)?,
-        WindowPosition::Center => apply_bottom(window, &monitor)?,
+        WindowPosition::Center => apply_center(window, &monitor)?,
     }
 
     Ok(())
@@ -93,13 +93,25 @@ pub(super) fn center_on_cursor_monitor(window: &WebviewWindow) -> Result<()> {
     let Some((monitor, _)) = monitor_from_cursor(window)? else {
         return Ok(());
     };
-    apply_bottom(window, &monitor)
+    apply_center(window, &monitor)
 }
 
 #[cfg(not(target_os = "android"))]
-#[allow(dead_code)]
 fn apply_center(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
-    apply_bottom(window, monitor)
+    let window_size = window.outer_size().map_err(|e| anyhow::anyhow!(e))?;
+    let monitor_x = monitor.position.x as f64;
+    let monitor_y = monitor.position.y as f64;
+    let available_x = (monitor.size.width as f64 - window_size.width as f64).max(0.0);
+    let available_y = (monitor.size.height as f64 - window_size.height as f64).max(0.0);
+
+    window
+        .set_position(PhysicalPosition::new(
+            (monitor_x + available_x / 2.0).round() as i32,
+            (monitor_y + available_y / 2.0).round() as i32,
+        ))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(())
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
