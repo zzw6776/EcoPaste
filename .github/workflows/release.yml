@@ -4,6 +4,7 @@ name: Release CI
   push:
     branches:
       - master
+  workflow_dispatch:
 
 permissions:
   contents: write
