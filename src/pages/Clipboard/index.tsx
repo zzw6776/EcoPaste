@@ -115,7 +115,7 @@ const Clipboard = () => {
             )
           : cn({
               "bg-white/0 dark:bg-black/0": isWin,
-              "rounded-[26px] border border-white/50 bg-white/70 dark:border-white/15 dark:bg-black/60":
+              "rounded-[26px] border border-white/50 bg-white/0 dark:border-white/15 dark:bg-black/0":
                 !isWin,
             }),
       )}
