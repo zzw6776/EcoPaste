@@ -190,7 +190,7 @@ jobs:
           uploadUpdaterJson: false
 
   build-android:
-    name: Build Android universal APK
+    name: Build Android per-ABI APKs
     needs: release-metadata
     runs-on: ubuntu-latest
     permissions:
@@ -247,7 +247,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         with:
-          args: --apk --config src-tauri/tauri.release.conf.json
+          args: --apk --split-per-abi --config src-tauri/tauri.release.conf.json
           mobile: android
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true
