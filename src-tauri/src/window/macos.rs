@@ -3,7 +3,14 @@
 
 #![allow(clippy::unused_unit)]
 
-use tauri::{AppHandle, Manager};
+use objc2_app_kit::{
+    NSAppKitVersionNumber, NSAutoresizingMaskOptions, NSGlassEffectView, NSGlassEffectViewStyle,
+    NSView as AppKitView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode,
+};
+use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
+use objc2_web_kit::WKWebView;
+use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_nspanel::{
     tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt,
 };
@@ -11,6 +18,9 @@ use tauri_nspanel::{
 use super::{get_window, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
 use crate::core::Result;
 use crate::settings::SettingsStore;
+
+const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
+const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
 
 tauri_panel! {
     panel!(MainPanel {
@@ -38,11 +48,13 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
 
     let clipboard_window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
 
+    // 必须在 to_panel 改写 NSWindow 类之前重挂载 WKWebView，否则 WebKit 注销窗口 KVO 时会崩溃。
+    schedule_clipboard_surface(&clipboard_window)?;
+
     let panel = clipboard_window
         .to_panel::<MainPanel>()
         .map_err(|e| anyhow::anyhow!("to_panel failed: {e:?}"))?;
 
-    panel.set_corner_radius(26.0);
     panel.set_level(PanelLevel::Dock.value());
     panel.set_style_mask(
         StyleMask::empty()
@@ -51,6 +63,7 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
             .nonactivating_panel()
             .into(),
     );
+    panel.set_transparent(true);
     panel.set_collection_behavior(
         CollectionBehavior::new()
             .stationary()
@@ -58,6 +71,8 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
             .full_screen_auxiliary()
             .into(),
     );
+
+    panel.set_corner_radius(CLIPBOARD_CORNER_RADIUS);
 
     let handler = MainPanelEventHandler::new();
 
@@ -77,6 +92,95 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     panel.set_event_handler(Some(handler.as_ref()));
 
     Ok(())
+}
+
+/// 在 Tauri 回调提供真实 WKWebView 后，将它交给对应的原生材质承载。
+fn schedule_clipboard_surface(window: &WebviewWindow) -> Result<()> {
+    window
+        .with_webview(move |platform_webview| {
+            let result = (|| -> Result<()> {
+                let window_ptr = platform_webview.ns_window().cast::<AppKitWindow>();
+                if window_ptr.is_null() {
+                    return Err(anyhow::anyhow!("clipboard NSWindow pointer is null").into());
+                }
+
+                // Tauri 保证 with_webview 回调期间这些指针有效且运行在 WebView 所属主线程。
+                let native_window = unsafe { &*window_ptr };
+                let container = native_window
+                    .contentView()
+                    .ok_or_else(|| anyhow::anyhow!("clipboard NSWindow has no content view"))?;
+
+                if supports_liquid_glass() {
+                    let webview_ptr = platform_webview.inner().cast::<WKWebView>();
+                    if webview_ptr.is_null() {
+                        return Err(anyhow::anyhow!("clipboard WKWebView pointer is null").into());
+                    }
+
+                    let webview = unsafe { &*webview_ptr };
+                    install_clipboard_liquid_glass(&container, webview)?;
+                    log::info!("installed macOS liquid glass clipboard surface");
+                } else {
+                    install_clipboard_vibrancy(&container)?;
+                    log::info!("installed legacy macOS vibrancy clipboard surface");
+                }
+
+                Ok(())
+            })();
+
+            if let Err(err) = result {
+                log::error!("install clipboard native surface failed: {err:?}");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("schedule clipboard native surface failed: {e}"))?;
+
+    Ok(())
+}
+
+/// macOS 26+ 使用单个 NSGlassEffectView 承载真实 WKWebView。
+fn install_clipboard_liquid_glass(container: &AppKitView, webview: &WKWebView) -> Result<()> {
+    let main_thread = ObjcMainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("clipboard glass setup must run on the main thread"))?;
+    let glass_view = NSGlassEffectView::initWithFrame(main_thread.alloc(), container.bounds());
+
+    glass_view.setStyle(NSGlassEffectViewStyle::Regular);
+    glass_view.setCornerRadius(CLIPBOARD_CORNER_RADIUS);
+    glass_view.setTintColor(None);
+    glass_view.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    webview.removeFromSuperview();
+    glass_view.setContentView(Some(webview));
+    container.addSubview(&glass_view);
+
+    Ok(())
+}
+
+/// 较旧 macOS 没有 Liquid Glass API，退回公开的 Popover vibrancy 材质。
+fn install_clipboard_vibrancy(content_view: &AppKitView) -> Result<()> {
+    let main_thread = ObjcMainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("clipboard vibrancy setup must run on the main thread"))?;
+    let material_view = NSVisualEffectView::new(main_thread);
+
+    material_view.setFrame(content_view.bounds());
+    material_view.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    material_view.setMaterial(NSVisualEffectMaterial::Popover);
+    material_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    material_view.setState(NSVisualEffectState::Active);
+    content_view.addSubview_positioned_relativeTo(
+        &material_view,
+        NSWindowOrderingMode::Below,
+        None,
+    );
+
+    Ok(())
+}
+
+/// NSGlassEffectView 从 macOS 26 对应的 AppKit 版本开始可用。
+fn supports_liquid_glass() -> bool {
+    unsafe { NSAppKitVersionNumber >= MIN_APPKIT_VERSION_LIQUID_GLASS }
 }
 
 /// 禁用 macOS App Nap，确保长时间未唤醒时依然保持 0 毫秒即时响应。

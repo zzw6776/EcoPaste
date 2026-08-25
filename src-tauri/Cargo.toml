@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.13"
+version = "1.1.16"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -72,7 +72,8 @@ window-vibrancy = "0.6"
 core-graphics = "0.25"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSDictionary", "NSURL", "NSArray", "NSGeometry", "NSAttributedString", "NSProcessInfo"] }
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "NSImage", "NSView", "NSWindow", "NSEvent", "NSApplication", "NSResponder", "NSPasteboard", "NSPasteboardItem", "NSDraggingItem", "NSDraggingSession", "NSAttributedString", "NSStringDrawing", "NSColor", "NSFont", "NSParagraphStyle", "NSBezierPath", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "NSImage", "NSView", "NSWindow", "NSEvent", "NSApplication", "NSResponder", "NSPasteboard", "NSPasteboardItem", "NSDraggingItem", "NSDraggingSession", "NSAttributedString", "NSStringDrawing", "NSColor", "NSFont", "NSParagraphStyle", "NSBezierPath", "NSGraphics", "NSVisualEffectView", "NSGlassEffectView"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebView", "objc2-app-kit"] }
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
 plist = { version = "1", default-features = false }
 tauri-plugin-macos-permissions = "2"

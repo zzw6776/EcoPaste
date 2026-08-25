@@ -58,7 +58,6 @@ EcoPaste 采用 Rust-First 的 Tauri 架构：
 - `rust-toolchain.toml` 指定的 Rust 工具链（`1.96.0`，包含 `rustfmt` 和 `clippy`）。
 - Tauri v2 所需的系统原生依赖。请参考
   [Tauri prerequisites](https://tauri.app/start/prerequisites/) 中对应系统的说明。
-- Trellis 工作流文档请参考 [Trellis 文档](https://docs.trytrellis.app/zh)。
 
 ### 安装依赖
 
