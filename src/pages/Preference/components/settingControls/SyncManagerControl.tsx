@@ -18,6 +18,7 @@ import {
   setSyncDeviceName,
   syncNow,
 } from "@/commands";
+import { updateSettings } from "@/stores/settings";
 import { cn } from "@/utils/cn";
 import { getModalApi } from "@/utils/feedback";
 import { isAndroid } from "@/utils/is";
@@ -98,6 +99,12 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       const code = await createSyncGroup();
       setPairingCode(code);
       setPairingCodeOpen(true);
+    });
+  }
+
+  async function handleEnable() {
+    await run(async () => {
+      await updateSettings({ sync: { enabled: true } });
     });
   }
 
@@ -251,7 +258,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
 
   return (
     <div className="flex w-full flex-col gap-2">
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+      <div className="grid grid-cols-1 items-start gap-2 md:grid-cols-2">
         <div className="rounded-2 border border-ant-border-secondary bg-ant-fill-quaternary p-3">
           <div className="flex items-center gap-2">
             <i
@@ -367,6 +374,15 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       <Space wrap>
         {status?.paired ? (
           <>
+            {!status.enabled ? (
+              <Button
+                disabled={disabled || busy}
+                onClick={handleEnable}
+                type="primary"
+              >
+                {t("sync.actions.enable")}
+              </Button>
+            ) : null}
             <Button disabled={disabled || busy} onClick={handleExport}>
               {t("sync.actions.pairDevice")}
             </Button>

@@ -15,6 +15,7 @@ dist-ssr
 /sync-server/protocol/target/
 /sync-server/protocol/Cargo.lock
 *.local
+/signing.properties
 
 # Editor directories and files
 .vscode/*

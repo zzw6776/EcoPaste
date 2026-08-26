@@ -1,18 +1,22 @@
-* text=auto
+# 默认：所有文本文件在三个平台工作区都使用 LF
+* text=auto eol=lf
 
-*.rs text eol=lf
-*.toml text eol=lf
-*.json text eol=lf
-*.jsonl text eol=lf
-*.ts text eol=lf
-*.tsx text eol=lf
-*.js text eol=lf
-*.jsx text eol=lf
-*.css text eol=lf
-*.md text eol=lf
-*.yml text eol=lf
-*.yaml text eol=lf
+# Windows 批处理文件例外
+*.bat text eol=crlf
+*.cmd text eol=crlf
 
+# Unix/Android 可执行脚本必须 LF
+*.sh text eol=lf
+gradlew text eol=lf
+src-tauri/gen/android/gradlew text eol=lf
+
+# 二进制不做换行转换
 *.png binary
+*.jpg binary
+*.jpeg binary
 *.ico binary
 *.icns binary
+*.apk binary
+*.keystore binary
+*.jks binary
+*.zip binary

@@ -235,6 +235,21 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Restore Android signing properties
+        env:
+          SIGNING_ZIP_PASSWORD: ${{ secrets.SIGNING_PROPERTIES_ZIP_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_ZIP_PASSWORD" ]; then
+            echo "SIGNING_PROPERTIES_ZIP_PASSWORD is not configured." >&2
+            exit 1
+          fi
+
+          unzip -P "$SIGNING_ZIP_PASSWORD" -o signing.properties.zip signing.properties
+          printf '\nkeystore.file=release.keystore\n' >> signing.properties
+          chmod 600 signing.properties
+          test -s signing.properties
+          test -s release.keystore
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:

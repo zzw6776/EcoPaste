@@ -67,6 +67,7 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
   const collapsed = childSetting && parentDisabled;
   const visual = resolveSettingVisual(setting.id);
   const mobile = isAndroid || isMobile();
+  const wideControl = setting.control.type === "syncManager";
   const highlightOpacity = shouldReduceMotion
     ? 0.08
     : [0, 0.1, 0.055, 0.085, 0.045, 0.07, 0.025, 0];
@@ -89,7 +90,9 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
         "group relative flex overflow-hidden border-ant-split border-b transition-colors last:border-b-0 hover:bg-ant-fill-quaternary motion-reduce:transition-none",
         mobile
           ? "flex-col items-stretch gap-0 px-3"
-          : "items-center gap-5 px-4",
+          : wideControl
+            ? "flex-col items-stretch gap-0 px-4"
+            : "items-center gap-5 px-4",
         {
           "pl-6": childSetting && mobile,
           "pl-12": childSetting && !mobile,
@@ -128,7 +131,7 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
       <div
         className={cn(
           "relative flex min-w-0 items-start",
-          mobile ? "w-full gap-3" : "flex-1 gap-5",
+          mobile || wideControl ? "w-full gap-3" : "flex-1 gap-5",
         )}
       >
         <span
@@ -172,7 +175,11 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
       <div
         className={cn(
           "relative flex justify-end opacity-90 transition-opacity group-hover:opacity-100 motion-reduce:transition-none",
-          mobile ? "mt-2 w-full pl-10" : "shrink-0",
+          mobile
+            ? "mt-2 w-full pl-10"
+            : wideControl
+              ? "mt-3 w-full pl-10"
+              : "shrink-0",
         )}
       >
         <PreferenceSettingControl
