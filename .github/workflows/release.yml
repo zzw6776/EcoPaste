@@ -148,7 +148,7 @@ jobs:
           ref: ${{ needs.release-metadata.outputs.tag_name }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 
@@ -202,7 +202,7 @@ jobs:
           ref: ${{ needs.release-metadata.outputs.tag_name }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 

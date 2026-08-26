@@ -156,6 +156,168 @@ export interface CleanCacheResult {
   storageUsage: StorageUsage;
 }
 
+export interface SyncStatus {
+  enabled: boolean;
+  paired: boolean;
+  deviceId: string;
+  deviceName: string;
+  groupId: string | null;
+  endpointId: string;
+  cloudEndpointId: string;
+  cloudDirectAddresses: string[];
+  cloudRelayUrls: string[];
+  pendingEvents: number;
+  pendingManualItems: number;
+  peerCount: number;
+  lastSuccessAt: string | null;
+  lan: SyncChannelStatus;
+  cloud: SyncChannelStatus;
+  peers: SyncPeerStatus[];
+}
+
+export type SyncChannelState =
+  | "disabled"
+  | "idle"
+  | "connecting"
+  | "online"
+  | "error";
+
+export interface SyncChannelStatus {
+  state: SyncChannelState;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+}
+
+export interface SyncPeerStatus {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  endpointId: string;
+  directAddresses: string[];
+  relayUrls: string[];
+  state: SyncChannelState;
+  connectedAddress: string | null;
+  transport: string | null;
+  lastSeenAt: string | null;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+}
+
+export type SyncItemState = "idle" | "syncing" | "success" | "manual" | "error";
+
+export interface SyncItemChannelStatus {
+  state: SyncItemState;
+  deliveredTargets: number;
+  totalTargets: number;
+  lastError: string | null;
+}
+
+export interface SyncItemStatus {
+  itemId: string;
+  lan: SyncItemChannelStatus;
+  cloud: SyncItemChannelStatus;
+}
+
+export type SyncTarget = "lan" | "cloud";
+
+export interface SyncPairingPreview {
+  inviterDeviceName: string;
+  sameGroup: boolean;
+}
+
+export const getSyncStatus = async () => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.GET_SYNC_STATUS,
+    "commands:labels.loadSyncStatus",
+  );
+};
+
+export const createSyncGroup = async () => {
+  return call<string>(
+    TAURI_COMMAND.CREATE_SYNC_GROUP,
+    "commands:labels.createSyncGroup",
+  );
+};
+
+export const exportSyncPairingCode = async () => {
+  return call<string>(
+    TAURI_COMMAND.EXPORT_SYNC_PAIRING_CODE,
+    "commands:labels.exportSyncPairingCode",
+  );
+};
+
+export const inspectSyncPairingCode = async (pairingCode: string) => {
+  return call<SyncPairingPreview>(
+    TAURI_COMMAND.INSPECT_SYNC_PAIRING_CODE,
+    "commands:labels.inspectSyncPairingCode",
+    { pairingCode },
+  );
+};
+
+export const joinSyncGroup = async (
+  pairingCode: string,
+  replaceExisting = false,
+) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.JOIN_SYNC_GROUP,
+    "commands:labels.joinSyncGroup",
+    { pairingCode, replaceExisting },
+  );
+};
+
+export const leaveSyncGroup = async () => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.LEAVE_SYNC_GROUP,
+    "commands:labels.leaveSyncGroup",
+  );
+};
+
+export const setSyncDeviceName = async (name: string) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.SET_SYNC_DEVICE_NAME,
+    "commands:labels.setSyncDeviceName",
+    { name },
+  );
+};
+
+export const syncNow = async () => {
+  return call<SyncStatus>(TAURI_COMMAND.SYNC_NOW, "commands:labels.syncNow");
+};
+
+export const reconnectSyncPeer = async (deviceId?: string) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.RECONNECT_SYNC_PEER,
+    "commands:labels.reconnectSyncPeer",
+    { deviceId },
+  );
+};
+
+export const getSyncItemStatuses = async (itemIds: string[]) => {
+  return call<SyncItemStatus[]>(
+    TAURI_COMMAND.GET_SYNC_ITEM_STATUSES,
+    "commands:labels.loadSyncItemStatuses",
+    { itemIds },
+  );
+};
+
+export const syncItemNow = async (itemId: string, target: SyncTarget) => {
+  return call<SyncItemStatus>(
+    TAURI_COMMAND.SYNC_ITEM_NOW,
+    "commands:labels.syncItemNow",
+    { itemId, target },
+  );
+};
+
+export const uploadSyncItem = async (itemId: string) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.UPLOAD_SYNC_ITEM,
+    "commands:labels.uploadSyncItem",
+    { itemId },
+  );
+};
+
 export interface StorageLocation {
   currentPath: string;
   defaultPath: string;

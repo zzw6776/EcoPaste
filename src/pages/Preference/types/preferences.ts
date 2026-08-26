@@ -6,6 +6,7 @@ export type PreferenceTabId =
   | "reuse"
   | "workflow"
   | "shortcuts"
+  | "sync"
   | "data"
   | "about";
 
@@ -76,6 +77,7 @@ export type PreferenceControl =
   | { type: "action"; danger?: boolean }
   | { type: "sponsorQr" }
   | { type: "status" }
+  | { type: "syncManager" }
   | { type: "shortcutTags"; shortcuts: PreferenceShortcutTag[] };
 
 export interface PreferenceSetting {

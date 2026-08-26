@@ -15,6 +15,7 @@ mod menu;
 mod mouse;
 mod settings;
 mod shortcut;
+mod sync;
 mod tray;
 mod update;
 mod window;
@@ -171,6 +172,18 @@ pub fn run() {
             commands::resume_global_shortcuts,
             commands::update_settings,
             commands::reset_settings,
+            commands::get_sync_status,
+            commands::create_sync_group,
+            commands::export_sync_pairing_code,
+            commands::inspect_sync_pairing_code,
+            commands::join_sync_group,
+            commands::leave_sync_group,
+            commands::set_sync_device_name,
+            commands::sync_now,
+            commands::reconnect_sync_peer,
+            commands::get_sync_item_statuses,
+            commands::sync_item_now,
+            commands::upload_sync_item,
             commands::export_history_backup,
             commands::inspect_history_backup,
             commands::take_pending_backup,
@@ -231,6 +244,7 @@ pub fn run() {
                 })?;
                 handle_db.manage(db::DatabaseState::new(pool));
                 clipboard::init(&handle_db)?;
+                sync::init(&handle_db).await?;
                 #[cfg(target_os = "android")]
                 {
                     commands::android::set_app_handle(handle_db.clone());

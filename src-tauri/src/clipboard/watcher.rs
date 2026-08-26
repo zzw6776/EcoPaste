@@ -10,6 +10,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "android")]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -34,6 +36,9 @@ use crate::settings::SettingsStore;
 
 /// 剪贴板更新事件名。前端监听此事件后增量刷新 / 重新拉取列表。
 pub const CLIPBOARD_UPDATED_EVENT: &str = "clipboard://updated";
+
+#[cfg(target_os = "android")]
+static ANDROID_LAST_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// macOS 轮询 `changeCount` 的间隔。上游 clipboard-rs 默认 500ms，对复制响应（尤其图片）
 /// 偏慢；我们 fork 出 `new_with_interval` 后调到 120ms，跟手且 CPU 开销可忽略。
@@ -153,6 +158,8 @@ pub async fn persist_and_notify(
     ) {
         log::warn!("emit {CLIPBOARD_UPDATED_EVENT} failed: {err}");
     }
+    item_to_write.id = result.id.clone();
+    crate::sync::enqueue_local_item(app, item_to_write);
     Ok(result)
 }
 
@@ -212,15 +219,12 @@ fn spawn_android_watcher(
     store: ImageStore,
     pause: WatcherPause,
 ) {
-    use super::payload::{ClipboardPayload, TextPayload};
     use tauri_plugin_clipboard_manager::ClipboardExt;
 
     tauri::async_runtime::spawn(async move {
         log::info!("android clipboard watcher task started");
-        let mut last_text: Option<String> = None;
-
         loop {
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
 
             if pause.is_paused() {
                 continue;
@@ -231,43 +235,80 @@ fn spawn_android_watcher(
                 _ => continue,
             };
 
-            if last_text.as_deref() == Some(&text) {
+            if !is_new_android_text(&text) {
                 continue;
             }
-            last_text = Some(text.clone());
-
-            let settings = app
-                .try_state::<SettingsStore>()
-                .map(|s| s.snapshot())
-                .unwrap_or_default();
-
-            let payload = ClipboardPayload::Text(TextPayload {
-                text: text.clone(),
-                html: None,
-                rtf: None,
-            });
-
-            let item = match build_item_with_settings(
-                &store,
-                &payload,
-                &settings.clipboard.capture,
-                &settings.clipboard.sensitive,
-                settings.clipboard.content.copy_plain,
-            ) {
-                Ok(Some(item)) => item,
-                _ => continue,
-            };
-
-            if guard.should_skip(&item.content_hash) {
-                continue;
-            }
-
-            let pool = app.state::<crate::db::DatabaseState>().pool().await;
-            if let Err(err) = persist_and_notify(&app, &pool, &item, None).await {
-                log::error!("android clipboard watcher: persist failed: {err}");
-            }
+            persist_android_text(&app, &guard, &store, &pause, text).await;
         }
     });
+}
+
+#[cfg(target_os = "android")]
+pub fn capture_android_text(app: &AppHandle, text: String) {
+    if !is_new_android_text(&text) {
+        return;
+    }
+    let app = app.clone();
+    let guard = app.state::<Arc<WritebackGuard>>().inner().clone();
+    let store = app.state::<ImageStore>().inner().clone();
+    let pause = app.state::<WatcherPause>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        persist_android_text(&app, &guard, &store, &pause, text).await;
+    });
+}
+
+#[cfg(target_os = "android")]
+fn is_new_android_text(text: &str) -> bool {
+    let mut last = ANDROID_LAST_TEXT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("Android clipboard state poisoned");
+    if last.as_deref() == Some(text) {
+        return false;
+    }
+    *last = Some(text.to_owned());
+    true
+}
+
+#[cfg(target_os = "android")]
+async fn persist_android_text(
+    app: &AppHandle,
+    guard: &WritebackGuard,
+    store: &ImageStore,
+    pause: &WatcherPause,
+    text: String,
+) {
+    use super::payload::{ClipboardPayload, TextPayload};
+
+    if pause.is_paused() || text.trim().is_empty() {
+        return;
+    }
+    let settings = app
+        .try_state::<SettingsStore>()
+        .map(|store| store.snapshot())
+        .unwrap_or_default();
+    let payload = ClipboardPayload::Text(TextPayload {
+        text,
+        html: None,
+        rtf: None,
+    });
+    let item = match build_item_with_settings(
+        store,
+        &payload,
+        &settings.clipboard.capture,
+        &settings.clipboard.sensitive,
+        settings.clipboard.content.copy_plain,
+    ) {
+        Ok(Some(item)) => item,
+        _ => return,
+    };
+    if guard.should_skip(&item.content_hash) {
+        return;
+    }
+    let pool = app.state::<crate::db::DatabaseState>().pool().await;
+    if let Err(error) = persist_and_notify(app, &pool, &item, None).await {
+        log::error!("Android clipboard capture persist failed: {error}");
+    }
 }
 
 #[cfg(not(target_os = "android"))]

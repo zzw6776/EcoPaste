@@ -10,9 +10,16 @@ EcoPaste 是跨平台剪贴板管理器，采用 Rust-First 的 Tauri 架构。
 - **仅支持 macOS + Windows + Android**：不要新增 Linux 或 iOS 代码、依赖、构建产物或文档承诺。
 - **已发布版本按发布数据处理**：数据结构、配置格式、默认值和 migration 变更必须有明确迁移策略，不再直接覆盖已发布数据契约。
 - **每次改动必须升级版本**：每个进入 `master` 的提交都必须提升 `package.json` 版本，并同步更新 `src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`；Tauri 桌面包和 Android 包统一使用该版本。
+- **固定 Rust 工具链**：所有本地和 AI 会话都使用仓库根目录 `rust-toolchain.toml` 管理的 rustup 工具链，不使用 Homebrew Rust 或绕过版本文件的 `cargo`；测试 profile 采用低磁盘配置。
+- **Rust 构建低磁盘配置**：客户端只生成 macOS/Windows 使用的 `rlib` 与 Android 使用的 `cdylib`，不要恢复仅供 iOS 的 `staticlib`；客户端和同步服务保留自身 `debug = 1` 与增量编译，第三方依赖使用 `debug = 0`，测试使用 `debug = 0` 且关闭增量编译。不要为了省空间自动删除客户端 Android、服务端 `target` 或 Cargo registry，否则下次会重新编译或下载。
+- **Android 日常只构建 arm64**：本地开发和真机验收统一使用 `pnpm android:build:debug`；成功后 APK 保存在 `artifacts/android/`，Gradle 产物自动清理；只有正式多 ABI 发布流程才构建其它 Android targets。
+- **Docker 构建缓存隔离**：同步服务使用 `sync-server/docker-up.sh` 构建和启动；脚本通过 `ecopaste-sync-slim` Buildx builder 复用下载与编译缓存，将缓存控制在 3 GiB 内，成功替换后自动删除旧服务镜像，并在构建后停止 builder。需要彻底回收时只操作该 builder，不使用共享全局缓存的 `docker compose up --build`，也不手动执行无过滤条件的 `docker image prune` 或 `docker builder prune`。
+- **共享依赖缓存保守清理**：默认保留 Cargo registry/git、pnpm store、当前 Gradle wrapper 和 Gradle modules；它们体积较小或跨项目共享，删除会导致重新下载。旧 Gradle 版本可能属于其它项目，未经用户明确授权不得删除。
+- **配对方向明确**：二维码生成方是要加入的同步空间基准；扫码设备已属于其它同步空间时，必须让用户显式选择“加入二维码设备”或“保留本机并展示本机二维码”。切换空间时清理旧同步队列和路由但保留本地剪贴板历史，禁止静默覆盖或自动合并两套密钥与事件序列。
+- **Android 配对扫码固定使用 Worker**：当前高版本密集配对二维码无法被 Android WebView 原生 `BarcodeDetector` 稳定识别，`qr-scanner` 必须禁用原生检测器并使用其 Worker；调整该策略前必须用真实完整配对二维码完成真机识别验证。
+- **同步地址与重连**：Iroh Endpoint ID 是稳定设备身份，直连 IP、端口和 Relay URL 只作动态路由；局域网通过 `iroh-mdns-address-lookup` 刷新地址，缓存路由必须同时保留直连与 Relay。启动、窗口回到前台和地址发现变化立即连接，离线按 `2/5/15/30/60/300` 秒退避，禁止恢复高频轮询或把连接超时当作成功周期；全部设备和单设备都必须保留手动重连入口。
 - **主动演进当前项目**：实现新能力时以当前代码、产品需求和平台约束为准，把当前仓库作为唯一实现基线。
 - **尊重 dirty worktree**：不要回滚或覆盖非本轮改动；需要动到已修改文件时先读清楚。
-- **提交与推送分支策略**：需要推送代码且当前分支是 `master` 时，自动新建工作分支，在新分支提交并推送；当前分支不是 `master` 时，先询问用户是在当前分支提交并推送，还是新建分支后提交并推送。
 
 ## 技术栈
 
@@ -80,14 +87,23 @@ src/            # 前端 components/pages/stores/hooks/locales/utils
 pnpm install
 pnpm tauri dev
 pnpm tauri build
+pnpm android:build:debug
 pnpm lint
 pnpm format
+pnpm clean:native
 
+source "$HOME/.cargo/env"
 cd src-tauri
 cargo fmt
 cargo clippy -- -D warnings
 cargo test
+
+cd ../sync-server
+cargo test --workspace
+./docker-up.sh
 ```
+
+`pnpm clean:native` 只用于明确需要回收可再生构建产物时；运行前先确认没有 Cargo、Tauri 或 Gradle 构建进程。服务端协议 crate 属于 `sync-server` workspace，不单独生成或清理 `sync-server/protocol/target`。
 
 ## Rust 约定
 

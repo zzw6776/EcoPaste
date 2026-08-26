@@ -556,24 +556,6 @@ export const preferenceTabs: PreferenceTab[] = [
             },
           },
           {
-            control: { max: 5, min: 1, suffixKey: "lines", type: "number" },
-            id: "appearance.textMaxLines",
-            keywords: ["density", "text", "line", "compact"],
-            path: ["clipboard", "display", "textMaxLines"],
-            value: (settings) => {
-              return settings.clipboard.display.textMaxLines;
-            },
-          },
-          {
-            control: { max: 100, min: 20, suffixKey: "px", type: "number" },
-            id: "appearance.imageMaxHeight",
-            keywords: ["density", "image", "height", "thumbnail"],
-            path: ["clipboard", "display", "imageMaxHeight"],
-            value: (settings) => {
-              return settings.clipboard.display.imageMaxHeight;
-            },
-          },
-          {
             control: { max: 5, min: 1, suffixKey: "files", type: "number" },
             id: "appearance.fileMaxCount",
             keywords: ["density", "file", "count", "array"],
@@ -945,6 +927,95 @@ export const preferenceTabs: PreferenceTab[] = [
             value: (settings) => {
               return settings.update.includeNightly;
             },
+          },
+        ],
+      },
+    ],
+  },
+  {
+    icon: "i-lucide:refresh-cw",
+    id: "sync",
+    sections: [
+      {
+        id: "syncBehavior",
+        settings: [
+          {
+            control: { type: "switch" },
+            id: "sync.enabled",
+            keywords: ["sync", "device", "clipboard"],
+            path: ["sync", "enabled"],
+            value: (settings) => {
+              return settings.sync.enabled;
+            },
+          },
+          {
+            control: { type: "switch" },
+            id: "sync.autoWriteClipboard",
+            keywords: ["sync", "clipboard", "write"],
+            path: ["sync", "autoWriteClipboard"],
+            value: (settings) => {
+              return settings.sync.autoWriteClipboard;
+            },
+          },
+          {
+            control: { max: 2048, min: 0, suffixKey: "mb", type: "number" },
+            id: "sync.autoUploadMaxMb",
+            keywords: ["sync", "file", "upload", "size"],
+            path: ["sync", "autoUploadMaxMb"],
+            value: (settings) => {
+              return settings.sync.autoUploadMaxMb;
+            },
+          },
+          {
+            control: { type: "switch" },
+            id: "sync.syncSensitive",
+            keywords: ["sync", "sensitive", "secret"],
+            path: ["sync", "syncSensitive"],
+            value: (settings) => {
+              return settings.sync.syncSensitive;
+            },
+          },
+        ],
+      },
+      {
+        id: "syncServer",
+        settings: [
+          {
+            control: { type: "text" },
+            id: "sync.serverEndpointId",
+            keywords: ["sync", "server", "iroh", "endpoint"],
+            path: ["sync", "serverEndpointId"],
+            value: (settings) => {
+              return settings.sync.serverEndpointId;
+            },
+          },
+          {
+            control: { type: "textarea" },
+            id: "sync.serverDirectAddresses",
+            keywords: ["sync", "server", "udp", "address"],
+            path: ["sync", "serverDirectAddresses"],
+            value: (settings) => {
+              return settings.sync.serverDirectAddresses;
+            },
+          },
+          {
+            control: { type: "textarea" },
+            id: "sync.serverRelayUrls",
+            keywords: ["sync", "server", "relay"],
+            path: ["sync", "serverRelayUrls"],
+            value: (settings) => {
+              return settings.sync.serverRelayUrls;
+            },
+          },
+        ],
+      },
+      {
+        id: "syncDevices",
+        settings: [
+          {
+            control: { type: "syncManager" },
+            id: "sync.devices",
+            keywords: ["sync", "pair", "device"],
           },
         ],
       },

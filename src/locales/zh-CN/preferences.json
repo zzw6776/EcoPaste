@@ -63,10 +63,8 @@
       "gb": "GB",
       "hours": "小时",
       "items": "条",
-      "lines": "行",
       "mb": "MB",
       "percent": "%",
-      "px": "px",
       "seconds": "秒"
     },
     "retentionUnits": {
@@ -137,6 +135,17 @@
       },
       "source": {
         "title": "应用过滤"
+      },
+      "syncBehavior": {
+        "description": "本地事件日志始终是事实源；先尝试局域网直连，失败后再使用云端 Hub。",
+        "title": "同步策略"
+      },
+      "syncDevices": {
+        "title": "设备与状态"
+      },
+      "syncServer": {
+        "description": "云端不可用时不影响已配对设备的局域网直连。每行填写一个地址。",
+        "title": "可选云端 Hub"
       },
       "updates": {
         "title": "更新"
@@ -227,10 +236,6 @@
           "description": "限制文件记录在列表卡片中最多显示的文件数量。",
           "title": "文件最多显示数量"
         },
-        "imageMaxHeight": {
-          "description": "限制图片记录在列表卡片中的缩略图高度。",
-          "title": "图片最大显示高度"
-        },
         "language": {
           "description": "切换 EcoPaste 的界面语言。",
           "options": {
@@ -242,10 +247,6 @@
         "showOriginalPreview": {
           "description": "有备注的记录默认显示备注，鼠标移入卡片时临时显示原始内容。",
           "title": "悬停显示原始内容"
-        },
-        "textMaxLines": {
-          "description": "限制文本记录在列表卡片中最多显示的行数。",
-          "title": "文本内容最大显示行数"
         },
         "theme": {
           "description": "选择界面使用浅色、深色，或跟随系统外观。",
@@ -594,6 +595,43 @@
           "title": "忽略应用"
         }
       },
+      "sync": {
+        "autoUploadMaxMb": {
+          "description": "单个文件不超过该大小时自动加密上传；0 表示所有文件都需要手动上传。文件夹始终手动上传。",
+          "title": "文件自动上传上限"
+        },
+        "autoWriteClipboard": {
+          "description": "关闭时远端内容只进入历史记录，不覆盖当前系统剪贴板。",
+          "title": "自动写入系统剪贴板"
+        },
+        "devices": {
+          "description": "为本机启用同步，或通过配对码连接已有设备并查看投递状态。",
+          "title": "我的设备"
+        },
+        "enabled": {
+          "description": "开启后同步文本、富文本、图片和符合策略的文件。",
+          "title": "启用多端同步"
+        },
+        "serverDirectAddresses": {
+          "description": "服务端公网或局域网 UDP 地址，例如 203.0.113.10:44820。",
+          "placeholder": "每行一个 IP:端口",
+          "title": "Hub 直连地址"
+        },
+        "serverEndpointId": {
+          "description": "sync-server 启动日志输出的 ECOPASTE_SERVER_ENDPOINT_ID。留空时仅使用局域网设备直连。",
+          "placeholder": "Iroh Endpoint ID",
+          "title": "Hub Endpoint ID"
+        },
+        "serverRelayUrls": {
+          "description": "可选 Iroh relay URL。自建服务只有固定公网 UDP 地址时可留空。",
+          "placeholder": "每行一个 relay URL",
+          "title": "Hub Relay 地址"
+        },
+        "syncSensitive": {
+          "description": "开启后密码、Token 等标记为敏感的内容也会端到端加密同步。建议保持关闭。",
+          "title": "同步敏感内容"
+        }
+      },
       "updates": {
         "autoCheck": {
           "description": "定期检查 EcoPaste 是否有可用的新版本。",
@@ -689,6 +727,9 @@
       "shortcuts": {
         "title": "快捷键"
       },
+      "sync": {
+        "title": "同步"
+      },
       "workflow": {
         "title": "界面"
       }
@@ -717,5 +758,72 @@
     "reset": "还原默认目录",
     "resetConfirmContent": "将把当前历史数据库、设置文件和资源缓存迁回默认数据目录，并在迁移成功后删除当前自定义数据目录。",
     "resetConfirmTitle": "还原默认数据目录"
+  },
+  "sync": {
+    "actions": {
+      "cancel": "取消",
+      "connectOther": "连接到其他设备",
+      "create": "在本机启用同步",
+      "join": "连接已有设备",
+      "leave": "断开本机连接",
+      "pairDevice": "添加新设备",
+      "reconnectAll": "重新连接全部设备",
+      "reconnectDevice": "重新连接 {{device}}",
+      "saveName": "保存名称",
+      "scanQrCode": "扫描二维码",
+      "syncNow": "立即同步",
+      "usePairingCode": "改用配对码"
+    },
+    "channels": {
+      "cloud": "云端",
+      "lan": "局域网"
+    },
+    "conflict": {
+      "joinRemote": "加入“{{device}}”",
+      "keepLocal": "保留本机并显示本机码",
+      "title": "选择以哪台设备为准",
+      "warning": "二维码由“{{device}}”生成。加入对方会清除本机旧同步队列和设备路由，但保留本地剪贴板历史；保留本机则会显示本机二维码，请让对方扫描。"
+    },
+    "joinPlaceholder": "粘贴另一台设备生成的配对码",
+    "joinTitle": "连接已有设备",
+    "lastSeen": "最近发现：{{time}}",
+    "lastSuccess": "最近成功：{{time}}",
+    "leaveTitle": "断开本机连接",
+    "leaveWarning": "本机的同步身份、投递队列和设备路由缓存会被清除，本地剪贴板历史不会删除。",
+    "noPeers": "暂无已配对设备",
+    "notPaired": "未连接",
+    "paired": "已连接",
+    "pairingCodeFallback": "无法扫码时，可复制下面的配对码到另一台设备：",
+    "pairingCodeHint": "此配对码包含同步密钥，请只通过可信渠道交给自己的设备。完成连接后关闭本窗口。",
+    "pairingCodeTitle": "设备配对码",
+    "routes": {
+      "cloud": "云端",
+      "lan": "局域网直连",
+      "lan+cloud": "局域网 + 云端",
+      "offline": "离线"
+    },
+    "scanner": {
+      "hint": "将另一台设备显示的 EcoPaste 二维码放入取景框内",
+      "invalidCode": "这不是有效的 EcoPaste 设备二维码",
+      "noCamera": "没有检测到可用摄像头",
+      "permissionDenied": "相机权限未开启，请允许 EcoPaste 使用相机后重试",
+      "starting": "正在启动相机",
+      "title": "扫描设备二维码",
+      "unavailable": "相机启动失败，请改用配对码连接",
+      "videoLabel": "设备二维码扫描取景框"
+    },
+    "states": {
+      "connecting": "连接中",
+      "disabled": "未启用",
+      "error": "异常",
+      "idle": "离线",
+      "online": "在线"
+    },
+    "summary": "{{peers}} 台对端设备 · {{pending}} 个事件等待上传云端 · {{manual}} 个文件等待手动上传",
+    "transport": {
+      "direct": "直连",
+      "relay": "中继",
+      "unknown": "未知"
+    }
   }
 }

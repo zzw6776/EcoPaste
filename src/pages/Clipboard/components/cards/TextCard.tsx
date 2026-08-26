@@ -18,7 +18,7 @@ interface TextCardProps extends ClipboardItem {
 }
 
 /**
- * 文本类卡片：渲染 summary（列表视图 content 已置空），按设置限制最大显示行数。
+ * 文本类卡片：渲染 summary（列表视图 content 已置空），行数上限跟随当前卡片布局。
  * 子类型（HTML/RTF/URL/Email/Color/Path）以小 Tag 提示。
  */
 const TextCard: FC<TextCardProps> = (props) => {

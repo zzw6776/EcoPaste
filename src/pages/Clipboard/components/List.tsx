@@ -12,11 +12,13 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
+  getSyncItemStatuses,
   hideWindow,
   listClipboardGroups,
   openClipboardItemLink,
   pasteClipboardItem,
   revealClipboardItem,
+  type SyncItemStatus,
   saveClipboardImageToFile,
   toggleClipboardItemFavorite,
   toggleClipboardItemPinned,
@@ -83,6 +85,9 @@ const List: FC = () => {
   const [isModifierPressed, setIsModifierPressed] = useState(false);
   const [customGroups, setCustomGroups] = useState<ClipboardGroupRecord[]>([]);
   const [noteTarget, setNoteTarget] = useState<ClipboardItem | null>(null);
+  const [syncStatuses, setSyncStatuses] = useState(
+    () => new Map<string, SyncItemStatus>(),
+  );
   const listContainerRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const isAtTopRef = useRef(true);
@@ -144,6 +149,7 @@ const List: FC = () => {
     loadRange,
     loadedInitial,
     loading,
+    loadedItems,
     patchItemById,
     reload,
     reloadCurrentRange,
@@ -155,6 +161,25 @@ const List: FC = () => {
     keyword,
     kind: category ?? void 0,
     sort,
+  });
+
+  async function refreshSyncStatuses() {
+    const itemIds = [...loadedItems.values()].map((item) => item.id);
+    if (itemIds.length === 0) {
+      setSyncStatuses(new Map());
+      return;
+    }
+    const statuses = await getSyncItemStatuses(itemIds);
+    setSyncStatuses(new Map(statuses.map((status) => [status.itemId, status])));
+  }
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: loadedItems 是批量状态查询的唯一触发快照
+  useEffect(() => {
+    void refreshSyncStatuses();
+  }, [loadedItems]);
+
+  useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
+    void refreshSyncStatuses();
   });
   const {
     closeHoverPreviewForScroll,
@@ -990,6 +1015,14 @@ const List: FC = () => {
       }
     };
 
+    const handleSyncStatusChange = (status: SyncItemStatus) => {
+      setSyncStatuses((current) => {
+        const next = new Map(current);
+        next.set(status.itemId, status);
+        return next;
+      });
+    };
+
     const handleMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
       if (event.button !== 0) {
         if (event.button !== 1) return;
@@ -1103,10 +1136,12 @@ const List: FC = () => {
           onPointerMove={handlePointerMove}
           onQuickAction={handleQuickAction}
           onQuickPaste={hintKey ? handleQuickPaste : void 0}
+          onSyncStatusChange={handleSyncStatusChange}
           quickActionLabels={quickActionLabels}
           quickActions={visibleQuickActions}
           rootRef={registerItemElement(item.id)}
           showOriginalOnHover={showOriginalPreview}
+          syncStatus={syncStatuses.get(item.id)}
         />
       </div>
     );

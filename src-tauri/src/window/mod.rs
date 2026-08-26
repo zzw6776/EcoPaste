@@ -157,6 +157,9 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
         emit_visibility(app_handle, label, true);
         lifecycle::on_shown(app_handle, label);
     }
+    if result.is_ok() {
+        crate::sync::notify_foreground(app_handle);
+    }
     result
 }
 

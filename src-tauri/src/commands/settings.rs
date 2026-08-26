@@ -53,6 +53,9 @@ pub async fn update_settings(app: AppHandle, patch: serde_json::Value) -> Result
     let touches_android = patch_obj
         .map(|map| map.contains_key("android"))
         .unwrap_or(false);
+    let touches_sync = patch_obj
+        .map(|map| map.contains_key("sync"))
+        .unwrap_or(false);
 
     let next = app.state::<SettingsStore>().update(patch)?;
 
@@ -80,6 +83,10 @@ pub async fn update_settings(app: AppHandle, patch: serde_json::Value) -> Result
         }
     }
 
+    if touches_sync {
+        crate::sync::notify_settings_changed(&app);
+    }
+
     emit_settings_updated(&app, &next);
 
     Ok(next)
@@ -91,6 +98,7 @@ pub async fn reset_settings(app: AppHandle) -> Result<Settings> {
     let next = app.state::<SettingsStore>().reset()?;
 
     apply_reset_side_effects(&app, &next);
+    crate::sync::notify_settings_changed(&app);
     emit_settings_updated(&app, &next);
 
     Ok(next)

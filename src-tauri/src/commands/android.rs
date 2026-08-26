@@ -55,6 +55,7 @@ struct AndroidOverlayClipboardItem {
     display_created_at: String,
     is_favorite: bool,
     is_pinned: bool,
+    sync: crate::sync::SyncItemStatus,
 }
 
 #[cfg(target_os = "android")]
@@ -75,6 +76,18 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
             ..Default::default()
         };
         let (items, _) = crate::db::items::query_items_page(&pool, &query).await?;
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let mut sync_statuses =
+            if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+                manager
+                    .item_statuses(&item_ids)
+                    .await?
+                    .into_iter()
+                    .map(|status| (status.item_id.clone(), status))
+                    .collect::<std::collections::HashMap<_, _>>()
+            } else {
+                std::collections::HashMap::new()
+            };
         let redact_sensitive = app
             .state::<crate::settings::SettingsStore>()
             .snapshot()
@@ -84,6 +97,9 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
         let items = items
             .into_iter()
             .map(|item| {
+                let sync = sync_statuses
+                    .remove(&item.id)
+                    .unwrap_or_else(|| crate::sync::SyncItemStatus::idle(item.id.clone()));
                 let kind = match item.kind {
                     ClipboardKind::Text => "text",
                     ClipboardKind::Image => "image",
@@ -170,11 +186,55 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     display_created_at,
                     is_favorite: item.is_favorite,
                     is_pinned: item.is_pinned,
+                    sync,
                 }
             })
             .collect::<Vec<_>>();
 
         serde_json::to_string(&items).map_err(|error| anyhow::anyhow!(error).into())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn load_overlay_sync_status_json() -> Result<String> {
+    let app = APP_HANDLE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    tauri::async_runtime::block_on(async move {
+        let manager = app.state::<std::sync::Arc<crate::sync::SyncManager>>();
+        serde_json::to_string(&manager.status().await?)
+            .map_err(|error| anyhow::anyhow!(error).into())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn sync_overlay_item_json(id: String, target: crate::sync::SyncTarget) -> Result<String> {
+    let app = APP_HANDLE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    tauri::async_runtime::block_on(async move {
+        let pool = app.state::<crate::db::DatabaseState>().pool().await;
+        let item = crate::db::items::find_item_by_id(&pool, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("剪贴板记录不存在"))?;
+        let manager = app.state::<std::sync::Arc<crate::sync::SyncManager>>();
+        let status = manager.inner().clone().sync_item_now(item, target).await?;
+        serde_json::to_string(&status).map_err(|error| anyhow::anyhow!(error).into())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn reconnect_overlay_peer(device_id: Option<String>) -> Result<()> {
+    let app = APP_HANDLE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    tauri::async_runtime::block_on(async move {
+        let manager = app.state::<std::sync::Arc<crate::sync::SyncManager>>();
+        manager.inner().clone().reconnect_peer(device_id).await?;
+        Ok(())
     })
 }
 
@@ -229,7 +289,7 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_initNdkCont
     context: jni::sys::jobject,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) {
+        if let Ok(env) = jni::JNIEnv::from_raw(raw_env) {
             if GLOBAL_VM.get().is_none() {
                 if let Ok(vm) = env.get_java_vm() {
                     let _ = GLOBAL_VM.set(vm);
@@ -306,6 +366,108 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlay
 
 #[cfg(target_os = "android")]
 #[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlaySyncStatusJson(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jstring {
+    let Ok(env) = jni::JNIEnv::from_raw(raw_env) else {
+        return std::ptr::null_mut();
+    };
+    let json = load_overlay_sync_status_json().unwrap_or_else(|error| {
+        log::error!("load Android overlay sync status failed: {error}");
+        "{}".to_owned()
+    });
+    env.new_string(json)
+        .map(jni::objects::JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_syncOverlayItemJson(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    id: jni::sys::jstring,
+    target: jni::sys::jstring,
+) -> jni::sys::jstring {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return std::ptr::null_mut();
+    };
+    let id = jni::objects::JString::from_raw(id);
+    let target = jni::objects::JString::from_raw(target);
+    let result = env
+        .get_string(&id)
+        .map(String::from)
+        .and_then(|id| {
+            env.get_string(&target)
+                .map(String::from)
+                .map(|target| (id, target))
+        })
+        .map_err(|error| anyhow::anyhow!("read Android sync item request failed: {error}"))
+        .and_then(|(id, target)| {
+            let target = match target.as_str() {
+                "lan" => crate::sync::SyncTarget::Lan,
+                "cloud" => crate::sync::SyncTarget::Cloud,
+                _ => return Err(anyhow::anyhow!("invalid sync target")),
+            };
+            sync_overlay_item_json(id, target)
+                .map_err(|error| anyhow::anyhow!("sync Android overlay item failed: {error}"))
+        });
+    let json = result.unwrap_or_else(|error| {
+        log::error!("sync Android overlay item failed: {error}");
+        serde_json::json!({ "error": error.to_string() }).to_string()
+    });
+    env.new_string(json)
+        .map(jni::objects::JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_reconnectOverlayPeer(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    device_id: jni::sys::jstring,
+) -> jni::sys::jboolean {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return 0;
+    };
+    let device_id = jni::objects::JString::from_raw(device_id);
+    let device_id = env
+        .get_string(&device_id)
+        .map(String::from)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match reconnect_overlay_peer(device_id) {
+        Ok(()) => 1,
+        Err(error) => {
+            log::warn!("Android overlay reconnect failed: {error}");
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_captureClipboardText(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    text: jni::sys::jstring,
+) {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return;
+    };
+    let text = jni::objects::JString::from_raw(text);
+    let Ok(text) = env.get_string(&text).map(String::from) else {
+        return;
+    };
+    if let Some(app) = APP_HANDLE.get() {
+        crate::clipboard::capture_android_text(app, text);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
 pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_pasteOverlayItem(
     raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
@@ -329,6 +491,20 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_pasteOverla
             log::error!("paste Android overlay item failed: {error}");
             0
         }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncNetworkChanged(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.wake();
     }
 }
 
@@ -387,6 +563,38 @@ mod jni_bridge {
             serde_json::from_str(&rust_str)
                 .map_err(|e| anyhow!("parse permissions JSON failed: {e}").into())
         })
+    }
+
+    fn read_device_string(method: &str, signature: &str, with_context: bool) -> Result<String> {
+        with_jni_env(|env, context, bridge_class| {
+            let arguments = if with_context {
+                vec![JValue::Object(context)]
+            } else {
+                Vec::new()
+            };
+            let result = env
+                .call_static_method(bridge_class, method, signature, &arguments)
+                .map_err(|e| anyhow!("call {method} failed: {e}"))?;
+            let jstr: JString = result
+                .l()
+                .map_err(|e| anyhow!("extract {method} result failed: {e}"))?
+                .into();
+            env.get_string(&jstr)
+                .map(String::from)
+                .map_err(|e| anyhow!("read {method} result failed: {e}").into())
+        })
+    }
+
+    pub fn device_name() -> Result<String> {
+        read_device_string(
+            "getDeviceName",
+            "(Landroid/content/Context;)Ljava/lang/String;",
+            true,
+        )
+    }
+
+    pub fn device_model() -> Result<String> {
+        read_device_string("getDeviceModel", "()Ljava/lang/String;", false)
     }
 
     pub fn request_permission(kind: &str) -> Result<()> {
@@ -500,6 +708,57 @@ mod jni_bridge {
             Ok(val)
         })
     }
+
+    pub fn notify_overlay_sync_status_changed() -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            env.call_static_method(bridge_class, "onSyncStatusChanged", "()V", &[])
+                .map_err(|e| anyhow!("call onSyncStatusChanged failed: {e}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn set_lan_discovery_enabled(enabled: bool) -> Result<()> {
+        with_jni_env(|env, context, bridge_class| {
+            env.call_static_method(
+                bridge_class,
+                "setLanDiscoveryEnabled",
+                "(Landroid/content/Context;Z)V",
+                &[JValue::Object(context), JValue::Bool(enabled as u8)],
+            )
+            .map_err(|e| anyhow!("call setLanDiscoveryEnabled failed: {e}"))?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn notify_overlay_sync_status_changed() {
+    if let Err(error) = jni_bridge::notify_overlay_sync_status_changed() {
+        log::debug!("notify Android overlay sync status failed: {error}");
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn set_lan_discovery_enabled(enabled: bool) {
+    if let Err(error) = jni_bridge::set_lan_discovery_enabled(enabled) {
+        log::debug!("update Android LAN discovery lock failed: {error}");
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_device_name() -> Option<String> {
+    jni_bridge::device_name()
+        .inspect_err(|error| log::warn!("read Android device name failed: {error}"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_device_model() -> Option<String> {
+    jni_bridge::device_model()
+        .inspect_err(|error| log::warn!("read Android device model failed: {error}"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
 }
 
 /// 获取 Android 端各项权限与服务运行状态

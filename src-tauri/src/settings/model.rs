@@ -18,8 +18,39 @@ pub struct Settings {
     pub appearance: Appearance,
     pub shortcuts: Shortcuts,
     pub clipboard: Clipboard,
+    pub sync: SyncSettings,
     pub onboarding: Onboarding,
     pub update: Update,
+}
+
+/// 多端同步的公开配置。设备组 token、内容密钥与 Iroh 私钥单独保存在受限权限文件中。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncSettings {
+    pub enabled: bool,
+    /// 收到远端内容后是否立即覆盖系统剪贴板；关闭时仍会进入本地历史记录。
+    pub auto_write_clipboard: bool,
+    /// 单个文件小于等于该值时自动上传，0 表示文件只允许手动上传。
+    pub auto_upload_max_mb: u32,
+    /// 敏感内容默认不参与同步，用户必须显式开启。
+    pub sync_sensitive: bool,
+    pub server_endpoint_id: String,
+    pub server_direct_addresses: Vec<String>,
+    pub server_relay_urls: Vec<String>,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_write_clipboard: false,
+            auto_upload_max_mb: 10,
+            sync_sensitive: false,
+            server_endpoint_id: String::new(),
+            server_direct_addresses: Vec::new(),
+            server_relay_urls: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -438,25 +469,17 @@ impl Default for Content {
     }
 }
 
-/// 历史列表里不同内容类型的展示上限。
+/// 历史列表里的文件展示上限。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Display {
-    /// 文本摘要最多显示行数。
-    pub text_max_lines: u8,
-    /// 图片缩略图显示高度，单位 px。
-    pub image_max_height: u16,
     /// 文件列表最多返回并显示的条目数。
     pub file_max_count: u8,
 }
 
 impl Default for Display {
     fn default() -> Self {
-        Self {
-            text_max_lines: 3,
-            image_max_height: 64,
-            file_max_count: 3,
-        }
+        Self { file_max_count: 3 }
     }
 }
 

@@ -123,8 +123,6 @@ export interface Content {
 }
 
 export interface Display {
-  textMaxLines: number;
-  imageMaxHeight: number;
   fileMaxCount: number;
 }
 
@@ -184,6 +182,16 @@ export interface Filters {
   excludedAppIds: string[];
 }
 
+export interface SyncSettings {
+  enabled: boolean;
+  autoWriteClipboard: boolean;
+  autoUploadMaxMb: number;
+  syncSensitive: boolean;
+  serverEndpointId: string;
+  serverDirectAddresses: string[];
+  serverRelayUrls: string[];
+}
+
 export interface OnboardingLegacyImport {
   checked: boolean;
   imported: boolean;
@@ -225,6 +233,7 @@ export interface Settings {
   appearance: Appearance;
   shortcuts: Shortcuts;
   clipboard: Clipboard;
+  sync: SyncSettings;
   onboarding: Onboarding;
   update: Update;
 }

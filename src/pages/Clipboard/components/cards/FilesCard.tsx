@@ -22,7 +22,7 @@ const FilesCard: FC<ClipboardItem> = (props) => {
   }
 
   return (
-    <div className="flex flex-col gap-1">
+    <div className="relative flex flex-col gap-1">
       {entries.map((entry) => {
         return <FileRow entry={entry} key={entry.path} keyword={keyword} />;
       })}

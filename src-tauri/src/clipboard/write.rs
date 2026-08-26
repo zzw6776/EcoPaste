@@ -23,7 +23,6 @@ use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 use super::guard::WritebackGuard;
 use super::storage::ImageStore;
 use crate::core::{AppError, Result};
-#[cfg(not(target_os = "android"))]
 use crate::db::items::content_hash;
 #[cfg(not(target_os = "android"))]
 use crate::db::models::ClipboardSubKind;
@@ -68,7 +67,9 @@ pub fn write_to_clipboard_app(
     use tauri_plugin_clipboard_manager::ClipboardExt;
     let text = item.search_text.as_deref().unwrap_or(&item.content);
     if !text.is_empty() {
-        guard.suppress(item.content_hash.clone());
+        // Android 只能写纯文本。HTML/RTF 条目会写入 search_text，因此必须登记
+        // 实际写入文本的哈希，才能与轮询监听器重新读取后计算出的哈希一致。
+        guard.suppress(content_hash(ClipboardKind::Text, text));
         app.clipboard()
             .write_text(text)
             .map_err(|e| AppError::Clipboard(e.to_string()))?;

@@ -185,6 +185,7 @@ fn write_atomic(path: &Path, settings: &Settings) -> Result<()> {
 fn validate_settings(settings: &Settings) -> Result<()> {
     validate_window_open_group(&settings.clipboard.window.select_group_on_open)?;
     validate_android_gesture(&settings.android.gesture)?;
+    validate_sync(&settings.sync)?;
 
     let open_clipboard = normalize_shortcut_value(&settings.shortcuts.open_clipboard);
     let open_preference = normalize_shortcut_value(&settings.shortcuts.open_preference);
@@ -199,6 +200,30 @@ fn validate_settings(settings: &Settings) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+fn validate_sync(sync: &super::model::SyncSettings) -> Result<()> {
+    if sync.auto_upload_max_mb > 2048 {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "sync automatic upload threshold must not exceed 2048 MB"
+        )));
+    }
+    if sync.server_direct_addresses.len() > 16 || sync.server_relay_urls.len() > 8 {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "sync server has too many addresses"
+        )));
+    }
+    if sync
+        .server_direct_addresses
+        .iter()
+        .chain(sync.server_relay_urls.iter())
+        .any(|value| value.contains(['\n', '\r']) || value.len() > 512)
+    {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "sync server address is invalid"
+        )));
+    }
     Ok(())
 }
 
@@ -372,6 +397,32 @@ mod tests {
             parsed.clipboard.window.select_group_on_open,
             crate::settings::WINDOW_OPEN_SELECTION_PRESERVE
         );
+    }
+
+    #[test]
+    fn removed_display_fields_are_ignored_and_not_reserialized() {
+        let legacy = r#"{
+            "clipboard": {
+                "display": {
+                    "textMaxLines": 3,
+                    "imageMaxHeight": 64,
+                    "fileMaxCount": 4
+                }
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(parsed.clipboard.display.file_max_count, 4);
+
+        let normalized = serde_json::to_value(parsed).unwrap();
+        let display = normalized
+            .pointer("/clipboard/display")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+
+        assert_eq!(display.get("fileMaxCount"), Some(&serde_json::json!(4)));
+        assert!(!display.contains_key("textMaxLines"));
+        assert!(!display.contains_key("imageMaxHeight"));
     }
 
     #[test]
