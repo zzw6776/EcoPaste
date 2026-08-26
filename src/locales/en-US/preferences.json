@@ -63,10 +63,8 @@
       "gb": "GB",
       "hours": "hours",
       "items": "items",
-      "lines": "lines",
       "mb": "MB",
       "percent": "%",
-      "px": "px",
       "seconds": "seconds"
     },
     "retentionUnits": {
@@ -137,6 +135,17 @@
       },
       "source": {
         "title": "App Filters"
+      },
+      "syncBehavior": {
+        "description": "The local event log remains the source of truth. EcoPaste tries direct LAN first and falls back to the cloud Hub.",
+        "title": "Sync Policy"
+      },
+      "syncDevices": {
+        "title": "Devices and Status"
+      },
+      "syncServer": {
+        "description": "A cloud outage does not stop direct LAN sync between paired devices. Enter one address per line.",
+        "title": "Optional Cloud Hub"
       },
       "updates": {
         "title": "Updates"
@@ -227,10 +236,6 @@
           "description": "Limit how many files are shown in each file record card.",
           "title": "Maximum Files Shown"
         },
-        "imageMaxHeight": {
-          "description": "Limit thumbnail height for image records in the list.",
-          "title": "Maximum Image Height"
-        },
         "language": {
           "description": "Switch the EcoPaste interface language.",
           "options": {
@@ -242,10 +247,6 @@
         "showOriginalPreview": {
           "description": "Records with notes show the note by default, then temporarily reveal original content when hovering over the card.",
           "title": "Show Original on Hover"
-        },
-        "textMaxLines": {
-          "description": "Limit how many lines are shown in each text record card.",
-          "title": "Maximum Text Lines"
         },
         "theme": {
           "description": "Use light mode, dark mode, or follow the system appearance.",
@@ -594,6 +595,43 @@
           "title": "Ignored Apps"
         }
       },
+      "sync": {
+        "autoUploadMaxMb": {
+          "description": "Files up to this size are encrypted and uploaded automatically. Set 0 to require manual upload for every file. Folders are always manual.",
+          "title": "Automatic File Upload Limit"
+        },
+        "autoWriteClipboard": {
+          "description": "When disabled, remote items enter history without replacing the current system clipboard.",
+          "title": "Write to System Clipboard Automatically"
+        },
+        "devices": {
+          "description": "Enable sync on this device or connect it to an existing device with a pairing code, and inspect delivery state.",
+          "title": "My Devices"
+        },
+        "enabled": {
+          "description": "Synchronize text, rich text, images, and files allowed by the upload policy.",
+          "title": "Enable Multi-device Sync"
+        },
+        "serverDirectAddresses": {
+          "description": "Public or LAN UDP address of the server, for example 203.0.113.10:44820.",
+          "placeholder": "One IP:port per line",
+          "title": "Hub Direct Addresses"
+        },
+        "serverEndpointId": {
+          "description": "ECOPASTE_SERVER_ENDPOINT_ID printed by sync-server. Leave empty for LAN-only peer sync.",
+          "placeholder": "Iroh Endpoint ID",
+          "title": "Hub Endpoint ID"
+        },
+        "serverRelayUrls": {
+          "description": "Optional Iroh relay URLs. Leave empty when the server has a reachable fixed UDP address.",
+          "placeholder": "One relay URL per line",
+          "title": "Hub Relay Addresses"
+        },
+        "syncSensitive": {
+          "description": "Also sync passwords, tokens, and other items marked sensitive using end-to-end encryption. Keeping this off is recommended.",
+          "title": "Sync Sensitive Content"
+        }
+      },
       "updates": {
         "autoCheck": {
           "description": "Periodically check whether a new EcoPaste version is available.",
@@ -689,6 +727,9 @@
       "shortcuts": {
         "title": "Shortcuts"
       },
+      "sync": {
+        "title": "Sync"
+      },
       "workflow": {
         "title": "Interface"
       }
@@ -717,5 +758,72 @@
     "reset": "Reset to default directory",
     "resetConfirmContent": "EcoPaste will move the current history database, settings, and resource cache back to the default data directory, then delete the current custom data directory after migration succeeds.",
     "resetConfirmTitle": "Reset Data Directory"
+  },
+  "sync": {
+    "actions": {
+      "cancel": "Cancel",
+      "connectOther": "Connect to Another Device",
+      "create": "Set Up Sync Here",
+      "join": "Connect Existing Device",
+      "leave": "Disconnect This Device",
+      "pairDevice": "Add New Device",
+      "reconnectAll": "Reconnect all devices",
+      "reconnectDevice": "Reconnect {{device}}",
+      "saveName": "Save Name",
+      "scanQrCode": "Scan QR Code",
+      "syncNow": "Sync Now",
+      "usePairingCode": "Use Pairing Code Instead"
+    },
+    "channels": {
+      "cloud": "Cloud",
+      "lan": "LAN"
+    },
+    "conflict": {
+      "joinRemote": "Join {{device}}",
+      "keepLocal": "Keep This Device and Show Its Code",
+      "title": "Choose Which Device to Keep",
+      "warning": "This QR code was generated by {{device}}. Joining it clears this device's previous sync queue and routes while preserving local clipboard history. Keeping this device shows its QR code for the other device to scan."
+    },
+    "joinPlaceholder": "Paste the pairing code generated by another device",
+    "joinTitle": "Connect Existing Device",
+    "lastSeen": "Last seen: {{time}}",
+    "lastSuccess": "Last success: {{time}}",
+    "leaveTitle": "Disconnect This Device",
+    "leaveWarning": "This device's sync identity, delivery queue, and peer route cache will be cleared. Local clipboard history will be kept.",
+    "noPeers": "No paired devices",
+    "notPaired": "Not Connected",
+    "paired": "Connected",
+    "pairingCodeFallback": "If scanning is unavailable, copy this pairing code to the other device:",
+    "pairingCodeHint": "This pairing code contains the sync key. Share it only with your own devices over a trusted channel.",
+    "pairingCodeTitle": "Device Pairing Code",
+    "routes": {
+      "cloud": "Cloud",
+      "lan": "Direct LAN",
+      "lan+cloud": "LAN + Cloud",
+      "offline": "Offline"
+    },
+    "scanner": {
+      "hint": "Place the EcoPaste QR code shown on the other device inside the frame",
+      "invalidCode": "This is not a valid EcoPaste device QR code",
+      "noCamera": "No available camera was found",
+      "permissionDenied": "Camera permission is disabled. Allow EcoPaste to use the camera and try again",
+      "starting": "Starting camera",
+      "title": "Scan Device QR Code",
+      "unavailable": "The camera could not start. Use the pairing code instead",
+      "videoLabel": "Device QR code scanner preview"
+    },
+    "states": {
+      "connecting": "Connecting",
+      "disabled": "Disabled",
+      "error": "Error",
+      "idle": "Offline",
+      "online": "Online"
+    },
+    "summary": "{{peers}} peer devices · {{pending}} events waiting for cloud upload · {{manual}} files waiting for manual upload",
+    "transport": {
+      "direct": "Direct",
+      "relay": "Relay",
+      "unknown": "Unknown"
+    }
   }
 }

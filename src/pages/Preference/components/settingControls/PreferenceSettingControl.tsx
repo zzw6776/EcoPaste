@@ -26,6 +26,7 @@ import SliderControl from "./SliderControl";
 import SortableCheckboxTreeControl from "./SortableCheckboxTreeControl";
 import StatusControl from "./StatusControl";
 import SwitchControl from "./SwitchControl";
+import SyncManagerControl from "./SyncManagerControl";
 import TextareaControl from "./TextareaControl";
 import TextControl from "./TextControl";
 
@@ -199,6 +200,8 @@ const PreferenceSettingControl: FC<PreferenceSettingControlProps> = (props) => {
       );
     case "status":
       return <StatusControl setting={setting} />;
+    case "syncManager":
+      return <SyncManagerControl disabled={disabled} />;
     case "shortcutTags":
       return <ShortcutTagsControl setting={setting} />;
   }

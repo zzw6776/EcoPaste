@@ -50,6 +50,11 @@ class MainActivity : TauriActivity() {
     override fun onResume() {
         super.onResume()
         EcoPasteBridge.setCurrentActivity(this)
+        try {
+            EcoPasteBridge.notifySyncNetworkChanged()
+        } catch (error: Throwable) {
+            android.util.Log.w("MainActivity", "notify sync foreground warning: ${error.message}")
+        }
     }
 
     override fun onDestroy() {

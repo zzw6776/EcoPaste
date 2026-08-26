@@ -102,6 +102,66 @@
     "switchCustomGroup": "切换自定义分组",
     "toggleRange": "切换全部 / 收藏"
   },
+  "syncFile": {
+    "upload": "上传并同步文件",
+    "uploadQueued": "文件已加入同步队列"
+  },
+  "syncItem": {
+    "cloud": {
+      "error": "云端同步失败，点击重试",
+      "errorWithReason": "云端：{{reason}}，点击重试",
+      "idle": "云端：本次未使用",
+      "manual": "云端：超过自动同步大小，点击上传",
+      "queued": "已开始云端同步",
+      "success": "云端：已上传",
+      "syncing": "云端：正在上传"
+    },
+    "lan": {
+      "error": "局域网同步失败，点击重试",
+      "errorWithReason": "局域网：{{reason}}，点击重试",
+      "idle": "局域网：当前无在线设备，已跳过",
+      "manual": "局域网：需要手动同步，点击传输",
+      "queued": "已开始局域网同步",
+      "success": "局域网：已投递到 {{delivered}}/{{total}} 台设备",
+      "syncing": "局域网：正在投递"
+    }
+  },
+  "syncStatus": {
+    "cloud": {
+      "connecting": "云端正在连接",
+      "disabled": "云端未启用",
+      "error": "云端连接异常",
+      "idle": "云端未连接",
+      "online": "云端连接正常",
+      "pending": "{{count}} 条事件等待上传",
+      "title": "云端"
+    },
+    "lan": {
+      "connecting": "局域网正在连接",
+      "disabled": "局域网同步未启用",
+      "error": "局域网连接异常",
+      "idle": "当前没有在线设备",
+      "noPeers": "暂无已配对设备",
+      "online": "局域网连接正常",
+      "reconnectAll": "重新连接全部设备",
+      "reconnectDevice": "重新连接 {{device}}",
+      "title": "局域网设备"
+    },
+    "lastSeen": "最近发现：{{time}}",
+    "lastSuccess": "最近成功：{{time}}",
+    "peer": {
+      "connecting": "连接中",
+      "disabled": "未启用",
+      "error": "异常",
+      "idle": "离线",
+      "online": "在线"
+    },
+    "transport": {
+      "direct": "直连",
+      "relay": "中继",
+      "unknown": "连接方式未知"
+    }
+  },
   "types": {
     "color": "颜色",
     "email": "邮箱",

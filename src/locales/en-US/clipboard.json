@@ -102,6 +102,66 @@
     "switchCustomGroup": "Switch custom group",
     "toggleRange": "Toggle all / favorites"
   },
+  "syncFile": {
+    "upload": "Upload and sync files",
+    "uploadQueued": "Files added to the sync queue"
+  },
+  "syncItem": {
+    "cloud": {
+      "error": "Cloud sync failed; click to retry",
+      "errorWithReason": "Cloud: {{reason}}; click to retry",
+      "idle": "Cloud: not used for this item",
+      "manual": "Cloud: exceeds the automatic limit; click to upload",
+      "queued": "Cloud sync started",
+      "success": "Cloud: uploaded",
+      "syncing": "Cloud: uploading"
+    },
+    "lan": {
+      "error": "LAN sync failed; click to retry",
+      "errorWithReason": "LAN: {{reason}}; click to retry",
+      "idle": "LAN: no online devices; skipped",
+      "manual": "LAN: manual sync required; click to transfer",
+      "queued": "LAN sync started",
+      "success": "LAN: delivered to {{delivered}}/{{total}} devices",
+      "syncing": "LAN: delivering"
+    }
+  },
+  "syncStatus": {
+    "cloud": {
+      "connecting": "Cloud is connecting",
+      "disabled": "Cloud is disabled",
+      "error": "Cloud connection error",
+      "idle": "Cloud is disconnected",
+      "online": "Cloud is connected",
+      "pending": "{{count}} events waiting to upload",
+      "title": "Cloud"
+    },
+    "lan": {
+      "connecting": "LAN is connecting",
+      "disabled": "LAN sync is disabled",
+      "error": "LAN connection error",
+      "idle": "No online LAN devices",
+      "noPeers": "No paired devices",
+      "online": "LAN is connected",
+      "reconnectAll": "Reconnect all devices",
+      "reconnectDevice": "Reconnect {{device}}",
+      "title": "LAN devices"
+    },
+    "lastSeen": "Last seen: {{time}}",
+    "lastSuccess": "Last success: {{time}}",
+    "peer": {
+      "connecting": "Connecting",
+      "disabled": "Disabled",
+      "error": "Error",
+      "idle": "Offline",
+      "online": "Online"
+    },
+    "transport": {
+      "direct": "Direct",
+      "relay": "Relay",
+      "unknown": "Unknown route"
+    }
+  },
   "types": {
     "color": "Color",
     "email": "Email",

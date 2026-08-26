@@ -67,8 +67,6 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
     },
     display: {
       fileMaxCount: 3,
-      imageMaxHeight: 64,
-      textMaxLines: 4,
     },
     feedback: {
       copySound: false,
@@ -127,6 +125,15 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
     openClipboard: "Alt+C",
     openPreference: "Alt+X",
     winV: false,
+  },
+  sync: {
+    autoUploadMaxMb: 10,
+    autoWriteClipboard: false,
+    enabled: false,
+    serverDirectAddresses: [],
+    serverEndpointId: "",
+    serverRelayUrls: [],
+    syncSensitive: false,
   },
   update: {
     autoCheck: true,

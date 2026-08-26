@@ -6,6 +6,7 @@ import { prepareClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowE
 interface SearchInputProps extends Omit<InputProps, "prefix"> {
   blurToken?: number;
   clearToken?: number;
+  focusCursor?: "auto" | "end";
   focusToken?: number;
 }
 
@@ -16,6 +17,7 @@ const SearchInput: FC<SearchInputProps> = (props) => {
   const {
     blurToken = 0,
     clearToken = 0,
+    focusCursor = "auto",
     focusToken = 0,
     onChange,
     ...rest
@@ -31,8 +33,9 @@ const SearchInput: FC<SearchInputProps> = (props) => {
 
     await prepareClipboardWindowEditableFocus();
     const isAlreadyFocused = document.activeElement === inputRef.current.input;
-    inputRef.current?.focus({ cursor: isAlreadyFocused ? "end" : "all" });
-  }, []);
+    const cursor = focusCursor === "end" || isAlreadyFocused ? "end" : "all";
+    inputRef.current?.focus({ cursor });
+  }, [focusCursor]);
 
   useEffect(() => {
     if (blurToken <= 0) return;

@@ -36,6 +36,7 @@ import { getModalApi } from "@/utils/feedback";
 import { isAndroid, isMobile } from "@/utils/is";
 import { formatShortcutDisplay } from "@/utils/shortcut";
 import SearchInput from "./SearchInput";
+import SyncStatusIcons from "./SyncStatusIcons";
 
 interface WindowVisibilityPayload {
   label: string;
@@ -65,6 +66,9 @@ const Header: FC = () => {
 
   const [searchBlurToken, setSearchBlurToken] = useState(0);
   const [searchClearToken, setSearchClearToken] = useState(0);
+  const [searchFocusCursor, setSearchFocusCursor] = useState<"auto" | "end">(
+    "auto",
+  );
   const [searchFocusToken, setSearchFocusToken] = useState(0);
 
   const { groupId, range } = snapshot;
@@ -136,6 +140,7 @@ const Header: FC = () => {
 
   const focusSearch = () => {
     setSearchOpen(true);
+    setSearchFocusCursor("auto");
     setSearchFocusToken((c) => c + 1);
   };
 
@@ -163,6 +168,7 @@ const Header: FC = () => {
         debouncedSetKeyword(next.trim());
         return next;
       });
+      setSearchFocusCursor("end");
       setSearchFocusToken((c) => c + 1);
     };
 
@@ -303,6 +309,7 @@ const Header: FC = () => {
               blurToken={searchBlurToken}
               className="w-full"
               clearToken={searchClearToken}
+              focusCursor={searchFocusCursor}
               focusToken={searchFocusToken}
               onChange={handleKeywordChange}
               placeholder="搜索剪贴板历史..."
@@ -310,6 +317,8 @@ const Header: FC = () => {
               value={searchValue}
             />
           </div>
+
+          <SyncStatusIcons compact />
 
           <Dropdown
             menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
@@ -467,6 +476,7 @@ const Header: FC = () => {
               blurToken={searchBlurToken}
               className="w-64"
               clearToken={searchClearToken}
+              focusCursor={searchFocusCursor}
               focusToken={searchFocusToken}
               onChange={handleKeywordChange}
               placeholder={t("header.searchPlaceholder")}
@@ -670,6 +680,7 @@ const Header: FC = () => {
 
       {/* 右侧：极简 `...` 更多操作 */}
       <div className="z-10 flex items-center gap-1">
+        <SyncStatusIcons />
         <Dropdown
           menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
           tooltip={t("header.moreActions")}

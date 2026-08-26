@@ -31,6 +31,9 @@ pub use read::ClipboardReader;
 pub use sound::play_copy_sound;
 pub use source::detect_frontmost;
 pub use storage::ImageStore;
+#[cfg(target_os = "android")]
+pub use watcher::capture_android_text;
+pub(crate) use watcher::CLIPBOARD_UPDATED_EVENT;
 pub use watcher::{init, materialize_source, persist_and_notify, WatcherPause};
 pub use write::write_to_clipboard;
 #[cfg(target_os = "android")]

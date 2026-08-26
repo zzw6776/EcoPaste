@@ -1,5 +1,6 @@
 import type { DragEvent, FC, MouseEvent, PointerEvent, Ref } from "react";
 import { useState } from "react";
+import type { SyncItemStatus } from "@/commands";
 import { popupClipboardItemMenu, startDragClipboardItem } from "@/commands";
 import AssetImage from "@/components/AssetImage";
 import type { ItemActionLabels } from "@/constants/itemActions";
@@ -17,6 +18,7 @@ import ClipboardQuickActions from "./ClipboardQuickActions";
 import FilesCard from "./FilesCard";
 import ImageCard from "./ImageCard";
 import NoteContentSwitcher from "./NoteContentSwitcher";
+import SyncItemIndicators from "./SyncItemIndicators";
 import TextCard from "./TextCard";
 
 interface ClipboardCardProps {
@@ -38,6 +40,8 @@ interface ClipboardCardProps {
   onQuickAction?: (action: ItemAction) => Promise<void> | void;
   showOriginalOnHover?: boolean;
   rootRef?: Ref<HTMLDivElement>;
+  syncStatus?: SyncItemStatus;
+  onSyncStatusChange?: (status: SyncItemStatus) => void;
 }
 
 /**
@@ -69,6 +73,8 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     onQuickAction,
     showOriginalOnHover = true,
     rootRef,
+    syncStatus,
+    onSyncStatusChange,
   } = props;
   const {
     kind,
@@ -84,6 +90,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     summary,
   } = item;
   const [hovered, setHovered] = useState(false);
+  const [footerHovered, setFooterHovered] = useState(false);
 
   const theme = getAppTheme(
     sourceAppName,
@@ -128,6 +135,14 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     onPointerMove?.(event);
+  };
+
+  const handleFooterPointerEnter = () => {
+    setFooterHovered(true);
+  };
+
+  const handleFooterPointerLeave = () => {
+    setFooterHovered(false);
   };
 
   const handleMobileActionMouseDown = (
@@ -314,11 +329,22 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         </div>
 
         {/* 3. 底部极简元信息与快捷操作 */}
-        <div className="flex h-7 shrink-0 select-none items-center justify-between px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400">
-          <span className="truncate">{metaText}</span>
+        <div
+          className="flex h-7 shrink-0 select-none items-center justify-between px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400"
+          onPointerEnter={handleFooterPointerEnter}
+          onPointerLeave={handleFooterPointerLeave}
+        >
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="truncate">{metaText}</span>
+            <SyncItemIndicators
+              itemId={item.id}
+              onChange={onSyncStatusChange}
+              status={syncStatus}
+            />
+          </div>
 
           {/* 右侧：移动端常驻操作按钮，桌面端 hover 时展示 */}
-          <div className="flex items-center">
+          <div className="flex shrink-0 items-center gap-1">
             {isMob ? (
               <div className="flex items-center gap-1">
                 <button
@@ -357,15 +383,16 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                   <i className="i-lucide:trash-2 size-3.5" />
                 </button>
               </div>
-            ) : hovered && quickActions.length > 0 ? (
+            ) : footerHovered && quickActions.length > 0 ? (
               <ClipboardQuickActions
                 item={item}
                 labels={quickActionLabels}
                 onQuickAction={onQuickAction}
                 quickActions={quickActions}
-                visible={hovered}
+                visible={footerHovered}
               />
-            ) : hintKey ? (
+            ) : null}
+            {hintKey ? (
               <span className="flex items-center gap-1 font-mono text-[10.5px] text-neutral-400 tracking-tight">
                 <span className="text-[9px] opacity-75">≡</span>
                 <span>{hintKey}</span>

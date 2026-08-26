@@ -327,6 +327,7 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     getItem,
     getItemIndexById,
     loadedInitial,
+    loadedItems: items,
     loading,
     loadingMore: loadingRangeCount > 0 && loadedInitial,
     loadRange,

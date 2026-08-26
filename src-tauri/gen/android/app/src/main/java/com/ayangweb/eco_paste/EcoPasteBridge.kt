@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -35,6 +36,7 @@ object EcoPasteBridge {
     private const val KEY_GESTURE_RIGHT_WIDTH_DP = "gesture_right_width_dp"
     private const val KEY_GESTURE_RIGHT_HEIGHT_DP = "gesture_right_height_dp"
     private var currentActivityRef: WeakReference<Activity>? = null
+    private var lanDiscoveryLock: WifiManager.MulticastLock? = null
     var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
         private set
 
@@ -51,6 +53,7 @@ object EcoPasteBridge {
     // 剪贴板变更监听回调队列
     private val clipboardChangeListeners = mutableListOf<(String) -> Unit>()
     private var lastCapturedText: String? = null
+    private var syncStatusChangedListener: (() -> Unit)? = null
 
     @JvmStatic
     external fun initNdkContext(context: Context)
@@ -59,7 +62,32 @@ object EcoPasteBridge {
     external fun loadOverlayItemsJson(keyword: String, limit: Int): String
 
     @JvmStatic
+    external fun loadOverlaySyncStatusJson(): String
+
+    @JvmStatic
+    external fun syncOverlayItemJson(id: String, target: String): String
+
+    @JvmStatic
+    external fun reconnectOverlayPeer(deviceId: String): Boolean
+
+    @JvmStatic
+    external fun captureClipboardText(text: String)
+
+    @JvmStatic
     external fun pasteOverlayItem(id: String): Boolean
+
+    @JvmStatic
+    external fun notifySyncNetworkChanged()
+
+    @JvmStatic
+    fun setSyncStatusChangedListener(listener: (() -> Unit)?) {
+        syncStatusChangedListener = listener
+    }
+
+    @JvmStatic
+    fun onSyncStatusChanged() {
+        Handler(Looper.getMainLooper()).post { syncStatusChangedListener?.invoke() }
+    }
 
     @JvmStatic
     fun setCurrentActivity(activity: Activity?) {
@@ -75,6 +103,52 @@ object EcoPasteBridge {
             .getString(KEY_ENGINE_MODE, "accessibility")
             ?.takeIf { it == "accessibility" || it == "root" || it == "foreground" }
             ?: "accessibility"
+    }
+
+    /** Android 默认过滤组播；仅在同步端点运行期间允许接收局域网发现报文。 */
+    @JvmStatic
+    @Synchronized
+    fun setLanDiscoveryEnabled(context: Context, enabled: Boolean) {
+        if (!enabled) {
+            lanDiscoveryLock?.takeIf { it.isHeld }?.release()
+            lanDiscoveryLock = null
+            return
+        }
+        if (lanDiscoveryLock?.isHeld == true) return
+
+        val wifiManager = context.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+        lanDiscoveryLock = wifiManager.createMulticastLock("EcoPasteLanDiscovery").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    /** 返回 Android 设置中用户可见的设备名称，未配置时才回退到厂商和型号。 */
+    @JvmStatic
+    fun getDeviceName(context: Context): String {
+        val configuredName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
+            Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+        } else {
+            null
+        }
+        if (!configuredName.isNullOrBlank()) {
+            return configuredName.trim()
+        }
+
+        val manufacturer = Build.MANUFACTURER.trim()
+        val model = getDeviceModel()
+        return if (manufacturer.isEmpty() || model.startsWith(manufacturer, ignoreCase = true)) {
+            model
+        } else {
+            "$manufacturer $model"
+        }
+    }
+
+    /** 返回设备硬件描述，仅用于识别旧版本自动生成的型号名称。 */
+    @JvmStatic
+    fun getDeviceModel(): String {
+        return Build.MODEL.trim()
     }
 
     /**
@@ -530,6 +604,11 @@ object EcoPasteBridge {
     fun onClipboardCaptured(text: String) {
         if (text.isBlank() || text == lastCapturedText) return
         lastCapturedText = text
+        try {
+            captureClipboardText(text)
+        } catch (error: Throwable) {
+            Log.w(TAG, "send clipboard capture to Rust failed: ${error.message}")
+        }
         for (listener in clipboardChangeListeners) {
             try {
                 listener(text)
