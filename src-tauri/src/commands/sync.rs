@@ -14,8 +14,16 @@ pub async fn get_sync_status(manager: State<'_, Arc<SyncManager>>) -> Result<Syn
 }
 
 #[tauri::command]
-pub async fn create_sync_group(manager: State<'_, Arc<SyncManager>>) -> Result<String> {
+pub async fn create_sync_group(
+    app: AppHandle,
+    manager: State<'_, Arc<SyncManager>>,
+) -> Result<String> {
     manager.create_group()?;
+    let settings = app
+        .state::<SettingsStore>()
+        .update(serde_json::json!({ "sync": { "enabled": true } }))?;
+    crate::commands::settings::emit_settings_updated(&app, &settings);
+    manager.wake();
     manager.pairing_code().await.map_err(Into::into)
 }
 

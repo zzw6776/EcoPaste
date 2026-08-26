@@ -2,14 +2,13 @@ services:
   ecopaste-sync:
     build: .
     image: ecopaste-sync-server:local
+    network_mode: host
     restart: unless-stopped
     environment:
       ECOPASTE_DATA_DIR: /data
-      ECOPASTE_BIND: 0.0.0.0:44820
+      ECOPASTE_BIND: 0.0.0.0:4443
       ECOPASTE_MAX_BLOB_BYTES: 2147483648
       RUST_LOG: info
-    ports:
-      - "44820:44820/udp"
     volumes:
       - ecopaste-sync-data:/data
 

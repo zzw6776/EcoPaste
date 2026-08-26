@@ -1,3 +1,4 @@
+import java.io.File
 import java.util.Properties
 
 plugins {
@@ -13,6 +14,35 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val repositoryRoot = rootProject.projectDir.resolve("../../..").canonicalFile
+val signingPropertiesFile = repositoryRoot.resolve("signing.properties")
+val signingProperties = Properties()
+if (!signingPropertiesFile.isFile) {
+    throw GradleException("Android signing requires $signingPropertiesFile.")
+}
+signingPropertiesFile.inputStream().use { signingProperties.load(it) }
+
+fun requireSigningValue(vararg names: String): String {
+    return names.firstNotNullOfOrNull { name ->
+        signingProperties.getProperty(name)?.trim()?.takeIf { it.isNotEmpty() }
+    } ?: throw GradleException(
+        "Missing Android signing property. Add one of: ${names.joinToString(", ")}",
+    )
+}
+
+val signingKeystorePath =
+    requireSigningValue("keystore.file", "keystore.path", "storeFile", "store.file")
+val signingKeystoreFile = File(signingKeystorePath).let { candidate ->
+    if (candidate.isAbsolute) candidate else repositoryRoot.resolve(signingKeystorePath)
+}
+if (!signingKeystoreFile.isFile) {
+    throw GradleException("Android keystore does not exist: $signingKeystoreFile")
+}
+val signingStorePassword =
+    requireSigningValue("keystore.password", "storePassword", "store.password")
+val signingKeyAlias = requireSigningValue("key.alias", "keyAlias")
+val signingKeyPassword = requireSigningValue("key.password", "keyPassword")
+
 android {
     compileSdk = 36
     namespace = "com.ayangweb.eco_paste"
@@ -24,12 +54,21 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
+    signingConfigs {
+        create("shared") {
+            storeFile = signingKeystoreFile
+            storePassword = signingStorePassword
+            keyAlias = signingKeyAlias
+            keyPassword = signingKeyPassword
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("shared")
             packaging {
                 jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
@@ -39,6 +78,7 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
+            signingConfig = signingConfigs.getByName("shared")
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
