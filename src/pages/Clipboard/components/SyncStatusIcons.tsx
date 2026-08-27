@@ -13,6 +13,7 @@ import {
 import { TAURI_EVENT } from "@/constants/events";
 import { cn } from "@/utils/cn";
 import { log } from "@/utils/log";
+import CloudRecordsDrawer from "./CloudRecordsDrawer";
 
 interface SyncStatusIconsProps {
   compact?: boolean;
@@ -22,6 +23,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const { compact = false } = props;
   const { t } = useTranslation("clipboard");
   const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
   const mountedRef = useRef(false);
   const unlistenRef = useRef<null | (() => void)>(null);
@@ -69,6 +71,14 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     }
   }
 
+  function handleOpenRecords() {
+    setRecordsOpen(true);
+  }
+
+  function handleCloseRecords() {
+    setRecordsOpen(false);
+  }
+
   const lanState = status?.lan.state ?? "disabled";
   const cloudState = status?.cloud.state ?? "disabled";
   const buttonClassName = compact ? "size-8" : "size-7";
@@ -114,6 +124,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
               ...(status?.cloudRelayUrls ?? []),
             ]}
             endpointId={status?.cloudEndpointId ?? ""}
+            onOpenRecords={handleOpenRecords}
             status={status}
           />
         }
@@ -139,6 +150,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
           </button>
         </Tooltip>
       </Popover>
+      <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
     </div>
   );
 };
@@ -269,11 +281,12 @@ const LanPeerDetails: FC<LanPeerDetailsProps> = (props) => {
 interface CloudDetailsProps {
   addresses: readonly string[];
   endpointId: string;
+  onOpenRecords: () => void;
   status: SyncStatus | null;
 }
 
 const CloudDetails: FC<CloudDetailsProps> = (props) => {
-  const { addresses, endpointId, status } = props;
+  const { addresses, endpointId, onOpenRecords, status } = props;
   const { t } = useTranslation("clipboard");
   const cloud = status?.cloud;
 
@@ -285,21 +298,23 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
       >
         {t(`syncStatus.cloud.${cloud?.state ?? "disabled"}`)}
       </span>
-      {endpointId ? (
+      {status?.cloudEnabled && endpointId ? (
         <div className="break-all font-mono text-ant-secondary text-xs">
           {endpointId}
         </div>
       ) : null}
-      {addresses.map((address) => {
-        return (
-          <div
-            className="break-all font-mono text-ant-secondary text-xs"
-            key={address}
-          >
-            {address}
-          </div>
-        );
-      })}
+      {status?.cloudEnabled
+        ? addresses.map((address) => {
+            return (
+              <div
+                className="break-all font-mono text-ant-secondary text-xs"
+                key={address}
+              >
+                {address}
+              </div>
+            );
+          })
+        : null}
       {cloud?.lastSuccessAt ? (
         <span className="text-ant-secondary text-xs">
           {t("syncStatus.lastSuccess", {
@@ -315,6 +330,15 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
           {t("syncStatus.cloud.pending", { count: status.pendingEvents })}
         </span>
       ) : null}
+      <Button
+        block
+        disabled={!status?.enabled || !status.cloudEnabled || !status.paired}
+        icon={<i className="i-lucide:cloud-download size-4" />}
+        onClick={onOpenRecords}
+        size="small"
+      >
+        {t("syncStatus.records.open")}
+      </Button>
     </div>
   );
 };

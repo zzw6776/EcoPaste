@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -195,12 +196,60 @@ impl PairingCode {
     }
 }
 
-pub fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<EndpointAddr>> {
-    endpoint_addr(
-        &settings.server_endpoint_id,
-        &settings.server_direct_addresses,
-        &settings.server_relay_urls,
-    )
+pub fn server_is_configured(settings: &SyncSettings) -> bool {
+    settings.cloud_enabled && !settings.server_endpoint_id.trim().is_empty()
+}
+
+/// Resolves Hub hostnames at connection time so IP changes are picked up on every reconnect.
+pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<EndpointAddr>> {
+    if !server_is_configured(settings) {
+        return Ok(None);
+    }
+
+    let endpoint_id = EndpointId::from_str(settings.server_endpoint_id.trim())
+        .context("invalid Iroh endpoint id")?;
+    let mut addresses = Vec::new();
+    let mut resolved = HashSet::new();
+    let mut direct_error = None;
+    for direct in &settings.server_direct_addresses {
+        let direct = direct.trim();
+        if direct.is_empty() {
+            continue;
+        }
+        if let Ok(address) = direct.parse() {
+            if resolved.insert(address) {
+                addresses.push(TransportAddr::Ip(address));
+            }
+            continue;
+        }
+        match tokio::net::lookup_host(direct).await {
+            Ok(found) => {
+                for address in found {
+                    if resolved.insert(address) {
+                        addresses.push(TransportAddr::Ip(address));
+                    }
+                }
+            }
+            Err(error) => {
+                direct_error = Some(anyhow::anyhow!("无法解析 Hub 地址 {direct}: {error}"))
+            }
+        }
+    }
+    for relay in &settings.server_relay_urls {
+        let relay = relay.trim();
+        if !relay.is_empty() {
+            addresses.push(TransportAddr::Relay(
+                RelayUrl::from_str(relay).context("invalid Iroh relay URL")?,
+            ));
+        }
+    }
+    if addresses.is_empty() {
+        if let Some(error) = direct_error {
+            return Err(error);
+        }
+        bail!("请至少填写一个 Hub 直连地址或 Relay 地址");
+    }
+    Ok(Some(EndpointAddr::from_parts(endpoint_id, addresses)))
 }
 
 pub fn peer_endpoint_addr(peer: &ecopaste_sync_protocol::PeerAnnouncement) -> Result<EndpointAddr> {
@@ -503,5 +552,31 @@ mod tests {
 
         assert_eq!(address.ip_addrs().count(), 1);
         assert_eq!(address.relay_urls().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_cloud_ignores_stale_invalid_configuration() {
+        let settings = SyncSettings {
+            cloud_enabled: false,
+            server_endpoint_id: "not-an-endpoint".to_owned(),
+            server_direct_addresses: vec!["bad address".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(server_endpoint_addr(&settings).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_direct_address_accepts_a_hostname() {
+        let settings = SyncSettings {
+            cloud_enabled: true,
+            server_endpoint_id: SecretKey::generate().public().to_string(),
+            server_direct_addresses: vec!["localhost:44820".to_owned()],
+            ..Default::default()
+        };
+
+        let address = server_endpoint_addr(&settings).await.unwrap().unwrap();
+
+        assert!(address.ip_addrs().next().is_some());
     }
 }

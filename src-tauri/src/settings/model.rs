@@ -28,6 +28,8 @@ pub struct Settings {
 #[serde(default, rename_all = "camelCase")]
 pub struct SyncSettings {
     pub enabled: bool,
+    /// 云端 Hub 是可选通道；关闭时不得解析或连接残留的 Hub 配置。
+    pub cloud_enabled: bool,
     /// 收到远端内容后是否立即覆盖系统剪贴板；关闭时仍会进入本地历史记录。
     pub auto_write_clipboard: bool,
     /// 单个文件小于等于该值时自动上传，0 表示文件只允许手动上传。
@@ -43,6 +45,7 @@ impl Default for SyncSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            cloud_enabled: false,
             auto_write_clipboard: false,
             auto_upload_max_mb: 10,
             sync_sensitive: false,

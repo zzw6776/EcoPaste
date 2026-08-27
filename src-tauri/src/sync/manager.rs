@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, RwLock, Weak},
@@ -38,11 +38,13 @@ use crate::{
 use super::{
     crypto,
     identity::{
-        peer_endpoint_addr, server_endpoint_addr, GroupSecrets, IdentityStore, PairingCode,
+        peer_endpoint_addr, server_endpoint_addr, server_is_configured, GroupSecrets,
+        IdentityStore, PairingCode,
     },
     model::{
-        BlobManifest, BlobRole, ClipboardEnvelope, StoredBlob, SyncChannelState, SyncChannelStatus,
-        SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget, SyncedClipboardItem,
+        BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage, StoredBlob,
+        SyncChannelState, SyncChannelStatus, SyncItemStatus, SyncPairingPreview, SyncStatus,
+        SyncTarget, SyncedClipboardItem,
     },
     repository,
 };
@@ -184,9 +186,21 @@ impl SyncManager {
         PairingCode {
             version: 1,
             group,
-            server_endpoint_id: settings.server_endpoint_id,
-            server_direct_addresses: settings.server_direct_addresses,
-            server_relay_urls: settings.server_relay_urls,
+            server_endpoint_id: if settings.cloud_enabled {
+                settings.server_endpoint_id
+            } else {
+                String::new()
+            },
+            server_direct_addresses: if settings.cloud_enabled {
+                settings.server_direct_addresses
+            } else {
+                Vec::new()
+            },
+            server_relay_urls: if settings.cloud_enabled {
+                settings.server_relay_urls
+            } else {
+                Vec::new()
+            },
             inviter: self.announcement(&endpoint),
         }
         .encode()
@@ -211,11 +225,12 @@ impl SyncManager {
         if !settings.enabled || identity.group.is_none() {
             lan = SyncChannelStatus::new(SyncChannelState::Disabled);
             cloud = SyncChannelStatus::new(SyncChannelState::Disabled);
-        } else if server_endpoint_addr(&settings)?.is_none() {
+        } else if !server_is_configured(&settings) {
             cloud = SyncChannelStatus::new(SyncChannelState::Disabled);
         }
         Ok(SyncStatus {
             enabled: settings.enabled,
+            cloud_enabled: settings.cloud_enabled,
             paired: identity.group.is_some(),
             device_id: identity.device_id,
             device_name: identity.device_name,
@@ -281,6 +296,93 @@ impl SyncManager {
 
     pub async fn item_statuses(&self, item_ids: &[String]) -> Result<Vec<SyncItemStatus>> {
         repository::item_statuses(&self.pool().await, item_ids).await
+    }
+
+    /// Reads encrypted Hub history without advancing the normal synchronization cursor.
+    pub async fn cloud_records(
+        self: &Arc<Self>,
+        before_cursor: Option<u64>,
+        limit: u16,
+    ) -> Result<CloudRecordPage> {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !settings.cloud_enabled {
+            bail!("请先启用多端同步和云端同步");
+        }
+        let group = self
+            .identity
+            .snapshot()
+            .group
+            .context("请先创建或加入同步设备组")?;
+        let server = server_endpoint_addr(&settings)
+            .await?
+            .context("请先完成云端 Hub 配置")?;
+        let endpoint = self.ensure_endpoint().await?;
+        let connection =
+            tokio::time::timeout(Duration::from_secs(8), endpoint.connect(server, ALPN))
+                .await
+                .context("读取云端记录连接超时")??;
+        self.ensure_cloud_group(&connection, &group).await?;
+        let response = call(
+            &connection,
+            Request::ListEvents {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                before_cursor,
+                limit: limit.clamp(1, 100),
+            },
+        )
+        .await?;
+        let Response::EventsPage {
+            events,
+            next_before_cursor,
+            total,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("云端返回了无效的记录响应");
+        };
+
+        let identity = self.identity.snapshot();
+        let mut device_names = repository::list_peer_statuses(&self.pool().await)
+            .await?
+            .into_iter()
+            .map(|peer| (peer.device_id, peer.device_name))
+            .collect::<HashMap<_, _>>();
+        device_names.insert(identity.device_id, identity.device_name);
+        let key = group.content_key_bytes()?;
+        let records = events
+            .into_iter()
+            .filter_map(|cloud_event| {
+                let event = cloud_event.event;
+                let envelope = match crypto::decrypt_event(&key, &event).and_then(|envelope| {
+                    validate_envelope(&envelope)?;
+                    Ok(envelope)
+                }) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        log::warn!("skip invalid cloud record {}: {error}", event.event_id);
+                        return None;
+                    }
+                };
+                let device_name = device_names
+                    .get(&event.origin_device_id)
+                    .cloned()
+                    .unwrap_or_else(|| short_device_id(&event.origin_device_id));
+                Some(cloud_record(
+                    cloud_event.cursor,
+                    event,
+                    envelope,
+                    device_name,
+                ))
+            })
+            .collect();
+        Ok(CloudRecordPage {
+            records,
+            next_before_cursor,
+            total,
+        })
     }
 
     async fn enqueue_item_inner(
@@ -603,7 +705,7 @@ impl SyncManager {
         let mut cloud_succeeded = false;
         let mut cloud_error = None;
         if target != Some(SyncTarget::Lan) {
-            if let Some(server) = server_endpoint_addr(&settings)? {
+            if let Some(server) = server_endpoint_addr(&settings).await? {
                 self.set_channel_status(
                     SyncTarget::Cloud,
                     SyncChannelState::Connecting,
@@ -1309,11 +1411,11 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
             manager.watch_wake.notified().await;
             continue;
         };
-        if !settings.enabled {
+        if !settings.enabled || !settings.cloud_enabled {
             manager.watch_wake.notified().await;
             continue;
         }
-        let server = match server_endpoint_addr(&settings) {
+        let server = match server_endpoint_addr(&settings).await {
             Ok(Some(server)) => server,
             Ok(None) => {
                 manager.watch_wake.notified().await;
@@ -1642,7 +1744,7 @@ async fn dispatch_peer(
             let mut file = tokio::fs::File::open(path).await?;
             tokio::io::copy(&mut file, send).await?;
         }
-        Request::CreateGroup { .. } | Request::Watch { .. } => {
+        Request::CreateGroup { .. } | Request::Watch { .. } | Request::ListEvents { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
     }
@@ -1837,6 +1939,72 @@ fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cloud_record(
+    cursor: u64,
+    event: EncryptedEvent,
+    envelope: ClipboardEnvelope,
+    device_name: String,
+) -> CloudRecord {
+    let is_sensitive = envelope.item.is_sensitive;
+    let file_count = envelope.blobs.len().try_into().unwrap_or(u32::MAX);
+    let total_size = envelope.blobs.iter().map(|blob| blob.original_size).sum();
+    let preview = match envelope.item.kind.as_str() {
+        "files" => envelope
+            .blobs
+            .iter()
+            .map(|blob| blob.name.as_str())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("、"),
+        "image" => envelope
+            .item
+            .summary
+            .clone()
+            .unwrap_or_else(|| "图片".to_owned()),
+        _ => envelope
+            .item
+            .summary
+            .clone()
+            .or(envelope.item.search_text.clone())
+            .unwrap_or_else(|| envelope.item.content.clone()),
+    };
+    CloudRecord {
+        cursor,
+        event_id: event.event_id,
+        device_name,
+        kind: envelope.item.kind,
+        preview: if is_sensitive {
+            String::new()
+        } else {
+            truncate_preview(&preview)
+        },
+        file_count,
+        total_size,
+        created_at: Utc
+            .timestamp_millis_opt(event.created_at_ms)
+            .single()
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339(),
+        is_sensitive,
+    }
+}
+
+fn truncate_preview(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+fn short_device_id(device_id: &str) -> String {
+    let short = device_id.chars().take(8).collect::<String>();
+    format!("设备 {short}")
 }
 
 fn validate_blob_manifest(manifest: &BlobManifest) -> Result<()> {

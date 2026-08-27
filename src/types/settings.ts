@@ -184,6 +184,7 @@ export interface Filters {
 
 export interface SyncSettings {
   enabled: boolean;
+  cloudEnabled: boolean;
   autoWriteClipboard: boolean;
   autoUploadMaxMb: number;
   syncSensitive: boolean;

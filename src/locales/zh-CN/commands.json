@@ -42,6 +42,7 @@
     "loadAutostart": "读取开机启动状态",
     "loadClipboardGroups": "加载分组",
     "loadClipboardList": "加载列表",
+    "loadCloudRecords": "读取云端记录",
     "loadPreviewContent": "加载预览内容",
     "loadPreviewState": "加载预览状态",
     "loadRunAsAdminStatus": "读取管理员启动状态",

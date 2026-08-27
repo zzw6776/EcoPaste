@@ -613,8 +613,8 @@
           "title": "启用多端同步"
         },
         "serverDirectAddresses": {
-          "description": "服务端公网或局域网 UDP 地址，例如 203.0.113.10:44820。",
-          "placeholder": "每行一个 IP:端口",
+          "description": "服务端公网或局域网 UDP 地址，例如 203.0.113.10:44820 或 sync.example.com:44820。",
+          "placeholder": "每行一个 IP:端口或域名:端口",
           "title": "Hub 直连地址"
         },
         "serverEndpointId": {
@@ -779,6 +779,18 @@
     "channels": {
       "cloud": "云端",
       "lan": "局域网"
+    },
+    "cloud": {
+      "description": "云端仅保存端到端加密的数据；认证和解密都在本机完成。",
+      "directAddresses": "Hub 直连地址",
+      "disabledHint": "开启后可配置 Hub，并在局域网不可用时自动使用云端。",
+      "domainHint": "直连地址支持 IP:端口或域名:端口；域名会在每次重连时重新解析。",
+      "enabled": "启用云端同步",
+      "endpointId": "Hub Endpoint ID",
+      "records": "查看云端记录",
+      "relayUrls": "Hub Relay 地址（可选）",
+      "save": "保存云端配置",
+      "title": "云端 Hub 配置"
     },
     "conflict": {
       "joinRemote": "加入“{{device}}”",

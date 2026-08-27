@@ -90,6 +90,7 @@ class EcoPasteOverlayPanel(
     private data class OverlaySyncStatus(
         val lanState: String,
         val cloudState: String,
+        val cloudEnabled: Boolean,
         val cloudEndpointId: String,
         val cloudDirectAddresses: List<String>,
         val cloudRelayUrls: List<String>,
@@ -97,6 +98,17 @@ class EcoPasteOverlayPanel(
         val cloudLastSuccessAt: String,
         val pendingEvents: Int,
         val peers: List<OverlayPeerStatus>,
+    )
+
+    private data class CloudRecord(
+        val eventId: String,
+        val deviceName: String,
+        val kind: String,
+        val preview: String,
+        val createdAt: String,
+        val fileCount: Int,
+        val totalSize: Long,
+        val isSensitive: Boolean,
     )
 
     private var reconnectInProgress = false
@@ -119,6 +131,7 @@ class EcoPasteOverlayPanel(
     private var cloudStatusButton: ImageButton? = null
     private var expandedSyncTarget: String? = null
     private var syncStatus: OverlaySyncStatus? = null
+    private var showingCloudRecords = false
 
     fun show(heightPercent: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
@@ -130,6 +143,7 @@ class EcoPasteOverlayPanel(
 
         activeFilter = ItemFilter.ALL
         loadedItems = emptyList()
+        showingCloudRecords = false
 
         val bounds = displayBounds()
         val panelHeight = (bounds.height() * heightPercent.coerceIn(30, 90) / 100f).toInt()
@@ -352,6 +366,7 @@ class EcoPasteOverlayPanel(
         return OverlaySyncStatus(
             lanState = lan.optString("state", "disabled"),
             cloudState = cloud.optString("state", "disabled"),
+            cloudEnabled = root.optBoolean("cloudEnabled"),
             cloudEndpointId = root.optString("cloudEndpointId"),
             cloudDirectAddresses = jsonStrings(root.optJSONArray("cloudDirectAddresses")),
             cloudRelayUrls = jsonStrings(root.optJSONArray("cloudRelayUrls")),
@@ -448,20 +463,35 @@ class EcoPasteOverlayPanel(
                 }
             }
         } else {
-            if (!status?.cloudEndpointId.isNullOrBlank()) {
-                container.addView(detailText(status?.cloudEndpointId.orEmpty()))
+            if (status?.cloudEnabled != true) {
+                container.addView(detailText("云端同步未启用"))
+            } else {
+                if (status.cloudEndpointId.isNotBlank()) {
+                    container.addView(detailText(status.cloudEndpointId))
+                }
+                (status.cloudDirectAddresses + status.cloudRelayUrls).forEach { address ->
+                    container.addView(detailText(address))
+                }
+                if (status.cloudError.isNotBlank()) {
+                    container.addView(detailText(status.cloudError, error = true))
+                }
+                if (status.cloudLastSuccessAt.isNotBlank()) {
+                    container.addView(detailText("最近成功：${status.cloudLastSuccessAt}"))
+                }
+                if (status.pendingEvents > 0) {
+                    container.addView(detailText("${status.pendingEvents} 条事件等待上传"))
+                }
             }
-            (status?.cloudDirectAddresses.orEmpty() + status?.cloudRelayUrls.orEmpty()).forEach { address ->
-                container.addView(detailText(address))
-            }
-            if (!status?.cloudError.isNullOrBlank()) {
-                container.addView(detailText(status?.cloudError.orEmpty(), error = true))
-            }
-            if (!status?.cloudLastSuccessAt.isNullOrBlank()) {
-                container.addView(detailText("最近成功：${status?.cloudLastSuccessAt}"))
-            }
-            if ((status?.pendingEvents ?: 0) > 0) {
-                container.addView(detailText("${status?.pendingEvents} 条事件等待上传"))
+            if (status?.cloudEnabled == true && status.cloudEndpointId.isNotBlank()) {
+                container.addView(TextView(context).apply {
+                    text = "☁  查看云端记录"
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.rgb(0, 122, 255))
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    setOnClickListener { requestCloudRecords() }
+                })
             }
         }
         container.background = roundedBackground(cardColor(), dp(12).toFloat())
@@ -508,6 +538,125 @@ class EcoPasteOverlayPanel(
                 }
             }
         }, "ecopaste-overlay-reconnect").start()
+    }
+
+    private fun requestCloudRecords() {
+        if (panelView == null) return
+        showingCloudRecords = true
+        filterContainer?.visibility = View.GONE
+        itemContainer?.apply {
+            removeAllViews()
+            addView(statusText(R.string.overlay_panel_loading))
+        }
+        Thread({
+            val json = try {
+                EcoPasteBridge.loadOverlayCloudRecordsJson()
+            } catch (error: Throwable) {
+                Log.e(TAG, "load overlay cloud records failed: ${error.message}", error)
+                JSONObject().put("error", error.message.orEmpty()).toString()
+            }
+            mainHandler.post {
+                if (panelView == null || !showingCloudRecords) return@post
+                renderCloudRecords(json)
+            }
+        }, "ecopaste-overlay-cloud-records").start()
+    }
+
+    private fun renderCloudRecords(json: String) {
+        val container = itemContainer ?: return
+        container.removeAllViews()
+        container.addView(TextView(context).apply {
+            text = "‹  云端剪贴板记录"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(primaryTextColor())
+            setPadding(dp(4), dp(6), dp(4), dp(12))
+            setOnClickListener { closeCloudRecords() }
+        })
+        val root = try {
+            JSONObject(json)
+        } catch (error: Exception) {
+            JSONObject().put("error", error.message.orEmpty())
+        }
+        val error = root.optString("error")
+        if (error.isNotBlank()) {
+            container.addView(detailText(error, error = true))
+            return
+        }
+        val values = root.optJSONArray("records") ?: JSONArray()
+        if (values.length() == 0) {
+            container.addView(detailText("云端暂无剪贴板记录"))
+            return
+        }
+        for (index in 0 until values.length()) {
+            val value = values.optJSONObject(index) ?: continue
+            container.addView(createCloudRecordCard(parseCloudRecord(value)))
+        }
+    }
+
+    private fun parseCloudRecord(value: JSONObject): CloudRecord {
+        return CloudRecord(
+            eventId = value.optString("eventId"),
+            deviceName = value.optString("deviceName", "EcoPaste"),
+            kind = value.optString("kind", "text"),
+            preview = value.optString("preview"),
+            createdAt = value.optString("createdAt").replace('T', ' ').take(16),
+            fileCount = value.optInt("fileCount"),
+            totalSize = value.optLong("totalSize"),
+            isSensitive = value.optBoolean("isSensitive"),
+        )
+    }
+
+    private fun createCloudRecordCard(record: CloudRecord): View {
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBackground(cardColor(), dp(12).toFloat())
+            addView(TextView(context).apply {
+                text = buildString {
+                    append(record.deviceName)
+                    if (record.isSensitive) append("  ·  敏感")
+                }
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(primaryTextColor())
+            })
+            addView(TextView(context).apply {
+                text = buildString {
+                    append(record.createdAt)
+                    if (record.fileCount > 0) append(" · ${record.fileCount} 个文件")
+                    if (record.totalSize > 0) append(" · ${formatBytes(record.totalSize)}")
+                }
+                textSize = 10f
+                setTextColor(tertiaryTextColor())
+                setPadding(0, dp(3), 0, dp(6))
+            })
+            addView(TextView(context).apply {
+                text = if (record.isSensitive) "敏感内容已隐藏" else record.preview.ifBlank {
+                    when (record.kind) {
+                        "image" -> "图片"
+                        "files" -> "文件"
+                        else -> "空文本"
+                    }
+                }
+                textSize = 13f
+                setTextColor(primaryTextColor())
+                maxLines = 5
+            })
+        }.also {
+            it.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                bottomMargin = dp(8)
+            }
+        }
+    }
+
+    private fun closeCloudRecords() {
+        showingCloudRecords = false
+        filterContainer?.visibility = View.VISIBLE
+        renderItems()
     }
 
     private fun createDragHandle(): View {
@@ -765,6 +914,7 @@ class EcoPasteOverlayPanel(
     }
 
     private fun renderItems() {
+        if (showingCloudRecords) return
         val container = itemContainer ?: return
         container.removeAllViews()
         val visibleItems = loadedItems.filter { item ->
@@ -1209,6 +1359,18 @@ class EcoPasteOverlayPanel(
             "disabled" -> "未启用"
             else -> "离线"
         }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var size = bytes.toDouble() / 1024.0
+        var unit = 0
+        while (size >= 1024 && unit < units.lastIndex) {
+            size /= 1024
+            unit += 1
+        }
+        return if (size >= 10) "%.0f %s".format(size, units[unit]) else "%.1f %s".format(size, units[unit])
     }
 
     private fun dp(value: Int): Int = (value * context.resources.displayMetrics.density).toInt()

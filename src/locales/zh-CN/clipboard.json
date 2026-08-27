@@ -156,6 +156,18 @@
       "idle": "离线",
       "online": "在线"
     },
+    "records": {
+      "empty": "云端暂无剪贴板记录",
+      "end": "已显示全部记录",
+      "files": "{{count}} 个文件",
+      "loadMore": "加载更多",
+      "open": "查看云端记录",
+      "refresh": "刷新云端记录",
+      "sensitive": "敏感",
+      "sensitivePreview": "敏感内容已隐藏",
+      "title": "云端剪贴板记录",
+      "total": "共 {{count}} 条"
+    },
     "transport": {
       "direct": "直连",
       "relay": "中继",

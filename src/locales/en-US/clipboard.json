@@ -156,6 +156,18 @@
       "idle": "Offline",
       "online": "Online"
     },
+    "records": {
+      "empty": "No clipboard records in the cloud",
+      "end": "All records are shown",
+      "files": "{{count}} files",
+      "loadMore": "Load more",
+      "open": "View cloud records",
+      "refresh": "Refresh cloud records",
+      "sensitive": "Sensitive",
+      "sensitivePreview": "Sensitive content is hidden",
+      "title": "Cloud clipboard records",
+      "total": "{{count}} total"
+    },
     "transport": {
       "direct": "Direct",
       "relay": "Relay",

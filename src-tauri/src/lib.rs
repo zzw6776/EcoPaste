@@ -173,6 +173,7 @@ pub fn run() {
             commands::update_settings,
             commands::reset_settings,
             commands::get_sync_status,
+            commands::list_cloud_records,
             commands::create_sync_group,
             commands::export_sync_pairing_code,
             commands::inspect_sync_pairing_code,

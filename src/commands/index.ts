@@ -158,6 +158,7 @@ export interface CleanCacheResult {
 
 export interface SyncStatus {
   enabled: boolean;
+  cloudEnabled: boolean;
   paired: boolean;
   deviceId: string;
   deviceName: string;
@@ -173,6 +174,24 @@ export interface SyncStatus {
   lan: SyncChannelStatus;
   cloud: SyncChannelStatus;
   peers: SyncPeerStatus[];
+}
+
+export interface CloudRecord {
+  cursor: number;
+  eventId: string;
+  deviceName: string;
+  kind: string;
+  preview: string;
+  fileCount: number;
+  totalSize: number;
+  createdAt: string;
+  isSensitive: boolean;
+}
+
+export interface CloudRecordPage {
+  records: CloudRecord[];
+  nextBeforeCursor: number | null;
+  total: number;
 }
 
 export type SyncChannelState =
@@ -231,6 +250,14 @@ export const getSyncStatus = async () => {
   return call<SyncStatus>(
     TAURI_COMMAND.GET_SYNC_STATUS,
     "commands:labels.loadSyncStatus",
+  );
+};
+
+export const listCloudRecords = async (beforeCursor?: number, limit = 30) => {
+  return call<CloudRecordPage>(
+    TAURI_COMMAND.LIST_CLOUD_RECORDS,
+    "commands:labels.loadCloudRecords",
+    { beforeCursor, limit },
   );
 };
 
