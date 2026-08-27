@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { useMount, useUnmount } from "ahooks";
-import { Button, Input, Modal, Space, Typography } from "antd";
+import { Button, Input, Modal, Space, Switch, Typography } from "antd";
 import { QRCodeSVG } from "qrcode.react";
 import type { ChangeEvent, FC } from "react";
 import { useRef, useState } from "react";
@@ -18,6 +18,7 @@ import {
   setSyncDeviceName,
   syncNow,
 } from "@/commands";
+import CloudRecordsDrawer from "@/pages/Clipboard/components/CloudRecordsDrawer";
 import { updateSettings } from "@/stores/settings";
 import { cn } from "@/utils/cn";
 import { getModalApi } from "@/utils/feedback";
@@ -41,7 +42,12 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   const [scannerOpen, setScannerOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
   const [deviceName, setDeviceName] = useState("");
+  const [cloudEndpointId, setCloudEndpointId] = useState("");
+  const [cloudDirectAddresses, setCloudDirectAddresses] = useState("");
+  const [cloudRelayUrls, setCloudRelayUrls] = useState("");
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const deviceNameDirtyRef = useRef(false);
+  const cloudConfigDirtyRef = useRef(false);
   const mountedRef = useRef(false);
   const qrScannerRef = useRef<SyncQrScannerHandle | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
@@ -52,6 +58,11 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       setStatus(next);
       if (!deviceNameDirtyRef.current) {
         setDeviceName(next.deviceName);
+      }
+      if (!cloudConfigDirtyRef.current) {
+        setCloudEndpointId(next.cloudEndpointId);
+        setCloudDirectAddresses(next.cloudDirectAddresses.join("\n"));
+        setCloudRelayUrls(next.cloudRelayUrls.join("\n"));
       }
     } catch (error) {
       log.error("load sync settings status failed", error);
@@ -222,6 +233,54 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
     void handleReconnect();
   }
 
+  async function handleCloudEnabledChange(cloudEnabled: boolean) {
+    await run(async () => {
+      await updateSettings({ sync: { cloudEnabled } });
+    });
+  }
+
+  function handleCloudSwitch(checked: boolean) {
+    void handleCloudEnabledChange(checked);
+  }
+
+  function handleCloudEndpointIdChange(event: ChangeEvent<HTMLInputElement>) {
+    cloudConfigDirtyRef.current = true;
+    setCloudEndpointId(event.target.value);
+  }
+
+  function handleCloudDirectAddressesChange(
+    event: ChangeEvent<HTMLTextAreaElement>,
+  ) {
+    cloudConfigDirtyRef.current = true;
+    setCloudDirectAddresses(event.target.value);
+  }
+
+  function handleCloudRelayUrlsChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    cloudConfigDirtyRef.current = true;
+    setCloudRelayUrls(event.target.value);
+  }
+
+  async function handleSaveCloudConfig() {
+    await run(async () => {
+      await updateSettings({
+        sync: {
+          serverDirectAddresses: splitAddressLines(cloudDirectAddresses),
+          serverEndpointId: cloudEndpointId.trim(),
+          serverRelayUrls: splitAddressLines(cloudRelayUrls),
+        },
+      });
+      cloudConfigDirtyRef.current = false;
+    });
+  }
+
+  function handleOpenRecords() {
+    setRecordsOpen(true);
+  }
+
+  function handleCloseRecords() {
+    setRecordsOpen(false);
+  }
+
   const busy = loading || reconnectingKey !== null;
 
   function handleOpenJoin() {
@@ -326,39 +385,145 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
             >
               {t(`sync.states.${status?.cloud.state ?? "disabled"}`)}
             </span>
+            <Switch
+              aria-label={t("sync.cloud.enabled")}
+              checked={status?.cloudEnabled ?? false}
+              className="ml-auto"
+              disabled={disabled || busy || !status?.enabled}
+              onChange={handleCloudSwitch}
+              size="small"
+            />
           </div>
-          {status?.cloudEndpointId ? (
+          {status?.cloudEnabled && status.cloudEndpointId ? (
             <div className="mt-2 break-all font-mono text-ant-secondary text-xs">
               {status.cloudEndpointId}
             </div>
           ) : null}
-          {[
-            ...(status?.cloudDirectAddresses ?? []),
-            ...(status?.cloudRelayUrls ?? []),
-          ].map((address) => {
-            return (
-              <div
-                className="mt-1 break-all font-mono text-ant-secondary text-xs"
-                key={address}
-              >
-                {address}
-              </div>
-            );
-          })}
-          {status?.cloud.lastSuccessAt ? (
+          {status?.cloudEnabled
+            ? [...status.cloudDirectAddresses, ...status.cloudRelayUrls].map(
+                (address) => {
+                  return (
+                    <div
+                      className="mt-1 break-all font-mono text-ant-secondary text-xs"
+                      key={address}
+                    >
+                      {address}
+                    </div>
+                  );
+                },
+              )
+            : null}
+          {status?.cloudEnabled && status.cloud.lastSuccessAt ? (
             <div className="mt-2 text-ant-secondary text-xs">
               {t("sync.lastSuccess", {
                 time: new Date(status.cloud.lastSuccessAt).toLocaleString(),
               })}
             </div>
           ) : null}
-          {status?.cloud.lastError ? (
+          {status?.cloudEnabled && status.cloud.lastError ? (
             <div className="mt-2 text-ant-error text-xs">
               {status.cloud.lastError}
             </div>
           ) : null}
+          {status?.cloudEnabled ? (
+            <Button
+              className="mt-2"
+              disabled={
+                disabled || busy || !status.paired || !status.cloudEndpointId
+              }
+              icon={<i className="i-lucide:cloud-download size-4" />}
+              onClick={handleOpenRecords}
+              size="small"
+            >
+              {t("sync.cloud.records")}
+            </Button>
+          ) : (
+            <div className="mt-2 text-ant-secondary text-xs">
+              {t("sync.cloud.disabledHint")}
+            </div>
+          )}
         </div>
       </div>
+
+      {status?.cloudEnabled ? (
+        <div className="rounded-2 border border-ant-border-secondary bg-ant-container p-3">
+          <div className="mb-3 flex items-center gap-2">
+            <div className="flex size-8 items-center justify-center rounded-2 bg-ant-fill-quaternary text-ant-info">
+              <i className="i-lucide:cloud-cog size-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="font-medium text-sm">{t("sync.cloud.title")}</div>
+              <div className="text-ant-secondary text-xs">
+                {t("sync.cloud.description")}
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <label
+              className="flex flex-col gap-1 md:col-span-2"
+              htmlFor="sync-cloud-endpoint-id"
+            >
+              <span className="text-ant-secondary text-xs">
+                {t("sync.cloud.endpointId")}
+              </span>
+              <Input
+                disabled={disabled || busy}
+                id="sync-cloud-endpoint-id"
+                onChange={handleCloudEndpointIdChange}
+                placeholder={t("settings.sync.serverEndpointId.placeholder")}
+                value={cloudEndpointId}
+              />
+            </label>
+            <label
+              className="flex flex-col gap-1"
+              htmlFor="sync-cloud-direct-addresses"
+            >
+              <span className="text-ant-secondary text-xs">
+                {t("sync.cloud.directAddresses")}
+              </span>
+              <Input.TextArea
+                autoSize={{ maxRows: 5, minRows: 3 }}
+                disabled={disabled || busy}
+                id="sync-cloud-direct-addresses"
+                onChange={handleCloudDirectAddressesChange}
+                placeholder={t(
+                  "settings.sync.serverDirectAddresses.placeholder",
+                )}
+                value={cloudDirectAddresses}
+              />
+            </label>
+            <label
+              className="flex flex-col gap-1"
+              htmlFor="sync-cloud-relay-urls"
+            >
+              <span className="text-ant-secondary text-xs">
+                {t("sync.cloud.relayUrls")}
+              </span>
+              <Input.TextArea
+                autoSize={{ maxRows: 5, minRows: 3 }}
+                disabled={disabled || busy}
+                id="sync-cloud-relay-urls"
+                onChange={handleCloudRelayUrlsChange}
+                placeholder={t("settings.sync.serverRelayUrls.placeholder")}
+                value={cloudRelayUrls}
+              />
+            </label>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <span className="text-ant-secondary text-xs">
+              {t("sync.cloud.domainHint")}
+            </span>
+            <Button
+              disabled={disabled || busy || !cloudConfigDirtyRef.current}
+              loading={loading}
+              onClick={handleSaveCloudConfig}
+              type="primary"
+            >
+              {t("sync.cloud.save")}
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <Space.Compact className="w-full">
         <Input
@@ -477,6 +642,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
           </div>
         )}
       </Modal>
+      <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
     </div>
   );
 };
@@ -558,4 +724,11 @@ function channelStateClassName(state?: SyncStatus["lan"]["state"]) {
     default:
       return "text-ant-tertiary";
   }
+}
+
+function splitAddressLines(value: string) {
+  return value
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 }

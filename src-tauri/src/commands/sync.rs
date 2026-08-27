@@ -5,12 +5,29 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     core::Result,
     settings::SettingsStore,
-    sync::{PairingCode, SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus, SyncTarget},
+    sync::{
+        CloudRecordPage, PairingCode, SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus,
+        SyncTarget,
+    },
 };
 
 #[tauri::command]
 pub async fn get_sync_status(manager: State<'_, Arc<SyncManager>>) -> Result<SyncStatus> {
     Ok(manager.status().await?)
+}
+
+#[tauri::command]
+pub async fn list_cloud_records(
+    manager: State<'_, Arc<SyncManager>>,
+    before_cursor: Option<u64>,
+    limit: u16,
+) -> Result<CloudRecordPage> {
+    manager
+        .inner()
+        .clone()
+        .cloud_records(before_cursor, limit)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -49,10 +66,12 @@ pub async fn join_sync_group(
     replace_existing: bool,
 ) -> Result<SyncStatus> {
     let code = PairingCode::decode(&pairing_code)?;
+    let cloud_enabled = !code.server_endpoint_id.trim().is_empty();
     manager.join_group(&code, replace_existing).await?;
     let settings = app.state::<SettingsStore>().update(serde_json::json!({
         "sync": {
             "enabled": true,
+            "cloudEnabled": cloud_enabled,
             "serverEndpointId": code.server_endpoint_id,
             "serverDirectAddresses": code.server_direct_addresses,
             "serverRelayUrls": code.server_relay_urls,

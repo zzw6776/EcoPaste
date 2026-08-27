@@ -190,11 +190,27 @@ jobs:
           uploadUpdaterJson: false
 
   build-android:
-    name: Build Android per-ABI APKs
+    name: Build Android ${{ matrix.label }}
     needs: release-metadata
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ARM64
+            rust_target: aarch64-linux-android
+            tauri_target: aarch64
+          - label: ARMv7
+            rust_target: armv7-linux-androideabi
+            tauri_target: armv7
+          - label: x86
+            rust_target: i686-linux-android
+            tauri_target: i686
+          - label: x86_64
+            rust_target: x86_64-linux-android
+            tauri_target: x86_64
     steps:
       - name: Checkout release
         uses: actions/checkout@v4
@@ -204,7 +220,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: ${{ matrix.rust_target }}
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -253,6 +269,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          shared-key: android-${{ matrix.tauri_target }}
           workspaces: src-tauri
 
       - name: Build and upload Android app
@@ -262,7 +279,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         with:
-          args: --apk --split-per-abi --config src-tauri/tauri.release.conf.json
+          args: --apk --split-per-abi --target ${{ matrix.tauri_target }} --config src-tauri/tauri.release.conf.json
           mobile: android
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true

@@ -194,6 +194,31 @@ impl HubService {
                 }
                 write_frame(send, &Response::Changed { latest_cursor }).await?;
             }
+            Request::ListEvents {
+                group_id,
+                access_token,
+                before_cursor,
+                limit,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                let limit = limit.clamp(1, 100);
+                let (events, next_before_cursor) = self
+                    .repository
+                    .list_events_before(&group_id, before_cursor, limit)
+                    .await?;
+                let total = self.repository.event_count(&group_id).await?;
+                write_frame(
+                    send,
+                    &Response::EventsPage {
+                        events,
+                        next_before_cursor,
+                        total,
+                    },
+                )
+                .await?;
+            }
         }
         Ok(())
     }

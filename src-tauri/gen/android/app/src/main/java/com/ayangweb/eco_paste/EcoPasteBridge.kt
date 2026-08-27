@@ -65,6 +65,9 @@ object EcoPasteBridge {
     external fun loadOverlaySyncStatusJson(): String
 
     @JvmStatic
+    external fun loadOverlayCloudRecordsJson(): String
+
+    @JvmStatic
     external fun syncOverlayItemJson(id: String, target: String): String
 
     @JvmStatic

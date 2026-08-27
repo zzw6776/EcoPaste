@@ -196,6 +196,23 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
 }
 
 #[cfg(target_os = "android")]
+fn load_overlay_cloud_records_json() -> Result<String> {
+    let app = APP_HANDLE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    let manager = app
+        .try_state::<std::sync::Arc<crate::sync::SyncManager>>()
+        .ok_or_else(|| anyhow::anyhow!("sync manager is not ready"))?
+        .inner()
+        .clone();
+    tauri::async_runtime::block_on(async move {
+        let page = manager.cloud_records(None, 50).await?;
+        serde_json::to_string(&page).map_err(|error| anyhow::anyhow!(error).into())
+    })
+}
+
+#[cfg(target_os = "android")]
 fn load_overlay_sync_status_json() -> Result<String> {
     let app = APP_HANDLE
         .get()
@@ -376,6 +393,24 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlay
     let json = load_overlay_sync_status_json().unwrap_or_else(|error| {
         log::error!("load Android overlay sync status failed: {error}");
         "{}".to_owned()
+    });
+    env.new_string(json)
+        .map(jni::objects::JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlayCloudRecordsJson(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jstring {
+    let Ok(env) = jni::JNIEnv::from_raw(raw_env) else {
+        return std::ptr::null_mut();
+    };
+    let json = load_overlay_cloud_records_json().unwrap_or_else(|error| {
+        log::error!("load Android overlay cloud records failed: {error}");
+        serde_json::json!({ "error": error.to_string() }).to_string()
     });
     env.new_string(json)
         .map(jni::objects::JString::into_raw)

@@ -6,7 +6,7 @@ pub(crate) mod repository;
 
 pub use identity::PairingCode;
 pub use manager::SyncManager;
-pub use model::{SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget};
+pub use model::{CloudRecordPage, SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget};
 
 use std::sync::Arc;
 

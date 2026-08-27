@@ -129,6 +129,7 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
   sync: {
     autoUploadMaxMb: 10,
     autoWriteClipboard: false,
+    cloudEnabled: false,
     enabled: false,
     serverDirectAddresses: [],
     serverEndpointId: "",

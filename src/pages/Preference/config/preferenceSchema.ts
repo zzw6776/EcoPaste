@@ -978,38 +978,6 @@ export const preferenceTabs: PreferenceTab[] = [
         ],
       },
       {
-        id: "syncServer",
-        settings: [
-          {
-            control: { type: "text" },
-            id: "sync.serverEndpointId",
-            keywords: ["sync", "server", "iroh", "endpoint"],
-            path: ["sync", "serverEndpointId"],
-            value: (settings) => {
-              return settings.sync.serverEndpointId;
-            },
-          },
-          {
-            control: { type: "textarea" },
-            id: "sync.serverDirectAddresses",
-            keywords: ["sync", "server", "udp", "address"],
-            path: ["sync", "serverDirectAddresses"],
-            value: (settings) => {
-              return settings.sync.serverDirectAddresses;
-            },
-          },
-          {
-            control: { type: "textarea" },
-            id: "sync.serverRelayUrls",
-            keywords: ["sync", "server", "relay"],
-            path: ["sync", "serverRelayUrls"],
-            value: (settings) => {
-              return settings.sync.serverRelayUrls;
-            },
-          },
-        ],
-      },
-      {
         id: "syncDevices",
         settings: [
           {

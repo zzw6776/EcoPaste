@@ -50,6 +50,7 @@ export const TAURI_COMMAND = {
   LIST_ALL_APPS: "list_all_apps",
   LIST_CLIPBOARD_GROUPS: "list_clipboard_groups",
   LIST_CLIPBOARD_ITEMS: "list_clipboard_items",
+  LIST_CLOUD_RECORDS: "list_cloud_records",
   NOTIFY_WINDOW_READY: "notify_window_ready",
   OPEN_CLIPBOARD_ITEM_LINK: "open_clipboard_item_link",
   OPEN_EXTERNAL_URL: "open_external_url",

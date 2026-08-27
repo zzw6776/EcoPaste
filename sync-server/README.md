@@ -15,10 +15,10 @@ EcoPaste 的可独立部署密文同步 Hub，传输层使用 Iroh 1.0/QUIC。�
 
 ```bash
 cd sync-server
-cargo run --release -- --data-dir ./data --bind 0.0.0.0:44820
+./run-local.sh
 ```
 
-首次启动会在 `data/iroh-secret.key` 生成持久化 Iroh 身份。不要删除或公开这个文件；身份改变后客户端保存的服务端 Endpoint ID 会失效。
+本机运行使用临时数据目录；停止后会自动删除 SQLite、密文文件和 Iroh 服务端身份。下次启动的 Endpoint ID 会改变，客户端需要重新填写。需要持久化的生产部署应显式传入独立的 `--data-dir`，不要复用本机临时启动配置。
 
 启动日志会输出：
 
@@ -28,7 +28,7 @@ ECOPASTE_SERVER_DIRECT_ADDRESS=<探测到的地址>
 ECOPASTE_SERVER_RELAY_URL=<Iroh relay 地址>
 ```
 
-部署在公网机器或 Docker 后，客户端应使用输出的 Endpoint ID，并把公网 `IP:44820` 作为 direct address。安全组和主机防火墙必须放行 UDP 44820。
+部署在公网机器后，客户端应使用输出的 Endpoint ID，并把公网 `IP:端口` 作为 direct address。安全组和主机防火墙必须放行相同的 UDP 端口。本机 Docker 默认使用 UDP 4443。
 
 客户端把这些值分别填入“同步服务 Endpoint ID / 直连地址 / Relay 地址”。配对码会把服务地址连同同步空间一起交给新设备；服务地址为空时只启用局域网同步，云端状态会明确显示为未启用。
 
@@ -51,7 +51,7 @@ docker compose logs -f ecopaste-sync
 
 `docker-up.sh` 使用 Rust 1.98 slim 构建镜像和项目专属的 `ecopaste-sync-slim` Buildx builder。Rust 基础镜像、Cargo registry 和编译结果会在后续构建中复用，不需要每次重新下载和全量编译。脚本在每次退出时把该 builder 的缓存控制在 3 GiB 内并停止 builder；当前热缓存约 2.3 GiB，正常重复构建不会被清除。超过上限时会优先淘汰旧缓存层，之后若重新用到这些层，才需要重新下载或编译。
 
-新镜像成功启动后，脚本会删除被替换的旧 `ecopaste-sync-server:local` 镜像，并清理该服务遗留的悬空镜像；当前运行镜像和命名卷不受影响，数据仍保存在 `ecopaste-sync-data`。如果构建或启动失败，旧镜像会保留，避免在新版本不可用时丢失回退基础。
+新镜像成功启动后，脚本会删除被替换的旧 `ecopaste-sync-server:local` 镜像，并清理该服务遗留的悬空镜像。本机容器的 `/data` 使用 tmpfs，容器停止或重建后自动清空，不创建持久化数据卷。如果构建或启动失败，旧镜像会保留，避免失去回退基础。
 
 builder 默认处于停止状态。查看缓存时先运行 `docker buildx inspect ecopaste-sync-slim --bootstrap`，再运行 `docker buildx du --builder ecopaste-sync-slim`，查看后可用 `docker buildx stop ecopaste-sync-slim` 重新停止。确认不再需要加速后，才运行 `docker buildx rm ecopaste-sync-slim` 彻底回收；这会导致下次构建重新下载基础镜像并重新编译依赖。不要使用全局 `docker image prune` 或 `docker builder prune` 代替项目脚本。
 
@@ -77,9 +77,9 @@ cargo test
 | `--max-blob-bytes` | `ECOPASTE_MAX_BLOB_BYTES` | `2147483648` | 单个密文文件上限 |
 | `--no-relay` | `ECOPASTE_NO_RELAY` | `false` | 禁用公共 Iroh relay，只允许直连 |
 
-## 数据与备份
+## 生产数据与备份
 
-运行时数据都在 `data-dir`：
+显式指定持久化 `data-dir` 的生产部署，运行时数据包括：
 
 ```text
 data/

@@ -214,6 +214,72 @@ impl Repository {
             .map(|value| value.unwrap_or(0))
     }
 
+    /// Reads one newest-first page without changing any device delivery cursor.
+    pub async fn list_events_before(
+        &self,
+        group_id: &str,
+        before_cursor: Option<u64>,
+        limit: u16,
+    ) -> Result<(Vec<CloudEvent>, Option<u64>)> {
+        let fetch_limit = i64::from(limit) + 1;
+        let rows = if let Some(before_cursor) = before_cursor {
+            sqlx::query(
+                r#"
+                SELECT cursor, event_id, origin_device_id, origin_sequence,
+                       created_at_ms, nonce, ciphertext
+                FROM events
+                WHERE group_id = ? AND cursor < ?
+                ORDER BY cursor DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(group_id)
+            .bind(i64::try_from(before_cursor).unwrap_or(i64::MAX))
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT cursor, event_id, origin_device_id, origin_sequence,
+                       created_at_ms, nonce, ciphertext
+                FROM events
+                WHERE group_id = ?
+                ORDER BY cursor DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(group_id)
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("list encrypted event page")?;
+
+        let mut events = rows
+            .into_iter()
+            .map(cloud_event_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let has_more = events.len() > usize::from(limit);
+        events.truncate(usize::from(limit));
+        let next_before_cursor = has_more.then(|| {
+            events
+                .last()
+                .expect("non-empty page when another event exists")
+                .cursor
+        });
+        Ok((events, next_before_cursor))
+    }
+
+    pub async fn event_count(&self, group_id: &str) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE group_id = ?")
+            .bind(group_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("count encrypted events")?;
+        u64::try_from(count).context("negative event count")
+    }
+
     /// Returns recently seen peers. Stale entries remain useful as an offline LAN route cache.
     pub async fn list_peers(
         &self,
@@ -322,6 +388,22 @@ pub fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
+    let cursor: i64 = row.try_get("cursor")?;
+    let sequence: i64 = row.try_get("origin_sequence")?;
+    Ok(CloudEvent {
+        cursor: u64::try_from(cursor).context("negative event cursor")?,
+        event: EncryptedEvent {
+            event_id: row.try_get("event_id")?,
+            origin_device_id: row.try_get("origin_device_id")?,
+            origin_sequence: u64::try_from(sequence).context("negative origin sequence")?,
+            created_at_ms: row.try_get("created_at_ms")?,
+            nonce: row.try_get("nonce")?,
+            ciphertext: row.try_get("ciphertext")?,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +425,52 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cloud_history_is_newest_first_and_paged() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let events = (1..=3)
+            .map(|sequence| EncryptedEvent {
+                event_id: format!("event_{sequence:03}"),
+                origin_device_id: "device_123".into(),
+                origin_sequence: sequence,
+                created_at_ms: sequence as i64,
+                nonce: vec![sequence as u8; 24],
+                ciphertext: vec![sequence as u8],
+            })
+            .collect::<Vec<_>>();
+        repository
+            .insert_events("group_123", &events)
+            .await
+            .unwrap();
+
+        let (first, next) = repository
+            .list_events_before("group_123", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|item| item.cursor).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(next, Some(2));
+
+        let (second, next) = repository
+            .list_events_before("group_123", next, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|item| item.cursor).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(next, None);
+        assert_eq!(repository.event_count("group_123").await.unwrap(), 3);
     }
 }

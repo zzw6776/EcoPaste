@@ -144,6 +144,17 @@ pub enum Request {
         #[n(2)]
         after_cursor: u64,
     },
+    #[n(6)]
+    ListEvents {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        before_cursor: Option<u64>,
+        #[n(3)]
+        limit: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -186,6 +197,15 @@ pub enum Response {
     Changed {
         #[n(0)]
         latest_cursor: u64,
+    },
+    #[n(7)]
+    EventsPage {
+        #[n(0)]
+        events: Vec<CloudEvent>,
+        #[n(1)]
+        next_before_cursor: Option<u64>,
+        #[n(2)]
+        total: u64,
     },
 }
 
@@ -276,6 +296,22 @@ mod tests {
             after_cursor: 7,
             events: Vec::new(),
             limit: 100,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        let decoded: Request = read_frame(&mut server).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn cloud_history_request_round_trip() {
+        let request = Request::ListEvents {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            before_cursor: Some(42),
+            limit: 30,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 

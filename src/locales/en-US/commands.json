@@ -42,6 +42,7 @@
     "loadAutostart": "Load launch-at-login state",
     "loadClipboardGroups": "Load groups",
     "loadClipboardList": "Load list",
+    "loadCloudRecords": "Load cloud records",
     "loadPreviewContent": "Load preview content",
     "loadPreviewState": "Load preview state",
     "loadRunAsAdminStatus": "Load administrator launch state",

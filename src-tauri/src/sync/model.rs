@@ -88,6 +88,7 @@ pub struct StoredBlob {
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
     pub enabled: bool,
+    pub cloud_enabled: bool,
     pub paired: bool,
     pub device_id: String,
     pub device_name: String,
@@ -185,6 +186,28 @@ pub struct SyncItemStatus {
     pub item_id: String,
     pub lan: SyncItemChannelStatus,
     pub cloud: SyncItemChannelStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRecord {
+    pub cursor: u64,
+    pub event_id: String,
+    pub device_name: String,
+    pub kind: String,
+    pub preview: String,
+    pub file_count: u32,
+    pub total_size: u64,
+    pub created_at: String,
+    pub is_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRecordPage {
+    pub records: Vec<CloudRecord>,
+    pub next_before_cursor: Option<u64>,
+    pub total: u64,
 }
 
 impl SyncItemStatus {
