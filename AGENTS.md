@@ -14,8 +14,8 @@ EcoPaste 是跨平台剪贴板管理器，采用 Rust-First 的 Tauri 架构。
 - **用户可见结果先核对链路**：修复页面显示或跨端结果前，按实际问题范围核对“数据来源 → 跨端传递 → 状态更新 → 组件渲染”，确认失效层后再修改；某一层取值正确只能证明该层，不能据此判断最终显示已修复。
 - **固定 Rust 工具链**：所有本地和 AI 会话都使用仓库根目录 `rust-toolchain.toml` 管理的 rustup 工具链，不使用 Homebrew Rust 或绕过版本文件的 `cargo`；测试 profile 采用低磁盘配置。
 - **Rust 构建低磁盘配置**：客户端只生成 macOS/Windows 使用的 `rlib` 与 Android 使用的 `cdylib`，不要恢复仅供 iOS 的 `staticlib`；桌面客户端、Android debug 和同步服务保留自身 `debug = 1` 与增量编译，release 使用 Cargo 默认策略，第三方依赖使用 `debug = 0`，测试使用 `debug = 0` 且关闭增量编译。不要为了省空间无条件删除完整客户端或服务端 `target`、Cargo registry，否则下次会重新编译或下载。
-- **本地构建缓存按阈值清理**：`pnpm tauri dev` / `pnpm tauri build` 在启动构建前检查桌面 host 的 dev + release 缓存，总量超过 6 GiB 才清理两个 profile，并保留已有桌面 bundle；Android arm64 打包前检查对应 Cargo target 与项目 Gradle 目录，总量超过 3 GiB 才清理 Android dev/release profile 和 Gradle 产物。未超阈值时保留缓存，构建结束、应用启动、重启和热更新均不触发清理；APK 与 bundle、Cargo registry/git、Gradle 共享依赖缓存始终保留。不得把阈值清理扩大为 `pnpm clean:native`。
-- **Android 日常只构建 arm64 release**：本地开发和真机验收默认使用 `pnpm android:build:release`；需要 ADB、WebView 或 JNI 调试时才使用 `pnpm android:build:debug`。两种 APK 成功后均保存在 `artifacts/android/`，构建前按上述阈值决定是否清理；只有正式多 ABI 发布流程才构建其它 Android targets。
+- **本地构建缓存按阈值清理**：`pnpm tauri dev` / `pnpm tauri build` 在启动构建前检查桌面 host 的 dev + release 缓存，总量超过 6 GiB 才清理两个 profile，并保留已有桌面 bundle；Android arm64 打包前检查对应 Cargo target 与项目 Gradle 目录，总量超过 3 GiB 才清理 Android dev/release profile 和 Gradle 产物。未超阈值时保留缓存，构建结束、应用启动、重启和热更新均不触发清理；当前最新版 APK 与 bundle、Cargo registry/git、Gradle 共享依赖缓存始终保留。不得把阈值清理扩大为 `pnpm clean:native`。
+- **Android 日常只构建 arm64 release**：本地开发和真机验收默认使用 `pnpm android:build:release`；需要 ADB、WebView 或 JNI 调试时才使用 `pnpm android:build:debug`。两种 APK 成功后均保存在 `artifacts/android/`，新 APK 成功写入后必须删除该目录中的全部旧版本 APK，只保留最新版本；构建前按上述阈值决定是否清理；只有正式多 ABI 发布流程才构建其它 Android targets。
 - **Docker 镜像由 CI 构建**：同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；服务端镜像构建输入发生变化时必须同步提升该版本及 `sync-server/Cargo.lock`，推送到 `master` 后由独立 GitHub Docker Image CI 构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。`sync-server/docker-up.sh` 只拉取远端镜像、替换本地容器并清理该服务的旧镜像，不在本机创建 Buildx builder 或 Rust 编译缓存。不要改回本地 `docker compose up --build`，也不要手动执行无过滤条件的 `docker image prune` 或 `docker builder prune`。
 - **本地同步服务数据持久化**：本机 Docker 服务的 `/data` 固定使用外部 Docker volume `ecopaste-sync-data`，`sync-server/docker-up.sh` 只替换容器和镜像，不得删除该数据卷；直接运行统一使用 `sync-server/run-local.sh` 的平台固定数据目录。停止或重建服务必须保留 Hub 数据、Iroh 服务端身份和密文文件，清理数据需要用户明确授权。
 - **共享依赖缓存保守清理**：默认保留 Cargo registry/git、pnpm store、当前 Gradle wrapper 和 Gradle modules；它们体积较小或跨项目共享，删除会导致重新下载。旧 Gradle 版本可能属于其它项目，未经用户明确授权不得删除。
@@ -24,7 +24,7 @@ EcoPaste 是跨平台剪贴板管理器，采用 Rust-First 的 Tauri 架构。
 - **局域网自动发现与加入**：复用 Iroh mDNS `UserData` 广播协议版本、设备名称和由组密钥单向派生的匿名空间标识，禁止广播 Token、内容密钥或配对码；申请走独立 `ecopaste/pair/2` ALPN，双方核对六位短码并由已有设备显式批准，60 秒超时且必须限流；批准信息必须经过申请端确认、批准端原子落库和最终完成确认后才结束 Iroh 连接。Android 仅在连接页面或手动刷新时短时持有 `MulticastLock`，后台不可达时回退二维码；局域网同步关闭时不得发现、广播或审批。被删除设备重新批准必须传播恢复记录，不能只删除本机墓碑。
 - **同步地址与重连**：Iroh Endpoint ID 是稳定设备身份，直连 IP、端口和 Relay URL 只作动态路由；局域网只允许由局域网发现/配对获得并由 mDNS 刷新的私网直连地址，禁止拨号或接受 Relay/公网路径。云端可独立选择关闭 Relay（默认）、Iroh 免费公共 Relay 或自定义 Relay，自定义认证 Token 必须存入受限身份文件，不能进入公开设置、日志或配对码。启动、窗口回到前台和地址发现变化立即连接，离线按 `2/5/15/30/60/300` 秒退避，禁止恢复高频轮询或把连接超时当作成功周期；全部设备和单设备都必须保留手动重连入口。
 - **主动演进当前项目**：实现新能力时以当前代码、产品需求和平台约束为准，把当前仓库作为唯一实现基线。
-- **尊重 dirty worktree**：不要回滚或覆盖非本轮改动；需要动到已修改文件时先读清楚。
+- **提交工作空间中的有用改动**：不要回滚或覆盖已有改动；需要动到已修改文件时先读清楚。提交时应纳入工作空间内所有有用改动，只排除确认无用的临时文件、生成噪声或用户明确要求保留的改动。
 
 ## 技术栈
 
