@@ -90,6 +90,55 @@ pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<Upse
     })
 }
 
+/// Merges a synchronized record without turning network receipt into local reuse time.
+pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
+    if let Some(existing) = find_item_by_content_hash(pool, &item.content_hash).await? {
+        sqlx::query(
+            r#"
+            UPDATE clipboard_items
+            SET created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
+                updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+            WHERE id = ?
+            "#,
+        )
+        .bind(item.created_at)
+        .bind(item.created_at)
+        .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(&existing.id)
+        .execute(pool)
+        .await
+        .context("merge synchronized clipboard timestamps")?;
+        return Ok(UpsertResult {
+            id: existing.id,
+            deduplicated: true,
+        });
+    }
+
+    insert_item(pool, item).await?;
+    Ok(UpsertResult {
+        id: item.id.clone(),
+        deduplicated: false,
+    })
+}
+
+/// Replaces timestamps with values reconciled from all versioned sync events for an item.
+pub async fn set_synced_item_timestamps(
+    pool: &SqlitePool,
+    item_id: &str,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query("UPDATE clipboard_items SET created_at = ?, updated_at = ? WHERE id = ?")
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(item_id)
+        .execute(pool)
+        .await
+        .context("reconcile synchronized clipboard timestamps")?;
+    Ok(())
+}
+
 /// 按 `content_hash` 查最近一条同内容记录（命中 `idx_clipboard_items_content_hash` 索引）。
 pub async fn find_item_by_content_hash(
     pool: &SqlitePool,
@@ -179,15 +228,27 @@ pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Clipb
     Ok(item)
 }
 
-/// Reads the most recently used clipboard records with full content for one-time sync backfill.
+/// Reads the most recent local-origin records with full content for one-time sync backfill.
+/// Remote-only records are already owned by another endpoint and must not be re-originated here.
 pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<ClipboardItem>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
-    qb.push(" ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC LIMIT ")
-        .push_bind(i64::from(limit));
+    qb.push(
+        r#"
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sync_item_events remote
+            WHERE remote.item_id = clipboard_items.id AND remote.direction = 'remote'
+        ) OR EXISTS (
+            SELECT 1 FROM sync_item_events local
+            WHERE local.item_id = clipboard_items.id AND local.direction = 'local'
+        )
+        ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC LIMIT
+        "#,
+    )
+    .push_bind(i64::from(limit));
 
     Ok(qb
         .build_query_as::<ClipboardItem>()
@@ -671,6 +732,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_items_for_sync_excludes_remote_only_records_before_limit() {
+        let pool = memory_pool().await;
+        for id in ["remote", "local", "unlinked"] {
+            insert_item(&pool, &sample_item(id)).await.unwrap();
+        }
+        for (event_id, item_id, direction, sequence) in [
+            ("remote-event", "remote", "remote", 1),
+            ("local-event", "local", "local", 2),
+        ] {
+            let event = ecopaste_sync_protocol::EncryptedEvent {
+                event_id: event_id.into(),
+                origin_device_id: "device".into(),
+                origin_sequence: sequence,
+                created_at_ms: sequence as i64,
+                nonce: vec![0; 24],
+                ciphertext: vec![1],
+            };
+            crate::sync::repository::insert_event(&pool, &event, true, &[])
+                .await
+                .unwrap();
+            crate::sync::repository::link_event_to_item(&pool, item_id, event_id, direction)
+                .await
+                .unwrap();
+        }
+
+        let items = recent_items_for_sync(&pool, 10).await.unwrap();
+        let ids = ids(&items);
+
+        assert!(ids.contains(&"local"));
+        assert!(ids.contains(&"unlinked"));
+        assert!(!ids.contains(&"remote"));
+    }
+
+    #[tokio::test]
     async fn upsert_inserts_when_content_is_new() {
         let pool = memory_pool().await;
         let result = upsert_item(&pool, &sample_item("a")).await.unwrap();
@@ -717,6 +812,30 @@ mod tests {
         assert_eq!(ids(&all), ["first"]);
         assert_eq!(all[0].use_count, 2);
         assert!(find_item_by_id(&pool, "second").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_upsert_merges_timestamps_without_counting_network_receipt_as_reuse() {
+        let pool = memory_pool().await;
+        let mut existing = sample_item("existing");
+        existing.created_at = DateTime::from_timestamp(1_700_000_010, 0).unwrap();
+        existing.updated_at = DateTime::from_timestamp(1_700_000_020, 0).unwrap();
+        insert_item(&pool, &existing).await.unwrap();
+
+        let mut incoming = sample_item("incoming");
+        incoming.content = existing.content.clone();
+        incoming.content_hash = existing.content_hash.clone();
+        incoming.created_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        incoming.updated_at = DateTime::from_timestamp(1_700_000_030, 0).unwrap();
+
+        let result = upsert_synced_item(&pool, &incoming).await.unwrap();
+        let merged = find_item_by_id(&pool, "existing").await.unwrap().unwrap();
+
+        assert_eq!(result.id, "existing");
+        assert!(result.deduplicated);
+        assert_eq!(merged.created_at, incoming.created_at);
+        assert_eq!(merged.updated_at, incoming.updated_at);
+        assert_eq!(merged.use_count, 1);
     }
 
     #[tokio::test]

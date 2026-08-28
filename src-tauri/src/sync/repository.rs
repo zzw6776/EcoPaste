@@ -11,13 +11,15 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use super::{
     identity::is_lan_ip,
     model::{
-        StoredBlob, StoredSyncEvent, SyncChannelState, SyncItemState, SyncItemStatus, SyncPeer,
-        SyncPeerStatus,
+        LinkedSyncEvent, StoredBlob, StoredSyncEvent, SyncChannelState, SyncItemState,
+        SyncItemStatus, SyncPeer, SyncPeerStatus,
     },
 };
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
 const HISTORY_BACKFILL_GROUP_KEY: &str = "history_backfill_group_id";
+const HISTORY_BACKFILL_VERSION: u8 = 2;
+const HISTORY_TIMESTAMP_REPAIR_GROUP_KEY: &str = "history_timestamp_repair_group_id";
 const LAST_SUCCESS_KEY: &str = "last_success_at";
 
 /// Allocates a monotonically increasing sequence for this device.
@@ -145,6 +147,77 @@ pub async fn event_for_item(pool: &SqlitePool, item_id: &str) -> Result<Option<S
     .fetch_optional(pool)
     .await
     .context("find sync event for clipboard item")
+}
+
+/// Returns the newest event originated locally for this clipboard item.
+pub async fn latest_local_event_for_item(
+    pool: &SqlitePool,
+    item_id: &str,
+) -> Result<Option<StoredSyncEvent>> {
+    let row = sqlx::query(
+        r#"
+        SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+               e.event_created_at_ms, e.nonce, e.ciphertext
+        FROM sync_item_events i
+        JOIN sync_events e ON e.event_id = i.event_id
+        WHERE i.item_id = ? AND i.direction = 'local'
+        ORDER BY e.cursor DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .context("find latest local sync event for clipboard item")?;
+
+    row.map(event_from_row).transpose()
+}
+
+/// Lists encrypted events linked to one clipboard item for timestamp reconciliation.
+pub async fn linked_events_for_item(
+    pool: &SqlitePool,
+    item_id: &str,
+) -> Result<Vec<StoredSyncEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+               e.event_created_at_ms, e.nonce, e.ciphertext
+        FROM sync_item_events i
+        JOIN sync_events e ON e.event_id = i.event_id
+        WHERE i.item_id = ?
+        ORDER BY e.cursor ASC
+        "#,
+    )
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .context("list sync events linked to clipboard item")?;
+
+    rows.into_iter().map(event_from_row).collect()
+}
+
+/// Lists all item/event links so an upgraded client can repair retained history timestamps.
+pub async fn linked_item_events(pool: &SqlitePool) -> Result<Vec<LinkedSyncEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT i.item_id, e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+               e.event_created_at_ms, e.nonce, e.ciphertext
+        FROM sync_item_events i
+        JOIN sync_events e ON e.event_id = i.event_id
+        ORDER BY e.cursor ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list clipboard item sync events")?;
+
+    rows.into_iter()
+        .map(|row| {
+            let item_id = row.try_get("item_id")?;
+            let stored = event_from_row(row)?;
+            Ok(LinkedSyncEvent { item_id, stored })
+        })
+        .collect()
 }
 
 pub async fn mark_applied(pool: &SqlitePool, event_id: &str) -> Result<()> {
@@ -929,15 +1002,35 @@ pub async fn set_cloud_cursor(pool: &SqlitePool, cursor: u64) -> Result<()> {
 
 /// Returns whether this sync space has completed its one-time local history backfill.
 pub async fn history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
+    let expected = format!("{HISTORY_BACKFILL_VERSION}:{group_id}");
     Ok(state_value(pool, HISTORY_BACKFILL_GROUP_KEY)
+        .await?
+        .as_deref()
+        == Some(expected.as_str()))
+}
+
+/// Marks the one-time local history backfill complete for the current sync space.
+pub async fn mark_history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<()> {
+    set_state_value(
+        pool,
+        HISTORY_BACKFILL_GROUP_KEY,
+        &format!("{HISTORY_BACKFILL_VERSION}:{group_id}"),
+    )
+    .await
+}
+
+pub async fn history_timestamp_repair_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
+    Ok(state_value(pool, HISTORY_TIMESTAMP_REPAIR_GROUP_KEY)
         .await?
         .as_deref()
         == Some(group_id))
 }
 
-/// Marks the one-time local history backfill complete for the current sync space.
-pub async fn mark_history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<()> {
-    set_state_value(pool, HISTORY_BACKFILL_GROUP_KEY, group_id).await
+pub async fn mark_history_timestamp_repair_completed(
+    pool: &SqlitePool,
+    group_id: &str,
+) -> Result<()> {
+    set_state_value(pool, HISTORY_TIMESTAMP_REPAIR_GROUP_KEY, group_id).await
 }
 
 pub async fn mark_success(pool: &SqlitePool) -> Result<()> {
@@ -1211,6 +1304,10 @@ mod tests {
     async fn history_backfill_marker_is_scoped_to_the_sync_space() {
         let pool = memory_pool().await;
 
+        assert!(!history_backfill_completed(&pool, "group-a").await.unwrap());
+        set_state_value(&pool, HISTORY_BACKFILL_GROUP_KEY, "group-a")
+            .await
+            .unwrap();
         assert!(!history_backfill_completed(&pool, "group-a").await.unwrap());
         mark_history_backfill_completed(&pool, "group-a")
             .await

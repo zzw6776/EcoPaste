@@ -405,6 +405,7 @@ mod tests {
                 source_platform: "macos".into(),
                 created_at_ms: 1,
                 content_hash: "hash".into(),
+                updated_at_ms: Some(2),
             },
             blobs: Vec::new(),
         };

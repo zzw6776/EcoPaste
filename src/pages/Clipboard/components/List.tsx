@@ -71,6 +71,7 @@ interface ClipboardUpdatedPayload {
   id?: string;
   imported?: boolean;
   kind?: ClipboardKind;
+  reconciled?: boolean;
 }
 
 interface ClipboardMenuActionPayload {
@@ -301,6 +302,11 @@ const List: FC = () => {
     if (payload.imported) {
       closePreview("backupImport");
       setSelectedId(null);
+      requestReloadAtTop();
+      return;
+    }
+
+    if (payload.reconciled) {
       requestReloadAtTop();
       return;
     }

@@ -52,9 +52,9 @@ use super::{
     },
     model::{
         BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage,
-        IncomingJoinRequest, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice, NearbySyncSpace,
-        StoredBlob, SyncChannelState, SyncChannelStatus, SyncItemStatus, SyncPairingPreview,
-        SyncStatus, SyncTarget, SyncedClipboardItem,
+        IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice,
+        NearbySyncSpace, StoredBlob, SyncChannelState, SyncChannelStatus, SyncItemStatus,
+        SyncPairingPreview, SyncStatus, SyncTarget, SyncedClipboardItem,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -680,7 +680,8 @@ impl SyncManager {
     }
 
     pub async fn enqueue_item(&self, item: ClipboardItem, force_files: bool) -> Result<()> {
-        self.enqueue_item_inner(item, force_files, true).await?;
+        self.enqueue_item_inner(item, force_files, true, false)
+            .await?;
         Ok(())
     }
 
@@ -699,7 +700,7 @@ impl SyncManager {
         {
             bail!("局域网同步已关闭");
         }
-        self.enqueue_item_inner(item.clone(), true, false)
+        self.enqueue_item_inner(item.clone(), true, false, false)
             .await?
             .context("此记录未满足当前同步策略")?;
         self.run_cycle(Some(target), None, Duration::from_secs(8), false)
@@ -808,6 +809,7 @@ impl SyncManager {
         item: ClipboardItem,
         force_files: bool,
         should_wake: bool,
+        history_backfill: bool,
     ) -> Result<Option<String>> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
@@ -824,12 +826,19 @@ impl SyncManager {
             return Ok(None);
         }
         let pool = self.pool().await;
-        if let Some(event_id) = repository::event_for_item(&pool, &item.id).await? {
-            repository::clear_pending_item(&pool, &item.id).await?;
-            if should_wake {
-                self.wake_transfer();
+        if let Some(stored) = repository::latest_local_event_for_item(&pool, &item.id).await? {
+            if event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item) {
+                repository::clear_pending_item(&pool, &item.id).await?;
+                if should_wake {
+                    self.wake_transfer();
+                }
+                return Ok(Some(stored.event.event_id));
             }
-            return Ok(Some(event_id));
+        } else if history_backfill {
+            if let Some(event_id) = repository::event_for_item(&pool, &item.id).await? {
+                repository::clear_pending_item(&pool, &item.id).await?;
+                return Ok(Some(event_id));
+            }
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
         let (envelope, blobs) = match self
@@ -977,6 +986,7 @@ impl SyncManager {
                     source_platform: platform_string(item.platform).into(),
                     created_at_ms: item.created_at.timestamp_millis(),
                     content_hash: item.content_hash.clone(),
+                    updated_at_ms: Some(item.updated_at.timestamp_millis()),
                 },
                 blobs: manifests,
             },
@@ -993,7 +1003,7 @@ impl SyncManager {
         let items = db::items::recent_items_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
         for item in items.into_iter().rev() {
             let item_id = item.id.clone();
-            if let Err(error) = self.enqueue_item_inner(item, false, false).await {
+            if let Err(error) = self.enqueue_item_inner(item, false, false, true).await {
                 log::warn!("backfill clipboard item {item_id} failed: {error}");
                 repository::mark_pending_item(pool, &item_id, "历史记录无法自动同步，请手动重试")
                     .await?;
@@ -1002,6 +1012,94 @@ impl SyncManager {
         repository::mark_history_backfill_completed(pool, &group.group_id).await?;
         self.emit_updated();
         Ok(())
+    }
+
+    /// Repairs records already applied by older clients from retained versioned events.
+    async fn repair_history_timestamps(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+    ) -> Result<()> {
+        if repository::history_timestamp_repair_completed(pool, &group.group_id).await? {
+            return Ok(());
+        }
+
+        let linked = repository::linked_item_events(pool).await?;
+        let reconciled = self
+            .reconcile_linked_timestamps(pool, group, linked)
+            .await?;
+        repository::mark_history_timestamp_repair_completed(pool, &group.group_id).await?;
+        if reconciled > 0 {
+            self.emit_clipboard_reconciled();
+        }
+        Ok(())
+    }
+
+    async fn reconcile_item_timestamps(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        item_id: &str,
+    ) -> Result<()> {
+        let linked = repository::linked_events_for_item(pool, item_id)
+            .await?
+            .into_iter()
+            .map(|stored| LinkedSyncEvent {
+                item_id: item_id.to_owned(),
+                stored,
+            })
+            .collect();
+        let reconciled = self
+            .reconcile_linked_timestamps(pool, group, linked)
+            .await?;
+        if reconciled > 0 {
+            self.emit_clipboard_reconciled();
+        }
+        Ok(())
+    }
+
+    async fn reconcile_linked_timestamps(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        linked: Vec<LinkedSyncEvent>,
+    ) -> Result<usize> {
+        let key = group.content_key_bytes()?;
+        let mut timestamps = HashMap::new();
+        for linked_event in linked {
+            let Ok(envelope) = crypto::decrypt_event(&key, &linked_event.stored.event) else {
+                continue;
+            };
+            if envelope.item.updated_at_ms.is_none() {
+                continue;
+            }
+            let (created_at, updated_at) =
+                synced_item_timestamps(&envelope.item, linked_event.stored.event.created_at_ms);
+            timestamps
+                .entry(linked_event.item_id)
+                .and_modify(
+                    |current: &mut (chrono::DateTime<Utc>, chrono::DateTime<Utc>)| {
+                        current.0 = current.0.min(created_at);
+                        current.1 = current.1.max(updated_at);
+                    },
+                )
+                .or_insert((created_at, updated_at));
+        }
+        let reconciled = timestamps.len();
+        for (item_id, (created_at, updated_at)) in timestamps {
+            db::items::set_synced_item_timestamps(pool, &item_id, created_at, updated_at).await?;
+        }
+        Ok(reconciled)
+    }
+
+    /// Notifies the list to reload after sync metadata changes item ordering.
+    fn emit_clipboard_reconciled(&self) {
+        if let Err(error) = self.app.emit(
+            crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+            serde_json::json!({ "reconciled": true }),
+        ) {
+            log::warn!("emit clipboard reconciliation update failed: {error}");
+        }
     }
 
     async fn run_cycle(
@@ -1041,6 +1139,7 @@ impl SyncManager {
         let endpoint = self.ensure_endpoint(&settings).await?;
         let pool = self.pool().await;
         self.backfill_recent_history(&pool, &group).await?;
+        self.repair_history_timestamps(&pool, &group).await?;
         let mut lan_succeeded = false;
         let mut lan_transfer_error = None;
         let mut lan_connection_error = None;
@@ -1507,6 +1606,8 @@ impl SyncManager {
             repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
             let item_id = self.apply_envelope(&event, envelope, group).await?;
             repository::link_event_to_item(&pool, &item_id, &event.event_id, "remote").await?;
+            self.reconcile_item_timestamps(&pool, group, &item_id)
+                .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
         }
         Ok(())
@@ -1600,11 +1701,7 @@ impl SyncManager {
                 paths.join("\n")
             }
         };
-        let now = Utc::now();
-        let created_at = Utc
-            .timestamp_millis_opt(envelope.item.created_at_ms)
-            .single()
-            .unwrap_or(now);
+        let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
         let item = ClipboardItem {
             id: uuid::Uuid::new_v4().to_string(),
             kind,
@@ -1635,7 +1732,7 @@ impl SyncManager {
             platform: parse_platform(&envelope.item.source_platform),
             note: None,
             created_at,
-            updated_at: now,
+            updated_at,
             source_app_name: None,
             source_app_icon_file: None,
             source_app_icon_path: None,
@@ -1647,7 +1744,7 @@ impl SyncManager {
             display_created_at: String::new(),
         };
         let pool = self.pool().await;
-        let result = db::items::upsert_item(&pool, &item).await?;
+        let result = db::items::upsert_synced_item(&pool, &item).await?;
         self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
         if self
             .app
@@ -2805,6 +2902,10 @@ async fn dispatch_peer(
                         )
                         .await
                         .ok();
+                        manager
+                            .reconcile_item_timestamps(&pool, &group, &item_id)
+                            .await
+                            .ok();
                         repository::mark_applied(&pool, &stored.event.event_id)
                             .await
                             .ok();
@@ -3083,18 +3184,51 @@ fn ensure_lan_connection(connection: &Connection) -> Result<()> {
         .iter()
         .find(|path| path.is_selected())
         .context("连接没有可用路径")?;
-    if !path.is_ip() {
+
+    ensure_lan_transport_addr(path.remote_addr())
+}
+
+/// 校验 Iroh 的结构化传输地址，避免把 `ip:地址` 展示文本误当作 SocketAddr 解析。
+fn ensure_lan_transport_addr(transport: &TransportAddr) -> Result<()> {
+    let TransportAddr::Ip(address) = transport else {
         bail!("局域网同步禁止使用 Relay");
-    }
-    let address = path
-        .remote_addr()
-        .to_string()
-        .parse::<std::net::SocketAddr>()
-        .context("局域网连接地址无效")?;
+    };
     if !is_lan_ip(address.ip()) {
         bail!("局域网同步禁止使用公网地址");
     }
+
     Ok(())
+}
+
+fn event_matches_item_timestamp(
+    event: &EncryptedEvent,
+    key: [u8; 32],
+    item: &ClipboardItem,
+) -> bool {
+    crypto::decrypt_event(&key, event).is_ok_and(|envelope| {
+        envelope.item.updated_at_ms == Some(item.updated_at.timestamp_millis())
+    })
+}
+
+fn synced_item_timestamps(
+    item: &SyncedClipboardItem,
+    event_created_at_ms: i64,
+) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    let fallback = Utc
+        .timestamp_millis_opt(event_created_at_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let created_at = Utc
+        .timestamp_millis_opt(item.created_at_ms)
+        .single()
+        .unwrap_or(fallback);
+    let updated_at = item
+        .updated_at_ms
+        .and_then(|value| Utc.timestamp_millis_opt(value).single())
+        .unwrap_or(created_at)
+        .max(created_at);
+
+    (created_at, updated_at)
 }
 
 fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
@@ -3356,5 +3490,28 @@ mod tests {
 
         assert_eq!(before.server_direct_addresses, vec!["10.120.90.36:4443"]);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn lan_transport_accepts_private_ip_without_string_round_trip() {
+        let transport = TransportAddr::Ip("192.168.50.84:56786".parse().unwrap());
+
+        assert_eq!(transport.to_string(), "ip:192.168.50.84:56786");
+        ensure_lan_transport_addr(&transport).unwrap();
+    }
+
+    #[test]
+    fn lan_transport_rejects_relay_and_public_ip() {
+        let relay = TransportAddr::Relay("https://relay.example.com".parse().unwrap());
+        let public = TransportAddr::Ip("8.8.8.8:443".parse().unwrap());
+
+        assert_eq!(
+            ensure_lan_transport_addr(&relay).unwrap_err().to_string(),
+            "局域网同步禁止使用 Relay"
+        );
+        assert_eq!(
+            ensure_lan_transport_addr(&public).unwrap_err().to_string(),
+            "局域网同步禁止使用公网地址"
+        );
     }
 }
