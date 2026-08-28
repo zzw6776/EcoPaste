@@ -20,6 +20,7 @@ jobs:
     outputs:
       prerelease: ${{ steps.release.outputs.prerelease }}
       release_id: ${{ steps.release.outputs.release_id }}
+      rust_dependencies_changed: ${{ steps.release.outputs.rust_dependencies_changed }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -90,6 +91,37 @@ jobs:
             prerelease=true
           fi
 
+          rust_dependency_hash() {
+            local revision="$1"
+            {
+              git show "${revision}:src-tauri/Cargo.toml" | awk '
+                /^\[package\]$/ { in_package = 1; print; next }
+                /^\[/ { in_package = 0 }
+                in_package && /^version = / { print "version = \"__VERSION__\""; next }
+                { print }
+              '
+              git show "${revision}:src-tauri/Cargo.lock" | awk '
+                /^\[\[package\]\]$/ { package_name = ""; print; next }
+                /^name = / { package_name = $0; print; next }
+                package_name == "name = \"EcoPaste\"" && /^version = / {
+                  print "version = \"__VERSION__\""
+                  next
+                }
+                { print }
+              '
+              git show "${revision}:rust-toolchain.toml"
+              git show "${revision}:.cargo/config.toml" 2>/dev/null || true
+              git show "${revision}:.github/workflows/release.yml"
+            } | sha256sum | cut -d " " -f 1
+          }
+
+          current_rust_dependency_hash="$(rust_dependency_hash "${target_sha}")"
+          previous_rust_dependency_hash="$(rust_dependency_hash "${target_sha}^")"
+          rust_dependencies_changed=false
+          if [[ "${current_rust_dependency_hash}" != "${previous_rust_dependency_hash}" ]]; then
+            rust_dependencies_changed=true
+          fi
+
           if gh release view "${tag_name}" >/dev/null 2>&1; then
             is_draft="$(gh release view "${tag_name}" --json isDraft --jq .isDraft)"
             if [[ "${is_draft}" != "true" ]]; then
@@ -115,6 +147,7 @@ jobs:
           {
             echo "prerelease=${prerelease}"
             echo "release_id=${release_id}"
+            echo "rust_dependencies_changed=${rust_dependencies_changed}"
             echo "tag_name=${tag_name}"
             echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
@@ -123,6 +156,7 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: release-metadata
     permissions:
+      actions: read
       contents: write
     strategy:
       fail-fast: false
@@ -137,9 +171,6 @@ jobs:
           - label: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-          - label: Windows ARM64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout release
@@ -169,9 +200,29 @@ jobs:
         env:
           PLATFORM: ${{ matrix.os }}
 
+      - name: Determine Cargo cache save policy
+        id: cargo-cache-policy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cache_count="$(gh cache list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --key "v0-rust-desktop-${{ matrix.target }}-" \
+            --limit 1 \
+            --json id \
+            --jq 'length')"
+          save="${{ needs.release-metadata.outputs.rust_dependencies_changed }}"
+          if [[ "${cache_count}" == "0" ]]; then
+            save=true
+          fi
+          echo "save=${save}" >> "${GITHUB_OUTPUT}"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ steps.cargo-cache-policy.outputs.save }}
+          shared-key: desktop-${{ matrix.target }}
           workspaces: src-tauri
 
       - name: Build and upload desktop app
@@ -194,6 +245,7 @@ jobs:
     needs: release-metadata
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     strategy:
       fail-fast: false
@@ -266,9 +318,28 @@ jobs:
           test -s signing.properties
           test -s release.keystore
 
+      - name: Determine Cargo cache save policy
+        id: cargo-cache-policy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cache_count="$(gh cache list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --key "v0-rust-android-${{ matrix.tauri_target }}-" \
+            --limit 1 \
+            --json id \
+            --jq 'length')"
+          save="${{ needs.release-metadata.outputs.rust_dependencies_changed }}"
+          if [[ "${cache_count}" == "0" ]]; then
+            save=true
+          fi
+          echo "save=${save}" >> "${GITHUB_OUTPUT}"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ steps.cargo-cache-policy.outputs.save }}
           shared-key: android-${{ matrix.tauri_target }}
           workspaces: src-tauri
 
@@ -314,3 +385,57 @@ jobs:
             args+=(--prerelease=false)
           fi
           gh release edit "${args[@]}"
+
+  cleanup-caches:
+    name: Clean Superseded Cargo Caches
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Keep only the latest release cache per target
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_prefixes=(
+            v0-rust-desktop-aarch64-apple-darwin-
+            v0-rust-desktop-x86_64-apple-darwin-
+            v0-rust-desktop-x86_64-pc-windows-msvc-
+            v0-rust-android-aarch64-
+            v0-rust-android-armv7-
+            v0-rust-android-i686-
+            v0-rust-android-x86_64-
+          )
+          legacy_prefixes=(
+            v0-rust-build-desktop-Darwin-arm64-
+            v0-rust-build-desktop-Windows_NT-x64-
+          )
+
+          for prefix in "${current_prefixes[@]}"; do
+            gh cache list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --key "${prefix}" \
+              --sort created_at \
+              --order desc \
+              --limit 100 \
+              --json id \
+              --jq '.[1:] | .[].id' |
+              while IFS= read -r cache_id; do
+                gh cache delete "${cache_id}" --repo "${GITHUB_REPOSITORY}"
+              done
+          done
+
+          for prefix in "${legacy_prefixes[@]}"; do
+            gh cache list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --key "${prefix}" \
+              --limit 100 \
+              --json id \
+              --jq '.[].id' |
+              while IFS= read -r cache_id; do
+                gh cache delete "${cache_id}" --repo "${GITHUB_REPOSITORY}"
+              done
+          done

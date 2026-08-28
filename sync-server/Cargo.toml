@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "ecopaste-sync-server"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish = false
 
