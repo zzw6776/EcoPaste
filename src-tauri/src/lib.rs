@@ -46,6 +46,12 @@ pub fn run() {
         } else {
             log::LevelFilter::Info
         })
+        // Iroh 的传输与路径选择日志频率极高，应用侧只保留真正需要关注的警告与错误。
+        .level_for("iroh", log::LevelFilter::Warn)
+        .level_for("noq", log::LevelFilter::Warn)
+        .level_for("noq_proto", log::LevelFilter::Warn)
+        .level_for("swarm_discovery", log::LevelFilter::Warn)
+        .level_for("tracing::span", log::LevelFilter::Warn)
         .targets(log_targets)
         .build();
 
@@ -125,6 +131,8 @@ pub fn run() {
             commands::get_clipboard_image_path,
             commands::get_clipboard_app_icon_path,
             commands::save_clipboard_image_to_file,
+            commands::open_android_clipboard_file,
+            commands::save_android_clipboard_file,
             commands::get_file_icon_path,
             commands::write_to_clipboard,
             commands::paste_clipboard_item,
@@ -180,8 +188,15 @@ pub fn run() {
             commands::join_sync_group,
             commands::leave_sync_group,
             commands::set_sync_device_name,
+            commands::set_cloud_relay_auth_token,
             commands::sync_now,
             commands::reconnect_sync_peer,
+            commands::remove_sync_peer,
+            commands::discover_nearby_sync_spaces,
+            commands::request_nearby_sync_join,
+            commands::get_nearby_sync_join_attempt,
+            commands::list_incoming_sync_join_requests,
+            commands::respond_incoming_sync_join_request,
             commands::get_sync_item_statuses,
             commands::sync_item_now,
             commands::upload_sync_item,

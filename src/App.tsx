@@ -19,9 +19,35 @@ import { setMessageApi, setModalApi } from "./utils/feedback";
 import { isAndroid, isTauri } from "./utils/is";
 import { log } from "./utils/log";
 
+const ANTD_DRAWER_CONFIG = isAndroid
+  ? ({
+      classNames: ({ props }) => {
+        const placement = props.placement ?? "right";
+        const reachesTop = placement !== "bottom";
+        const reachesBottom = placement !== "top";
+
+        return {
+          body: reachesBottom ? "android-safe-drawer-body" : "",
+          header: reachesTop ? "android-safe-drawer-header" : "",
+        };
+      },
+    } satisfies ConfigProviderProps["drawer"])
+  : void 0;
+
 const ANTD_MODAL_CONFIG = {
   centered: true,
+  classNames: isAndroid
+    ? {
+        body: "android-safe-modal-body",
+        container: "android-safe-modal-container",
+        wrapper: "android-safe-modal-wrapper",
+      }
+    : void 0,
 } satisfies ConfigProviderProps["modal"];
+
+const ANTD_MESSAGE_TOP = isAndroid
+  ? "calc(var(--mobile-safe-area-top) + 1rem)"
+  : 56;
 
 /**
  * 把设置语言映射到 Ant Design 内置 locale。
@@ -33,6 +59,7 @@ const resolveAntdLocale = (language: Language) => {
 };
 
 import { AndroidPermissionsModal } from "@/components/AndroidPermissionsModal";
+import SyncJoinApproval from "@/components/SyncJoinApproval";
 import {
   androidState,
   checkAndAutoPromptAndroidPermissions,
@@ -51,6 +78,7 @@ const AppContent: FC = () => {
   return (
     <>
       <RouterProvider router={router} />
+      <SyncJoinApproval />
       {isAndroid && (
         <AndroidPermissionsModal
           onClose={closeAndroidPermissionsModal}
@@ -119,8 +147,13 @@ const App: FC = () => {
   });
 
   return (
-    <ConfigProvider locale={locale} modal={ANTD_MODAL_CONFIG} theme={antdTheme}>
-      <AntdApp message={{ duration: 1.5, maxCount: 2, top: 56 }}>
+    <ConfigProvider
+      drawer={ANTD_DRAWER_CONFIG}
+      locale={locale}
+      modal={ANTD_MODAL_CONFIG}
+      theme={antdTheme}
+    >
+      <AntdApp message={{ duration: 1.5, maxCount: 2, top: ANTD_MESSAGE_TOP }}>
         <AppContent />
       </AntdApp>
     </ConfigProvider>

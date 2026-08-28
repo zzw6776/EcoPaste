@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fs,
     io::Write,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::RwLock,
@@ -15,7 +16,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use crate::settings::SyncSettings;
+use crate::settings::{CloudRelayMode, SyncSettings};
 
 const IDENTITY_FILENAME: &str = "sync-identity.json";
 const PAIRING_PREFIX_V1: &str = "ecopaste-pair-v1:";
@@ -74,6 +75,9 @@ pub struct PersistedIdentity {
     pub device_name_customized: Option<bool>,
     pub iroh_secret_key: String,
     pub group: Option<GroupSecrets>,
+    /// 自定义 Relay 的 Bearer Token；与公开设置分离，并随身份文件使用受限权限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_relay_auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -92,6 +96,10 @@ pub struct PairingCode {
     pub server_relay_urls: Vec<String>,
     #[n(5)]
     pub inviter: ecopaste_sync_protocol::PeerAnnouncement,
+    #[n(6)]
+    #[cbor(default)]
+    #[serde(default)]
+    pub cloud_relay_mode: CloudRelayMode,
 }
 
 pub struct IdentityStore {
@@ -150,6 +158,46 @@ impl IdentityStore {
         guard.device_name_customized = Some(true);
         write_identity(&self.path, &guard)?;
         Ok(guard.clone())
+    }
+
+    pub fn cloud_relay_auth_token(&self) -> Option<String> {
+        self.current
+            .read()
+            .expect("sync identity poisoned")
+            .cloud_relay_auth_token
+            .clone()
+    }
+
+    pub fn set_cloud_relay_auth_token(&self, token: Option<String>) -> Result<()> {
+        let token = token
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if token
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+        {
+            bail!("Relay Token 格式无效");
+        }
+        let mut guard = self.current.write().expect("sync identity poisoned");
+        guard.cloud_relay_auth_token = token;
+        write_identity(&self.path, &guard)
+    }
+
+    /// Android Context 就绪后接收原生系统设备名，修正启动早期生成的回退名称。
+    #[cfg(target_os = "android")]
+    pub fn refresh_system_device_name(&self, name: String) -> Result<bool> {
+        let name = normalize_device_name(name);
+        if name.is_empty() {
+            return Ok(false);
+        }
+
+        let mut guard = self.current.write().expect("sync identity poisoned");
+        if !refresh_automatic_device_name_to(&mut guard, name) {
+            return Ok(false);
+        }
+
+        write_identity(&self.path, &guard)?;
+        Ok(true)
     }
 }
 
@@ -235,15 +283,20 @@ pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<Endp
             }
         }
     }
-    for relay in &settings.server_relay_urls {
-        let relay = relay.trim();
-        if !relay.is_empty() {
-            addresses.push(TransportAddr::Relay(
-                RelayUrl::from_str(relay).context("invalid Iroh relay URL")?,
-            ));
+    if settings.cloud_relay_mode == CloudRelayMode::Custom {
+        for relay in &settings.server_relay_urls {
+            let relay = relay.trim();
+            if !relay.is_empty() {
+                addresses.push(TransportAddr::Relay(
+                    RelayUrl::from_str(relay).context("invalid Iroh relay URL")?,
+                ));
+            }
         }
     }
     if addresses.is_empty() {
+        if settings.cloud_relay_mode == CloudRelayMode::Public {
+            return Ok(Some(EndpointAddr::new(endpoint_id)));
+        }
         if let Some(error) = direct_error {
             return Err(error);
         }
@@ -252,32 +305,28 @@ pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<Endp
     Ok(Some(EndpointAddr::from_parts(endpoint_id, addresses)))
 }
 
+/// 局域网同步只接收局域网 IP 路由，Relay 和公网直连地址不会进入拨号集合。
 pub fn peer_endpoint_addr(peer: &ecopaste_sync_protocol::PeerAnnouncement) -> Result<EndpointAddr> {
-    endpoint_addr(&peer.endpoint_id, &peer.direct_addresses, &peer.relay_urls)?
-        .context("peer has no endpoint id")
+    let endpoint_id =
+        EndpointId::from_str(peer.endpoint_id.trim()).context("invalid Iroh endpoint id")?;
+    let mut addresses = Vec::new();
+    for direct in &peer.direct_addresses {
+        let address: SocketAddr = direct.parse().context("invalid Iroh direct address")?;
+        if is_lan_ip(address.ip()) {
+            addresses.push(TransportAddr::Ip(address));
+        }
+    }
+    if addresses.is_empty() {
+        bail!("peer has no LAN address");
+    }
+    Ok(EndpointAddr::from_parts(endpoint_id, addresses))
 }
 
-fn endpoint_addr(
-    endpoint_id: &str,
-    direct_addresses: &[String],
-    relay_urls: &[String],
-) -> Result<Option<EndpointAddr>> {
-    if endpoint_id.trim().is_empty() {
-        return Ok(None);
+pub(super) fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback(),
     }
-    let endpoint_id = EndpointId::from_str(endpoint_id).context("invalid Iroh endpoint id")?;
-    let mut addresses = Vec::new();
-    for direct in direct_addresses {
-        addresses.push(TransportAddr::Ip(
-            direct.parse().context("invalid Iroh direct address")?,
-        ));
-    }
-    for relay in relay_urls {
-        addresses.push(TransportAddr::Relay(
-            RelayUrl::from_str(relay).context("invalid Iroh relay URL")?,
-        ));
-    }
-    Ok(Some(EndpointAddr::from_parts(endpoint_id, addresses)))
 }
 
 fn new_identity() -> PersistedIdentity {
@@ -291,6 +340,7 @@ fn new_identity() -> PersistedIdentity {
         device_name_customized: Some(false),
         iroh_secret_key: HEXLOWER.encode(&secret_key.to_bytes()),
         group: None,
+        cloud_relay_auth_token: None,
     }
 }
 
@@ -304,9 +354,17 @@ fn default_device_name() -> String {
 
 /// 升级旧身份中的自动名称，同时保留用户手动保存过的名称。
 fn refresh_automatic_device_name(identity: &mut PersistedIdentity) -> bool {
+    refresh_automatic_device_name_to(identity, default_device_name())
+}
+
+/// 用确定的系统名称替换自动名称，并保护用户手动保存的名称。
+fn refresh_automatic_device_name_to(identity: &mut PersistedIdentity, name: String) -> bool {
+    let legacy_automatic_name = is_legacy_automatic_name(&identity.device_name);
     let should_refresh = match identity.device_name_customized {
-        Some(customized) => !customized,
-        None => is_legacy_automatic_name(&identity.device_name),
+        Some(false) => true,
+        // 旧 Android 迁移曾把“厂商 + 硬件型号”误标为自定义名称；仅对可确认的旧自动值纠正。
+        Some(true) => cfg!(target_os = "android") && legacy_automatic_name,
+        None => legacy_automatic_name,
     };
     if !should_refresh {
         if identity.device_name_customized.is_none() {
@@ -316,7 +374,6 @@ fn refresh_automatic_device_name(identity: &mut PersistedIdentity) -> bool {
         return false;
     }
 
-    let name = default_device_name();
     let changed = identity.device_name != name || identity.device_name_customized != Some(false);
     identity.device_name = name;
     identity.device_name_customized = Some(false);
@@ -331,6 +388,7 @@ fn is_legacy_automatic_name(name: &str) -> bool {
 
     environment_device_name().is_some_and(|value| value.trim() == name)
         || platform_model_name().is_some_and(|value| value.trim() == name)
+        || platform_legacy_fallback_name().is_some_and(|value| value.trim() == name)
 }
 
 fn environment_device_name() -> Option<String> {
@@ -364,6 +422,11 @@ fn platform_model_name() -> Option<String> {
     crate::commands::android::android_device_model()
 }
 
+#[cfg(target_os = "android")]
+fn platform_legacy_fallback_name() -> Option<String> {
+    crate::commands::android::android_device_fallback_name()
+}
+
 #[cfg(target_os = "macos")]
 fn platform_device_name() -> Option<String> {
     #[allow(deprecated)]
@@ -375,6 +438,11 @@ fn platform_device_name() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn platform_model_name() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn platform_legacy_fallback_name() -> Option<String> {
     None
 }
 
@@ -390,6 +458,11 @@ fn platform_model_name() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn platform_legacy_fallback_name() -> Option<String> {
+    None
+}
+
 #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
 fn platform_device_name() -> Option<String> {
     None
@@ -397,6 +470,11 @@ fn platform_device_name() -> Option<String> {
 
 #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
 fn platform_model_name() -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
+fn platform_legacy_fallback_name() -> Option<String> {
     None
 }
 
@@ -453,6 +531,23 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[derive(Encode)]
+    #[cbor(array)]
+    struct LegacyCborPairingCode {
+        #[n(0)]
+        version: u16,
+        #[n(1)]
+        group: GroupSecrets,
+        #[n(2)]
+        server_endpoint_id: String,
+        #[n(3)]
+        server_direct_addresses: Vec<String>,
+        #[n(4)]
+        server_relay_urls: Vec<String>,
+        #[n(5)]
+        inviter: ecopaste_sync_protocol::PeerAnnouncement,
+    }
+
     fn pairing_code_fixture() -> PairingCode {
         PairingCode {
             version: 1,
@@ -469,6 +564,7 @@ mod tests {
                 relay_urls: vec!["https://relay.example.com".to_owned()],
                 last_seen_ms: 1_777_777_777_777,
             },
+            cloud_relay_mode: CloudRelayMode::Custom,
         }
     }
 
@@ -489,11 +585,35 @@ mod tests {
 
     #[test]
     fn legacy_pairing_code_remains_supported() {
-        let code = pairing_code_fixture();
-        let json = serde_json::to_vec(&code).unwrap();
+        let mut value = serde_json::to_value(pairing_code_fixture()).unwrap();
+        value.as_object_mut().unwrap().remove("cloudRelayMode");
+        let json = serde_json::to_vec(&value).unwrap();
         let encoded = format!("{PAIRING_PREFIX_V1}{}", BASE64URL_NOPAD.encode(&json));
 
-        assert_eq!(PairingCode::decode(&encoded).unwrap(), code);
+        assert_eq!(
+            PairingCode::decode(&encoded).unwrap().cloud_relay_mode,
+            CloudRelayMode::Off
+        );
+    }
+
+    #[test]
+    fn previous_cbor_pairing_code_defaults_relay_to_off() {
+        let code = pairing_code_fixture();
+        let legacy = LegacyCborPairingCode {
+            version: code.version,
+            group: code.group,
+            server_endpoint_id: code.server_endpoint_id,
+            server_direct_addresses: code.server_direct_addresses,
+            server_relay_urls: code.server_relay_urls,
+            inviter: code.inviter,
+        };
+        let payload = minicbor::to_vec(legacy).unwrap();
+        let encoded = format!("{PAIRING_PREFIX_V2}{}", BASE64URL_NOPAD.encode(&payload));
+
+        assert_eq!(
+            PairingCode::decode(&encoded).unwrap().cloud_relay_mode,
+            CloudRelayMode::Off
+        );
     }
 
     #[test]
@@ -504,6 +624,20 @@ mod tests {
 
         assert!(refresh_automatic_device_name(&mut identity));
         assert_eq!(identity.device_name, default_device_name());
+        assert_eq!(identity.device_name_customized, Some(false));
+    }
+
+    #[test]
+    fn automatic_name_accepts_explicit_native_system_name() {
+        let mut identity = new_identity();
+        identity.device_name = "Android".to_owned();
+        identity.device_name_customized = Some(false);
+
+        assert!(refresh_automatic_device_name_to(
+            &mut identity,
+            "OnePlus 13".to_owned(),
+        ));
+        assert_eq!(identity.device_name, "OnePlus 13");
         assert_eq!(identity.device_name_customized, Some(false));
     }
 
@@ -536,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_address_keeps_direct_and_relay_routes() {
+    fn peer_address_keeps_only_lan_routes() {
         let secret = SecretKey::generate();
         let peer = ecopaste_sync_protocol::PeerAnnouncement {
             device_id: "00112233445566778899aabbccddeeff".to_owned(),
@@ -551,7 +685,22 @@ mod tests {
         let address = peer_endpoint_addr(&peer).unwrap();
 
         assert_eq!(address.ip_addrs().count(), 1);
-        assert_eq!(address.relay_urls().count(), 1);
+        assert_eq!(address.relay_urls().count(), 0);
+    }
+
+    #[test]
+    fn peer_address_rejects_public_direct_routes() {
+        let peer = ecopaste_sync_protocol::PeerAnnouncement {
+            device_id: "00112233445566778899aabbccddeeff".to_owned(),
+            device_name: "Peer".to_owned(),
+            platform: "macos".to_owned(),
+            endpoint_id: SecretKey::generate().public().to_string(),
+            direct_addresses: vec!["203.0.113.10:53192".to_owned()],
+            relay_urls: vec!["https://relay.example.com".to_owned()],
+            last_seen_ms: 1,
+        };
+
+        assert!(peer_endpoint_addr(&peer).is_err());
     }
 
     #[tokio::test]
@@ -578,5 +727,34 @@ mod tests {
         let address = server_endpoint_addr(&settings).await.unwrap().unwrap();
 
         assert!(address.ip_addrs().next().is_some());
+    }
+
+    #[tokio::test]
+    async fn public_relay_allows_endpoint_id_only_cloud_route() {
+        let settings = SyncSettings {
+            cloud_enabled: true,
+            cloud_relay_mode: CloudRelayMode::Public,
+            server_endpoint_id: SecretKey::generate().public().to_string(),
+            ..Default::default()
+        };
+
+        let address = server_endpoint_addr(&settings).await.unwrap().unwrap();
+
+        assert!(address.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_relay_ignores_an_unresolvable_bootstrap_address() {
+        let settings = SyncSettings {
+            cloud_enabled: true,
+            cloud_relay_mode: CloudRelayMode::Public,
+            server_endpoint_id: SecretKey::generate().public().to_string(),
+            server_direct_addresses: vec!["invalid.invalid:4443".to_owned()],
+            ..Default::default()
+        };
+
+        let address = server_endpoint_addr(&settings).await.unwrap().unwrap();
+
+        assert!(address.is_empty());
     }
 }

@@ -1,7 +1,6 @@
 services:
   ecopaste-sync:
-    build: .
-    image: ecopaste-sync-server:local
+    image: zzw6776/ecopaste-sync-server:${ECOPASTE_SYNC_IMAGE_TAG:-latest}
     restart: unless-stopped
     ports:
       - "4443:4443/udp"
@@ -10,5 +9,10 @@ services:
       ECOPASTE_BIND: 0.0.0.0:4443
       ECOPASTE_MAX_BLOB_BYTES: 2147483648
       RUST_LOG: info
-    tmpfs:
-      - /data
+    volumes:
+      - ecopaste-sync-data:/data
+
+volumes:
+  ecopaste-sync-data:
+    external: true
+    name: ecopaste-sync-data

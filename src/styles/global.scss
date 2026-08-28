@@ -8,8 +8,10 @@ body,
 
 html {
   --uno: scheme-light select-none overscroll-none antialiased;
-  --mobile-safe-area-top: max(env(safe-area-inset-top, 0px), 2rem);
-  --mobile-safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 0.75rem);
+  --mobile-system-inset-top: env(safe-area-inset-top, 0px);
+  --mobile-system-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --mobile-safe-area-top: max(var(--mobile-system-inset-top), 2rem);
+  --mobile-safe-area-bottom: max(var(--mobile-system-inset-bottom), 0.75rem);
 
   &.dark {
     --uno: scheme-dark;
@@ -33,6 +35,42 @@ html {
 }
 
 .mobile-safe-area-bottom {
+  padding-bottom: var(--mobile-safe-area-bottom) !important;
+}
+
+/* Portal 不继承页面布局安全区，需要在保留 antd 默认间距的基础上额外避让。 */
+.android-safe-drawer-header {
+  padding-top: calc(1rem + var(--mobile-safe-area-top)) !important;
+}
+
+.android-safe-drawer-body {
+  padding-bottom: calc(1.5rem + var(--mobile-safe-area-bottom)) !important;
+}
+
+.android-safe-modal-wrapper {
+  padding-top: var(--mobile-safe-area-top) !important;
+  padding-bottom: var(--mobile-safe-area-bottom) !important;
+}
+
+.android-safe-modal-container {
+  display: flex;
+  max-height: calc(
+    100dvh - var(--mobile-safe-area-top) - var(--mobile-safe-area-bottom)
+  );
+  flex-direction: column;
+}
+
+.android-safe-modal-body {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.android-safe-onboarding-content {
+  padding-bottom: calc(5rem + var(--mobile-safe-area-bottom)) !important;
+}
+
+.android-safe-onboarding-footer {
+  height: calc(4rem + var(--mobile-safe-area-bottom)) !important;
   padding-bottom: var(--mobile-safe-area-bottom) !important;
 }
 

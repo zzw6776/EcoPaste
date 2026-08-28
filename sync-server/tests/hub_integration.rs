@@ -25,12 +25,13 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await?;
+    let client_endpoint_id = client.id().to_string();
     let connection = client.connect(server_address, ALPN).await?;
 
     assert!(matches!(
         call(&connection, Request::Health).await?,
         Response::Health {
-            protocol_version: 1,
+            protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
             ..
         }
     ));
@@ -60,7 +61,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let first = sync_request(
         &group_id,
         &access_token,
-        device("device_123456", "Mac"),
+        device("device_123456", "Mac", &client_endpoint_id),
         0,
         vec![event.clone()],
     );
@@ -115,7 +116,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let notify_watch = sync_request(
         &group_id,
         &access_token,
-        device("device_123456", "Mac"),
+        device("device_123456", "Mac", &client_endpoint_id),
         1,
         vec![next_event.clone()],
     );
@@ -133,7 +134,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let second = sync_request(
         &group_id,
         &access_token,
-        device("device_654321", "Windows"),
+        device("device_654321", "Windows", &client_endpoint_id),
         0,
         Vec::new(),
     );
@@ -148,7 +149,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let unauthorized = sync_request(
         &group_id,
         &[7_u8; 32],
-        device("device_987654", "Android"),
+        device("device_987654", "Android", &client_endpoint_id),
         0,
         Vec::new(),
     );
@@ -172,12 +173,12 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     Ok(())
 }
 
-fn device(device_id: &str, name: &str) -> DeviceAnnouncement {
+fn device(device_id: &str, name: &str, endpoint_id: &str) -> DeviceAnnouncement {
     DeviceAnnouncement {
         device_id: device_id.into(),
         device_name: name.into(),
         platform: "test".into(),
-        endpoint_id: format!("endpoint_{device_id}"),
+        endpoint_id: endpoint_id.into(),
         direct_addresses: vec!["127.0.0.1:44820".into()],
         relay_urls: Vec::new(),
     }

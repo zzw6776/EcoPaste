@@ -158,7 +158,10 @@ export interface CleanCacheResult {
 
 export interface SyncStatus {
   enabled: boolean;
+  lanEnabled: boolean;
   cloudEnabled: boolean;
+  cloudRelayMode: "off" | "public" | "custom";
+  cloudRelayAuthConfigured: boolean;
   paired: boolean;
   deviceId: string;
   deviceName: string;
@@ -173,6 +176,9 @@ export interface SyncStatus {
   lastSuccessAt: string | null;
   lan: SyncChannelStatus;
   cloud: SyncChannelStatus;
+  cloudWatch: SyncChannelStatus;
+  cloudConnectedAddress: string | null;
+  cloudTransport: string | null;
   peers: SyncPeerStatus[];
 }
 
@@ -199,6 +205,7 @@ export type SyncChannelState =
   | "idle"
   | "connecting"
   | "online"
+  | "degraded"
   | "error";
 
 export interface SyncChannelStatus {
@@ -246,10 +253,61 @@ export interface SyncPairingPreview {
   sameGroup: boolean;
 }
 
+export interface NearbySyncDevice {
+  deviceName: string;
+  platform: string;
+  endpointId: string;
+  directAddresses: string[];
+  relayUrls: string[];
+  lastSeenAt: string;
+}
+
+export interface NearbySyncSpace {
+  spaceId: string;
+  sameGroup: boolean;
+  devices: NearbySyncDevice[];
+}
+
+export type NearbyJoinState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "error";
+
+export interface NearbyJoinAttempt {
+  requestId: string;
+  targetDeviceName: string;
+  comparisonCode: string;
+  state: NearbyJoinState;
+  expiresAt: string;
+  pairingCode: string | null;
+  lastError: string | null;
+}
+
+export interface IncomingJoinRequest {
+  requestId: string;
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  endpointId: string;
+  comparisonCode: string;
+  previouslyRemoved: boolean;
+  expiresAt: string;
+}
+
 export const getSyncStatus = async () => {
   return call<SyncStatus>(
     TAURI_COMMAND.GET_SYNC_STATUS,
     "commands:labels.loadSyncStatus",
+  );
+};
+
+export const setCloudRelayAuthToken = async (token: string | null) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.SET_CLOUD_RELAY_AUTH_TOKEN,
+    "commands:labels.setCloudRelayAuthToken",
+    { token },
   );
 };
 
@@ -318,6 +376,55 @@ export const reconnectSyncPeer = async (deviceId?: string) => {
     TAURI_COMMAND.RECONNECT_SYNC_PEER,
     "commands:labels.reconnectSyncPeer",
     { deviceId },
+  );
+};
+
+export const removeSyncPeer = async (deviceId: string) => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.REMOVE_SYNC_PEER,
+    "commands:labels.removeSyncPeer",
+    { deviceId },
+  );
+};
+
+export const discoverNearbySyncSpaces = async () => {
+  return call<NearbySyncSpace[]>(
+    TAURI_COMMAND.DISCOVER_NEARBY_SYNC_SPACES,
+    "commands:labels.discoverNearbySyncSpaces",
+  );
+};
+
+export const requestNearbySyncJoin = async (endpointId: string) => {
+  return call<NearbyJoinAttempt>(
+    TAURI_COMMAND.REQUEST_NEARBY_SYNC_JOIN,
+    "commands:labels.requestNearbySyncJoin",
+    { endpointId },
+  );
+};
+
+export const getNearbySyncJoinAttempt = async (requestId: string) => {
+  return call<NearbyJoinAttempt | null>(
+    TAURI_COMMAND.GET_NEARBY_SYNC_JOIN_ATTEMPT,
+    "commands:labels.loadNearbySyncJoinAttempt",
+    { requestId },
+  );
+};
+
+export const listIncomingSyncJoinRequests = async () => {
+  return call<IncomingJoinRequest[]>(
+    TAURI_COMMAND.LIST_INCOMING_SYNC_JOIN_REQUESTS,
+    "commands:labels.loadIncomingSyncJoinRequests",
+  );
+};
+
+export const respondIncomingSyncJoinRequest = async (
+  requestId: string,
+  approved: boolean,
+) => {
+  return call<void>(
+    TAURI_COMMAND.RESPOND_INCOMING_SYNC_JOIN_REQUEST,
+    "commands:labels.respondIncomingSyncJoinRequest",
+    { approved, requestId },
   );
 };
 
@@ -1183,6 +1290,28 @@ export const saveClipboardImageToFile = async (id: string) => {
   }
 
   return path;
+};
+
+/** Android：通过系统应用选择器打开文件记录中的一个文件。 */
+export const openAndroidClipboardFile = async (id: string, index: number) => {
+  await call<void>(
+    TAURI_COMMAND.OPEN_ANDROID_CLIPBOARD_FILE,
+    "commands:labels.openFile",
+    { id, index },
+  );
+};
+
+/** Android：通过系统文档选择器另存文件；取消选择时返回 false。 */
+export const saveAndroidClipboardFile = async (id: string, index: number) => {
+  const saved = await call<boolean>(
+    TAURI_COMMAND.SAVE_ANDROID_CLIPBOARD_FILE,
+    "commands:labels.saveFile",
+    { id, index },
+  );
+  if (saved) {
+    getMessageApi().success(i18n.t("commands:messages.fileSaved"));
+  }
+  return saved;
 };
 
 /**

@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useMount, useUnmount } from "ahooks";
-import { Button, Popover, Tooltip } from "antd";
-import type { FC } from "react";
+import { Button, Drawer } from "antd";
+import type { FC, MouseEventHandler, ReactElement } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -10,8 +10,11 @@ import {
   type SyncChannelState,
   type SyncStatus,
 } from "@/commands";
+import Popover from "@/components/Popover";
+import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import { cn } from "@/utils/cn";
+import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
 import CloudRecordsDrawer from "./CloudRecordsDrawer";
 
@@ -24,6 +27,9 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const { t } = useTranslation("clipboard");
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
+  const [detailsTarget, setDetailsTarget] = useState<"lan" | "cloud" | null>(
+    null,
+  );
   const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
   const mountedRef = useRef(false);
   const unlistenRef = useRef<null | (() => void)>(null);
@@ -72,6 +78,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   }
 
   function handleOpenRecords() {
+    setDetailsTarget(null);
     setRecordsOpen(true);
   }
 
@@ -79,90 +86,183 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     setRecordsOpen(false);
   }
 
+  function handleOpenLanDetails() {
+    setDetailsTarget("lan");
+  }
+
+  function handleOpenCloudDetails() {
+    setDetailsTarget("cloud");
+  }
+
+  function handleCloseDetails() {
+    setDetailsTarget(null);
+  }
+
+  function handleReconnectAll() {
+    void handleReconnect();
+  }
+
   const lanState = status?.lan.state ?? "disabled";
   const cloudState = status?.cloud.state ?? "disabled";
   const buttonClassName = compact ? "size-8" : "size-7";
+  const lanLabel = t(`syncStatus.lan.${lanState}`);
+  const cloudLabel = t(`syncStatus.cloud.${cloudState}`);
+  const cloudDetails = (
+    <CloudDetails
+      addresses={[...(status?.cloudDirectAddresses ?? [])]}
+      endpointId={status?.cloudEndpointId ?? ""}
+      onOpenRecords={handleOpenRecords}
+      showTitle={!isAndroid}
+      status={status}
+    />
+  );
 
   return (
-    <div className="flex shrink-0 items-center gap-0.5">
-      <Popover
-        content={
-          <LanDetails
-            onReconnect={handleReconnect}
-            reconnectingKey={reconnectingKey}
-            status={status}
-          />
-        }
-        placement="bottomRight"
-        trigger="click"
-      >
-        <Tooltip title={t(`syncStatus.lan.${lanState}`)}>
-          <button
-            aria-label={t(`syncStatus.lan.${lanState}`)}
-            className={cn(
-              "flex cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary",
+    <>
+      <div className="flex shrink-0 items-center gap-0.5">
+        {isAndroid ? (
+          <>
+            {renderStatusButton(
+              lanLabel,
+              "i-lucide:wifi",
+              lanState,
               buttonClassName,
-              stateClassName(lanState),
+              handleOpenLanDetails,
             )}
-            type="button"
-          >
-            <i
-              className={cn(
-                "i-lucide:wifi size-4",
-                lanState === "connecting" && "animate-pulse",
+            {renderStatusButton(
+              cloudLabel,
+              "i-lucide:cloud",
+              cloudState,
+              buttonClassName,
+              handleOpenCloudDetails,
+            )}
+          </>
+        ) : (
+          <>
+            <Popover
+              content={
+                <LanDetails
+                  onReconnect={handleReconnect}
+                  reconnectingKey={reconnectingKey}
+                  status={status}
+                />
+              }
+              placement="bottomRight"
+              tooltip={lanLabel}
+              trigger="click"
+            >
+              {renderStatusButton(
+                lanLabel,
+                "i-lucide:wifi",
+                lanState,
+                buttonClassName,
               )}
-            />
-          </button>
-        </Tooltip>
-      </Popover>
+            </Popover>
 
-      <Popover
-        content={
-          <CloudDetails
-            addresses={[
-              ...(status?.cloudDirectAddresses ?? []),
-              ...(status?.cloudRelayUrls ?? []),
-            ]}
-            endpointId={status?.cloudEndpointId ?? ""}
-            onOpenRecords={handleOpenRecords}
-            status={status}
-          />
-        }
-        placement="bottomRight"
-        trigger="click"
-      >
-        <Tooltip title={t(`syncStatus.cloud.${cloudState}`)}>
-          <button
-            aria-label={t(`syncStatus.cloud.${cloudState}`)}
-            className={cn(
-              "flex cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary",
-              buttonClassName,
-              stateClassName(cloudState),
-            )}
-            type="button"
-          >
-            <i
-              className={cn(
-                "i-lucide:cloud size-4",
-                cloudState === "connecting" && "animate-pulse",
+            <Popover
+              content={cloudDetails}
+              placement="bottomRight"
+              tooltip={cloudLabel}
+              trigger="click"
+            >
+              {renderStatusButton(
+                cloudLabel,
+                "i-lucide:cloud",
+                cloudState,
+                buttonClassName,
               )}
+            </Popover>
+          </>
+        )}
+      </div>
+
+      {isAndroid ? (
+        <Drawer
+          destroyOnHidden
+          extra={
+            detailsTarget === "lan" ? (
+              <Button
+                aria-label={t("syncStatus.lan.reconnectAll")}
+                disabled={
+                  !status?.lanEnabled ||
+                  !status?.peers.length ||
+                  reconnectingKey !== null
+                }
+                icon={<i className="i-lucide:refresh-cw size-4" />}
+                loading={reconnectingKey === "all"}
+                onClick={handleReconnectAll}
+                type="text"
+              />
+            ) : null
+          }
+          onClose={handleCloseDetails}
+          open={detailsTarget !== null}
+          placement="bottom"
+          title={
+            detailsTarget === "lan"
+              ? t("syncStatus.lan.title")
+              : t("syncStatus.cloud.title")
+          }
+        >
+          {detailsTarget === "lan" ? (
+            <LanDetails
+              onReconnect={handleReconnect}
+              reconnectingKey={reconnectingKey}
+              showHeader={false}
+              status={status}
             />
-          </button>
-        </Tooltip>
-      </Popover>
+          ) : (
+            cloudDetails
+          )}
+        </Drawer>
+      ) : null}
+
       <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
-    </div>
+    </>
   );
 };
+
+/**
+ * 渲染局域网与云端状态按钮；移动端直接响应点击，桌面端由 Popover 接管。
+ */
+function renderStatusButton(
+  label: string,
+  icon: string,
+  state: SyncChannelState,
+  buttonClassName: string,
+  onClick?: MouseEventHandler<HTMLButtonElement>,
+): ReactElement {
+  return (
+    <button
+      aria-label={label}
+      className={cn(
+        "flex cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary",
+        buttonClassName,
+        stateClassName(state),
+      )}
+      onClick={onClick}
+      type="button"
+    >
+      <i
+        className={cn(
+          icon,
+          "size-4",
+          state === "connecting" && "animate-pulse",
+        )}
+      />
+    </button>
+  );
+}
 
 interface LanDetailsProps {
   onReconnect: (deviceId?: string) => Promise<void>;
   reconnectingKey: string | null;
+  showHeader?: boolean;
   status: SyncStatus | null;
 }
 
 const LanDetails: FC<LanDetailsProps> = (props) => {
-  const { onReconnect, reconnectingKey, status } = props;
+  const { onReconnect, reconnectingKey, showHeader = true, status } = props;
   const { t } = useTranslation("clipboard");
 
   function handleReconnectAll() {
@@ -170,21 +270,32 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
   }
 
   return (
-    <div className="flex w-72 flex-col gap-2 text-sm">
-      <div className="flex items-center justify-between gap-2">
-        <strong>{t("syncStatus.lan.title")}</strong>
-        <Tooltip title={t("syncStatus.lan.reconnectAll")}>
-          <Button
-            aria-label={t("syncStatus.lan.reconnectAll")}
-            disabled={!status?.peers.length || reconnectingKey !== null}
-            icon={<i className="i-lucide:refresh-cw size-3.5" />}
-            loading={reconnectingKey === "all"}
-            onClick={handleReconnectAll}
-            size="small"
-            type="text"
-          />
-        </Tooltip>
-      </div>
+    <div
+      className={cn(
+        "flex flex-col gap-2 text-sm",
+        showHeader ? "w-72" : "w-full",
+      )}
+    >
+      {showHeader ? (
+        <div className="flex items-center justify-between gap-2">
+          <strong>{t("syncStatus.lan.title")}</strong>
+          <Tooltip title={t("syncStatus.lan.reconnectAll")}>
+            <Button
+              aria-label={t("syncStatus.lan.reconnectAll")}
+              disabled={
+                !status?.lanEnabled ||
+                !status?.peers.length ||
+                reconnectingKey !== null
+              }
+              icon={<i className="i-lucide:refresh-cw size-3.5" />}
+              loading={reconnectingKey === "all"}
+              onClick={handleReconnectAll}
+              size="small"
+              type="text"
+            />
+          </Tooltip>
+        </div>
+      ) : null}
       {status?.peers.length ? (
         status.peers.map((peer) => {
           return (
@@ -192,7 +303,7 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
               key={peer.deviceId}
               onReconnect={onReconnect}
               peer={peer}
-              reconnectDisabled={reconnectingKey !== null}
+              reconnectDisabled={!status.lanEnabled || reconnectingKey !== null}
               reconnecting={reconnectingKey === peer.deviceId}
             />
           );
@@ -216,15 +327,26 @@ interface LanPeerDetailsProps {
 const LanPeerDetails: FC<LanPeerDetailsProps> = (props) => {
   const { onReconnect, peer, reconnectDisabled, reconnecting } = props;
   const { t } = useTranslation("clipboard");
-  const addresses = peer.connectedAddress
-    ? [peer.connectedAddress]
-    : peer.directAddresses;
+  const [candidateAddressesOpen, setCandidateAddressesOpen] = useState(false);
+  const isOnline = peer.state === "online";
+  const connectedAddress = isOnline ? peer.connectedAddress : null;
+  const candidateAddresses = peer.directAddresses.filter(
+    (address, index, addresses) => {
+      return (
+        address !== connectedAddress && addresses.indexOf(address) === index
+      );
+    },
+  );
   const reconnectLabel = t("syncStatus.lan.reconnectDevice", {
     device: peer.deviceName,
   });
 
   function handleReconnect() {
     void onReconnect(peer.deviceId);
+  }
+
+  function handleCandidateAddressesToggle() {
+    setCandidateAddressesOpen((open) => !open);
   }
 
   return (
@@ -250,20 +372,49 @@ const LanPeerDetails: FC<LanPeerDetailsProps> = (props) => {
       </div>
       <div className="mt-1 text-ant-secondary text-xs">
         {peer.platform}
-        {peer.transport
+        {isOnline && peer.transport
           ? ` · ${t(`syncStatus.transport.${peer.transport}`)}`
           : ""}
       </div>
-      {addresses.map((address) => {
-        return (
-          <div
-            className="mt-1 break-all font-mono text-ant-secondary text-xs"
-            key={address}
+      {connectedAddress ? (
+        <div className="mt-1 break-all font-mono text-ant-secondary text-xs">
+          {connectedAddress}
+        </div>
+      ) : null}
+      {!isOnline && candidateAddresses.length > 0 ? (
+        <>
+          <button
+            aria-expanded={candidateAddressesOpen}
+            className="mt-1 flex cursor-pointer items-center gap-1 border-0 bg-transparent p-0 text-ant-secondary text-xs hover:text-ant-text"
+            onClick={handleCandidateAddressesToggle}
+            type="button"
           >
-            {address}
-          </div>
-        );
-      })}
+            <i
+              className={cn(
+                "i-lucide:chevron-right size-3 transition-transform",
+                candidateAddressesOpen && "rotate-90",
+              )}
+            />
+            <span>
+              {t("syncStatus.candidateAddresses", {
+                count: candidateAddresses.length,
+              })}
+            </span>
+          </button>
+          {candidateAddressesOpen
+            ? candidateAddresses.map((address) => {
+                return (
+                  <div
+                    className="mt-1 break-all font-mono text-ant-secondary text-xs"
+                    key={address}
+                  >
+                    {address}
+                  </div>
+                );
+              })
+            : null}
+        </>
+      ) : null}
       {peer.lastSeenAt ? (
         <div className="mt-1 text-ant-secondary text-xs">
           {t("syncStatus.lastSeen", {
@@ -282,17 +433,29 @@ interface CloudDetailsProps {
   addresses: readonly string[];
   endpointId: string;
   onOpenRecords: () => void;
+  showTitle?: boolean;
   status: SyncStatus | null;
 }
 
 const CloudDetails: FC<CloudDetailsProps> = (props) => {
-  const { addresses, endpointId, onOpenRecords, status } = props;
+  const {
+    addresses,
+    endpointId,
+    onOpenRecords,
+    showTitle = true,
+    status,
+  } = props;
   const { t } = useTranslation("clipboard");
   const cloud = status?.cloud;
 
   return (
-    <div className="flex w-72 flex-col gap-2 text-sm">
-      <strong>{t("syncStatus.cloud.title")}</strong>
+    <div
+      className={cn(
+        "flex flex-col gap-2 text-sm",
+        showTitle ? "w-72" : "w-full",
+      )}
+    >
+      {showTitle ? <strong>{t("syncStatus.cloud.title")}</strong> : null}
       <span
         className={cn("text-xs", stateClassName(cloud?.state ?? "disabled"))}
       >
@@ -315,6 +478,16 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
             );
           })
         : null}
+      {status?.cloudEnabled && status.cloudConnectedAddress ? (
+        <div className="break-all font-mono text-ant-secondary text-xs">
+          {t("syncStatus.cloud.activeRoute", {
+            address: status.cloudConnectedAddress,
+            transport: t(
+              `syncStatus.transport.${status.cloudTransport ?? "unknown"}`,
+            ),
+          })}
+        </div>
+      ) : null}
       {cloud?.lastSuccessAt ? (
         <span className="text-ant-secondary text-xs">
           {t("syncStatus.lastSuccess", {
@@ -349,6 +522,8 @@ function stateClassName(state: SyncChannelState) {
       return "text-ant-success";
     case "connecting":
       return "text-ant-info";
+    case "degraded":
+      return "text-ant-warning";
     case "error":
       return "text-ant-error";
     default:

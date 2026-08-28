@@ -770,17 +770,21 @@
       "pairDevice": "添加新设备",
       "reconnectAll": "重新连接全部设备",
       "reconnectDevice": "重新连接 {{device}}",
+      "removeDevice": "删除设备",
+      "removeDeviceNamed": "删除 {{device}}",
       "saveName": "保存名称",
       "saveServer": "保存",
       "scanQrCode": "扫描二维码",
       "syncNow": "立即同步",
       "usePairingCode": "改用配对码"
     },
+    "candidateAddresses": "{{count}} 个候选地址",
     "channels": {
       "cloud": "云端",
       "lan": "局域网"
     },
     "cloud": {
+      "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
       "description": "云端仅保存端到端加密的数据；认证和解密都在本机完成。",
       "directAddresses": "Hub 直连地址",
       "disabledHint": "开启后可配置 Hub，并在局域网不可用时自动使用云端。",
@@ -788,6 +792,18 @@
       "enabled": "启用云端同步",
       "endpointId": "Hub Endpoint ID",
       "records": "查看云端记录",
+      "relay": {
+        "custom": "自定义 Relay",
+        "description": "只影响云端 Hub；局域网同步始终禁止使用 Relay。",
+        "enabled": "允许云端使用 Relay",
+        "public": "免费公共 Relay",
+        "publicHint": "使用 Iroh 公共 Relay，无需 Token；服务可能限流，不提供可用性保证。",
+        "title": "云端 Relay",
+        "token": "Relay Token（可选）",
+        "tokenConfigured": "已配置；留空且不修改将继续保留",
+        "tokenHint": "仅自建 Relay 要求认证时填写，Token 保存在本机受限身份文件中。输入空值并保存可清除。",
+        "tokenPlaceholder": "Bearer Token"
+      },
       "relayUrls": "Hub Relay 地址（可选）",
       "save": "保存云端配置",
       "title": "云端 Hub 配置"
@@ -798,18 +814,51 @@
       "title": "选择以哪台设备为准",
       "warning": "二维码由“{{device}}”生成。加入对方会清除本机旧同步队列和设备路由，但保留本地剪贴板历史；保留本机则会显示本机二维码，请让对方扫描。"
     },
+    "deviceName": {
+      "description": "其他设备会看到这个名称；默认使用系统设置中的设备名称。",
+      "placeholder": "设备名称",
+      "title": "本机名称"
+    },
     "joinPlaceholder": "粘贴另一台设备生成的配对码",
     "joinTitle": "连接已有设备",
+    "lan": {
+      "enabled": "启用局域网同步"
+    },
     "lastSeen": "最近发现：{{time}}",
     "lastSuccess": "最近成功：{{time}}",
     "leaveTitle": "断开本机连接",
     "leaveWarning": "本机的同步身份、投递队列和设备路由缓存会被清除，本地剪贴板历史不会删除。",
+    "nearby": {
+      "approvalDescription": "请确认 {{device}} 上显示的短码与下方一致。批准后会通过当前 Iroh 加密连接发送配对信息。",
+      "approvalTitle": "允许“{{device}}”加入？",
+      "approve": "允许加入",
+      "comparisonCode": "双端核对短码",
+      "comparisonCodeHint": "请在 {{device}} 上确认相同短码，然后批准申请",
+      "currentSpace": "当前同步空间",
+      "description": "仅扫描当前局域网，不经过云端，也不会自动加入。",
+      "empty": "没有发现可加入的同步空间，可刷新或继续使用二维码",
+      "joinApproved": "确认加入",
+      "reject": "拒绝",
+      "removedDeviceWarning": "该设备之前已被删除。本次批准会重新授权，并将恢复状态同步给其他设备。",
+      "requestJoin": "申请加入",
+      "scanning": "正在扫描附近设备…",
+      "states": {
+        "approved": "已有设备已批准，请确认加入",
+        "error": "申请失败",
+        "expired": "申请已超时",
+        "pending": "等待已有设备批准，60 秒后自动失效",
+        "rejected": "已有设备已拒绝"
+      },
+      "title": "附近同步空间"
+    },
     "noPeers": "暂无已配对设备",
     "notPaired": "未连接",
     "paired": "已连接",
     "pairingCodeFallback": "无法扫码时，可复制下面的配对码到另一台设备：",
     "pairingCodeHint": "此配对码包含同步密钥，请只通过可信渠道交给自己的设备。完成连接后关闭本窗口。",
     "pairingCodeTitle": "设备配对码",
+    "removeTitle": "删除“{{device}}”？",
+    "removeWarning": "删除标记会通过局域网和云端传播到同步空间内的其他设备。各设备会删除“{{device}}”的路由和投递状态，该设备上线后会自动退出同步空间。已有剪贴板历史不会删除。",
     "routes": {
       "cloud": "云端",
       "lan": "局域网直连",
@@ -828,6 +877,7 @@
     },
     "states": {
       "connecting": "连接中",
+      "degraded": "部分异常",
       "disabled": "未启用",
       "error": "异常",
       "idle": "离线",

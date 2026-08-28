@@ -29,6 +29,13 @@ pub struct AndroidEngineResult {
     pub message: String,
 }
 
+/// Result returned by the Android native file bridge without user-facing text.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AndroidFileActionResult {
+    pub status: String,
+    pub message: String,
+}
+
 #[cfg(target_os = "android")]
 static GLOBAL_VM: std::sync::OnceLock<jni::JavaVM> = std::sync::OnceLock::new();
 #[cfg(target_os = "android")]
@@ -37,9 +44,67 @@ static GLOBAL_CONTEXT: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync:
 static BRIDGE_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
 #[cfg(target_os = "android")]
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+struct PendingAutomaticDeviceName {
+    value: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PendingAutomaticDeviceName {
+    fn replace(&self, name: String) {
+        *self.value.lock().expect("pending device name poisoned") = Some(name);
+    }
+
+    fn take(&self) -> Option<String> {
+        self.value
+            .lock()
+            .expect("pending device name poisoned")
+            .take()
+    }
+
+    fn restore_if_empty(&self, name: String) {
+        let mut pending = self.value.lock().expect("pending device name poisoned");
+        if pending.is_none() {
+            *pending = Some(name);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+static PENDING_AUTOMATIC_DEVICE_NAME: std::sync::LazyLock<PendingAutomaticDeviceName> =
+    std::sync::LazyLock::new(PendingAutomaticDeviceName::default);
+
 #[cfg(target_os = "android")]
 pub fn set_app_handle(app_handle: tauri::AppHandle) {
     let _ = APP_HANDLE.set(app_handle);
+    refresh_pending_automatic_device_name();
+}
+
+/// 暂存 Android 系统名称，并在 Rust 同步运行时就绪后可靠交付。
+#[cfg(target_os = "android")]
+fn enqueue_automatic_device_name(name: String) {
+    PENDING_AUTOMATIC_DEVICE_NAME.replace(name);
+    refresh_pending_automatic_device_name();
+}
+
+/// 消费已取得的系统名称；运行时未就绪或持久化失败时保留待下次重试。
+#[cfg(target_os = "android")]
+fn refresh_pending_automatic_device_name() {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() else {
+        return;
+    };
+    let Some(name) = PENDING_AUTOMATIC_DEVICE_NAME.take() else {
+        return;
+    };
+
+    if let Err(error) = manager.refresh_system_device_name(name.clone()) {
+        PENDING_AUTOMATIC_DEVICE_NAME.restore_if_empty(name);
+        log::warn!("refresh Android automatic device name failed: {error}");
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -299,6 +364,30 @@ fn paste_overlay_item(id: String) -> Result<()> {
 }
 
 #[cfg(target_os = "android")]
+fn persist_overlay_panel_height_percent(height_percent: i32) -> Result<()> {
+    if !(30..=90).contains(&height_percent) {
+        return Err(
+            anyhow::anyhow!("Android gesture popup height must be between 30% and 90%").into(),
+        );
+    }
+
+    let app = APP_HANDLE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    let next = app
+        .state::<crate::settings::SettingsStore>()
+        .update(serde_json::json!({
+            "android": {
+                "gesture": {
+                    "popupHeightPercent": height_percent,
+                },
+            },
+        }))?;
+    crate::commands::settings::emit_settings_updated(app, &next);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_initNdkContext(
     raw_env: *mut jni::sys::JNIEnv,
@@ -531,6 +620,26 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_pasteOverla
 
 #[cfg(target_os = "android")]
 #[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_persistOverlayPanelHeightPercent(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    height_percent: jni::sys::jint,
+) -> jni::sys::jboolean {
+    match std::panic::catch_unwind(|| persist_overlay_panel_height_percent(height_percent)) {
+        Ok(Ok(())) => 1,
+        Ok(Err(error)) => {
+            log::error!("persist Android overlay panel height failed: {error}");
+            0
+        }
+        Err(_) => {
+            log::error!("persist Android overlay panel height panicked");
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
 pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncNetworkChanged(
     _raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
@@ -541,6 +650,23 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncN
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
         manager.wake();
     }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_refreshAutomaticDeviceName(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    name: jni::sys::jstring,
+) {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return;
+    };
+    let name = jni::objects::JString::from_raw(name);
+    let Ok(name) = env.get_string(&name).map(String::from) else {
+        return;
+    };
+    enqueue_automatic_device_name(name);
 }
 
 #[cfg(target_os = "android")]
@@ -632,6 +758,10 @@ mod jni_bridge {
         read_device_string("getDeviceModel", "()Ljava/lang/String;", false)
     }
 
+    pub fn device_fallback_name() -> Result<String> {
+        read_device_string("getDeviceFallbackName", "()Ljava/lang/String;", false)
+    }
+
     pub fn request_permission(kind: &str) -> Result<()> {
         with_jni_env(|env, context, bridge_class| {
             let kind_jstr = env
@@ -707,6 +837,63 @@ mod jni_bridge {
         })
     }
 
+    fn file_action(method: &str, path: &std::path::Path) -> Result<AndroidFileActionResult> {
+        with_jni_env(|env, context, bridge_class| {
+            let path = path
+                .to_str()
+                .ok_or_else(|| anyhow!("Android clipboard file path is not valid UTF-8"))?;
+            let path_jstr = env
+                .new_string(path)
+                .map_err(|e| anyhow!("new_string failed: {e}"))?;
+            let result = env
+                .call_static_method(
+                    bridge_class,
+                    method,
+                    "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(context), JValue::Object(&path_jstr)],
+                )
+                .map_err(|e| anyhow!("call {method} failed: {e}"))?;
+            let result: JString = result
+                .l()
+                .map_err(|e| anyhow!("extract {method} result failed: {e}"))?
+                .into();
+            let json: String = env
+                .get_string(&result)
+                .map_err(|e| anyhow!("read {method} result failed: {e}"))?
+                .into();
+
+            serde_json::from_str(&json)
+                .map_err(|e| anyhow!("parse {method} result failed: {e}").into())
+        })
+    }
+
+    pub fn open_clipboard_file(path: &std::path::Path) -> Result<AndroidFileActionResult> {
+        file_action("openClipboardFile", path)
+    }
+
+    pub fn save_clipboard_file(path: &std::path::Path) -> Result<AndroidFileActionResult> {
+        file_action("saveClipboardFile", path)
+    }
+
+    pub fn log_file_action(stage: &str, message: &str) -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            let stage = env
+                .new_string(stage)
+                .map_err(|e| anyhow!("create file action log stage failed: {e}"))?;
+            let message = env
+                .new_string(message)
+                .map_err(|e| anyhow!("create file action log message failed: {e}"))?;
+            env.call_static_method(
+                bridge_class,
+                "logFileAction",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&stage), JValue::Object(&message)],
+            )
+            .map_err(|e| anyhow!("write Android file action log failed: {e}"))?;
+            Ok(())
+        })
+    }
+
     pub fn apply_gesture_settings(settings: &crate::settings::AndroidGesture) -> Result<()> {
         with_jni_env(|env, context, bridge_class| {
             env.call_static_method(
@@ -766,6 +953,72 @@ mod jni_bridge {
     }
 }
 
+/// Opens one Rust-validated file through Android's system app chooser.
+pub fn open_android_clipboard_file_path(path: &std::path::Path) -> Result<AndroidFileActionResult> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::open_clipboard_file(path)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = path;
+        Ok(AndroidFileActionResult {
+            status: "unavailable".to_owned(),
+            message: String::new(),
+        })
+    }
+}
+
+/// Exports one Rust-validated file through Android's system document picker.
+pub fn save_android_clipboard_file_path(path: &std::path::Path) -> Result<AndroidFileActionResult> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::save_clipboard_file(path)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = path;
+        Ok(AndroidFileActionResult {
+            status: "unavailable".to_owned(),
+            message: String::new(),
+        })
+    }
+}
+
+/// Writes one diagnostic stage to a stable Android logcat tag.
+pub fn log_android_file_action(stage: &str, message: impl AsRef<str>) {
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::{c_char, c_int, CString};
+
+        #[link(name = "log")]
+        extern "C" {
+            fn __android_log_write(
+                priority: c_int,
+                tag: *const c_char,
+                text: *const c_char,
+            ) -> c_int;
+        }
+
+        let Ok(tag) = CString::new("EcoPasteFileAction") else {
+            return;
+        };
+        let text = format!("{stage} | {}", message.as_ref()).replace('\0', "\\0");
+        let Ok(text) = CString::new(text) else {
+            return;
+        };
+
+        // Android's WARN priority remains visible on production builds and does not depend on JNI.
+        unsafe {
+            __android_log_write(5, tag.as_ptr(), text.as_ptr());
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (stage, message);
+    }
+}
+
 #[cfg(target_os = "android")]
 pub(crate) fn notify_overlay_sync_status_changed() {
     if let Err(error) = jni_bridge::notify_overlay_sync_status_changed() {
@@ -792,6 +1045,14 @@ pub(crate) fn android_device_name() -> Option<String> {
 pub(crate) fn android_device_model() -> Option<String> {
     jni_bridge::device_model()
         .inspect_err(|error| log::warn!("read Android device model failed: {error}"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_device_fallback_name() -> Option<String> {
+    jni_bridge::device_fallback_name()
+        .inspect_err(|error| log::warn!("read Android fallback device name failed: {error}"))
         .ok()
         .filter(|name| !name.trim().is_empty())
 }
@@ -899,5 +1160,39 @@ pub fn perform_android_auto_paste() -> Result<bool> {
     #[cfg(not(target_os = "android"))]
     {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingAutomaticDeviceName;
+
+    #[test]
+    fn pending_device_name_waits_until_consumed() {
+        let pending = PendingAutomaticDeviceName::default();
+
+        pending.replace("OnePlus 13".to_owned());
+
+        assert_eq!(pending.take().as_deref(), Some("OnePlus 13"));
+        assert_eq!(pending.take(), None);
+    }
+
+    #[test]
+    fn failed_older_name_does_not_replace_newer_pending_name() {
+        let pending = PendingAutomaticDeviceName::default();
+
+        pending.replace("New system name".to_owned());
+        pending.restore_if_empty("Old system name".to_owned());
+
+        assert_eq!(pending.take().as_deref(), Some("New system name"));
+    }
+
+    #[test]
+    fn failed_name_is_restored_when_no_newer_name_exists() {
+        let pending = PendingAutomaticDeviceName::default();
+
+        pending.restore_if_empty("OnePlus 13".to_owned());
+
+        assert_eq!(pending.take().as_deref(), Some("OnePlus 13"));
     }
 }

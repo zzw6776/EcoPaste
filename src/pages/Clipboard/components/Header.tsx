@@ -301,37 +301,48 @@ const Header: FC = () => {
   if (isMobile()) {
     return (
       <div className="flex shrink-0 select-none flex-col gap-2 px-3 pt-1 pb-2">
-        {/* 顶部栏：搜索框 + 更多操作 */}
-        <div className="flex items-center gap-2">
-          <div className="flex-1">
-            <SearchInput
-              allowClear
-              blurToken={searchBlurToken}
-              className="w-full"
-              clearToken={searchClearToken}
-              focusCursor={searchFocusCursor}
-              focusToken={searchFocusToken}
-              onChange={handleKeywordChange}
-              placeholder="搜索剪贴板历史..."
-              size="middle"
-              value={searchValue}
+        <div className="flex h-10 items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <img
+              alt=""
+              className="size-8 shrink-0 object-contain"
+              draggable={false}
+              src="/logo.png"
             />
+            <span className="truncate font-semibold text-ant-text text-lg">
+              EcoPaste
+            </span>
           </div>
 
-          <SyncStatusIcons compact />
+          <div className="flex shrink-0 items-center gap-1">
+            <SyncStatusIcons compact />
 
-          <Dropdown
-            menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
-            trigger={MORE_ACTION_TRIGGER}
-          >
-            <button
-              className="flex size-9 cursor-pointer items-center justify-center rounded-xl bg-white text-neutral-700 shadow-xs transition-colors hover:bg-neutral-100 dark:bg-neutral-800 dark:text-neutral-200"
-              type="button"
+            <Dropdown
+              menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
+              trigger={MORE_ACTION_TRIGGER}
             >
-              <i className="i-lucide:more-vertical size-4" />
-            </button>
-          </Dropdown>
+              <button
+                className="flex size-9 cursor-pointer items-center justify-center rounded-xl bg-ant-container text-ant-secondary shadow-xs transition-colors hover:bg-ant-fill-tertiary"
+                type="button"
+              >
+                <i className="i-lucide:more-vertical size-4" />
+              </button>
+            </Dropdown>
+          </div>
         </div>
+
+        <SearchInput
+          allowClear
+          blurToken={searchBlurToken}
+          className="w-full"
+          clearToken={searchClearToken}
+          focusCursor={searchFocusCursor}
+          focusToken={searchFocusToken}
+          onChange={handleKeywordChange}
+          placeholder="搜索剪贴板历史..."
+          size="middle"
+          value={searchValue}
+        />
 
         {/* 分类与画板横向滑块 */}
         <div className="no-scrollbar -mx-3 flex items-center gap-1.5 overflow-x-auto px-3 py-0.5">

@@ -6,8 +6,8 @@ use crate::{
     core::Result,
     settings::SettingsStore,
     sync::{
-        CloudRecordPage, PairingCode, SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus,
-        SyncTarget,
+        CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace, PairingCode,
+        SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus, SyncTarget,
     },
 };
 
@@ -72,6 +72,7 @@ pub async fn join_sync_group(
         "sync": {
             "enabled": true,
             "cloudEnabled": cloud_enabled,
+            "cloudRelayMode": code.cloud_relay_mode,
             "serverEndpointId": code.server_endpoint_id,
             "serverDirectAddresses": code.server_direct_addresses,
             "serverRelayUrls": code.server_relay_urls,
@@ -105,6 +106,15 @@ pub async fn set_sync_device_name(
 }
 
 #[tauri::command]
+pub async fn set_cloud_relay_auth_token(
+    manager: State<'_, Arc<SyncManager>>,
+    token: Option<String>,
+) -> Result<SyncStatus> {
+    manager.set_cloud_relay_auth_token(token)?;
+    Ok(manager.status().await?)
+}
+
+#[tauri::command]
 pub async fn sync_now(manager: State<'_, Arc<SyncManager>>) -> Result<SyncStatus> {
     manager.run_now().await?;
     Ok(manager.status().await?)
@@ -117,6 +127,69 @@ pub async fn reconnect_sync_peer(
 ) -> Result<SyncStatus> {
     manager.reconnect_peer(device_id).await?;
     Ok(manager.status().await?)
+}
+
+#[tauri::command]
+pub async fn remove_sync_peer(
+    manager: State<'_, Arc<SyncManager>>,
+    device_id: String,
+) -> Result<SyncStatus> {
+    manager.remove_peer(&device_id).await?;
+    Ok(manager.status().await?)
+}
+
+#[tauri::command]
+pub async fn discover_nearby_sync_spaces(
+    manager: State<'_, Arc<SyncManager>>,
+) -> Result<Vec<NearbySyncSpace>> {
+    manager
+        .inner()
+        .clone()
+        .discover_nearby_spaces()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn request_nearby_sync_join(
+    manager: State<'_, Arc<SyncManager>>,
+    endpoint_id: String,
+) -> Result<NearbyJoinAttempt> {
+    manager
+        .inner()
+        .clone()
+        .request_nearby_join(endpoint_id.trim())
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_nearby_sync_join_attempt(
+    manager: State<'_, Arc<SyncManager>>,
+    request_id: String,
+) -> Result<Option<NearbyJoinAttempt>> {
+    Ok(manager.outgoing_join_attempt(request_id.trim()))
+}
+
+#[tauri::command]
+pub async fn list_incoming_sync_join_requests(
+    manager: State<'_, Arc<SyncManager>>,
+) -> Result<Vec<IncomingJoinRequest>> {
+    Ok(manager.incoming_join_requests().await)
+}
+
+#[tauri::command]
+pub async fn respond_incoming_sync_join_request(
+    manager: State<'_, Arc<SyncManager>>,
+    request_id: String,
+    approved: bool,
+) -> Result<()> {
+    manager
+        .inner()
+        .clone()
+        .respond_nearby_join(request_id.trim(), approved)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

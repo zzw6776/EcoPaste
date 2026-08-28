@@ -1,5 +1,6 @@
 import { Input } from "antd";
 import type { ChangeEvent, FC } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { router } from "@/router";
 import { openAndroidPermissionsModal } from "@/stores/android";
@@ -51,6 +52,17 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
     onTabSelect,
   } = props;
   const mobile = isAndroid || isMobile();
+  const activeTabRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!mobile || activeTabRef.current?.dataset.tabId !== activeTab.id) return;
+
+    activeTabRef.current.scrollIntoView({
+      behavior: "auto",
+      block: "nearest",
+      inline: "start",
+    });
+  }, [activeTab.id, mobile]);
 
   const handleBack = () => {
     void router.navigate("/");
@@ -144,8 +156,10 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
                     ? "bg-ant-primary text-ant-light-solid"
                     : "bg-ant-fill-quaternary text-ant-secondary",
                 )}
+                data-tab-id={tab.id}
                 key={tab.id}
                 onClick={handleClick}
+                ref={selected ? activeTabRef : void 0}
                 type="button"
               >
                 <i

@@ -2,6 +2,7 @@
 //!
 //! 每个字段都 `#[serde(default)]`，缺字段时回落到 `Default`，这样新增字段不破坏旧配置文件。
 
+use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::ClipboardItemSort;
@@ -28,6 +29,8 @@ pub struct Settings {
 #[serde(default, rename_all = "camelCase")]
 pub struct SyncSettings {
     pub enabled: bool,
+    /// 局域网设备直连通道；关闭时不发现、连接或接受对端同步。
+    pub lan_enabled: bool,
     /// 云端 Hub 是可选通道；关闭时不得解析或连接残留的 Hub 配置。
     pub cloud_enabled: bool,
     /// 收到远端内容后是否立即覆盖系统剪贴板；关闭时仍会进入本地历史记录。
@@ -36,6 +39,8 @@ pub struct SyncSettings {
     pub auto_upload_max_mb: u32,
     /// 敏感内容默认不参与同步，用户必须显式开启。
     pub sync_sensitive: bool,
+    /// 云端 Relay 策略。默认关闭；公共模式使用 Iroh 免费公共 Relay，自定义模式使用下方地址。
+    pub cloud_relay_mode: CloudRelayMode,
     pub server_endpoint_id: String,
     pub server_direct_addresses: Vec<String>,
     pub server_relay_urls: Vec<String>,
@@ -45,15 +50,29 @@ impl Default for SyncSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            lan_enabled: true,
             cloud_enabled: false,
             auto_write_clipboard: false,
             auto_upload_max_mb: 10,
             sync_sensitive: false,
+            cloud_relay_mode: CloudRelayMode::Off,
             server_endpoint_id: String::new(),
             server_direct_addresses: Vec::new(),
             server_relay_urls: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudRelayMode {
+    #[n(0)]
+    #[default]
+    Off,
+    #[n(1)]
+    Public,
+    #[n(2)]
+    Custom,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +96,7 @@ pub struct AndroidGesture {
 impl Default for AndroidGesture {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             hide_overlay: false,
             popup_height_percent: 60,
             left_width_dp: 144,

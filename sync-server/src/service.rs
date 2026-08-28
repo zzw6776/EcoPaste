@@ -50,8 +50,16 @@ impl HubService {
             .clone()
     }
 
-    async fn handle_stream(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        if let Err(error) = self.dispatch(&mut send, &mut recv).await {
+    async fn handle_stream(
+        &self,
+        remote_endpoint_id: &str,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> Result<()> {
+        if let Err(error) = self
+            .dispatch(remote_endpoint_id, &mut send, &mut recv)
+            .await
+        {
             warn!(?error, "sync request failed");
             write_frame(&mut send, &response_for_error(&error))
                 .await
@@ -61,7 +69,12 @@ impl HubService {
         Ok(())
     }
 
-    async fn dispatch(&self, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
+    async fn dispatch(
+        &self,
+        remote_endpoint_id: &str,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+    ) -> Result<()> {
         let request: Request = read_frame(recv).await.context("read request frame")?;
         match request {
             Request::Health => {
@@ -94,6 +107,9 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
+                if device.endpoint_id != remote_endpoint_id {
+                    bail!("device endpoint identity does not match the connection");
+                }
                 if events.len() > usize::from(MAX_EVENTS_PER_BATCH) {
                     bail!("too many events");
                 }
@@ -138,6 +154,8 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
                 validate_blob(&blob_id, size, self.max_blob_bytes)?;
                 let destination = blob_path(&self.blob_root, &group_id, &blob_id);
                 if self.repository.blob_size(&group_id, &blob_id).await? == Some(size)
@@ -160,6 +178,8 @@ impl HubService {
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 validate_identifier("blob_id", &blob_id)?;
                 let size = self
@@ -184,6 +204,8 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
                 let notification = self.group_notification(&group_id).await;
                 let notified = notification.notified();
                 tokio::pin!(notified);
@@ -194,6 +216,35 @@ impl HubService {
                 }
                 write_frame(send, &Response::Changed { latest_cursor }).await?;
             }
+            Request::WatchGroup {
+                group_id,
+                access_token,
+                after_cursor,
+                after_removed_at_ms,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                let notification = self.group_notification(&group_id).await;
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
+                let mut latest_removed_at_ms =
+                    self.repository.latest_removed_at_ms(&group_id).await?;
+                if latest_cursor <= after_cursor && latest_removed_at_ms <= after_removed_at_ms {
+                    let _ = tokio::time::timeout(Duration::from_secs(60), &mut notified).await;
+                    latest_cursor = self.repository.latest_cursor(&group_id).await?;
+                    latest_removed_at_ms = self.repository.latest_removed_at_ms(&group_id).await?;
+                }
+                write_frame(
+                    send,
+                    &Response::GroupChanged {
+                        latest_cursor,
+                        latest_removed_at_ms,
+                    },
+                )
+                .await?;
+            }
             Request::ListEvents {
                 group_id,
                 access_token,
@@ -202,6 +253,8 @@ impl HubService {
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 let limit = limit.clamp(1, 100);
                 let (events, next_before_cursor) = self
@@ -219,6 +272,46 @@ impl HubService {
                 )
                 .await?;
             }
+            Request::SyncRemovedDevices {
+                group_id,
+                access_token,
+                devices,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                if devices.len() > 256 {
+                    bail!("too many removed devices");
+                }
+                let removed = if self
+                    .repository
+                    .is_removed_endpoint(&group_id, remote_endpoint_id)
+                    .await?
+                {
+                    self.repository.list_removed_devices(&group_id).await?
+                } else {
+                    let removed = self
+                        .repository
+                        .merge_removed_devices(&group_id, &devices)
+                        .await?;
+                    if !devices.is_empty() {
+                        self.group_notification(&group_id).await.notify_waiters();
+                    }
+                    removed
+                };
+                write_frame(send, &Response::RemovedDevices { devices: removed }).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_endpoint_active(&self, group_id: &str, endpoint_id: &str) -> Result<()> {
+        if self
+            .repository
+            .is_removed_endpoint(group_id, endpoint_id)
+            .await?
+        {
+            bail!("device was removed from this sync group");
         }
         Ok(())
     }
@@ -226,15 +319,17 @@ impl HubService {
 
 impl ProtocolHandler for HubService {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        debug!(remote = %connection.remote_id(), "accepted sync connection");
+        let remote_endpoint_id = connection.remote_id().to_string();
+        debug!(remote = %remote_endpoint_id, "accepted sync connection");
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
                 Err(_) => break,
             };
             let service = self.clone();
+            let remote_endpoint_id = remote_endpoint_id.clone();
             tokio::spawn(async move {
-                if let Err(error) = service.handle_stream(send, recv).await {
+                if let Err(error) = service.handle_stream(&remote_endpoint_id, send, recv).await {
                     warn!(?error, "sync stream failed");
                 }
             });

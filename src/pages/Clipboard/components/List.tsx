@@ -12,13 +12,16 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
+  getClipboardPreviewPayload,
   getSyncItemStatuses,
   hideWindow,
   listClipboardGroups,
+  openAndroidClipboardFile,
   openClipboardItemLink,
   pasteClipboardItem,
   revealClipboardItem,
   type SyncItemStatus,
+  saveAndroidClipboardFile,
   saveClipboardImageToFile,
   toggleClipboardItemFavorite,
   toggleClipboardItemPinned,
@@ -45,6 +48,7 @@ import type {
   ClipboardItem,
   ClipboardKind,
   ClipboardRange,
+  FileEntry,
 } from "@/types/clipboard";
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
@@ -54,6 +58,7 @@ import {
   isSpaceKey,
   useClipboardPreviewController,
 } from "../hooks/useClipboardPreviewController";
+import AndroidFileDetailsDrawer from "./AndroidFileDetailsDrawer";
 import ClipboardCard from "./cards/ClipboardCard";
 import NoteModal from "./NoteModal";
 
@@ -85,6 +90,10 @@ const List: FC = () => {
   const [isModifierPressed, setIsModifierPressed] = useState(false);
   const [customGroups, setCustomGroups] = useState<ClipboardGroupRecord[]>([]);
   const [noteTarget, setNoteTarget] = useState<ClipboardItem | null>(null);
+  const [fileDetailsTarget, setFileDetailsTarget] =
+    useState<ClipboardItem | null>(null);
+  const [fileDetailsEntries, setFileDetailsEntries] = useState<FileEntry[]>([]);
+  const [fileActionKey, setFileActionKey] = useState<string | null>(null);
   const [syncStatuses, setSyncStatuses] = useState(
     () => new Map<string, SyncItemStatus>(),
   );
@@ -92,6 +101,7 @@ const List: FC = () => {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const isAtTopRef = useRef(true);
   const itemElementMapRef = useRef(new Map<string, HTMLDivElement>());
+  const fileDetailsRequestRef = useRef(0);
   const closePreviewRef = useRef<(reason: string) => void>(() => {});
   const displaySettingsMountedRef = useRef(false);
   const keywordRef = useRef("");
@@ -839,6 +849,81 @@ const List: FC = () => {
     consumeDeferredReloadAtTop();
   };
 
+  async function handleOpenAndroidFile(item: ClipboardItem, index: number) {
+    const key = `open:${item.id}:${index}`;
+    setFileActionKey(key);
+    try {
+      await openAndroidClipboardFile(item.id, index);
+    } catch {
+      // 命令层已统一显示错误。
+    } finally {
+      setFileActionKey(null);
+    }
+  }
+
+  async function handleSaveAndroidFile(item: ClipboardItem, index: number) {
+    const key = `save:${item.id}:${index}`;
+    setFileActionKey(key);
+    try {
+      await saveAndroidClipboardFile(item.id, index);
+    } catch {
+      // 命令层已统一显示错误。
+    } finally {
+      setFileActionKey(null);
+    }
+  }
+
+  /** 使用完整路径数量判断，避免卡片展示上限把多文件记录误判为单文件。 */
+  function hasOneOpenableFile(item: ClipboardItem) {
+    const entries = item.fileEntries ?? [];
+    const totalFiles = item.content.split("\n").filter((path) => {
+      return path.length > 0;
+    }).length;
+
+    return totalFiles === 1 && entries.length === 1 && !entries[0]?.isDir;
+  }
+
+  /** 先显示卡片已有数据，再复用预览接口补齐最多 64 个文件条目。 */
+  async function showAndroidFileDetails(item: ClipboardItem) {
+    const requestId = fileDetailsRequestRef.current + 1;
+    fileDetailsRequestRef.current = requestId;
+    setFileDetailsTarget(item);
+    setFileDetailsEntries(item.fileEntries ?? []);
+
+    try {
+      const payload = await getClipboardPreviewPayload(item.id);
+      if (fileDetailsRequestRef.current !== requestId || !payload) return;
+
+      setFileDetailsEntries(payload.files);
+    } catch {
+      // 命令层已统一显示错误，已加载的卡片条目仍可操作。
+    }
+  }
+
+  function handleMobileFileOpen(item: ClipboardItem) {
+    if (!hasOneOpenableFile(item)) {
+      void showAndroidFileDetails(item);
+      return;
+    }
+
+    void handleOpenAndroidFile(item, 0);
+  }
+
+  function handleMobileFileSave(item: ClipboardItem) {
+    if (!hasOneOpenableFile(item)) {
+      void showAndroidFileDetails(item);
+      return;
+    }
+
+    void handleSaveAndroidFile(item, 0);
+  }
+
+  function handleCloseFileDetails() {
+    fileDetailsRequestRef.current += 1;
+    setFileDetailsTarget(null);
+    setFileDetailsEntries([]);
+  }
+
   /**
    * 自动刷新请求只在顶部执行；离开顶部时保留 pending，等待回顶后消费。
    */
@@ -918,6 +1003,18 @@ const List: FC = () => {
         item={noteTarget}
         onClose={handleCloseNote}
         onSaved={handleNoteSaved}
+      />
+      <AndroidFileDetailsDrawer
+        busyKey={fileActionKey}
+        entries={fileDetailsEntries}
+        item={fileDetailsTarget}
+        onClose={handleCloseFileDetails}
+        onOpen={(item, index) => {
+          void handleOpenAndroidFile(item, index);
+        }}
+        onSave={(item, index) => {
+          void handleSaveAndroidFile(item, index);
+        }}
       />
     </div>
   );
@@ -1062,6 +1159,11 @@ const List: FC = () => {
       setSelectedId(item.id);
 
       if (isMobile()) {
+        if (item.kind === "files") {
+          handleMobileFileOpen(item);
+          return;
+        }
+
         closePreview("mobileSingleClickPaste");
         pasteClipboardItem(item.id, false);
         return;
@@ -1127,8 +1229,16 @@ const List: FC = () => {
               : item.id === selectedId
           }
           item={item}
+          mobileFileOpenLabel={t("fileAccess.open")}
+          mobileFileSaveLabel={t("fileAccess.saveAs")}
           onAuxClick={handleAuxClick}
           onDoubleClick={handleDoubleClick}
+          onMobileFileOpen={() => {
+            handleMobileFileOpen(item);
+          }}
+          onMobileFileSave={() => {
+            handleMobileFileSave(item);
+          }}
           onMouseDown={handleMouseDown}
           onOpenLink={handleOpenLink}
           onPointerEnter={handlePointerEnter}

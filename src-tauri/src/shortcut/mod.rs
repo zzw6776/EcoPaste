@@ -280,12 +280,27 @@ fn handle_event(app: &AppHandle, action: &'static str, event: ShortcutEvent) {
     if !matches!(event.state(), ShortcutState::Pressed) {
         return;
     }
-    let label = match action {
-        "open_clipboard" => CLIPBOARD_WINDOW_LABEL,
-        "open_preference" => PREFERENCE_WINDOW_LABEL,
+    let result = match action {
+        "open_clipboard" => window::toggle_window(app, CLIPBOARD_WINDOW_LABEL),
+        "open_preference" => toggle_preference_window(app),
         _ => return,
     };
-    if let Err(err) = window::toggle_window(app, label) {
-        log::warn!("toggle window via shortcut {action} failed: {err}");
+    if let Err(err) = result {
+        log::warn!("handle window shortcut {action} failed: {err}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+/// 设置窗口已在焦点前台时隐藏，否则打开并重新聚焦。
+fn toggle_preference_window(app: &AppHandle) -> Result<()> {
+    let focused = app
+        .get_webview_window(PREFERENCE_WINDOW_LABEL)
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false);
+
+    if focused {
+        window::hide_window(app, PREFERENCE_WINDOW_LABEL)
+    } else {
+        window::show_window(app, PREFERENCE_WINDOW_LABEL)
     }
 }

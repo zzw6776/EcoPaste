@@ -23,6 +23,13 @@
     "searchGroupFavorites": "No favorites in \"{{group}}\" match \"{{keyword}}\"",
     "searchHistory": "No records found for \"{{keyword}}\""
   },
+  "fileAccess": {
+    "directoryHint": "Folders cannot be opened or saved as a copy yet",
+    "missing": "The file no longer exists",
+    "open": "Open with",
+    "saveAs": "Save as",
+    "title": "File details"
+  },
   "footer": {
     "shortcuts": "Shortcuts",
     "total": "{{count}} items"
@@ -108,6 +115,7 @@
   },
   "syncItem": {
     "cloud": {
+      "activeRoute": "Last successful route ({{transport}}): {{address}}",
       "error": "Cloud sync failed; click to retry",
       "errorWithReason": "Cloud: {{reason}}; click to retry",
       "idle": "Cloud: not used for this item",
@@ -127,8 +135,10 @@
     }
   },
   "syncStatus": {
+    "candidateAddresses": "Candidate addresses: {{count}}",
     "cloud": {
       "connecting": "Cloud is connecting",
+      "degraded": "Cloud is partially degraded",
       "disabled": "Cloud is disabled",
       "error": "Cloud connection error",
       "idle": "Cloud is disconnected",
@@ -138,6 +148,7 @@
     },
     "lan": {
       "connecting": "LAN is connecting",
+      "degraded": "Some LAN connections are degraded",
       "disabled": "LAN sync is disabled",
       "error": "LAN connection error",
       "idle": "No online LAN devices",
@@ -151,6 +162,7 @@
     "lastSuccess": "Last success: {{time}}",
     "peer": {
       "connecting": "Connecting",
+      "degraded": "Degraded",
       "disabled": "Disabled",
       "error": "Error",
       "idle": "Offline",

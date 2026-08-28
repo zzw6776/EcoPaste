@@ -17,6 +17,7 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.eco_paste"
