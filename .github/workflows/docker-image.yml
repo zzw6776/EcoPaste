@@ -15,10 +15,17 @@ concurrency:
   group: docker-image-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  REGISTRY_IMAGE: zzw6776/ecopaste-sync-server
+
 jobs:
-  build-and-push:
-    name: Build and Push Sync Server
+  prepare:
+    name: Prepare Docker Build
     runs-on: ubuntu-latest
+    outputs:
+      dependency_hash: ${{ steps.version.outputs.dependency_hash }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,20 +75,63 @@ jobs:
             prerelease=true
           fi
 
+          dependency_hash="$({
+            awk '
+              /^\[package\]$/ { in_package = 1; print; next }
+              /^\[/ { in_package = 0 }
+              in_package && /^version = / { print "version = \"__VERSION__\""; next }
+              { print }
+            ' sync-server/Cargo.toml
+            awk '
+              /^\[\[package\]\]$/ { package_name = ""; print; next }
+              /^name = / { package_name = $0; print; next }
+              package_name == "name = \"ecopaste-sync-server\"" && /^version = / {
+                print "version = \"__VERSION__\""
+                next
+              }
+              { print }
+            ' sync-server/Cargo.lock
+            cat sync-server/protocol/Cargo.toml sync-server/Dockerfile
+          } | sha256sum | cut -d " " -f 1)"
+
           {
-            echo "version=${version}"
+            echo "dependency_hash=${dependency_hash}"
             echo "prerelease=${prerelease}"
+            echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Validate Docker Hub credentials
         shell: bash
         env:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
         run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" ]]; then
+            echo "::error::Repository variable DOCKERHUB_USERNAME is not configured."
+            exit 1
+          fi
           if [[ -z "${DOCKERHUB_TOKEN}" ]]; then
             echo "::error::Repository secret DOCKERHUB_TOKEN is not configured."
             exit 1
           fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Login to Docker Hub
         uses: docker/login-action@v4
@@ -89,8 +139,91 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .buildkit-cache/${{ matrix.arch }}/cargo-registry
+            .buildkit-cache/${{ matrix.arch }}/cargo-target
+          key: sync-server-cargo-${{ matrix.arch }}-${{ needs.prepare.outputs.dependency_hash }}
+          restore-keys: |
+            sync-server-cargo-${{ matrix.arch }}-
+
+      - name: Inject Cargo registry cache
+        uses: reproducible-containers/buildkit-cache-dance@4b2444fec0c0fb9dbf175a96c094720a692ef810
+        with:
+          cache-source: .buildkit-cache/${{ matrix.arch }}/cargo-registry
+          cache-target: /usr/local/cargo/registry
+          scratch-dir: .buildkit-cache-dance/${{ matrix.arch }}/cargo-registry
+
+      - name: Inject Cargo target cache
+        uses: reproducible-containers/buildkit-cache-dance@4b2444fec0c0fb9dbf175a96c094720a692ef810
+        with:
+          cache-source: .buildkit-cache/${{ matrix.arch }}/cargo-target
+          cache-target: /build/target
+          scratch-dir: .buildkit-cache-dance/${{ matrix.arch }}/cargo-target
+
+      - name: Prepare Docker metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: sync-server
+          file: sync-server/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.REGISTRY_IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY_IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish Multi-Architecture Image
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -99,19 +232,57 @@ jobs:
         id: metadata
         uses: docker/metadata-action@v6
         with:
-          images: zzw6776/ecopaste-sync-server
+          images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=latest,enable=${{ steps.version.outputs.prerelease == 'false' }}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.prerelease == 'false' }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          context: sync-server
-          file: sync-server/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=sync-server
-          cache-to: type=gha,mode=max,scope=sync-server
+      - name: Create manifest and push tags
+        shell: bash
+        env:
+          DOCKER_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "${tag}" ]]; then
+              tag_args+=(--tag "${tag}")
+            fi
+          done <<< "${DOCKER_TAGS}"
+
+          digest_args=()
+          while IFS= read -r digest_file; do
+            digest_args+=("${REGISTRY_IMAGE}@sha256:$(basename "${digest_file}")")
+          done < <(find "${RUNNER_TEMP}/digests" -type f | sort)
+
+          if [[ "${#digest_args[@]}" -ne 2 ]]; then
+            echo "::error::Expected two platform digests, found ${#digest_args[@]}."
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ needs.prepare.outputs.version }}"
+
+      - name: Remove superseded Docker Cargo caches
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for arch in amd64 arm64; do
+            prefix="sync-server-cargo-${arch}-"
+            gh cache list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --key "${prefix}" \
+              --sort created_at \
+              --order desc \
+              --limit 100 \
+              --json id \
+              --jq '.[1:] | .[].id' |
+              while IFS= read -r cache_id; do
+                gh cache delete "${cache_id}" --repo "${GITHUB_REPOSITORY}"
+              done
+          done
