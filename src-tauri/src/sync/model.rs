@@ -44,6 +44,8 @@ pub struct SyncedClipboardItem {
     pub created_at_ms: i64,
     #[n(12)]
     pub content_hash: String,
+    #[n(13)]
+    pub updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -77,6 +79,12 @@ pub enum BlobRole {
 pub struct StoredSyncEvent {
     pub cursor: u64,
     pub event: ecopaste_sync_protocol::EncryptedEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkedSyncEvent {
+    pub item_id: String,
+    pub stored: StoredSyncEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +225,93 @@ pub struct CloudRecordPage {
     pub records: Vec<CloudRecord>,
     pub next_before_cursor: Option<u64>,
     pub total: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Encode, Decode)]
+    #[cbor(map)]
+    struct LegacySyncedClipboardItem {
+        #[n(0)]
+        kind: String,
+        #[n(1)]
+        sub_kind: Option<String>,
+        #[n(2)]
+        content: String,
+        #[n(3)]
+        search_text: Option<String>,
+        #[n(4)]
+        summary: Option<String>,
+        #[n(5)]
+        file_types: Option<String>,
+        #[n(6)]
+        size: Option<i64>,
+        #[n(7)]
+        width: Option<i64>,
+        #[n(8)]
+        height: Option<i64>,
+        #[n(9)]
+        is_sensitive: bool,
+        #[n(10)]
+        source_platform: String,
+        #[n(11)]
+        created_at_ms: i64,
+        #[n(12)]
+        content_hash: String,
+    }
+
+    #[test]
+    fn synced_item_defaults_missing_updated_at_for_legacy_events() {
+        let legacy = LegacySyncedClipboardItem {
+            kind: "text".into(),
+            sub_kind: None,
+            content: "hello".into(),
+            search_text: None,
+            summary: Some("hello".into()),
+            file_types: None,
+            size: Some(5),
+            width: None,
+            height: None,
+            is_sensitive: false,
+            source_platform: "macos".into(),
+            created_at_ms: 123,
+            content_hash: "hash".into(),
+        };
+
+        let encoded = minicbor::to_vec(legacy).unwrap();
+        let decoded: SyncedClipboardItem = minicbor::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.created_at_ms, 123);
+        assert_eq!(decoded.updated_at_ms, None);
+    }
+
+    #[test]
+    fn legacy_decoder_ignores_updated_at_from_new_events() {
+        let current = SyncedClipboardItem {
+            kind: "text".into(),
+            sub_kind: None,
+            content: "hello".into(),
+            search_text: None,
+            summary: Some("hello".into()),
+            file_types: None,
+            size: Some(5),
+            width: None,
+            height: None,
+            is_sensitive: false,
+            source_platform: "macos".into(),
+            created_at_ms: 123,
+            content_hash: "hash".into(),
+            updated_at_ms: Some(456),
+        };
+
+        let encoded = minicbor::to_vec(current).unwrap();
+        let decoded: LegacySyncedClipboardItem = minicbor::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.created_at_ms, 123);
+        assert_eq!(decoded.content_hash, "hash");
+    }
 }
 
 impl SyncItemStatus {
