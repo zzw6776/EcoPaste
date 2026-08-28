@@ -69,6 +69,9 @@ export type UpdateFrequency = "daily" | "weekly" | "monthly";
 
 export type OnboardingLegacyImportType = "normal" | "favorite";
 
+/** Rust enum `CloudRelayMode`（`rename_all = "lowercase"`）。 */
+export type CloudRelayMode = "off" | "public" | "custom";
+
 export interface General {
   autoStart: boolean;
   runAsAdmin: boolean;
@@ -184,10 +187,12 @@ export interface Filters {
 
 export interface SyncSettings {
   enabled: boolean;
+  lanEnabled: boolean;
   cloudEnabled: boolean;
   autoWriteClipboard: boolean;
   autoUploadMaxMb: number;
   syncSensitive: boolean;
+  cloudRelayMode: CloudRelayMode;
   serverEndpointId: string;
   serverDirectAddresses: string[];
   serverRelayUrls: string[];

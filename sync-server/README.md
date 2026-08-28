@@ -18,7 +18,7 @@ cd sync-server
 ./run-local.sh
 ```
 
-本机运行使用临时数据目录；停止后会自动删除 SQLite、密文文件和 Iroh 服务端身份。下次启动的 Endpoint ID 会改变，客户端需要重新填写。需要持久化的生产部署应显式传入独立的 `--data-dir`，不要复用本机临时启动配置。
+本机运行使用固定数据目录，保存 SQLite、密文文件和 Iroh 服务端身份；停止并重新启动后 Endpoint ID 保持不变。macOS 默认使用 `~/Library/Application Support/EcoPaste Sync Server`，Windows 默认使用 `%LOCALAPPDATA%/EcoPaste Sync Server`，也可以通过 `ECOPASTE_LOCAL_DATA_DIR` 指定其它目录。
 
 启动日志会输出：
 
@@ -28,9 +28,9 @@ ECOPASTE_SERVER_DIRECT_ADDRESS=<探测到的地址>
 ECOPASTE_SERVER_RELAY_URL=<Iroh relay 地址>
 ```
 
-部署在公网机器后，客户端应使用输出的 Endpoint ID，并把公网 `IP:端口` 作为 direct address。安全组和主机防火墙必须放行相同的 UDP 端口。本机 Docker 默认使用 UDP 4443。
+部署在公网机器后，客户端应使用输出的 Endpoint ID，并把公网 `IP:端口` 作为 direct address。安全组和主机防火墙必须放行相同的 UDP 端口。本机 Docker 默认把容器的 UDP 4443 映射到宿主机 UDP 4443。
 
-客户端把这些值分别填入“同步服务 Endpoint ID / 直连地址 / Relay 地址”。配对码会把服务地址连同同步空间一起交给新设备；服务地址为空时只启用局域网同步，云端状态会明确显示为未启用。
+客户端把 Endpoint ID 和公网 `IP:端口` 填入云端 Hub 配置。云端 Relay 默认关闭：需要穿透或直连不可达时可开启“免费公共 Relay”（无需 Token），自建 Relay 则选择“自定义 Relay”并按服务要求填写可选 Bearer Token。Relay 只用于云端 Hub，局域网同步始终只接受私网直连路径，并通过 mDNS 刷新动态地址。配对码会把 Hub 地址和 Relay 模式连同同步空间交给新设备，但不会携带自定义 Relay Token；服务地址为空时只启用局域网同步。
 
 ## 同步唤醒与耗电
 
@@ -49,11 +49,13 @@ cd sync-server
 docker compose logs -f ecopaste-sync
 ```
 
-`docker-up.sh` 使用 Rust 1.98 slim 构建镜像和项目专属的 `ecopaste-sync-slim` Buildx builder。Rust 基础镜像、Cargo registry 和编译结果会在后续构建中复用，不需要每次重新下载和全量编译。脚本在每次退出时把该 builder 的缓存控制在 3 GiB 内并停止 builder；当前热缓存约 2.3 GiB，正常重复构建不会被清除。超过上限时会优先淘汰旧缓存层，之后若重新用到这些层，才需要重新下载或编译。
+`docker-up.sh` 不在本机编译服务，而是从 Docker Hub 拉取 `zzw6776/ecopaste-sync-server:latest`，因此本地不再保留 Rust Buildx 编译缓存。同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；升级该版本并推送到 `master` 时，GitHub Docker Image CI 自动构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。稳定版同时更新版本标签和 `latest`，预发布版只更新版本标签。需要固定版本时可在启动前设置 `ECOPASTE_SYNC_IMAGE_TAG`，例如 `ECOPASTE_SYNC_IMAGE_TAG=0.1.1 ./docker-up.sh`。
 
-新镜像成功启动后，脚本会删除被替换的旧 `ecopaste-sync-server:local` 镜像，并清理该服务遗留的悬空镜像。本机容器的 `/data` 使用 tmpfs，容器停止或重建后自动清空，不创建持久化数据卷。如果构建或启动失败，旧镜像会保留，避免失去回退基础。
+新镜像成功启动后，脚本会删除被替换的旧镜像，并清理该服务遗留的悬空镜像。本机容器的 `/data` 固定挂载外部 Docker volume `ecopaste-sync-data`，停止、重建容器或清理旧镜像都不会删除 Hub 数据和服务端身份；首次运行时脚本会自动创建该卷。如果拉取或启动失败，旧镜像会保留，避免失去回退基础。
 
-builder 默认处于停止状态。查看缓存时先运行 `docker buildx inspect ecopaste-sync-slim --bootstrap`，再运行 `docker buildx du --builder ecopaste-sync-slim`，查看后可用 `docker buildx stop ecopaste-sync-slim` 重新停止。确认不再需要加速后，才运行 `docker buildx rm ecopaste-sync-slim` 彻底回收；这会导致下次构建重新下载基础镜像并重新编译依赖。不要使用全局 `docker image prune` 或 `docker builder prune` 代替项目脚本。
+Compose 使用 `4443:4443/udp` 发布 Hub 端口。Linux 上客户端可通过宿主机地址访问；macOS 虚拟化 Docker 运行时还需要正确转发 UDP/QUIC，不能只根据容器启动成功判断 `127.0.0.1:4443` 或 Mac 局域网地址已经可达。部署后应分别完成 Mac 和 Android 的 Iroh 握手验证；运行时无法转发 UDP 时启用云端公共 Relay，或把服务原生运行在宿主机。
+
+Docker Hub 发布需要在 GitHub 仓库中配置值为 Docker Hub 用户名的 `DOCKERHUB_USERNAME` Variable，以及 `DOCKERHUB_TOKEN` Secret。Token 应使用 Docker Hub 专门为 CI 创建且具备 Read/Write 权限的 Access Token，不要把密码或 Token 直接写入 workflow。GitHub Actions 使用独立远端缓存，本机无需创建 Buildx builder；也不要为了清理该服务而执行无过滤条件的全局 `docker image prune` 或 `docker builder prune`。
 
 如需完全不依赖公共 Iroh relay，可增加环境变量 `ECOPASTE_NO_RELAY=true`；这时只保留 UDP 直连，公网部署必须保证客户端能够访问服务端 UDP 端口。
 

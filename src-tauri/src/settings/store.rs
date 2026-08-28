@@ -224,6 +224,16 @@ fn validate_sync(sync: &super::model::SyncSettings) -> Result<()> {
             "sync server address is invalid"
         )));
     }
+    if sync.cloud_relay_mode == super::model::CloudRelayMode::Custom
+        && sync
+            .server_relay_urls
+            .iter()
+            .all(|value| value.trim().is_empty())
+    {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "custom cloud relay mode requires at least one relay URL"
+        )));
+    }
     Ok(())
 }
 
@@ -361,6 +371,12 @@ mod tests {
         let parsed: Settings = serde_json::from_str(partial).unwrap();
         assert!(parsed.general.auto_start);
         assert!(!parsed.general.run_as_admin);
+        assert!(!parsed.android.gesture.enabled);
+        assert!(parsed.sync.lan_enabled);
+        assert_eq!(
+            parsed.sync.cloud_relay_mode,
+            crate::settings::CloudRelayMode::Off
+        );
         assert!(parsed.general.tray_icon, "default kept");
         assert_eq!(parsed.shortcuts.open_clipboard, "Alt+C");
         assert_eq!(
@@ -429,6 +445,14 @@ mod tests {
     fn validate_settings_rejects_invalid_open_group_selection() {
         let mut settings = Settings::default();
         settings.clipboard.window.select_group_on_open = "invalid".to_owned();
+
+        assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn custom_cloud_relay_requires_a_url() {
+        let mut settings = Settings::default();
+        settings.sync.cloud_relay_mode = crate::settings::CloudRelayMode::Custom;
 
         assert!(validate_settings(&settings).is_err());
     }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -48,6 +48,29 @@ pub struct PeerAnnouncement {
     pub relay_urls: Vec<String>,
     #[n(6)]
     pub last_seen_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cbor(map)]
+pub struct RemovedDevice {
+    #[n(0)]
+    pub device_id: String,
+    #[n(1)]
+    pub endpoint_id: String,
+    #[n(2)]
+    pub removed_at_ms: i64,
+    /// A later restoration supersedes the tombstone while preserving conflict history.
+    #[n(3)]
+    #[cbor(default)]
+    pub restored_at_ms: Option<i64>,
+}
+
+impl RemovedDevice {
+    pub fn is_removed(&self) -> bool {
+        self.restored_at_ms
+            .is_none_or(|restored_at_ms| self.removed_at_ms > restored_at_ms)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -155,6 +178,26 @@ pub enum Request {
         #[n(3)]
         limit: u16,
     },
+    #[n(7)]
+    SyncRemovedDevices {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        devices: Vec<RemovedDevice>,
+    },
+    #[n(8)]
+    WatchGroup {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        after_cursor: u64,
+        #[n(3)]
+        after_removed_at_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -206,6 +249,18 @@ pub enum Response {
         next_before_cursor: Option<u64>,
         #[n(2)]
         total: u64,
+    },
+    #[n(8)]
+    RemovedDevices {
+        #[n(0)]
+        devices: Vec<RemovedDevice>,
+    },
+    #[n(9)]
+    GroupChanged {
+        #[n(0)]
+        latest_cursor: u64,
+        #[n(1)]
+        latest_removed_at_ms: i64,
     },
 }
 
@@ -280,6 +335,17 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Debug, Encode, Decode)]
+    #[cbor(map)]
+    struct LegacyRemovedDevice {
+        #[n(0)]
+        device_id: String,
+        #[n(1)]
+        endpoint_id: String,
+        #[n(2)]
+        removed_at_ms: i64,
+    }
+
     #[tokio::test]
     async fn request_round_trip() {
         let request = Request::Sync {
@@ -319,5 +385,47 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn removed_devices_request_round_trip() {
+        let request = Request::SyncRemovedDevices {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            devices: vec![RemovedDevice {
+                device_id: "device_123".into(),
+                endpoint_id: "endpoint_123".into(),
+                removed_at_ms: 42,
+                restored_at_ms: None,
+            }],
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        let decoded: Request = read_frame(&mut server).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn restored_device_field_is_backward_compatible() {
+        let current = RemovedDevice {
+            device_id: "device_123".into(),
+            endpoint_id: "endpoint_123".into(),
+            removed_at_ms: 42,
+            restored_at_ms: Some(84),
+        };
+        let encoded = minicbor::to_vec(&current).unwrap();
+        let legacy: LegacyRemovedDevice = minicbor::decode(&encoded).unwrap();
+        assert_eq!(legacy.device_id, current.device_id);
+
+        let legacy = LegacyRemovedDevice {
+            device_id: "device_123".into(),
+            endpoint_id: "endpoint_123".into(),
+            removed_at_ms: 42,
+        };
+        let encoded = minicbor::to_vec(&legacy).unwrap();
+        let decoded: RemovedDevice = minicbor::decode(&encoded).unwrap();
+        assert_eq!(decoded.restored_at_ms, None);
     }
 }

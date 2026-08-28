@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "EcoPaste"
-version = "1.1.31"
+version = "1.1.55"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6019,7 +6019,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6364,8 +6364,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "swarm-discovery"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b4877f20f064de34b77d79237c9caa37c393590af8ef5a2f3253d59be5a338b"
 dependencies = [
  "acto",
  "hickory-proto",
@@ -7085,7 +7083,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

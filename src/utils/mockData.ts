@@ -8,7 +8,7 @@ import type { Settings } from "@/types/settings";
 export const DEFAULT_MOCK_SETTINGS: Settings = {
   android: {
     gesture: {
-      enabled: true,
+      enabled: false,
       hideOverlay: false,
       leftHeightDp: 56,
       leftWidthDp: 144,
@@ -130,7 +130,9 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
     autoUploadMaxMb: 10,
     autoWriteClipboard: false,
     cloudEnabled: false,
+    cloudRelayMode: "off",
     enabled: false,
+    lanEnabled: true,
     serverDirectAddresses: [],
     serverEndpointId: "",
     serverRelayUrls: [],

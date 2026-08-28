@@ -38,6 +38,10 @@ interface ClipboardCardProps {
   quickActions?: ItemAction[];
   quickActionLabels?: ItemActionLabels;
   onQuickAction?: (action: ItemAction) => Promise<void> | void;
+  onMobileFileOpen?: () => void;
+  onMobileFileSave?: () => void;
+  mobileFileOpenLabel?: string;
+  mobileFileSaveLabel?: string;
   showOriginalOnHover?: boolean;
   rootRef?: Ref<HTMLDivElement>;
   syncStatus?: SyncItemStatus;
@@ -71,6 +75,10 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     quickActions = [],
     quickActionLabels,
     onQuickAction,
+    onMobileFileOpen,
+    onMobileFileSave,
+    mobileFileOpenLabel,
+    mobileFileSaveLabel,
     showOriginalOnHover = true,
     rootRef,
     syncStatus,
@@ -161,6 +169,16 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     void onQuickAction?.("copy");
   };
 
+  const handleMobileFileOpen = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    onMobileFileOpen?.();
+  };
+
+  const handleMobileFileSave = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    onMobileFileSave?.();
+  };
+
   const handleMobileDelete = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     void onQuickAction?.("delete");
@@ -187,7 +205,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       className={cn(
         "relative flex w-full min-w-0 cursor-pointer select-none flex-col overflow-hidden rounded-[16px] border-0 bg-white transition-all duration-150 dark:bg-neutral-800",
         isMob
-          ? "mb-1 min-h-[105px] shadow-[0_2px_8px_rgba(0,0,0,0.04)] active:scale-[0.985]"
+          ? "mb-1 aspect-video shadow-[0_2px_8px_rgba(0,0,0,0.04)] active:scale-[0.985]"
           : "h-full",
         isSelected && !isMob ? "z-10" : "hover:shadow-md",
       )}
@@ -364,15 +382,40 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                     )}
                   />
                 </button>
-                <button
-                  className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
-                  onClick={handleMobileCopy}
-                  onMouseDown={handleMobileActionMouseDown}
-                  title="复制"
-                  type="button"
-                >
-                  <i className="i-lucide:copy size-3.5" />
-                </button>
+                {kind === "files" ? (
+                  <>
+                    <button
+                      aria-label={mobileFileOpenLabel}
+                      className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
+                      onClick={handleMobileFileOpen}
+                      onMouseDown={handleMobileActionMouseDown}
+                      title={mobileFileOpenLabel}
+                      type="button"
+                    >
+                      <i className="i-lucide:external-link size-3.5" />
+                    </button>
+                    <button
+                      aria-label={mobileFileSaveLabel}
+                      className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
+                      onClick={handleMobileFileSave}
+                      onMouseDown={handleMobileActionMouseDown}
+                      title={mobileFileSaveLabel}
+                      type="button"
+                    >
+                      <i className="i-lucide:download size-3.5" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
+                    onClick={handleMobileCopy}
+                    onMouseDown={handleMobileActionMouseDown}
+                    title="复制"
+                    type="button"
+                  >
+                    <i className="i-lucide:copy size-3.5" />
+                  </button>
+                )}
                 <button
                   className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors hover:text-red-500 active:bg-neutral-100 dark:active:bg-neutral-700"
                   onClick={handleMobileDelete}

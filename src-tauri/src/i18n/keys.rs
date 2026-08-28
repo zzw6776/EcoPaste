@@ -21,6 +21,11 @@ pub enum ClipboardMenuKey {
 
 #[derive(Debug, Clone, Copy)]
 pub enum CommandKey {
+    AndroidDirectoryUnsupported,
+    AndroidFileMissing,
+    AndroidFileOpenFailed,
+    AndroidFileOpenUnavailable,
+    AndroidFileSaveFailed,
     DragSourceFilesMissing,
     DragImageMissing,
     DragTextEmpty,

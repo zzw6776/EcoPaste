@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.31"
+version = "1.1.55"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -113,6 +113,10 @@ windows = { version = "0.52", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+
+# Remove when swarm-discovery publishes the closed-mailbox GC fix after 0.6.3.
+[patch.crates-io]
+swarm-discovery = { path = "vendor/swarm-discovery" }
 
 # Keep enough symbols for normal debugging without retaining full debug metadata.
 [profile.dev]

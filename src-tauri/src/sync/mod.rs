@@ -2,11 +2,15 @@ mod crypto;
 mod identity;
 mod manager;
 mod model;
+mod pairing;
 pub(crate) mod repository;
 
 pub use identity::PairingCode;
 pub use manager::SyncManager;
-pub use model::{CloudRecordPage, SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget};
+pub use model::{
+    CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace, SyncItemStatus,
+    SyncPairingPreview, SyncStatus, SyncTarget,
+};
 
 use std::sync::Arc;
 

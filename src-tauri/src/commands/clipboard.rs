@@ -1,7 +1,7 @@
 //! 剪贴板相关命令：手动重新读取、解析图片路径。供前端按需触发。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local, Utc};
@@ -239,6 +239,154 @@ pub async fn save_clipboard_image_to_file(
         .map(str::to_owned)
         .map(Some)
         .ok_or_else(|| AppError::Clipboard("save path is not valid utf-8".to_owned()))
+}
+
+/// Opens one file from an Android clipboard record through the system app chooser.
+#[tauri::command]
+pub async fn open_android_clipboard_file(
+    app: AppHandle,
+    db: State<'_, DatabaseState>,
+    id: String,
+    index: usize,
+) -> Result<()> {
+    log_android_file_action("rust.open.request", format!("id={id} index={index}"));
+    let path = android_clipboard_file_path(&app, &db, "open", &id, index).await?;
+    let result = crate::commands::android::open_android_clipboard_file_path(&path)?;
+    log_android_file_action(
+        "rust.open.result",
+        format!("status={} message={}", result.status, result.message),
+    );
+    match result.status.as_str() {
+        "success" => Ok(()),
+        "missing" => Err(android_file_error(
+            &app,
+            crate::i18n::commands::Key::AndroidFileMissing,
+        )),
+        "unavailable" => Err(android_file_error(
+            &app,
+            crate::i18n::commands::Key::AndroidFileOpenUnavailable,
+        )),
+        _ => {
+            log::warn!("Android file opener failed: {}", result.message);
+            Err(android_file_error(
+                &app,
+                crate::i18n::commands::Key::AndroidFileOpenFailed,
+            ))
+        }
+    }
+}
+
+/// Exports one file from an Android clipboard record through the system document picker.
+#[tauri::command]
+pub async fn save_android_clipboard_file(
+    app: AppHandle,
+    db: State<'_, DatabaseState>,
+    id: String,
+    index: usize,
+) -> Result<bool> {
+    log_android_file_action("rust.save.request", format!("id={id} index={index}"));
+    let path = android_clipboard_file_path(&app, &db, "save", &id, index).await?;
+    let result = crate::commands::android::save_android_clipboard_file_path(&path)?;
+    log_android_file_action(
+        "rust.save.result",
+        format!("status={} message={}", result.status, result.message),
+    );
+    match result.status.as_str() {
+        "success" => Ok(true),
+        "cancelled" => Ok(false),
+        "missing" => Err(android_file_error(
+            &app,
+            crate::i18n::commands::Key::AndroidFileMissing,
+        )),
+        _ => {
+            log::warn!("Android file export failed: {}", result.message);
+            Err(android_file_error(
+                &app,
+                crate::i18n::commands::Key::AndroidFileSaveFailed,
+            ))
+        }
+    }
+}
+
+async fn android_clipboard_file_path(
+    app: &AppHandle,
+    db: &State<'_, DatabaseState>,
+    action: &str,
+    id: &str,
+    index: usize,
+) -> Result<PathBuf> {
+    let pool = db.pool().await;
+    let item = match find_item_by_id(&pool, id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            log_android_file_action(&format!("rust.{action}.item_missing"), format!("id={id}"));
+            return Err(android_file_error(
+                app,
+                crate::i18n::commands::Key::AndroidFileMissing,
+            ));
+        }
+        Err(error) => {
+            log_android_file_action(
+                &format!("rust.{action}.db_failed"),
+                format!("id={id} error={error}"),
+            );
+            return Err(error);
+        }
+    };
+    let path_count = item
+        .content
+        .lines()
+        .filter(|value| !value.is_empty())
+        .count();
+    let Some(path) = item
+        .content
+        .lines()
+        .filter(|value| !value.is_empty())
+        .nth(index)
+        .map(PathBuf::from)
+    else {
+        log_android_file_action(
+            &format!("rust.{action}.index_missing"),
+            format!("id={id} index={index} count={path_count}"),
+        );
+        return Err(android_file_error(
+            app,
+            crate::i18n::commands::Key::AndroidFileMissing,
+        ));
+    };
+    log_android_file_action(
+        &format!("rust.{action}.path"),
+        format!(
+            "id={id} index={index} count={path_count} exists={} file={} dir={} path={}",
+            path.exists(),
+            path.is_file(),
+            path.is_dir(),
+            path.display()
+        ),
+    );
+    if path.is_dir() {
+        return Err(android_file_error(
+            app,
+            crate::i18n::commands::Key::AndroidDirectoryUnsupported,
+        ));
+    }
+    if !path.is_file() {
+        return Err(android_file_error(
+            app,
+            crate::i18n::commands::Key::AndroidFileMissing,
+        ));
+    }
+    Ok(path)
+}
+
+fn log_android_file_action(stage: &str, message: impl AsRef<str>) {
+    crate::commands::android::log_android_file_action(stage, message);
+}
+
+fn android_file_error(app: &AppHandle, key: crate::i18n::commands::Key) -> AppError {
+    AppError::Clipboard(
+        crate::i18n::commands::label(crate::i18n::current_language(app), key).to_owned(),
+    )
 }
 
 /// `get_file_icon_path` 的返回：icon 绝对路径 + 文件当前是否存在于磁盘。

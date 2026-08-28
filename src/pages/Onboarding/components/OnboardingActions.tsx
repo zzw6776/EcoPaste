@@ -1,6 +1,8 @@
 import { Button } from "antd";
 import type { FC, ReactNode } from "react";
 import { useState } from "react";
+import { cn } from "@/utils/cn";
+import { isAndroid } from "@/utils/is";
 
 interface OnboardingActionsProps {
   nextText: ReactNode;
@@ -68,7 +70,12 @@ const OnboardingActions: FC<OnboardingActionsProps> = (props) => {
   };
 
   return (
-    <footer className="absolute inset-x-0 bottom-0 z-10 flex h-16 items-center justify-between border-ant-border-secondary border-t bg-ant-bg-layout/95 px-4 backdrop-blur-md sm:h-18 sm:px-10">
+    <footer
+      className={cn(
+        "absolute inset-x-0 bottom-0 z-10 flex h-16 items-center justify-between border-ant-border-secondary border-t bg-ant-bg-layout/95 px-4 backdrop-blur-md sm:h-18 sm:px-10",
+        isAndroid && "android-safe-onboarding-footer",
+      )}
+    >
       <div>
         {showBack && (
           <Button disabled={busy} onClick={handleBackClick} size="middle">

@@ -3,6 +3,7 @@ package com.ayangweb.eco_paste
 import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -16,16 +17,24 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import android.webkit.MimeTypeMap
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
 import java.io.InputStreamReader
 import java.lang.ref.WeakReference
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 object EcoPasteBridge {
     private const val TAG = "EcoPasteBridge"
+    private const val FILE_ACTION_TAG = "EcoPasteFileAction"
     private const val PREFS_NAME = "ecopaste_android"
     private const val KEY_ENGINE_MODE = "engine_mode"
     private const val KEY_GESTURE_ENABLED = "gesture_enabled"
@@ -80,7 +89,13 @@ object EcoPasteBridge {
     external fun pasteOverlayItem(id: String): Boolean
 
     @JvmStatic
+    external fun persistOverlayPanelHeightPercent(heightPercent: Int): Boolean
+
+    @JvmStatic
     external fun notifySyncNetworkChanged()
+
+    @JvmStatic
+    external fun refreshAutomaticDeviceName(name: String)
 
     @JvmStatic
     fun setSyncStatusChangedListener(listener: (() -> Unit)?) {
@@ -99,6 +114,128 @@ object EcoPasteBridge {
 
     @JvmStatic
     fun getCurrentActivity(): Activity? = currentActivityRef?.get()
+
+    /** Stable logcat channel for end-to-end Android file action diagnostics. */
+    @JvmStatic
+    fun logFileAction(stage: String, message: String) {
+        Log.w(FILE_ACTION_TAG, "$stage | $message")
+    }
+
+    /** Opens one validated clipboard file through a temporary read-only content URI. */
+    @JvmStatic
+    fun openClipboardFile(context: Context, path: String): String {
+        logFileAction("native.open.start", "path=$path")
+        return try {
+            val file = File(path)
+            if (!file.isFile) {
+                logFileAction("native.open.missing", "exists=${file.exists()} path=$path")
+                return fileActionResult("missing")
+            }
+
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+            val resolvedMimeType = mimeType(file)
+            logFileAction("native.open.uri", "mime=$resolvedMimeType uri=$uri")
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, resolvedMimeType)
+                clipData = ClipData.newRawUri(file.name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            val targetContext = getCurrentActivity() ?: context
+            val chooser = Intent.createChooser(viewIntent, null).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (targetContext !is Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            logFileAction(
+                "native.open.launch",
+                "context=${targetContext.javaClass.name} flags=${chooser.flags}",
+            )
+            targetContext.startActivity(chooser)
+            logFileAction("native.open.success", "chooser started")
+            fileActionResult("success")
+        } catch (error: ActivityNotFoundException) {
+            Log.w(FILE_ACTION_TAG, "native.open.unavailable | ${error.message}", error)
+            fileActionResult("unavailable", error.message.orEmpty())
+        } catch (error: Throwable) {
+            Log.e(FILE_ACTION_TAG, "native.open.failed | ${error.message}", error)
+            fileActionResult("failed", error.message.orEmpty())
+        }
+    }
+
+    /** Exports one validated clipboard file through Android's Storage Access Framework. */
+    @JvmStatic
+    fun saveClipboardFile(context: Context, path: String): String {
+        logFileAction("native.save.start", "package=${context.packageName} path=$path")
+        val file = File(path)
+        if (!file.isFile) {
+            logFileAction("native.save.missing", "exists=${file.exists()} path=$path")
+            return fileActionResult("missing")
+        }
+        val activity = getCurrentActivity() as? MainActivity
+        if (activity == null) {
+            logFileAction("native.save.unavailable", "MainActivity is not available")
+            return fileActionResult("unavailable")
+        }
+        val result = AtomicReference(fileActionResult("failed"))
+        val completed = CountDownLatch(1)
+
+        Handler(Looper.getMainLooper()).post {
+            val resolvedMimeType = mimeType(file)
+            logFileAction(
+                "native.save.picker",
+                "name=${file.name} mime=$resolvedMimeType",
+            )
+            activity.createDocument(file.name, resolvedMimeType) { targetUri ->
+                if (targetUri == null) {
+                    logFileAction("native.save.cancelled", "picker returned no URI")
+                    result.set(fileActionResult("cancelled"))
+                    completed.countDown()
+                    return@createDocument
+                }
+                logFileAction("native.save.copy.start", "target=$targetUri")
+                thread(name = "EcoPasteFileExport") {
+                    try {
+                        FileInputStream(file).use { input ->
+                            activity.contentResolver.openOutputStream(targetUri, "w").use { output ->
+                                requireNotNull(output) { "destination stream unavailable" }
+                                input.copyTo(output)
+                            }
+                        }
+                        logFileAction("native.save.success", "target=$targetUri")
+                        result.set(fileActionResult("success"))
+                    } catch (error: Throwable) {
+                        Log.e(FILE_ACTION_TAG, "native.save.failed | ${error.message}", error)
+                        result.set(fileActionResult("failed", error.message.orEmpty()))
+                    } finally {
+                        completed.countDown()
+                    }
+                }
+            }
+        }
+
+        if (!completed.await(10, TimeUnit.MINUTES)) {
+            logFileAction("native.save.timeout", "document picker timed out")
+            return fileActionResult("failed", "document picker timed out")
+        }
+        return result.get()
+    }
+
+    private fun mimeType(file: File): String {
+        val extension = file.extension.lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: "application/octet-stream"
+    }
+
+    private fun fileActionResult(status: String, message: String = ""): String {
+        return JSONObject().apply {
+            put("status", status)
+            put("message", message)
+        }.toString()
+    }
 
     @JvmStatic
     fun initialize(context: Context) {
@@ -139,6 +276,12 @@ object EcoPasteBridge {
             return configuredName.trim()
         }
 
+        return getDeviceFallbackName()
+    }
+
+    /** 返回旧版本使用过的厂商与硬件型号组合，用于修正已持久化的自动名称。 */
+    @JvmStatic
+    fun getDeviceFallbackName(): String {
         val manufacturer = Build.MANUFACTURER.trim()
         val model = getDeviceModel()
         return if (manufacturer.isEmpty() || model.startsWith(manufacturer, ignoreCase = true)) {
@@ -526,7 +669,7 @@ object EcoPasteBridge {
     fun getGestureConfig(context: Context): GestureConfig {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return GestureConfig(
-            enabled = prefs.getBoolean(KEY_GESTURE_ENABLED, true),
+            enabled = prefs.getBoolean(KEY_GESTURE_ENABLED, false),
             hideOverlay = prefs.getBoolean(KEY_GESTURE_HIDE_OVERLAY, false),
             popupHeightPercent = prefs.getInt(KEY_GESTURE_POPUP_HEIGHT_PERCENT, 60),
             leftWidthDp = prefs.getInt(KEY_GESTURE_LEFT_WIDTH_DP, 144),
@@ -534,6 +677,15 @@ object EcoPasteBridge {
             rightWidthDp = prefs.getInt(KEY_GESTURE_RIGHT_WIDTH_DP, 144),
             rightHeightDp = prefs.getInt(KEY_GESTURE_RIGHT_HEIGHT_DP, 56),
         )
+    }
+
+    /** 缓存原生浮窗刚刚调整的高度，供下一次唤起立即读取。 */
+    @JvmStatic
+    fun rememberGesturePopupHeightPercent(context: Context, heightPercent: Int) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_GESTURE_POPUP_HEIGHT_PERCENT, heightPercent.coerceIn(30, 90))
+            .apply()
     }
 
     @JvmStatic

@@ -3,7 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { FC, ReactNode } from "react";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
 import { cn } from "@/utils/cn";
-import { isMac } from "@/utils/is";
+import { isAndroid, isMac } from "@/utils/is";
 import type { OnboardingStepDefinition } from "../types";
 
 interface OnboardingShellProps {
@@ -51,7 +51,12 @@ const OnboardingShell: FC<OnboardingShellProps> = (props) => {
       >
         <div className="absolute inset-x-0 top-0 h-12" data-tauri-drag-region />
 
-        <div className="relative z-1 flex shrink-0 items-center justify-between px-4 pt-8 sm:px-5 sm:pt-4">
+        <div
+          className={cn(
+            "relative z-1 flex shrink-0 items-center justify-between px-4 sm:px-5",
+            isAndroid ? "mobile-safe-area-top" : "pt-8 sm:pt-4",
+          )}
+        >
           <div className="flex min-w-0 items-center gap-3">
             <div className="relative overflow-hidden rounded-full">
               <Progress
@@ -84,7 +89,12 @@ const OnboardingShell: FC<OnboardingShellProps> = (props) => {
           <LanguageSwitcher />
         </div>
 
-        <div className="relative z-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pt-2 pb-20 sm:px-10 sm:pb-24">
+        <div
+          className={cn(
+            "relative z-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pt-2 pb-20 sm:px-10 sm:pb-24",
+            isAndroid && "android-safe-onboarding-content",
+          )}
+        >
           <AnimatePresence initial={false} mode="wait">
             <motion.div
               animate={contentVariants.animate}

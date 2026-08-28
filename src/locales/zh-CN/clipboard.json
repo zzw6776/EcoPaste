@@ -23,6 +23,13 @@
     "searchGroupFavorites": "「{{group}}」分组下的收藏中未找到与「{{keyword}}」相关的记录",
     "searchHistory": "未找到「{{keyword}}」相关记录"
   },
+  "fileAccess": {
+    "directoryHint": "文件夹暂不支持直接打开或另存为",
+    "missing": "文件已不存在",
+    "open": "打开方式",
+    "saveAs": "另存为",
+    "title": "文件详情"
+  },
   "footer": {
     "shortcuts": "快捷键",
     "total": "共 {{count}} 项"
@@ -108,6 +115,7 @@
   },
   "syncItem": {
     "cloud": {
+      "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
       "error": "云端同步失败，点击重试",
       "errorWithReason": "云端：{{reason}}，点击重试",
       "idle": "云端：本次未使用",
@@ -127,8 +135,10 @@
     }
   },
   "syncStatus": {
+    "candidateAddresses": "{{count}} 个候选地址",
     "cloud": {
       "connecting": "云端正在连接",
+      "degraded": "云端部分链路异常",
       "disabled": "云端未启用",
       "error": "云端连接异常",
       "idle": "云端未连接",
@@ -138,6 +148,7 @@
     },
     "lan": {
       "connecting": "局域网正在连接",
+      "degraded": "局域网部分连接异常",
       "disabled": "局域网同步未启用",
       "error": "局域网连接异常",
       "idle": "当前没有在线设备",
@@ -151,6 +162,7 @@
     "lastSuccess": "最近成功：{{time}}",
     "peer": {
       "connecting": "连接中",
+      "degraded": "部分异常",
       "disabled": "未启用",
       "error": "异常",
       "idle": "离线",

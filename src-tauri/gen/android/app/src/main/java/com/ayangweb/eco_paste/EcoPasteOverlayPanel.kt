@@ -18,6 +18,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
@@ -31,7 +32,9 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /** 不切换 Activity 的原生剪贴板悬浮面板。 */
 class EcoPasteOverlayPanel(
@@ -89,11 +92,14 @@ class EcoPasteOverlayPanel(
 
     private data class OverlaySyncStatus(
         val lanState: String,
+        val lanEnabled: Boolean,
         val cloudState: String,
         val cloudEnabled: Boolean,
         val cloudEndpointId: String,
         val cloudDirectAddresses: List<String>,
         val cloudRelayUrls: List<String>,
+        val cloudConnectedAddress: String,
+        val cloudTransport: String,
         val cloudError: String,
         val cloudLastSuccessAt: String,
         val pendingEvents: Int,
@@ -132,6 +138,7 @@ class EcoPasteOverlayPanel(
     private var expandedSyncTarget: String? = null
     private var syncStatus: OverlaySyncStatus? = null
     private var showingCloudRecords = false
+    private val heightPersistenceExecutor = Executors.newSingleThreadExecutor()
 
     fun show(heightPercent: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
@@ -146,7 +153,8 @@ class EcoPasteOverlayPanel(
         showingCloudRecords = false
 
         val bounds = displayBounds()
-        val panelHeight = (bounds.height() * heightPercent.coerceIn(30, 90) / 100f).toInt()
+        val initialHeightPercent = heightPercent.coerceIn(30, 90)
+        val panelHeight = (bounds.height() * initialHeightPercent / 100f).toInt()
         val outsideHeight = (bounds.height() - panelHeight).coerceAtLeast(1)
         val sessionId = ++nextSessionId
         val root = GestureDismissFrameLayout(context, sessionId, outsideOnly = false)
@@ -165,7 +173,7 @@ class EcoPasteOverlayPanel(
             ),
         )
 
-        content.addView(createDragHandle())
+        content.addView(createDragHandle(initialHeightPercent, bounds.height()))
         content.addView(createHeader())
         syncDetailsContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -232,6 +240,7 @@ class EcoPasteOverlayPanel(
             activeSessionId = sessionId
             onSessionChanged(sessionId)
             EcoPasteBridge.setSyncStatusChangedListener { requestSyncStatus() }
+            installBottomSystemInset(root, content)
             installSystemGestureExclusion(outside, preserveBottomSystemArea = false)
             installSystemGestureExclusion(root, preserveBottomSystemArea = true)
         } catch (error: Exception) {
@@ -365,11 +374,18 @@ class EcoPasteOverlayPanel(
         val cloud = root.optJSONObject("cloud") ?: JSONObject()
         return OverlaySyncStatus(
             lanState = lan.optString("state", "disabled"),
+            lanEnabled = root.optBoolean("lanEnabled"),
             cloudState = cloud.optString("state", "disabled"),
             cloudEnabled = root.optBoolean("cloudEnabled"),
             cloudEndpointId = root.optString("cloudEndpointId"),
             cloudDirectAddresses = jsonStrings(root.optJSONArray("cloudDirectAddresses")),
             cloudRelayUrls = jsonStrings(root.optJSONArray("cloudRelayUrls")),
+            cloudConnectedAddress = root.optString("cloudConnectedAddress")
+                .takeUnless { it == "null" }
+                .orEmpty(),
+            cloudTransport = root.optString("cloudTransport")
+                .takeUnless { it == "null" }
+                .orEmpty(),
             cloudError = cloud.optString("lastError"),
             cloudLastSuccessAt = cloud.optString("lastSuccessAt"),
             pendingEvents = root.optInt("pendingEvents"),
@@ -421,7 +437,7 @@ class EcoPasteOverlayPanel(
             }, LinearLayout.LayoutParams(0, dp(36), 1f).apply {
                 gravity = Gravity.CENTER_VERTICAL
             })
-            if (target == "lan") {
+            if (target == "lan" && status?.lanEnabled == true) {
                 addView(reconnectButton("重新连接全部设备") { reconnectPeer(null) })
             }
         })
@@ -454,11 +470,13 @@ class EcoPasteOverlayPanel(
                             ),
                             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
                         )
-                        addView(
-                            reconnectButton("重新连接 ${peer.deviceName}") {
-                                reconnectPeer(peer.deviceId)
-                            },
-                        )
+                        if (status.lanEnabled) {
+                            addView(
+                                reconnectButton("重新连接 ${peer.deviceName}") {
+                                    reconnectPeer(peer.deviceId)
+                                },
+                            )
+                        }
                     })
                 }
             }
@@ -469,8 +487,16 @@ class EcoPasteOverlayPanel(
                 if (status.cloudEndpointId.isNotBlank()) {
                     container.addView(detailText(status.cloudEndpointId))
                 }
-                (status.cloudDirectAddresses + status.cloudRelayUrls).forEach { address ->
+                status.cloudDirectAddresses.forEach { address ->
                     container.addView(detailText(address))
+                }
+                if (status.cloudConnectedAddress.isNotBlank()) {
+                    val transport = when (status.cloudTransport) {
+                        "direct" -> "直连"
+                        "relay" -> "中继"
+                        else -> "未知"
+                    }
+                    container.addView(detailText("最近成功路径（$transport）：${status.cloudConnectedAddress}"))
                 }
                 if (status.cloudError.isNotBlank()) {
                     container.addView(detailText(status.cloudError, error = true))
@@ -659,7 +685,12 @@ class EcoPasteOverlayPanel(
         renderItems()
     }
 
-    private fun createDragHandle(): View {
+    /** 上沿拖动区域：向上拉长、向下缩短，松手后把百分比写回统一设置。 */
+    private fun createDragHandle(initialHeightPercent: Int, displayHeight: Int): View {
+        var startRawY = 0f
+        var startHeight = 0
+        var currentHeightPercent = initialHeightPercent
+
         return FrameLayout(context).apply {
             addView(
                 View(context).apply {
@@ -670,11 +701,82 @@ class EcoPasteOverlayPanel(
                 },
                 FrameLayout.LayoutParams(dp(40), dp(4), Gravity.CENTER),
             )
+            setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startRawY = event.rawY
+                        startHeight = panelView?.layoutParams?.height
+                            ?: (displayHeight * initialHeightPercent / 100f).toInt()
+                        view.parent?.requestDisallowInterceptTouchEvent(true)
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val nextHeight = startHeight + (startRawY - event.rawY).roundToInt()
+                        resizePanel(nextHeight, displayHeight)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        view.parent?.requestDisallowInterceptTouchEvent(false)
+                        if (event.actionMasked == MotionEvent.ACTION_UP) {
+                            val currentHeight = panelView?.layoutParams?.height ?: startHeight
+                            val nextPercent = (currentHeight * 100f / displayHeight)
+                                .roundToInt()
+                                .coerceIn(30, 90)
+                            resizePanel(
+                                (displayHeight * nextPercent / 100f).roundToInt(),
+                                displayHeight,
+                            )
+                            if (currentHeightPercent != nextPercent) {
+                                currentHeightPercent = nextPercent
+                                persistPanelHeightPercent(nextPercent)
+                            }
+                        }
+                    }
+                }
+                true
+            }
         }.also {
             it.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(20),
             )
+        }
+    }
+
+    /** 同步更新上下两个覆盖窗口，避免调整过程中出现不可点击的空隙。 */
+    private fun resizePanel(requestedHeight: Int, displayHeight: Int) {
+        val panel = panelView ?: return
+        val outside = outsideView ?: return
+        val minHeight = (displayHeight * 0.3f).roundToInt()
+        val maxHeight = (displayHeight * 0.9f).roundToInt()
+        val panelHeight = requestedHeight.coerceIn(minHeight, maxHeight)
+        val outsideHeight = (displayHeight - panelHeight).coerceAtLeast(1)
+
+        try {
+            val outsideParams = outside.layoutParams as WindowManager.LayoutParams
+            outsideParams.height = outsideHeight
+            windowManager.updateViewLayout(outside, outsideParams)
+
+            val panelParams = panel.layoutParams as WindowManager.LayoutParams
+            panelParams.height = panelHeight
+            windowManager.updateViewLayout(panel, panelParams)
+            installSystemGestureExclusion(outside, preserveBottomSystemArea = false)
+            installSystemGestureExclusion(panel, preserveBottomSystemArea = true)
+        } catch (error: Exception) {
+            Log.w(TAG, "resize overlay panel failed: ${error.message}")
+        }
+    }
+
+    /** Rust 设置落盘成功后再更新 SharedPreferences 镜像，确保两份状态一致。 */
+    private fun persistPanelHeightPercent(nextPercent: Int) {
+        heightPersistenceExecutor.execute {
+            val persisted = try {
+                EcoPasteBridge.persistOverlayPanelHeightPercent(nextPercent)
+            } catch (error: Throwable) {
+                Log.e(TAG, "persist overlay panel height failed: ${error.message}", error)
+                false
+            }
+            if (persisted) {
+                EcoPasteBridge.rememberGesturePopupHeightPercent(context, nextPercent)
+            }
         }
     }
 
@@ -1205,6 +1307,21 @@ class EcoPasteOverlayPanel(
         }
     }
 
+    /** 浮窗本身延伸到屏幕底部，但内容始终避开系统导航与手势区域。 */
+    private fun installBottomSystemInset(root: View, content: View) {
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val bottomInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(WindowInsets.Type.systemBars()).bottom
+            } else {
+                @Suppress("DEPRECATION")
+                insets.systemWindowInsetBottom
+            }
+            content.setPadding(0, 0, 0, bottomInset.coerceAtLeast(dp(8)))
+            insets
+        }
+        root.requestApplyInsets()
+    }
+
     private inner class GestureDismissFrameLayout(
         context: Context,
         private val sessionId: Long,
@@ -1241,11 +1358,10 @@ class EcoPasteOverlayPanel(
                 MotionEvent.ACTION_MOVE -> {
                     val deltaX = event.x - startX
                     val deltaY = event.y - startY
-                    val horizontalDismiss = abs(deltaX) >= dp(52) &&
+                    val horizontalDismiss = !fromHandle && abs(deltaX) >= dp(52) &&
                         abs(deltaX) > abs(deltaY) * 1.2f &&
                         ((fromLeftEdge && deltaX > 0) || (fromRightEdge && deltaX < 0))
-                    val verticalDismiss = fromHandle && deltaY >= dp(64) && abs(deltaY) > abs(deltaX)
-                    if (horizontalDismiss || verticalDismiss) {
+                    if (horizontalDismiss) {
                         requestDismiss()
                         return true
                     }
@@ -1336,6 +1452,7 @@ class EcoPasteOverlayPanel(
         return when (state) {
             "online" -> Color.rgb(52, 199, 89)
             "connecting" -> Color.rgb(0, 122, 255)
+            "degraded" -> Color.rgb(255, 159, 10)
             "error" -> Color.rgb(255, 69, 58)
             else -> tertiaryTextColor()
         }
@@ -1355,6 +1472,7 @@ class EcoPasteOverlayPanel(
         return when (state) {
             "online" -> "在线"
             "connecting" -> "连接中"
+            "degraded" -> "部分异常"
             "error" -> "异常"
             "disabled" -> "未启用"
             else -> "离线"

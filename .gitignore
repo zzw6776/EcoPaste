@@ -14,8 +14,15 @@ dist-ssr
 /sync-server/target/
 /sync-server/protocol/target/
 /sync-server/protocol/Cargo.lock
+/src-tauri/vendor/**/target/
 *.local
 /signing.properties
+
+# Local AI indexes, package stores, and ad-hoc build outputs
+/.codegraph/
+/.pnpm-store/
+/.workbuddy-ai/
+/apk/
 
 # Editor directories and files
 .vscode/*

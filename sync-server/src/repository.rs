@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use ecopaste_sync_protocol::{CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement};
+use ecopaste_sync_protocol::{
+    CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement, RemovedDevice,
+};
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use subtle::ConstantTimeEq;
 
@@ -77,6 +79,13 @@ impl Repository {
     /// Updates the peer route cache advertised to the rest of the group.
     pub async fn upsert_device(&self, group_id: &str, device: &DeviceAnnouncement) -> Result<()> {
         validate_identifier("device_id", &device.device_id)?;
+        validate_identifier("endpoint_id", &device.endpoint_id)?;
+        if self
+            .is_removed_device(group_id, &device.device_id, &device.endpoint_id)
+            .await?
+        {
+            bail!("device was removed from this sync group");
+        }
         if device.device_name.chars().count() > 80 || device.platform.len() > 24 {
             bail!("invalid device announcement");
         }
@@ -112,6 +121,160 @@ impl Repository {
         .await
         .context("upsert sync device")?;
         Ok(())
+    }
+
+    pub async fn is_removed_endpoint(&self, group_id: &str, endpoint_id: &str) -> Result<bool> {
+        let removed: i64 = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM removed_devices
+                WHERE group_id = ? AND endpoint_id = ?
+                  AND (restored_at_ms IS NULL OR removed_at_ms > restored_at_ms)
+            )
+            "#,
+        )
+        .bind(group_id)
+        .bind(endpoint_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("check removed sync endpoint")?;
+        Ok(removed != 0)
+    }
+
+    pub async fn is_removed_device(
+        &self,
+        group_id: &str,
+        device_id: &str,
+        endpoint_id: &str,
+    ) -> Result<bool> {
+        let removed: i64 = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM removed_devices
+                WHERE group_id = ? AND (device_id = ? OR endpoint_id = ?)
+                  AND (restored_at_ms IS NULL OR removed_at_ms > restored_at_ms)
+            )
+            "#,
+        )
+        .bind(group_id)
+        .bind(device_id)
+        .bind(endpoint_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("check removed sync device")?;
+        Ok(removed != 0)
+    }
+
+    /// Merges group-wide removal tombstones and purges matching routes from the Hub directory.
+    pub async fn merge_removed_devices(
+        &self,
+        group_id: &str,
+        devices: &[RemovedDevice],
+    ) -> Result<Vec<RemovedDevice>> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("begin merging removed devices")?;
+        for device in devices {
+            validate_identifier("device_id", &device.device_id)?;
+            validate_identifier("endpoint_id", &device.endpoint_id)?;
+            let now = now_ms();
+            sqlx::query(
+                r#"
+                INSERT INTO removed_devices (
+                    group_id, device_id, endpoint_id, removed_at_ms, restored_at_ms,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(group_id, device_id) DO UPDATE SET
+                    endpoint_id = excluded.endpoint_id,
+                    removed_at_ms = MAX(removed_devices.removed_at_ms, excluded.removed_at_ms),
+                    restored_at_ms = CASE
+                        WHEN excluded.restored_at_ms IS NULL THEN removed_devices.restored_at_ms
+                        ELSE MAX(COALESCE(removed_devices.restored_at_ms, 0), excluded.restored_at_ms)
+                    END,
+                    updated_at_ms = excluded.updated_at_ms
+                "#,
+            )
+            .bind(group_id)
+            .bind(&device.device_id)
+            .bind(&device.endpoint_id)
+            .bind(device.removed_at_ms)
+            .bind(device.restored_at_ms)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .context("store removed sync device")?;
+            let (stored_removed_at_ms, stored_restored_at_ms): (i64, Option<i64>) = sqlx::query_as(
+                r#"
+                    SELECT removed_at_ms, restored_at_ms FROM removed_devices
+                    WHERE group_id = ? AND device_id = ?
+                    "#,
+            )
+            .bind(group_id)
+            .bind(&device.device_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("read merged device membership")?;
+            if stored_restored_at_ms
+                .is_none_or(|restored_at_ms| stored_removed_at_ms > restored_at_ms)
+            {
+                sqlx::query(
+                    "DELETE FROM devices WHERE group_id = ? AND (device_id = ? OR endpoint_id = ?)",
+                )
+                .bind(group_id)
+                .bind(&device.device_id)
+                .bind(&device.endpoint_id)
+                .execute(&mut *transaction)
+                .await
+                .context("purge removed sync device route")?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit removed sync devices")?;
+        self.list_removed_devices(group_id).await
+    }
+
+    pub async fn list_removed_devices(&self, group_id: &str) -> Result<Vec<RemovedDevice>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT device_id, endpoint_id, removed_at_ms, restored_at_ms
+            FROM removed_devices
+            WHERE group_id = ?
+            ORDER BY removed_at_ms ASC
+            "#,
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list removed sync devices")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RemovedDevice {
+                    device_id: row.try_get("device_id")?,
+                    endpoint_id: row.try_get("endpoint_id")?,
+                    removed_at_ms: row.try_get("removed_at_ms")?,
+                    restored_at_ms: row.try_get("restored_at_ms")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn latest_removed_at_ms(&self, group_id: &str) -> Result<i64> {
+        let value: Option<i64> = sqlx::query_scalar(
+            r#"
+                SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0)))
+                FROM removed_devices WHERE group_id = ?
+                "#,
+        )
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("read latest removed device timestamp")?;
+        Ok(value.unwrap_or(0))
     }
 
     /// Inserts encrypted events and returns the IDs accepted by this hub.
@@ -472,5 +635,87 @@ mod tests {
         );
         assert_eq!(next, None);
         assert_eq!(repository.event_count("group_123").await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn removed_device_is_purged_and_cannot_reannounce() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let device = DeviceAnnouncement {
+            device_id: "device_123".into(),
+            device_name: "Android".into(),
+            platform: "android".into(),
+            endpoint_id: "endpoint_123".into(),
+            direct_addresses: Vec::new(),
+            relay_urls: Vec::new(),
+        };
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+
+        let removed = RemovedDevice {
+            device_id: device.device_id.clone(),
+            endpoint_id: device.endpoint_id.clone(),
+            removed_at_ms: 100,
+            restored_at_ms: None,
+        };
+        repository
+            .merge_removed_devices("group_123", std::slice::from_ref(&removed))
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .list_peers("group_123", "another_device")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .is_removed_device("group_123", &device.device_id, &device.endpoint_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.latest_removed_at_ms("group_123").await.unwrap(),
+            100
+        );
+        assert!(
+            repository
+                .upsert_device("group_123", &device)
+                .await
+                .is_err()
+        );
+
+        let restored = RemovedDevice {
+            restored_at_ms: Some(200),
+            ..removed
+        };
+        repository
+            .merge_removed_devices("group_123", &[restored])
+            .await
+            .unwrap();
+        assert!(
+            !repository
+                .is_removed_device("group_123", &device.device_id, &device.endpoint_id)
+                .await
+                .unwrap()
+        );
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.latest_removed_at_ms("group_123").await.unwrap(),
+            200
+        );
     }
 }

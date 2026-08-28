@@ -13,6 +13,8 @@ export const TAURI_EVENT = {
   PREFERENCE_HIGHLIGHT_SETTING: "preference://highlight-setting",
   PREVIEW_UPDATED: "preview://updated",
   SETTINGS_UPDATED: "settings://updated",
+  SYNC_JOIN_ATTEMPT_UPDATED: "sync://join-attempt-updated",
+  SYNC_JOIN_REQUESTED: "sync://join-requested",
   SYNC_UPDATED: "sync://updated",
   UPDATE_PROGRESS: "update://progress",
   WINDOW_BEFORE_DESTROY: "window://before-destroy",

@@ -1,16 +1,23 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+};
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement};
-use sqlx::{Row, SqlitePool};
+use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement, RemovedDevice};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use super::model::{
-    StoredBlob, StoredSyncEvent, SyncChannelState, SyncItemState, SyncItemStatus, SyncPeer,
-    SyncPeerStatus,
+use super::{
+    identity::is_lan_ip,
+    model::{
+        StoredBlob, StoredSyncEvent, SyncChannelState, SyncItemState, SyncItemStatus, SyncPeer,
+        SyncPeerStatus,
+    },
 };
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
+const HISTORY_BACKFILL_GROUP_KEY: &str = "history_backfill_group_id";
 const LAST_SUCCESS_KEY: &str = "last_success_at";
 
 /// Allocates a monotonically increasing sequence for this device.
@@ -389,13 +396,28 @@ async fn set_delivery_state(
 }
 
 pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("acquire sync peer connection")?;
+    upsert_peer_on(&mut connection, peer).await
+}
+
+async fn upsert_peer_on(connection: &mut SqliteConnection, peer: &PeerAnnouncement) -> Result<()> {
     let now = Utc::now();
+    let direct_addresses = lan_direct_addresses(&peer.direct_addresses);
     sqlx::query(
         r#"
         INSERT INTO sync_peers (
             device_id, device_name, platform, endpoint_id, direct_addresses,
             relay_urls, pull_cursor, last_seen_ms, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        )
+        SELECT ?, ?, ?, ?, ?, ?, 0, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sync_removed_peers
+            WHERE (device_id = ? OR endpoint_id = ?)
+              AND (restored_at_ms IS NULL OR removed_at_ms > restored_at_ms)
+        )
         ON CONFLICT(device_id) DO UPDATE SET
             device_name = excluded.device_name,
             platform = excluded.platform,
@@ -410,15 +432,271 @@ pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<(
     .bind(&peer.device_name)
     .bind(&peer.platform)
     .bind(&peer.endpoint_id)
-    .bind(serde_json::to_string(&peer.direct_addresses)?)
-    .bind(serde_json::to_string(&peer.relay_urls)?)
+    .bind(serde_json::to_string(&direct_addresses)?)
+    .bind("[]")
     .bind(peer.last_seen_ms)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .bind(&peer.device_id)
+    .bind(&peer.endpoint_id)
+    .execute(connection)
     .await
     .context("upsert sync peer")?;
     Ok(())
+}
+
+async fn restore_peer_on(
+    connection: &mut SqliteConnection,
+    device_id: &str,
+    endpoint_id: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query("DELETE FROM sync_removed_peers WHERE endpoint_id = ? AND device_id <> ?")
+        .bind(endpoint_id)
+        .bind(device_id)
+        .execute(&mut *connection)
+        .await
+        .context("remove stale endpoint membership")?;
+    sqlx::query(
+        r#"
+        INSERT INTO sync_removed_peers (
+            device_id, endpoint_id, removed_at_ms, restored_at_ms, created_at, updated_at
+        ) VALUES (?, ?, 0, ?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE SET
+            endpoint_id = excluded.endpoint_id,
+            restored_at_ms = MAX(COALESCE(sync_removed_peers.restored_at_ms, 0), excluded.restored_at_ms),
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(device_id)
+    .bind(endpoint_id)
+    .bind(now.timestamp_millis())
+    .bind(now)
+    .bind(now)
+    .execute(connection)
+    .await
+    .context("restore removed sync peer")?;
+    Ok(())
+}
+
+/// Restores a removed member and stores its current route as one membership transaction.
+pub async fn restore_and_upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
+    let mut transaction = pool.begin().await.context("begin approving sync peer")?;
+    restore_peer_on(&mut transaction, &peer.device_id, &peer.endpoint_id).await?;
+    upsert_peer_on(&mut transaction, peer).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit approved sync peer")?;
+    Ok(())
+}
+
+pub async fn is_peer_removed(
+    pool: &SqlitePool,
+    device_id: &str,
+    endpoint_id: &str,
+) -> Result<bool> {
+    let removed: i64 = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM sync_removed_peers
+            WHERE (device_id = ? OR endpoint_id = ?)
+              AND (restored_at_ms IS NULL OR removed_at_ms > restored_at_ms)
+        )
+        "#,
+    )
+    .bind(device_id)
+    .bind(endpoint_id)
+    .fetch_one(pool)
+    .await
+    .context("check removed sync peer")?;
+    Ok(removed != 0)
+}
+
+pub async fn removed_peer_ids(pool: &SqlitePool) -> Result<HashSet<String>> {
+    let rows = sqlx::query_scalar(
+        r#"
+        SELECT device_id FROM sync_removed_peers
+        WHERE restored_at_ms IS NULL OR removed_at_ms > restored_at_ms
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list removed sync peers")?;
+    Ok(rows.into_iter().collect())
+}
+
+pub async fn removed_devices(pool: &SqlitePool) -> Result<Vec<RemovedDevice>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT device_id, endpoint_id, removed_at_ms, restored_at_ms
+        FROM sync_removed_peers
+        WHERE endpoint_id NOT LIKE 'legacy:%'
+        ORDER BY removed_at_ms ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list removed sync devices")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RemovedDevice {
+                device_id: row.try_get("device_id")?,
+                endpoint_id: row.try_get("endpoint_id")?,
+                removed_at_ms: row.try_get("removed_at_ms")?,
+                restored_at_ms: row.try_get("restored_at_ms")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn latest_removed_at_ms(pool: &SqlitePool) -> Result<i64> {
+    let value: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0)))
+        FROM sync_removed_peers WHERE endpoint_id NOT LIKE 'legacy:%'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("read latest removed device timestamp")?;
+    Ok(value.unwrap_or(0))
+}
+
+/// 合并其他设备或 Hub 传来的删除标记，并清掉对应路由和投递状态。
+pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice]) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin merging removed sync devices")?;
+    for device in devices {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO sync_removed_peers (
+                device_id, endpoint_id, removed_at_ms, restored_at_ms, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                endpoint_id = excluded.endpoint_id,
+                removed_at_ms = MAX(sync_removed_peers.removed_at_ms, excluded.removed_at_ms),
+                restored_at_ms = CASE
+                    WHEN excluded.restored_at_ms IS NULL THEN sync_removed_peers.restored_at_ms
+                    ELSE MAX(COALESCE(sync_removed_peers.restored_at_ms, 0), excluded.restored_at_ms)
+                END,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&device.device_id)
+        .bind(&device.endpoint_id)
+        .bind(device.removed_at_ms)
+        .bind(device.restored_at_ms)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("merge removed sync device")?;
+
+        let (stored_removed_at_ms, stored_restored_at_ms): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT removed_at_ms, restored_at_ms FROM sync_removed_peers WHERE device_id = ?",
+        )
+        .bind(&device.device_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read merged sync device membership")?;
+        let effectively_removed = stored_restored_at_ms
+            .is_none_or(|restored_at_ms| stored_removed_at_ms > restored_at_ms);
+        if effectively_removed {
+            let target_id = format!("peer:{}", device.device_id);
+            for statement in [
+                "DELETE FROM sync_delivery_states WHERE target_id = ?",
+                "DELETE FROM sync_deliveries WHERE target_id = ?",
+            ] {
+                sqlx::query(statement)
+                    .bind(&target_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .with_context(|| format!("run {statement}"))?;
+            }
+            sqlx::query("DELETE FROM sync_peers WHERE device_id = ? OR endpoint_id = ?")
+                .bind(&device.device_id)
+                .bind(&device.endpoint_id)
+                .execute(&mut *transaction)
+                .await
+                .context("purge removed sync peer route")?;
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit removed sync devices")?;
+    Ok(())
+}
+
+/// 忘记单个对端及其投递状态，并阻止发现与 Hub 设备列表将它自动加回。
+pub async fn remove_peer(pool: &SqlitePool, device_id: &str) -> Result<Option<RemovedDevice>> {
+    let mut transaction = pool.begin().await.context("begin removing sync peer")?;
+    let endpoint_id: Option<String> =
+        sqlx::query_scalar("SELECT endpoint_id FROM sync_peers WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .context("find sync peer to remove")?;
+    let Some(endpoint_id) = endpoint_id else {
+        transaction
+            .rollback()
+            .await
+            .context("rollback missing sync peer removal")?;
+        return Ok(None);
+    };
+
+    let now = Utc::now();
+    let removed = RemovedDevice {
+        device_id: device_id.to_owned(),
+        endpoint_id,
+        removed_at_ms: now.timestamp_millis(),
+        restored_at_ms: None,
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO sync_removed_peers (
+            device_id, endpoint_id, removed_at_ms, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(device_id) DO UPDATE SET
+            endpoint_id = excluded.endpoint_id,
+            removed_at_ms = excluded.removed_at_ms,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&removed.device_id)
+    .bind(&removed.endpoint_id)
+    .bind(removed.removed_at_ms)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .context("remember removed sync peer")?;
+
+    let target_id = format!("peer:{device_id}");
+    for statement in [
+        "DELETE FROM sync_delivery_states WHERE target_id = ?",
+        "DELETE FROM sync_deliveries WHERE target_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(&target_id)
+            .execute(&mut *transaction)
+            .await
+            .with_context(|| format!("run {statement}"))?;
+    }
+    sqlx::query("DELETE FROM sync_peers WHERE device_id = ?")
+        .bind(device_id)
+        .execute(&mut *transaction)
+        .await
+        .context("delete sync peer")?;
+    transaction
+        .commit()
+        .await
+        .context("commit removing sync peer")?;
+    Ok(Some(removed))
 }
 
 /// Refreshes the volatile routes of a paired endpoint discovered on the local network.
@@ -426,37 +704,40 @@ pub async fn update_peer_routes(
     pool: &SqlitePool,
     endpoint_id: &str,
     direct_addresses: &[String],
-    relay_urls: &[String],
 ) -> Result<bool> {
     let now = Utc::now();
-    let direct_addresses = serde_json::to_string(direct_addresses)?;
-    let relay_urls = serde_json::to_string(relay_urls)?;
+    let direct_addresses = serde_json::to_string(&lan_direct_addresses(direct_addresses))?;
     let result = sqlx::query(
         r#"
         UPDATE sync_peers
         SET direct_addresses = CASE WHEN ? = '[]' THEN direct_addresses ELSE ? END,
-            relay_urls = CASE WHEN ? = '[]' THEN relay_urls ELSE ? END,
+            relay_urls = '[]',
             last_seen_ms = ?, updated_at = ?
         WHERE endpoint_id = ?
           AND ((? != '[]' AND direct_addresses != ?)
-            OR (? != '[]' AND relay_urls != ?))
+            OR relay_urls != '[]')
         "#,
     )
     .bind(&direct_addresses)
     .bind(&direct_addresses)
-    .bind(&relay_urls)
-    .bind(&relay_urls)
     .bind(now.timestamp_millis())
     .bind(now)
     .bind(endpoint_id)
     .bind(&direct_addresses)
     .bind(&direct_addresses)
-    .bind(&relay_urls)
-    .bind(&relay_urls)
     .execute(pool)
     .await
     .context("refresh discovered peer routes")?;
     Ok(result.rows_affected() > 0)
+}
+
+fn lan_direct_addresses(addresses: &[String]) -> Vec<String> {
+    addresses
+        .iter()
+        .filter_map(|value| value.parse::<SocketAddr>().ok())
+        .filter(|address| is_lan_ip(address.ip()))
+        .map(|address| address.to_string())
+        .collect()
 }
 
 pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
@@ -646,6 +927,19 @@ pub async fn set_cloud_cursor(pool: &SqlitePool, cursor: u64) -> Result<()> {
     set_state_value(pool, CLOUD_CURSOR_KEY, &cursor.to_string()).await
 }
 
+/// Returns whether this sync space has completed its one-time local history backfill.
+pub async fn history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
+    Ok(state_value(pool, HISTORY_BACKFILL_GROUP_KEY)
+        .await?
+        .as_deref()
+        == Some(group_id))
+}
+
+/// Marks the one-time local history backfill complete for the current sync space.
+pub async fn mark_history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<()> {
+    set_state_value(pool, HISTORY_BACKFILL_GROUP_KEY, group_id).await
+}
+
 pub async fn mark_success(pool: &SqlitePool) -> Result<()> {
     set_state_value(pool, LAST_SUCCESS_KEY, &Utc::now().to_rfc3339()).await
 }
@@ -812,6 +1106,7 @@ pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
         "DELETE FROM sync_event_blobs",
         "DELETE FROM sync_events",
         "DELETE FROM sync_peers",
+        "DELETE FROM sync_removed_peers",
         "DELETE FROM sync_state",
         "DELETE FROM sync_pending_items",
     ] {
@@ -891,6 +1186,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lan_delivery_keeps_the_event_pending_for_cloud() {
+        let pool = memory_pool().await;
+        insert_test_event(&pool, "event-1").await;
+
+        mark_delivered(&pool, "peer:android", &["event-1".into()])
+            .await
+            .unwrap();
+
+        assert!(pending_events_for_target(&pool, "peer:android", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            pending_events_for_target(&pool, "cloud", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn history_backfill_marker_is_scoped_to_the_sync_space() {
+        let pool = memory_pool().await;
+
+        assert!(!history_backfill_completed(&pool, "group-a").await.unwrap());
+        mark_history_backfill_completed(&pool, "group-a")
+            .await
+            .unwrap();
+        assert!(history_backfill_completed(&pool, "group-a").await.unwrap());
+        assert!(!history_backfill_completed(&pool, "group-b").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn item_status_tracks_each_route_independently() {
         let pool = memory_pool().await;
         insert_test_item(&pool, "item-1").await;
@@ -932,7 +1261,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_routes_update_known_peer_without_erasing_missing_routes() {
+    async fn removed_peer_stays_blocked_until_explicitly_restored() {
+        let pool = memory_pool().await;
+        let peer = PeerAnnouncement {
+            device_id: "android".into(),
+            device_name: "Pixel".into(),
+            platform: "android".into(),
+            endpoint_id: "endpoint".into(),
+            direct_addresses: vec!["127.0.0.1:35555".into()],
+            relay_urls: Vec::new(),
+            last_seen_ms: 100,
+        };
+        upsert_peer(&pool, &peer).await.unwrap();
+        insert_test_event(&pool, "event-1").await;
+        mark_delivered(&pool, "peer:android", &["event-1".into()])
+            .await
+            .unwrap();
+
+        assert!(remove_peer(&pool, "android").await.unwrap().is_some());
+        assert!(is_peer_removed(&pool, "android", "endpoint").await.unwrap());
+        assert!(list_peers(&pool).await.unwrap().is_empty());
+        let deliveries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_deliveries WHERE target_id = 'peer:android'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deliveries, 0);
+
+        upsert_peer(&pool, &peer).await.unwrap();
+        assert!(list_peers(&pool).await.unwrap().is_empty());
+
+        restore_and_upsert_peer(&pool, &peer).await.unwrap();
+        assert!(!is_peer_removed(&pool, "android", "endpoint").await.unwrap());
+        assert!(removed_devices(&pool).await.unwrap()[0]
+            .restored_at_ms
+            .is_some());
+        assert_eq!(list_peers(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approved_peer_restoration_rolls_back_when_route_storage_fails() {
+        let pool = memory_pool().await;
+        let peer = PeerAnnouncement {
+            device_id: "android".into(),
+            device_name: "Pixel".into(),
+            platform: "android".into(),
+            endpoint_id: "endpoint".into(),
+            direct_addresses: vec!["127.0.0.1:35555".into()],
+            relay_urls: Vec::new(),
+            last_seen_ms: 100,
+        };
+        upsert_peer(&pool, &peer).await.unwrap();
+        remove_peer(&pool, "android").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_android_peer
+            BEFORE INSERT ON sync_peers
+            WHEN NEW.device_id = 'android'
+            BEGIN
+                SELECT RAISE(ABORT, 'blocked for test');
+            END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(restore_and_upsert_peer(&pool, &peer).await.is_err());
+        assert!(is_peer_removed(&pool, "android", "endpoint").await.unwrap());
+        assert!(list_peers(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovered_routes_update_known_peer_and_clear_legacy_relays() {
         let pool = memory_pool().await;
         upsert_peer(
             &pool,
@@ -950,15 +1352,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            update_peer_routes(&pool, "endpoint", &["10.0.0.3:35555".into()], &[])
+            update_peer_routes(&pool, "endpoint", &["10.0.0.3:35555".into()])
                 .await
                 .unwrap()
         );
         let peer = list_peers(&pool).await.unwrap().remove(0).announcement;
         assert_eq!(peer.direct_addresses, ["10.0.0.3:35555"]);
-        assert_eq!(peer.relay_urls, ["https://relay.example"]);
+        assert!(peer.relay_urls.is_empty());
         assert!(
-            !update_peer_routes(&pool, "unknown", &["10.0.0.4:35555".into()], &[])
+            !update_peer_routes(&pool, "unknown", &["10.0.0.4:35555".into()])
                 .await
                 .unwrap()
         );

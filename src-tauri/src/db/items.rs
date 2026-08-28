@@ -179,6 +179,23 @@ pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Clipb
     Ok(item)
 }
 
+/// Reads the most recently used clipboard records with full content for one-time sync backfill.
+pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<ClipboardItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
+    qb.push(" ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC LIMIT ")
+        .push_bind(i64::from(limit));
+
+    Ok(qb
+        .build_query_as::<ClipboardItem>()
+        .fetch_all(pool)
+        .await
+        .context("failed to query recent clipboard items for sync")?)
+}
+
 /// 按 `id` 查找单条记录的「列表视图」副本——与 [`fetch_items`] 走同款 [`LIST_SELECT_ITEM`] 裁剪：
 /// text 类型条目的 `content` / `search_text` 一律置空，由前端用 `summary` 渲染。
 /// 供前端响应 `clipboard://updated` 事件时按 id 拉取使用，避免事件驱动刷新整页 refetch
@@ -632,6 +649,25 @@ mod tests {
         assert_eq!(found.use_count, 1);
 
         assert!(find_item_by_id(&pool, "missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recent_items_for_sync_uses_updated_order_and_keeps_full_content() {
+        let pool = memory_pool().await;
+        for (id, updated_at) in [
+            ("old", 1_700_000_001),
+            ("new", 1_700_000_003),
+            ("mid", 1_700_000_002),
+        ] {
+            let mut item = sample_item(id);
+            item.updated_at = DateTime::from_timestamp(updated_at, 0).unwrap();
+            insert_item(&pool, &item).await.unwrap();
+        }
+
+        let items = recent_items_for_sync(&pool, 2).await.unwrap();
+
+        assert_eq!(ids(&items), ["new", "mid"]);
+        assert_eq!(items[0].content, "content-new");
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@ import { AnimatePresence, motion } from "motion/react";
 import { type FC, useLayoutEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ScrollArea from "@/components/ScrollArea";
+import { cn } from "@/utils/cn";
+import { isMobile } from "@/utils/is";
 import type { allPreferenceSettings } from "../config/preferenceSchema";
 import {
   translatePreferenceSection,
@@ -33,6 +35,7 @@ interface PreferenceSearchResultsProps {
 const PreferenceSearchResults: FC<PreferenceSearchResultsProps> = (props) => {
   const { query, results, shouldReduceMotion, onPick } = props;
   const { t } = useTranslation("preferences");
+  const mobile = isMobile();
   const [measureNode, setMeasureNode] = useState<HTMLDivElement | null>(null);
   const [panelSize, setPanelSize] = useState<PanelSize>({
     height: PANEL_MIN_HEIGHT,
@@ -99,7 +102,7 @@ const PreferenceSearchResults: FC<PreferenceSearchResultsProps> = (props) => {
   const renderPanelContent = () => {
     if (results.length === 0) {
       return (
-        <div className="w-64 overflow-hidden p-4">
+        <div className={cn("overflow-hidden p-4", mobile ? "w-full" : "w-64")}>
           <Empty
             description={t("search.empty")}
             image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -109,7 +112,12 @@ const PreferenceSearchResults: FC<PreferenceSearchResultsProps> = (props) => {
     }
 
     return (
-      <ScrollArea className="max-h-88 w-max min-w-64 max-w-128 overflow-x-hidden overscroll-contain">
+      <ScrollArea
+        className={cn(
+          "max-h-88 overflow-x-hidden overscroll-contain",
+          mobile ? "w-full min-w-0" : "w-max min-w-64 max-w-128",
+        )}
+      >
         {results.map((result) => {
           const handleClick = () => {
             onPick(result);
@@ -145,7 +153,10 @@ const PreferenceSearchResults: FC<PreferenceSearchResultsProps> = (props) => {
     <>
       {query ? (
         <div
-          className="pointer-events-none invisible absolute top-full right-0 z-0 mt-2"
+          className={cn(
+            "pointer-events-none invisible absolute top-full z-0 mt-2",
+            mobile ? "inset-x-0" : "right-0",
+          )}
           data-measure-key={panelContentKey}
           ref={setMeasureNode}
         >
@@ -162,7 +173,10 @@ const PreferenceSearchResults: FC<PreferenceSearchResultsProps> = (props) => {
               width: panelSize.width,
               y: 0,
             }}
-            className="absolute top-full right-0 z-10 mt-2 overflow-hidden rounded-2 border border-ant-border-secondary bg-ant-elevated shadow-sm"
+            className={cn(
+              "absolute top-full z-10 mt-2 overflow-hidden rounded-2 border border-ant-border-secondary bg-ant-elevated shadow-sm",
+              mobile ? "inset-x-0" : "right-0",
+            )}
             exit={{
               height: panelSize.height,
               opacity: 0,

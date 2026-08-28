@@ -2,6 +2,8 @@ use ecopaste_sync_protocol::PeerAnnouncement;
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::CloudRelayMode;
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 pub struct ClipboardEnvelope {
@@ -88,7 +90,10 @@ pub struct StoredBlob {
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
     pub enabled: bool,
+    pub lan_enabled: bool,
     pub cloud_enabled: bool,
+    pub cloud_relay_mode: CloudRelayMode,
+    pub cloud_relay_auth_configured: bool,
     pub paired: bool,
     pub device_id: String,
     pub device_name: String,
@@ -103,6 +108,9 @@ pub struct SyncStatus {
     pub last_success_at: Option<String>,
     pub lan: SyncChannelStatus,
     pub cloud: SyncChannelStatus,
+    pub cloud_watch: SyncChannelStatus,
+    pub cloud_connected_address: Option<String>,
+    pub cloud_transport: Option<String>,
     pub peers: Vec<SyncPeerStatus>,
 }
 
@@ -113,6 +121,7 @@ pub enum SyncChannelState {
     Idle,
     Connecting,
     Online,
+    Degraded,
     Error,
 }
 
@@ -231,6 +240,60 @@ impl SyncItemStatus {
 pub struct SyncPairingPreview {
     pub inviter_device_name: String,
     pub same_group: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbySyncDevice {
+    pub device_name: String,
+    pub platform: String,
+    pub endpoint_id: String,
+    pub direct_addresses: Vec<String>,
+    pub relay_urls: Vec<String>,
+    pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbySyncSpace {
+    pub space_id: String,
+    pub same_group: bool,
+    pub devices: Vec<NearbySyncDevice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NearbyJoinState {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbyJoinAttempt {
+    pub request_id: String,
+    pub target_device_name: String,
+    pub comparison_code: String,
+    pub state: NearbyJoinState,
+    pub expires_at: String,
+    pub pairing_code: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingJoinRequest {
+    pub request_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub platform: String,
+    pub endpoint_id: String,
+    pub comparison_code: String,
+    pub previously_removed: bool,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone)]
