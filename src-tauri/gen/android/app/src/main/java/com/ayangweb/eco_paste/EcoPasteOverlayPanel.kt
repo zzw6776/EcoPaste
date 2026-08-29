@@ -3,6 +3,8 @@ package com.ayangweb.eco_paste
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -25,6 +27,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
@@ -33,6 +36,7 @@ import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -45,6 +49,7 @@ class EcoPasteOverlayPanel(
     companion object {
         private const val TAG = "EcoPasteOverlayPanel"
         private const val ITEM_LIMIT = 50
+        private const val CLOUD_RECORD_PAGE_SIZE = 30
     }
 
     private enum class ItemFilter {
@@ -111,6 +116,7 @@ class EcoPasteOverlayPanel(
         val deviceName: String,
         val kind: String,
         val preview: String,
+        val imagePath: String,
         val createdAt: String,
         val fileCount: Int,
         val totalSize: Long,
@@ -138,6 +144,16 @@ class EcoPasteOverlayPanel(
     private var expandedSyncTarget: String? = null
     private var syncStatus: OverlaySyncStatus? = null
     private var showingCloudRecords = false
+    private var cloudRecords = emptyList<CloudRecord>()
+    private var cloudNextBeforeCursor: Long? = null
+    private var cloudImagePreview: View? = null
+    private var syncStatusGeneration = 0
+    private var cloudLoadGeneration = 0
+    private var itemLoadFuture: Future<*>? = null
+    private var syncStatusFuture: Future<*>? = null
+    private var cloudLoadFuture: Future<*>? = null
+    private val queryExecutor = Executors.newSingleThreadExecutor()
+    private val actionExecutor = Executors.newFixedThreadPool(2)
     private val heightPersistenceExecutor = Executors.newSingleThreadExecutor()
 
     fun show(heightPercent: Int) {
@@ -151,6 +167,8 @@ class EcoPasteOverlayPanel(
         activeFilter = ItemFilter.ALL
         loadedItems = emptyList()
         showingCloudRecords = false
+        cloudRecords = emptyList()
+        cloudNextBeforeCursor = null
 
         val bounds = displayBounds()
         val initialHeightPercent = heightPercent.coerceIn(30, 90)
@@ -259,6 +277,29 @@ class EcoPasteOverlayPanel(
         removeCurrentPanel(sessionId)
     }
 
+    /** Releases background workers owned by the long-lived overlay service. */
+    fun destroy() {
+        removeCurrentPanel()
+        queryExecutor.shutdownNow()
+        actionExecutor.shutdownNow()
+        heightPersistenceExecutor.shutdownNow()
+    }
+
+    /** 返回面板内上一层；返回 false 表示当前已在根层，可由服务收起面板。 */
+    fun navigateBack(sessionId: Long?): Boolean {
+        if (sessionId != null && activeSessionId != sessionId) return true
+        if (cloudImagePreview != null) {
+            closeCloudImagePreview()
+            return true
+        }
+        if (showingCloudRecords) {
+            closeCloudRecords()
+            return true
+        }
+
+        return false
+    }
+
     /** 强制移除旧窗口，避免 View 对象存在但 Surface 已不可见时阻塞下一次唤起。 */
     private fun removeCurrentPanel(expectedSessionId: Long? = null) {
         if (expectedSessionId != null && activeSessionId != expectedSessionId) return
@@ -282,6 +323,12 @@ class EcoPasteOverlayPanel(
     }
 
     private fun clearPanelState() {
+        loadGeneration += 1
+        syncStatusGeneration += 1
+        cloudLoadGeneration += 1
+        itemLoadFuture?.cancel(false)
+        syncStatusFuture?.cancel(false)
+        cloudLoadFuture?.cancel(false)
         searchRunnable?.let { mainHandler.removeCallbacks(it) }
         searchRunnable = null
         searchInput = null
@@ -297,6 +344,7 @@ class EcoPasteOverlayPanel(
         cloudStatusButton = null
         expandedSyncTarget = null
         syncStatus = null
+        cloudImagePreview = null
         loadedItems = emptyList()
     }
 
@@ -306,7 +354,8 @@ class EcoPasteOverlayPanel(
             removeAllViews()
             addView(statusText(R.string.overlay_panel_loading))
         }
-        Thread({
+        itemLoadFuture?.cancel(false)
+        itemLoadFuture = queryExecutor.submit {
             val json = try {
                 EcoPasteBridge.loadOverlayItemsJson(keyword.trim(), ITEM_LIMIT)
             } catch (error: Throwable) {
@@ -319,12 +368,14 @@ class EcoPasteOverlayPanel(
                     renderItems()
                 }
             }
-        }, "ecopaste-overlay-load").start()
+        }
     }
 
     private fun requestSyncStatus() {
         if (panelView == null) return
-        Thread({
+        val generation = ++syncStatusGeneration
+        syncStatusFuture?.cancel(false)
+        syncStatusFuture = queryExecutor.submit {
             val json = try {
                 EcoPasteBridge.loadOverlaySyncStatusJson()
             } catch (error: Throwable) {
@@ -332,12 +383,12 @@ class EcoPasteOverlayPanel(
                 "{}"
             }
             mainHandler.post {
-                if (panelView == null) return@post
+                if (panelView == null || generation != syncStatusGeneration) return@post
                 syncStatus = parseSyncStatus(json)
                 renderTopSyncStatus()
                 renderSyncDetails()
             }
-        }, "ecopaste-overlay-sync-status").start()
+        }
     }
 
     private fun parseSyncStatus(json: String): OverlaySyncStatus {
@@ -548,7 +599,7 @@ class EcoPasteOverlayPanel(
         if (reconnectInProgress) return
         reconnectInProgress = true
         Toast.makeText(context, "正在重新连接", Toast.LENGTH_SHORT).show()
-        Thread({
+        actionExecutor.submit {
             val succeeded = try {
                 EcoPasteBridge.reconnectOverlayPeer(deviceId.orEmpty())
             } catch (error: Throwable) {
@@ -563,32 +614,46 @@ class EcoPasteOverlayPanel(
                     Toast.makeText(context, "重新连接失败", Toast.LENGTH_SHORT).show()
                 }
             }
-        }, "ecopaste-overlay-reconnect").start()
+        }
     }
 
-    private fun requestCloudRecords() {
+    private fun requestCloudRecords(append: Boolean = false) {
         if (panelView == null) return
+        if (append && cloudNextBeforeCursor == null) return
         showingCloudRecords = true
         filterContainer?.visibility = View.GONE
-        itemContainer?.apply {
-            removeAllViews()
-            addView(statusText(R.string.overlay_panel_loading))
+        if (!append) {
+            cloudRecords = emptyList()
+            cloudNextBeforeCursor = null
+            itemContainer?.apply {
+                removeAllViews()
+                addView(statusText(R.string.overlay_panel_loading))
+            }
         }
-        Thread({
+        val generation = ++cloudLoadGeneration
+        cloudLoadFuture?.cancel(false)
+        cloudLoadFuture = queryExecutor.submit {
             val json = try {
-                EcoPasteBridge.loadOverlayCloudRecordsJson()
+                EcoPasteBridge.loadOverlayCloudRecordsJson(
+                    if (append) cloudNextBeforeCursor ?: -1L else -1L,
+                    CLOUD_RECORD_PAGE_SIZE,
+                )
             } catch (error: Throwable) {
                 Log.e(TAG, "load overlay cloud records failed: ${error.message}", error)
                 JSONObject().put("error", error.message.orEmpty()).toString()
             }
             mainHandler.post {
-                if (panelView == null || !showingCloudRecords) return@post
-                renderCloudRecords(json)
+                if (
+                    panelView == null ||
+                    !showingCloudRecords ||
+                    generation != cloudLoadGeneration
+                ) return@post
+                renderCloudRecords(json, append)
             }
-        }, "ecopaste-overlay-cloud-records").start()
+        }
     }
 
-    private fun renderCloudRecords(json: String) {
+    private fun renderCloudRecords(json: String, append: Boolean) {
         val container = itemContainer ?: return
         container.removeAllViews()
         container.addView(TextView(context).apply {
@@ -610,13 +675,35 @@ class EcoPasteOverlayPanel(
             return
         }
         val values = root.optJSONArray("records") ?: JSONArray()
-        if (values.length() == 0) {
+        val pageRecords = buildList {
+            for (index in 0 until values.length()) {
+                val value = values.optJSONObject(index) ?: continue
+                add(parseCloudRecord(value))
+            }
+        }
+        cloudRecords = if (append) cloudRecords + pageRecords else pageRecords
+        cloudNextBeforeCursor = if (root.isNull("nextBeforeCursor")) {
+            null
+        } else {
+            root.optLong("nextBeforeCursor")
+        }
+        if (cloudRecords.isEmpty()) {
             container.addView(detailText("云端暂无剪贴板记录"))
             return
         }
-        for (index in 0 until values.length()) {
-            val value = values.optJSONObject(index) ?: continue
-            container.addView(createCloudRecordCard(parseCloudRecord(value)))
+        cloudRecords.forEach { record ->
+            container.addView(createCloudRecordCard(record))
+        }
+        if (cloudNextBeforeCursor != null) {
+            container.addView(TextView(context).apply {
+                text = "加载更多"
+                textSize = 12f
+                gravity = Gravity.CENTER
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(0, 122, 255))
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setOnClickListener { requestCloudRecords(append = true) }
+            })
         }
     }
 
@@ -626,6 +713,7 @@ class EcoPasteOverlayPanel(
             deviceName = value.optString("deviceName", "EcoPaste"),
             kind = value.optString("kind", "text"),
             preview = value.optString("preview"),
+            imagePath = value.optString("imagePath"),
             createdAt = value.optString("createdAt").replace('T', ' ').take(16),
             fileCount = value.optInt("fileCount"),
             totalSize = value.optLong("totalSize"),
@@ -657,8 +745,23 @@ class EcoPasteOverlayPanel(
                 setTextColor(tertiaryTextColor())
                 setPadding(0, dp(3), 0, dp(6))
             })
+            if (record.kind == "image" && record.imagePath.isNotBlank()) {
+                decodeScaledBitmap(record.imagePath, dp(640))?.let { bitmap ->
+                    addView(ImageView(context).apply {
+                        adjustViewBounds = true
+                        maxHeight = dp(220)
+                        scaleType = ImageView.ScaleType.CENTER_INSIDE
+                        setImageBitmap(bitmap)
+                        contentDescription = record.preview.ifBlank { "云端图片" }
+                        setOnClickListener { showCloudImagePreview(record.imagePath) }
+                    }, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ))
+                }
+            }
             addView(TextView(context).apply {
-                text = if (record.isSensitive) "敏感内容已隐藏" else record.preview.ifBlank {
+                text = record.preview.ifBlank {
                     when (record.kind) {
                         "image" -> "图片"
                         "files" -> "文件"
@@ -667,7 +770,6 @@ class EcoPasteOverlayPanel(
                 }
                 textSize = 13f
                 setTextColor(primaryTextColor())
-                maxLines = 5
             })
         }.also {
             it.layoutParams = LinearLayout.LayoutParams(
@@ -681,8 +783,60 @@ class EcoPasteOverlayPanel(
 
     private fun closeCloudRecords() {
         showingCloudRecords = false
+        cloudLoadGeneration += 1
+        cloudLoadFuture?.cancel(false)
         filterContainer?.visibility = View.VISIBLE
         renderItems()
+    }
+
+    /** 在当前悬浮面板内展示图片大图，避免跳转 Activity 或退出当前层级。 */
+    private fun showCloudImagePreview(path: String) {
+        val root = panelView as? FrameLayout ?: return
+        val bitmap = decodeScaledBitmap(path, displayBounds().width().coerceAtLeast(dp(1080)))
+            ?: return
+        closeCloudImagePreview()
+        val preview = FrameLayout(context).apply {
+            isClickable = true
+            setBackgroundColor(Color.argb(235, 0, 0, 0))
+            setOnClickListener { closeCloudImagePreview() }
+            addView(ImageView(context).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageBitmap(bitmap)
+                contentDescription = "关闭云端图片预览"
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+        }
+        root.addView(preview, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        ))
+        cloudImagePreview = preview
+    }
+
+    private fun closeCloudImagePreview() {
+        val preview = cloudImagePreview ?: return
+        (preview.parent as? FrameLayout)?.removeView(preview)
+        cloudImagePreview = null
+    }
+
+    /** 按显示尺寸采样图片，避免云端原图直接解码导致悬浮服务占用过多内存。 */
+    private fun decodeScaledBitmap(path: String, maxDimension: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var sampleSize = 1
+        while (
+            bounds.outWidth / sampleSize > maxDimension ||
+            bounds.outHeight / sampleSize > maxDimension
+        ) {
+            sampleSize *= 2
+        }
+        return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+        })
     }
 
     /** 上沿拖动区域：向上拉长、向下缩短，松手后把百分比写回统一设置。 */
@@ -883,7 +1037,7 @@ class EcoPasteOverlayPanel(
         mainHandler.post {
             if (!searchMode || panelView !== current) return@post
             params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            params.softInputMode = searchSoftInputMode()
             try {
                 windowManager.updateViewLayout(current, params)
             } catch (error: Exception) {
@@ -1172,7 +1326,7 @@ class EcoPasteOverlayPanel(
     }
 
     private fun synchronizeItem(itemId: String, target: String) {
-        Thread({
+        actionExecutor.submit {
             val json = try {
                 EcoPasteBridge.syncOverlayItemJson(itemId, target)
             } catch (error: Throwable) {
@@ -1205,7 +1359,7 @@ class EcoPasteOverlayPanel(
                     Toast.LENGTH_SHORT,
                 ).show()
             }
-        }, "ecopaste-overlay-sync-item").start()
+        }
     }
 
     private fun itemSyncDescription(target: String, channel: ItemSyncChannel): String {
@@ -1227,7 +1381,7 @@ class EcoPasteOverlayPanel(
         val focusRestoreDelay = if (searchMode) 180L else 0L
         hide()
         mainHandler.postDelayed({
-            Thread({
+            actionExecutor.submit {
                 val success = try {
                     EcoPasteBridge.pasteOverlayItem(id)
                 } catch (error: Throwable) {
@@ -1243,7 +1397,7 @@ class EcoPasteOverlayPanel(
                         ).show()
                     }
                 }
-            }, "ecopaste-overlay-paste").start()
+            }
         }, focusRestoreDelay)
     }
 
@@ -1289,11 +1443,7 @@ class EcoPasteOverlayPanel(
         root.post {
             if (root.width == 0 || root.height == 0) return@post
             val edgeWidth = dp(28)
-            val systemGestureHeight = root.rootWindowInsets
-                ?.mandatorySystemGestureInsets
-                ?.bottom
-                ?.coerceAtLeast(dp(48))
-                ?: dp(48)
+            val systemGestureHeight = mandatorySystemGestureBottomInset(root.rootWindowInsets)
             val exclusionBottom = if (preserveBottomSystemArea) {
                 (root.height - systemGestureHeight).coerceAtLeast(0)
             } else {
@@ -1307,11 +1457,30 @@ class EcoPasteOverlayPanel(
         }
     }
 
+    private fun mandatorySystemGestureBottomInset(insets: WindowInsets?): Int {
+        if (insets == null) return dp(48)
+        val bottom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom
+        } else {
+            @Suppress("DEPRECATION")
+            insets.mandatorySystemGestureInsets.bottom
+        }
+        return bottom.coerceAtLeast(dp(48))
+    }
+
+    private fun searchSoftInputMode(): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+        }
+        @Suppress("DEPRECATION")
+        return WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+    }
+
     /** 浮窗本身延伸到屏幕底部，但内容始终避开系统导航与手势区域。 */
     private fun installBottomSystemInset(root: View, content: View) {
         root.setOnApplyWindowInsetsListener { _, insets ->
             val bottomInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                insets.getInsets(WindowInsets.Type.systemBars()).bottom
+                insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime()).bottom
             } else {
                 @Suppress("DEPRECATION")
                 insets.systemWindowInsetBottom

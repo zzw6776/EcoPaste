@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.PersistableBundle
 import android.provider.Settings
 import android.util.Log
 import android.webkit.MimeTypeMap
@@ -22,10 +23,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
-import java.io.InputStreamReader
 import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -44,8 +43,14 @@ object EcoPasteBridge {
     private const val KEY_GESTURE_LEFT_HEIGHT_DP = "gesture_left_height_dp"
     private const val KEY_GESTURE_RIGHT_WIDTH_DP = "gesture_right_width_dp"
     private const val KEY_GESTURE_RIGHT_HEIGHT_DP = "gesture_right_height_dp"
+    private const val CLIPBOARD_WRITEBACK_MARKER = "com.ayangweb.eco_paste.WRITEBACK"
     private var currentActivityRef: WeakReference<Activity>? = null
     private var lanDiscoveryLock: WifiManager.MulticastLock? = null
+    private var lanDiscoveryLeaseCount = 0
+    private var applicationContext: Context? = null
+    private var clipboardManager: ClipboardManager? = null
+    private var clipboardListenerRegistered = false
+    private var foregroundCaptureActive = false
     var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
         private set
 
@@ -62,7 +67,12 @@ object EcoPasteBridge {
     // 剪贴板变更监听回调队列
     private val clipboardChangeListeners = mutableListOf<(String) -> Unit>()
     private var lastCapturedText: String? = null
+    private var lastCapturedTimestamp = Long.MIN_VALUE
+    private var legacyClipboardSequence = 0L
     private var syncStatusChangedListener: (() -> Unit)? = null
+    private val clipChangedListener = ClipboardManager.OnPrimaryClipChangedListener {
+        captureClipboardChange(clipboardManager, true)
+    }
 
     @JvmStatic
     external fun initNdkContext(context: Context)
@@ -74,7 +84,7 @@ object EcoPasteBridge {
     external fun loadOverlaySyncStatusJson(): String
 
     @JvmStatic
-    external fun loadOverlayCloudRecordsJson(): String
+    external fun loadOverlayCloudRecordsJson(beforeCursor: Long, limit: Int): String
 
     @JvmStatic
     external fun syncOverlayItemJson(id: String, target: String): String
@@ -239,10 +249,23 @@ object EcoPasteBridge {
 
     @JvmStatic
     fun initialize(context: Context) {
+        applicationContext = context.applicationContext
         currentEngineMode = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(KEY_ENGINE_MODE, "accessibility")
             ?.takeIf { it == "accessibility" || it == "root" || it == "foreground" }
             ?: "accessibility"
+        refreshClipboardListener()
+    }
+
+    /** Foreground mode listens only while EcoPaste owns a visible activity. */
+    @JvmStatic
+    @Synchronized
+    fun setForegroundCaptureActive(active: Boolean) {
+        foregroundCaptureActive = active
+        refreshClipboardListener()
+        if (active && currentEngineMode == "foreground") {
+            captureClipboardChange(clipboardManager, false)
+        }
     }
 
     /** Android 默认过滤组播；仅在同步端点运行期间允许接收局域网发现报文。 */
@@ -250,10 +273,13 @@ object EcoPasteBridge {
     @Synchronized
     fun setLanDiscoveryEnabled(context: Context, enabled: Boolean) {
         if (!enabled) {
+            lanDiscoveryLeaseCount = (lanDiscoveryLeaseCount - 1).coerceAtLeast(0)
+            if (lanDiscoveryLeaseCount > 0) return
             lanDiscoveryLock?.takeIf { it.isHeld }?.release()
             lanDiscoveryLock = null
             return
         }
+        lanDiscoveryLeaseCount += 1
         if (lanDiscoveryLock?.isHeld == true) return
 
         val wifiManager = context.applicationContext
@@ -648,6 +674,8 @@ object EcoPasteBridge {
             .edit()
             .putString(KEY_ENGINE_MODE, mode)
             .apply()
+        applicationContext = context.applicationContext
+        refreshClipboardListener()
         return engineResult(true, mode, mode != "root" || isRootClipboardGranted(context), "")
     }
 
@@ -752,13 +780,82 @@ object EcoPasteBridge {
         clipboardChangeListeners.add(listener)
     }
 
-    /**
-     * 无障碍服务或系统剪贴板抓取到内容变更时调用
-     */
+    /** Registers one system callback for root and foreground capture modes. */
+    @Synchronized
+    private fun refreshClipboardListener() {
+        val context = applicationContext ?: return
+        val manager = clipboardManager
+            ?: (context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager).also {
+                clipboardManager = it
+            }
+        val shouldListen = currentEngineMode == "root" ||
+            (currentEngineMode == "foreground" && foregroundCaptureActive)
+        if (shouldListen == clipboardListenerRegistered || manager == null) return
+
+        try {
+            if (shouldListen) {
+                manager.addPrimaryClipChangedListener(clipChangedListener)
+            } else {
+                manager.removePrimaryClipChangedListener(clipChangedListener)
+            }
+            clipboardListenerRegistered = shouldListen
+        } catch (error: Exception) {
+            Log.w(TAG, "update clipboard listener failed: ${error.message}")
+        }
+    }
+
+    /** Reads and dispatches one native clipboard event without any periodic polling. */
     @JvmStatic
-    fun onClipboardCaptured(text: String) {
-        if (text.isBlank() || text == lastCapturedText) return
+    @Synchronized
+    fun captureClipboardChange(manager: ClipboardManager?, confirmedChange: Boolean) {
+        try {
+            val description = manager?.primaryClipDescription ?: return
+            if (description.extras?.getBoolean(CLIPBOARD_WRITEBACK_MARKER, false) == true) {
+                return
+            }
+            val timestamp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                description.timestamp
+            } else {
+                0L
+            }
+            if (!confirmedChange && timestamp > 0L && timestamp == lastCapturedTimestamp) return
+
+            val clip = manager?.primaryClip ?: return
+            if (clip.itemCount <= 0) return
+            val context = applicationContext ?: EcoPasteAccessibilityService.instance ?: return
+            val text = clip.getItemAt(0).coerceToText(context)?.toString() ?: return
+            onClipboardCaptured(text, timestamp, confirmedChange)
+        } catch (error: Exception) {
+            Log.d(TAG, "read clipboard change failed: ${error.message}")
+        }
+    }
+
+    /** Writes a marked clip so native capture never turns synchronized content into a local event. */
+    @JvmStatic
+    fun writeClipboardText(context: Context, text: String) {
+        val clip = ClipData.newPlainText("EcoPaste", text)
+        clip.description.extras = PersistableBundle().apply {
+            putBoolean(CLIPBOARD_WRITEBACK_MARKER, true)
+        }
+        val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            ?: throw IllegalStateException("clipboard service unavailable")
+        manager.setPrimaryClip(clip)
+    }
+
+    /** Deduplicates multiple native callbacks for the same system clipboard generation. */
+    @JvmStatic
+    @Synchronized
+    fun onClipboardCaptured(text: String, timestamp: Long, confirmedChange: Boolean) {
+        if (text.isBlank()) return
+        val captureTimestamp = when {
+            timestamp > 0L -> timestamp
+            confirmedChange -> ++legacyClipboardSequence
+            text != lastCapturedText -> ++legacyClipboardSequence
+            else -> lastCapturedTimestamp
+        }
+        if (text == lastCapturedText && captureTimestamp == lastCapturedTimestamp) return
         lastCapturedText = text
+        lastCapturedTimestamp = captureTimestamp
         try {
             captureClipboardText(text)
         } catch (error: Throwable) {
@@ -777,11 +874,13 @@ object EcoPasteBridge {
     @JvmStatic
     fun checkRootAvailable(): Boolean {
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val output = reader.readLine()
-            process.waitFor()
-            output != null && output.contains("uid=0")
+            val process = ProcessBuilder("su", "-c", "id")
+                .redirectErrorStream(true)
+                .start()
+            if (!waitForProcess(process, 3_000L)) return false
+            process.inputStream.bufferedReader().use { reader ->
+                process.exitValue() == 0 && reader.readText().contains("uid=0")
+            }
         } catch (_: Exception) {
             false
         }
@@ -798,8 +897,9 @@ object EcoPasteBridge {
             val process = ProcessBuilder("su", "-c", cmd)
                 .redirectErrorStream(true)
                 .start()
+            if (!waitForProcess(process, 5_000L)) return false
             process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor() == 0
+            process.exitValue() == 0
         } catch (error: Exception) {
             Log.e(TAG, "grant root clipboard AppOps failed: ${error.message}", error)
             false
@@ -813,11 +913,33 @@ object EcoPasteBridge {
             val process = ProcessBuilder("su", "-c", "cmd appops get $pkg READ_CLIPBOARD")
                 .redirectErrorStream(true)
                 .start()
+            if (!waitForProcess(process, 3_000L)) return false
             val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor() == 0 && Regex("READ_CLIPBOARD:\\s*allow").containsMatchIn(output)
+            process.exitValue() == 0 && Regex("READ_CLIPBOARD:\\s*allow").containsMatchIn(output)
         } catch (error: Exception) {
             Log.d(TAG, "read root clipboard AppOps failed: ${error.message}")
             false
         }
+    }
+
+    /** Waits for short root commands without depending on newer Android Process APIs. */
+    private fun waitForProcess(process: Process, timeoutMs: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (System.nanoTime() < deadline) {
+            try {
+                process.exitValue()
+                return true
+            } catch (_: IllegalThreadStateException) {
+                try {
+                    Thread.sleep(50L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    process.destroy()
+                    return false
+                }
+            }
+        }
+        process.destroy()
+        return false
     }
 }

@@ -25,7 +25,9 @@ use crate::db::models::{
 };
 use crate::db::DatabaseState;
 use crate::settings::SettingsStore;
-use crate::window::{self, CLIPBOARD_WINDOW_LABEL};
+use crate::window;
+#[cfg(not(target_os = "android"))]
+use crate::window::CLIPBOARD_WINDOW_LABEL;
 
 /// 与前端 `src/constants/events.ts` 的 `TAURI_EVENT.CLIPBOARD_UPDATED` 一一对应。
 const CLIPBOARD_UPDATED_EVENT: &str = "clipboard://updated";
@@ -205,9 +207,9 @@ pub async fn save_clipboard_image_to_file(
         .add_filter("PNG", &["png"])
         .set_can_create_directories(true)
         .set_file_name(default_saved_image_file_name(&item))
-        .set_title(crate::i18n::clipboard_menu::label(
+        .set_title(crate::i18n::commands::label(
             crate::i18n::current_language(&app),
-            crate::i18n::clipboard_menu::Key::SaveImage,
+            crate::i18n::commands::Key::SaveImage,
         ));
 
     match app.path().download_dir() {
@@ -521,10 +523,10 @@ pub async fn play_copy_sound() {
 pub async fn write_to_clipboard(
     app: AppHandle,
     db: State<'_, DatabaseState>,
-    store: State<'_, ImageStore>,
+    _store: State<'_, ImageStore>,
     guard: State<'_, Arc<WritebackGuard>>,
     id: String,
-    plain: bool,
+    _plain: bool,
 ) -> Result<()> {
     let pool = db.pool().await;
     let item = find_item_by_id(&pool, &id)
@@ -532,12 +534,13 @@ pub async fn write_to_clipboard(
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
 
     let settings = app.state::<SettingsStore>().snapshot();
+    #[cfg(not(target_os = "android"))]
     let write_plain =
-        should_write_plain_for_copy(plain, item.kind, settings.clipboard.content.copy_plain);
+        should_write_plain_for_copy(_plain, item.kind, settings.clipboard.content.copy_plain);
     let hide_after_copy = settings.clipboard.content.copy_then_hide_window;
 
     #[cfg(not(target_os = "android"))]
-    crate::clipboard::write_to_clipboard(&store, guard.inner().as_ref(), &item, write_plain)?;
+    crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
     #[cfg(target_os = "android")]
     crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
@@ -560,26 +563,28 @@ pub async fn write_to_clipboard(
 pub async fn paste_clipboard_item(
     app: AppHandle,
     db: State<'_, DatabaseState>,
-    store: State<'_, ImageStore>,
+    _store: State<'_, ImageStore>,
     guard: State<'_, Arc<WritebackGuard>>,
     id: String,
-    plain: bool,
+    _plain: bool,
 ) -> Result<()> {
     let pool = db.pool().await;
     let item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
 
+    #[cfg(not(target_os = "android"))]
     let settings = app.state::<SettingsStore>().snapshot();
+    #[cfg(not(target_os = "android"))]
     let write_plain = should_write_plain_for_paste(
-        plain,
+        _plain,
         item.kind,
         settings.clipboard.content.paste_plain,
         settings.clipboard.content.paste_files_as_path,
     );
 
     #[cfg(not(target_os = "android"))]
-    crate::clipboard::write_to_clipboard(&store, guard.inner().as_ref(), &item, write_plain)?;
+    crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
     #[cfg(target_os = "android")]
     crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
@@ -625,11 +630,13 @@ pub async fn paste_clipboard_item(
 }
 
 /// 计算复制写回是否强制走纯文本；默认复制纯文本只作用于文本记录。
+#[cfg(not(target_os = "android"))]
 fn should_write_plain_for_copy(force_plain: bool, kind: ClipboardKind, copy_plain: bool) -> bool {
     force_plain || kind == ClipboardKind::Text && copy_plain
 }
 
 /// 计算粘贴写回是否强制走纯文本；文本去格式与文件路径粘贴分别由各自设置控制。
+#[cfg(not(target_os = "android"))]
 fn should_write_plain_for_paste(
     force_plain: bool,
     kind: ClipboardKind,

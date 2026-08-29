@@ -26,6 +26,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.Executors
 
 /** Root-only 全局上滑监控；左右感应区窗口用于阻止点击穿透。 */
 class EcoPasteOverlayService : Service() {
@@ -40,11 +41,19 @@ class EcoPasteOverlayService : Service() {
         private const val BACK_MOVE_THRESHOLD_DP = 52
         private const val SYSTEM_GESTURE_HEIGHT_DP = 48
         private const val SUMMON_DEBOUNCE_MS = 240L
-        private const val MONITOR_RESTART_DELAY_MS = 800L
+        private val MONITOR_RETRY_DELAYS_MS = longArrayOf(
+            2_000L,
+            5_000L,
+            15_000L,
+            30_000L,
+            60_000L,
+            300_000L,
+        )
         private var instance: EcoPasteOverlayService? = null
 
         fun notifyConfigChanged(monitorGeometryChanged: Boolean) {
             instance?.mainHandler?.post {
+                instance?.monitorFailureCount = 0
                 instance?.reconcileState(
                     refreshRoot = false,
                     forceMonitorRestart = monitorGeometryChanged,
@@ -54,6 +63,7 @@ class EcoPasteOverlayService : Service() {
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val rootCheckExecutor = Executors.newSingleThreadExecutor()
     private var windowManager: WindowManager? = null
     private var leftIndicator: View? = null
     private var rightIndicator: View? = null
@@ -63,9 +73,15 @@ class EcoPasteOverlayService : Service() {
     private var rootAvailable = false
     private var panelSessionId: Long? = null
     private var lastSummonAt = 0L
+    private var rootCheckGeneration = 0
+    private var monitorFailureCount = 0
     private val monitorRestartRunnable = Runnable {
         if (rootInputMonitor == null) {
-            reconcileState(refreshRoot = true, forceMonitorRestart = false)
+            reconcileState(
+                refreshRoot = true,
+                forceMonitorRestart = false,
+                resetFailures = false,
+            )
         }
     }
 
@@ -75,10 +91,10 @@ class EcoPasteOverlayService : Service() {
                 Intent.ACTION_SCREEN_OFF -> suspendGesture()
                 Intent.ACTION_SCREEN_ON,
                 Intent.ACTION_USER_PRESENT,
-                Intent.ACTION_USER_UNLOCKED -> reconcileState(
-                    refreshRoot = true,
-                    forceMonitorRestart = false,
-                )
+                Intent.ACTION_USER_UNLOCKED -> {
+                    monitorFailureCount = 0
+                    reconcileState(refreshRoot = true, forceMonitorRestart = false)
+                }
             }
         }
     }
@@ -102,6 +118,7 @@ class EcoPasteOverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        monitorFailureCount = 0
         reconcileState(refreshRoot = true, forceMonitorRestart = false)
         return START_STICKY
     }
@@ -163,10 +180,28 @@ class EcoPasteOverlayService : Service() {
     }
 
     /** 统一按开关、Root、亮屏和解锁状态决定是否运行。 */
-    private fun reconcileState(refreshRoot: Boolean, forceMonitorRestart: Boolean) {
+    private fun reconcileState(
+        refreshRoot: Boolean,
+        forceMonitorRestart: Boolean,
+        resetFailures: Boolean = true,
+    ) {
+        if (resetFailures) monitorFailureCount = 0
         val config = EcoPasteBridge.getGestureConfig(this)
         if (refreshRoot) {
-            rootAvailable = EcoPasteBridge.checkRootAvailable()
+            val generation = ++rootCheckGeneration
+            rootCheckExecutor.execute {
+                val available = EcoPasteBridge.checkRootAvailable()
+                mainHandler.post {
+                    if (generation != rootCheckGeneration) return@post
+                    rootAvailable = available
+                    reconcileState(
+                        refreshRoot = false,
+                        forceMonitorRestart = forceMonitorRestart,
+                        resetFailures = false,
+                    )
+                }
+            }
+            return
         }
 
         if (!config.enabled || !rootAvailable || !isInteractiveAndUnlocked()) {
@@ -188,6 +223,7 @@ class EcoPasteOverlayService : Service() {
     }
 
     private fun suspendGesture() {
+        rootCheckGeneration += 1
         overlayPanel?.hide()
         stopRootInputMonitor()
         removeIndicators()
@@ -224,6 +260,7 @@ class EcoPasteOverlayService : Service() {
             onReady = { ready ->
                 mainHandler.post {
                     if (ready) {
+                        monitorFailureCount = 0
                         mainHandler.removeCallbacks(monitorRestartRunnable)
                         Log.i(TAG, "Root InputMonitor ready: $signature")
                     } else if (rootInputMonitor === monitor) {
@@ -231,8 +268,20 @@ class EcoPasteOverlayService : Service() {
                         activeMonitorSignature = null
                         removeIndicators()
                         mainHandler.removeCallbacks(monitorRestartRunnable)
-                        mainHandler.postDelayed(monitorRestartRunnable, MONITOR_RESTART_DELAY_MS)
-                        Log.w(TAG, "Root InputMonitor exited; restart scheduled")
+                        val retryDelay = MONITOR_RETRY_DELAYS_MS.getOrNull(monitorFailureCount)
+                        if (retryDelay == null) {
+                            Log.w(
+                                TAG,
+                                "Root InputMonitor retry suspended until the next resume event",
+                            )
+                        } else {
+                            monitorFailureCount += 1
+                            mainHandler.postDelayed(monitorRestartRunnable, retryDelay)
+                            Log.w(
+                                TAG,
+                                "Root InputMonitor exited; restart scheduled in ${retryDelay}ms",
+                            )
+                        }
                     }
                 }
             },
@@ -240,7 +289,7 @@ class EcoPasteOverlayService : Service() {
                 mainHandler.post { showClipboardPanel() }
             },
             onBackSwipe = { sessionId ->
-                mainHandler.post { hideClipboardPanel(sessionId) }
+                mainHandler.post { navigateBackOrHideClipboardPanel(sessionId) }
             },
             onHomeSwipe = { sessionId ->
                 mainHandler.post { hideClipboardPanel(sessionId) }
@@ -425,6 +474,14 @@ class EcoPasteOverlayService : Service() {
         overlayPanel?.hide(sessionId)
     }
 
+    /** 优先关闭面板内的详情层；仅在根层才收起整个悬浮面板。 */
+    private fun navigateBackOrHideClipboardPanel(sessionId: Long?) {
+        if (sessionId != null && sessionId != panelSessionId) return
+        if (overlayPanel?.navigateBack(sessionId) == true) return
+
+        hideClipboardPanel(sessionId)
+    }
+
     private fun removeIndicators() {
         try {
             leftIndicator?.let { windowManager?.removeView(it) }
@@ -441,7 +498,9 @@ class EcoPasteOverlayService : Service() {
             unregisterReceiver(screenStateReceiver)
         } catch (_: Exception) {}
         suspendGesture()
+        overlayPanel?.destroy()
         overlayPanel = null
+        rootCheckExecutor.shutdownNow()
         instance = null
         super.onDestroy()
         Log.i(TAG, "Root gesture service destroyed")

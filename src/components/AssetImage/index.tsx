@@ -40,7 +40,7 @@ const AssetImage: FC<AssetImageProps> = (props) => {
 /**
  * 把本地文件路径转为 webview 可访问地址；空路径返回空字符串以避免异常。
  */
-const toAssetUrl = (filePath?: string | null, protocol?: string) => {
+export const toAssetUrl = (filePath?: string | null, protocol?: string) => {
   if (!filePath) return "";
 
   if (

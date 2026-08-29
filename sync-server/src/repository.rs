@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
     CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement, RemovedDevice,
 };
-use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+};
 use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone)]
@@ -21,7 +24,10 @@ impl Repository {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePool::connect_with(options)
             .await
             .with_context(|| format!("open SQLite database at {}", path.display()))?;
@@ -170,17 +176,18 @@ impl Repository {
         &self,
         group_id: &str,
         devices: &[RemovedDevice],
-    ) -> Result<Vec<RemovedDevice>> {
+    ) -> Result<(Vec<RemovedDevice>, bool)> {
         let mut transaction = self
             .pool
             .begin()
             .await
             .context("begin merging removed devices")?;
+        let mut changed = false;
         for device in devices {
             validate_identifier("device_id", &device.device_id)?;
             validate_identifier("endpoint_id", &device.endpoint_id)?;
             let now = now_ms();
-            sqlx::query(
+            let stored = sqlx::query(
                 r#"
                 INSERT INTO removed_devices (
                     group_id, device_id, endpoint_id, removed_at_ms, restored_at_ms,
@@ -194,6 +201,10 @@ impl Repository {
                         ELSE MAX(COALESCE(removed_devices.restored_at_ms, 0), excluded.restored_at_ms)
                     END,
                     updated_at_ms = excluded.updated_at_ms
+                WHERE removed_devices.endpoint_id != excluded.endpoint_id
+                   OR excluded.removed_at_ms > removed_devices.removed_at_ms
+                   OR COALESCE(excluded.restored_at_ms, 0) >
+                      COALESCE(removed_devices.restored_at_ms, 0)
                 "#,
             )
             .bind(group_id)
@@ -206,6 +217,7 @@ impl Repository {
             .execute(&mut *transaction)
             .await
             .context("store removed sync device")?;
+            changed |= stored.rows_affected() > 0;
             let (stored_removed_at_ms, stored_restored_at_ms): (i64, Option<i64>) = sqlx::query_as(
                 r#"
                     SELECT removed_at_ms, restored_at_ms FROM removed_devices
@@ -235,7 +247,7 @@ impl Repository {
             .commit()
             .await
             .context("commit removed sync devices")?;
-        self.list_removed_devices(group_id).await
+        Ok((self.list_removed_devices(group_id).await?, changed))
     }
 
     pub async fn list_removed_devices(&self, group_id: &str) -> Result<Vec<RemovedDevice>> {

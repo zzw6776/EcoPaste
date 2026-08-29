@@ -1,4 +1,6 @@
-use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::WebviewWindow;
+#[cfg(not(target_os = "android"))]
+use tauri::{PhysicalPosition, PhysicalSize};
 
 use crate::core::Result;
 use crate::settings::WindowPosition;
@@ -115,10 +117,12 @@ fn apply_center(window: &WebviewWindow, monitor: &MonitorInfo) -> Result<()> {
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(not(target_os = "android"))]
 use tauri::Manager;
 
 static CLIPBOARD_HEIGHT: AtomicU32 = AtomicU32::new(340);
 
+#[cfg(not(target_os = "android"))]
 pub fn get_clipboard_height() -> f64 {
     CLIPBOARD_HEIGHT.load(Ordering::Relaxed) as f64
 }

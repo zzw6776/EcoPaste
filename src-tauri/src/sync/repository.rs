@@ -300,6 +300,35 @@ pub async fn pending_events_for_target(
     rows.into_iter().map(event_from_row).collect()
 }
 
+/// Lists only events originated by this device that still need delivery to the Hub.
+/// Remote events already retain their original owner and must not be re-uploaded by every peer.
+pub async fn pending_origin_events_for_target(
+    pool: &SqlitePool,
+    target_id: &str,
+    origin_device_id: &str,
+    limit: u16,
+) -> Result<Vec<StoredSyncEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+               e.event_created_at_ms, e.nonce, e.ciphertext
+        FROM sync_events e
+        LEFT JOIN sync_deliveries d
+          ON d.event_id = e.event_id AND d.target_id = ?
+        WHERE d.event_id IS NULL AND e.origin_device_id = ?
+        ORDER BY e.cursor ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(target_id)
+    .bind(origin_device_id)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .context("list pending origin sync events")?;
+    rows.into_iter().map(event_from_row).collect()
+}
+
 pub async fn events_after_cursor(
     pool: &SqlitePool,
     after_cursor: u64,
@@ -777,6 +806,7 @@ pub async fn update_peer_routes(
     pool: &SqlitePool,
     endpoint_id: &str,
     direct_addresses: &[String],
+    refresh_presence: bool,
 ) -> Result<bool> {
     let now = Utc::now();
     let direct_addresses = serde_json::to_string(&lan_direct_addresses(direct_addresses))?;
@@ -801,7 +831,29 @@ pub async fn update_peer_routes(
     .execute(pool)
     .await
     .context("refresh discovered peer routes")?;
-    Ok(result.rows_affected() > 0)
+    let routes_changed = result.rows_affected() > 0;
+    if !routes_changed && refresh_presence {
+        sqlx::query("UPDATE sync_peers SET last_seen_ms = ?, updated_at = ? WHERE endpoint_id = ?")
+            .bind(now.timestamp_millis())
+            .bind(now)
+            .bind(endpoint_id)
+            .execute(pool)
+            .await
+            .context("refresh discovered peer presence")?;
+    }
+    Ok(routes_changed)
+}
+
+/// Resolves a paired device from its stable Iroh endpoint identity.
+pub async fn peer_device_id_by_endpoint(
+    pool: &SqlitePool,
+    endpoint_id: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar("SELECT device_id FROM sync_peers WHERE endpoint_id = ?")
+        .bind(endpoint_id)
+        .fetch_optional(pool)
+        .await
+        .context("find peer by endpoint")
 }
 
 fn lan_direct_addresses(addresses: &[String]) -> Vec<String> {
@@ -1449,7 +1501,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            update_peer_routes(&pool, "endpoint", &["10.0.0.3:35555".into()])
+            update_peer_routes(&pool, "endpoint", &["10.0.0.3:35555".into()], true)
                 .await
                 .unwrap()
         );
@@ -1457,7 +1509,7 @@ mod tests {
         assert_eq!(peer.direct_addresses, ["10.0.0.3:35555"]);
         assert!(peer.relay_urls.is_empty());
         assert!(
-            !update_peer_routes(&pool, "unknown", &["10.0.0.4:35555".into()])
+            !update_peer_routes(&pool, "unknown", &["10.0.0.4:35555".into()], true)
                 .await
                 .unwrap()
         );

@@ -10,8 +10,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-#[cfg(target_os = "android")]
-use std::sync::{Mutex, OnceLock};
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,9 +24,12 @@ use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
 use super::guard::WritebackGuard;
 use super::ingest::build_item_with_settings;
+#[cfg(not(target_os = "android"))]
 use super::read::ClipboardReader;
 use super::sound;
-use super::source::{self, FrontmostApp};
+#[cfg(not(target_os = "android"))]
+use super::source;
+use super::source::FrontmostApp;
 use super::storage::ImageStore;
 use crate::db::apps::upsert_app;
 use crate::db::items::{upsert_item, UpsertResult};
@@ -37,22 +39,22 @@ use crate::settings::SettingsStore;
 /// 剪贴板更新事件名。前端监听此事件后增量刷新 / 重新拉取列表。
 pub const CLIPBOARD_UPDATED_EVENT: &str = "clipboard://updated";
 
-#[cfg(target_os = "android")]
-static ANDROID_LAST_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
 /// macOS 轮询 `changeCount` 的间隔。上游 clipboard-rs 默认 500ms，对复制响应（尤其图片）
 /// 偏慢；我们 fork 出 `new_with_interval` 后调到 120ms，跟手且 CPU 开销可忽略。
 /// Windows 走事件驱动（`WM_CLIPBOARDUPDATE`），此值被忽略。
+#[cfg(not(target_os = "android"))]
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Another clipboard listener can briefly hold the Windows clipboard open. Retry those read
 /// failures within a bounded window before dropping the update.
+#[cfg(not(target_os = "android"))]
 const CLIPBOARD_READ_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(15),
     Duration::from_millis(35),
     Duration::from_millis(75),
 ];
 
+#[cfg(not(target_os = "android"))]
 fn read_with_retry<T, E>(
     retry_delays: &[Duration],
     mut read: impl FnMut() -> Result<Option<T>, E>,
@@ -207,47 +209,12 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     super::cleanup::spawn(app.clone());
     #[cfg(not(target_os = "android"))]
     spawn_watch_thread(app.clone(), guard, store, app_icon_store, registry, pause);
-    #[cfg(target_os = "android")]
-    spawn_android_watcher(app.clone(), guard, store, pause);
     Ok(())
 }
 
-#[cfg(target_os = "android")]
-fn spawn_android_watcher(
-    app: AppHandle,
-    guard: Arc<WritebackGuard>,
-    store: ImageStore,
-    pause: WatcherPause,
-) {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-
-    tauri::async_runtime::spawn(async move {
-        log::info!("android clipboard watcher task started");
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            if pause.is_paused() {
-                continue;
-            }
-
-            let text = match app.clipboard().read_text() {
-                Ok(t) if !t.trim().is_empty() => t,
-                _ => continue,
-            };
-
-            if !is_new_android_text(&text) {
-                continue;
-            }
-            persist_android_text(&app, &guard, &store, &pause, text).await;
-        }
-    });
-}
-
+/// Receives one deduplicated native Android clipboard-change event.
 #[cfg(target_os = "android")]
 pub fn capture_android_text(app: &AppHandle, text: String) {
-    if !is_new_android_text(&text) {
-        return;
-    }
     let app = app.clone();
     let guard = app.state::<Arc<WritebackGuard>>().inner().clone();
     let store = app.state::<ImageStore>().inner().clone();
@@ -255,19 +222,6 @@ pub fn capture_android_text(app: &AppHandle, text: String) {
     tauri::async_runtime::spawn(async move {
         persist_android_text(&app, &guard, &store, &pause, text).await;
     });
-}
-
-#[cfg(target_os = "android")]
-fn is_new_android_text(text: &str) -> bool {
-    let mut last = ANDROID_LAST_TEXT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("Android clipboard state poisoned");
-    if last.as_deref() == Some(text) {
-        return false;
-    }
-    *last = Some(text.to_owned());
-    true
 }
 
 #[cfg(target_os = "android")]

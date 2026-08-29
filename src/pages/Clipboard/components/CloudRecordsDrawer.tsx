@@ -1,12 +1,10 @@
-import { Button, Drawer, Empty, Spin, Tag, Tooltip } from "antd";
+import { Button, Drawer, Empty, Image, Spin, Tag, Tooltip } from "antd";
 import type { FC } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  type CloudRecord,
-  type CloudRecordPage,
-  listCloudRecords,
-} from "@/commands";
+import { Virtuoso } from "react-virtuoso";
+import { type CloudRecord, listCloudRecords } from "@/commands";
+import { toAssetUrl } from "@/components/AssetImage";
 import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
@@ -16,48 +14,99 @@ interface CloudRecordsDrawerProps {
   open: boolean;
 }
 
+const CLOUD_RECORD_PAGE_SIZE = 30;
+
 const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
   const { onClose, open } = props;
   const { t } = useTranslation("clipboard");
   const [records, setRecords] = useState<CloudRecord[]>([]);
-  const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [nextBeforeCursor, setNextBeforeCursor] = useState<number | null>(null);
+  const loadGenerationRef = useRef(0);
+  const loadingRef = useRef(false);
+  const navigationEntryRef = useRef(false);
+  const onCloseRef = useRef(onClose);
 
-  async function load(beforeCursor?: number) {
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!isAndroid || !open || navigationEntryRef.current) return;
+
+    window.history.pushState(
+      { ...window.history.state, ecopasteLayer: "cloud-records" },
+      "",
+    );
+    navigationEntryRef.current = true;
+    const handlePopState = () => {
+      if (!navigationEntryRef.current) return;
+
+      navigationEntryRef.current = false;
+      onCloseRef.current();
+    };
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [open]);
+
+  async function load(reset: boolean) {
+    if (loadingRef.current && !reset) return;
+
+    const generation = loadGenerationRef.current + 1;
+    loadGenerationRef.current = generation;
+    loadingRef.current = true;
     setLoading(true);
     try {
-      const page = await listCloudRecords(beforeCursor);
-      applyPage(page, beforeCursor !== void 0);
+      const beforeCursor = reset ? void 0 : (nextBeforeCursor ?? void 0);
+      const page = await listCloudRecords(beforeCursor, CLOUD_RECORD_PAGE_SIZE);
+      if (loadGenerationRef.current !== generation) return;
+
+      setRecords((current) => {
+        return reset ? page.records : [...current, ...page.records];
+      });
+      setTotal(page.total);
+      setNextBeforeCursor(page.nextBeforeCursor);
     } catch (error) {
       log.error("load cloud records failed", error);
     } finally {
-      setLoading(false);
+      if (loadGenerationRef.current === generation) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
-  }
-
-  function applyPage(page: CloudRecordPage, append: boolean) {
-    setRecords((current) => {
-      return append ? [...current, ...page.records] : page.records;
-    });
-    setNextCursor(page.nextBeforeCursor);
-    setTotal(page.total);
   }
 
   function handleOpenChange(nextOpen: boolean) {
     if (nextOpen) {
-      void load();
+      setRecords([]);
+      setNextBeforeCursor(null);
+      void load(true);
+    } else {
+      loadGenerationRef.current += 1;
+      loadingRef.current = false;
     }
   }
 
   function handleRefresh() {
-    void load();
+    void load(true);
   }
 
-  function handleLoadMore() {
-    if (nextCursor !== null) {
-      void load(nextCursor);
+  function handleEndReached() {
+    if (nextBeforeCursor !== null) {
+      void load(false);
     }
+  }
+
+  function handleClose() {
+    if (isAndroid && navigationEntryRef.current) {
+      navigationEntryRef.current = false;
+      window.history.back();
+    }
+    onClose();
   }
 
   return (
@@ -75,7 +124,7 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
           />
         </Tooltip>
       }
-      onClose={onClose}
+      onClose={handleClose}
       open={open}
       placement="right"
       size={isAndroid ? "large" : "default"}
@@ -89,22 +138,34 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
         </div>
       }
     >
-      <Spin spinning={loading && records.length === 0}>
+      <Spin className="h-full" spinning={loading && records.length === 0}>
         {records.length ? (
-          <div className="flex flex-col gap-2">
-            {records.map((record) => {
-              return <CloudRecordCard key={record.eventId} record={record} />;
-            })}
-            {nextCursor !== null ? (
-              <Button block loading={loading} onClick={handleLoadMore}>
-                {t("syncStatus.records.loadMore")}
-              </Button>
-            ) : (
-              <div className="py-2 text-center text-ant-tertiary text-xs">
-                {t("syncStatus.records.end")}
-              </div>
-            )}
-          </div>
+          <Virtuoso
+            className="h-full"
+            components={{
+              Footer: () => {
+                if (loading) {
+                  return <div className="h-12" />;
+                }
+                if (nextBeforeCursor !== null) return null;
+
+                return (
+                  <div className="py-2 text-center text-ant-tertiary text-xs">
+                    {t("syncStatus.records.end")}
+                  </div>
+                );
+              },
+            }}
+            data={records}
+            endReached={handleEndReached}
+            itemContent={(_index, record) => {
+              return (
+                <div className="pb-2">
+                  <CloudRecordCard record={record} />
+                </div>
+              );
+            }}
+          />
         ) : loading ? (
           <div className="h-24" />
         ) : (
@@ -123,10 +184,8 @@ const CloudRecordCard: FC<CloudRecordCardProps> = (props) => {
   const { record } = props;
   const { t } = useTranslation("clipboard");
   const sizeLabel = record.totalSize > 0 ? formatBytes(record.totalSize) : null;
-  const preview = record.isSensitive
-    ? t("syncStatus.records.sensitivePreview")
-    : record.preview ||
-      t(`types.${record.kind}`, { defaultValue: record.kind });
+  const preview =
+    record.preview || t(`types.${record.kind}`, { defaultValue: record.kind });
 
   return (
     <div className="rounded-2 border border-ant-border-secondary bg-ant-fill-quaternary p-3">
@@ -154,6 +213,16 @@ const CloudRecordCard: FC<CloudRecordCardProps> = (props) => {
           </div>
         </div>
       </div>
+      {record.imagePath ? (
+        <div className="mt-2 overflow-hidden rounded-2 bg-ant-container">
+          <Image
+            alt={preview}
+            className="max-h-72 w-full object-contain"
+            preview
+            src={toAssetUrl(record.imagePath)}
+          />
+        </div>
+      ) : null}
       <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed">
         {preview}
       </div>

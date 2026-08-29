@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -189,6 +189,18 @@ pub enum Request {
     },
     #[n(8)]
     WatchGroup {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        after_cursor: u64,
+        #[n(3)]
+        after_removed_at_ms: i64,
+    },
+    /// Keeps one response stream open and pushes group cursors after every change.
+    #[n(9)]
+    WatchGroupStream {
         #[n(0)]
         group_id: String,
         #[n(1)]

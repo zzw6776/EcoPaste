@@ -30,8 +30,8 @@ use rand::RngCore;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
-    io::AsyncWriteExt,
-    sync::{oneshot, Mutex, Notify},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore},
 };
 use uuid::Uuid;
 
@@ -54,7 +54,7 @@ use super::{
         BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage,
         IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice,
         NearbySyncSpace, StoredBlob, SyncChannelState, SyncChannelStatus, SyncItemStatus,
-        SyncPairingPreview, SyncStatus, SyncTarget, SyncedClipboardItem,
+        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -72,21 +72,32 @@ const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
+const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
 pub struct SyncManager {
     app: AppHandle,
     identity: Arc<IdentityStore>,
     runtime: Mutex<Option<EndpointRuntime>>,
-    wake: Notify,
+    lan_transfer_wake: Notify,
+    cloud_transfer_wake: Notify,
     watch_wake: Notify,
     nearby_wake: Notify,
-    cycle_lock: Mutex<()>,
+    lan_cycle_lock: Mutex<()>,
+    cloud_cycle_lock: Mutex<()>,
+    maintenance_lock: Mutex<()>,
     apply_lock: Mutex<()>,
+    inbound_stream_admission: Arc<Semaphore>,
+    inbound_blob_concurrency: Arc<Semaphore>,
     lan_status: RwLock<SyncChannelStatus>,
     cloud_status: RwLock<SyncChannelStatus>,
     cloud_watch_status: RwLock<SyncChannelStatus>,
     cloud_path: RwLock<ConnectionRoute>,
     lan_retry_peers: RwLock<HashSet<String>>,
+    lan_suspended_peers: RwLock<HashSet<String>>,
     nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
     incoming_join_requests: Mutex<HashMap<String, PendingIncomingJoinRequest>>,
     outgoing_join_attempts: RwLock<HashMap<String, NearbyJoinAttempt>>,
@@ -111,6 +122,12 @@ struct EndpointRuntime {
     router: Router,
     config: EndpointRuntimeConfig,
     _mdns: Option<MdnsAddressLookup>,
+}
+
+enum LanPeerSyncOutcome {
+    Succeeded,
+    ConnectionFailed(String),
+    TransferFailed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,16 +206,22 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         app: app.clone(),
         identity,
         runtime: Mutex::new(None),
-        wake: Notify::new(),
+        lan_transfer_wake: Notify::new(),
+        cloud_transfer_wake: Notify::new(),
         watch_wake: Notify::new(),
         nearby_wake: Notify::new(),
-        cycle_lock: Mutex::new(()),
+        lan_cycle_lock: Mutex::new(()),
+        cloud_cycle_lock: Mutex::new(()),
+        maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
+        inbound_stream_admission: Arc::new(Semaphore::new(128)),
+        inbound_blob_concurrency: Arc::new(Semaphore::new(4)),
         lan_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Idle)),
         cloud_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Disabled)),
         cloud_watch_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Disabled)),
         cloud_path: RwLock::new(ConnectionRoute::default()),
         lan_retry_peers: RwLock::new(HashSet::new()),
+        lan_suspended_peers: RwLock::new(HashSet::new()),
         nearby_devices: RwLock::new(HashMap::new()),
         incoming_join_requests: Mutex::new(HashMap::new()),
         outgoing_join_attempts: RwLock::new(HashMap::new()),
@@ -206,7 +229,8 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         pairing_sessions: AtomicUsize::new(0),
     });
     app.manage(manager.clone());
-    tauri::async_runtime::spawn(worker(manager.clone()));
+    tauri::async_runtime::spawn(lan_transfer_worker(manager.clone()));
+    tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
     manager.wake();
     Ok(())
@@ -214,12 +238,21 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
 
 impl SyncManager {
     pub fn wake(&self) {
-        self.wake.notify_one();
+        self.wake_transfer();
         self.watch_wake.notify_one();
     }
 
     fn wake_transfer(&self) {
-        self.wake.notify_one();
+        self.lan_transfer_wake.notify_one();
+        self.cloud_transfer_wake.notify_one();
+    }
+
+    fn wake_lan_transfer(&self) {
+        self.lan_transfer_wake.notify_one();
+    }
+
+    fn wake_cloud_transfer(&self) {
+        self.cloud_transfer_wake.notify_one();
     }
 
     /// Android 原生 Context 晚于 Rust setup 就绪，完成注入后刷新自动设备名。
@@ -254,7 +287,8 @@ impl SyncManager {
 
     /// Joins the scanned device and clears routes encrypted for a previous sync space.
     pub async fn join_group(&self, code: &PairingCode, replace_existing: bool) -> Result<()> {
-        let _guard = self.cycle_lock.lock().await;
+        let _cloud_guard = self.cloud_cycle_lock.lock().await;
+        let _lan_guard = self.lan_cycle_lock.lock().await;
         let current_group = self.identity.snapshot().group;
         let switching_group = current_group
             .as_ref()
@@ -278,7 +312,8 @@ impl SyncManager {
         if device_id.is_empty() || device_id == self.identity.snapshot().device_id {
             bail!("无法删除该设备");
         }
-        let _guard = self.cycle_lock.lock().await;
+        let _cloud_guard = self.cloud_cycle_lock.lock().await;
+        let _lan_guard = self.lan_cycle_lock.lock().await;
         let pool = self.pool().await;
         let peer = repository::list_peers(&pool)
             .await?
@@ -313,7 +348,8 @@ impl SyncManager {
     }
 
     pub async fn leave_group(&self) -> Result<()> {
-        let _guard = self.cycle_lock.lock().await;
+        let _cloud_guard = self.cloud_cycle_lock.lock().await;
+        let _lan_guard = self.lan_cycle_lock.lock().await;
         self.stop_runtime().await?;
         self.identity.set_group(None)?;
         let pool = self.pool().await;
@@ -321,6 +357,10 @@ impl SyncManager {
         self.lan_retry_peers
             .write()
             .expect("LAN retry peers poisoned")
+            .clear();
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
             .clear();
         self.wake();
         Ok(())
@@ -655,8 +695,33 @@ impl SyncManager {
     }
 
     pub async fn run_now(self: &Arc<Self>) -> Result<()> {
-        self.run_cycle(None, None, Duration::from_secs(8), false)
-            .await
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let cloud_enabled = server_is_configured(&settings);
+        if !settings.lan_enabled && !cloud_enabled {
+            return Ok(());
+        }
+        #[cfg(target_os = "android")]
+        if settings.lan_enabled {
+            self.refresh_android_lan_routes().await;
+        }
+        match (cloud_enabled, settings.lan_enabled) {
+            (true, true) => {
+                let (cloud, lan) = tokio::join!(
+                    self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false,),
+                    self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8), false,),
+                );
+                cloud.and(lan)
+            }
+            (true, false) => {
+                self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false)
+                    .await
+            }
+            (false, true) => {
+                self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8), false)
+                    .await
+            }
+            (false, false) => Ok(()),
+        }
     }
 
     /// Immediately reconnects all paired devices or one selected device.
@@ -670,6 +735,13 @@ impl SyncManager {
         {
             bail!("局域网同步已关闭");
         }
+        if let Some(device_id) = device_id.as_deref() {
+            self.resume_peer(device_id);
+        } else {
+            self.resume_all_peers();
+        }
+        #[cfg(target_os = "android")]
+        self.refresh_android_lan_routes().await;
         self.run_cycle(
             Some(SyncTarget::Lan),
             device_id.as_deref(),
@@ -677,6 +749,12 @@ impl SyncManager {
             false,
         )
         .await
+    }
+
+    #[cfg(target_os = "android")]
+    async fn refresh_android_lan_routes(&self) {
+        let _guard = AndroidLanDiscoveryGuard::acquire();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.nearby_wake.notified()).await;
     }
 
     pub async fn enqueue_item(&self, item: ClipboardItem, force_files: bool) -> Result<()> {
@@ -747,7 +825,7 @@ impl SyncManager {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 before_cursor,
-                limit: limit.clamp(1, 100),
+                limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
             },
         )
         .await?;
@@ -771,32 +849,45 @@ impl SyncManager {
             .collect::<HashMap<_, _>>();
         device_names.insert(identity.device_id, identity.device_name);
         let key = group.content_key_bytes()?;
-        let records = events
-            .into_iter()
-            .filter_map(|cloud_event| {
-                let event = cloud_event.event;
-                let envelope = match crypto::decrypt_event(&key, &event).and_then(|envelope| {
-                    validate_envelope(&envelope)?;
-                    Ok(envelope)
-                }) {
-                    Ok(envelope) => envelope,
+        let mut records = Vec::new();
+        for cloud_event in events {
+            let event = cloud_event.event;
+            let envelope = match crypto::decrypt_event(&key, &event).and_then(|envelope| {
+                validate_envelope(&envelope)?;
+                Ok(envelope)
+            }) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    log::warn!("skip invalid cloud record {}: {error}", event.event_id);
+                    continue;
+                }
+            };
+            let device_name = device_names
+                .get(&event.origin_device_id)
+                .cloned()
+                .unwrap_or_else(|| short_device_id(&event.origin_device_id));
+            let image_path = if envelope.item.kind == "image" {
+                match self
+                    .cloud_record_image_path(&connection, &group, &envelope)
+                    .await
+                {
+                    Ok(path) => path,
                     Err(error) => {
-                        log::warn!("skip invalid cloud record {}: {error}", event.event_id);
-                        return None;
+                        log::warn!("load cloud record image {} failed: {error}", event.event_id);
+                        None
                     }
-                };
-                let device_name = device_names
-                    .get(&event.origin_device_id)
-                    .cloned()
-                    .unwrap_or_else(|| short_device_id(&event.origin_device_id));
-                Some(cloud_record(
-                    cloud_event.cursor,
-                    event,
-                    envelope,
-                    device_name,
-                ))
-            })
-            .collect();
+                }
+            } else {
+                None
+            };
+            records.push(cloud_record(
+                cloud_event.cursor,
+                event,
+                envelope,
+                device_name,
+                image_path,
+            ));
+        }
         Ok(CloudRecordPage {
             records,
             next_before_cursor,
@@ -1109,7 +1200,11 @@ impl SyncManager {
         lan_connect_timeout: Duration,
         retry_only: bool,
     ) -> Result<()> {
-        let _guard = self.cycle_lock.lock().await;
+        let _guard = match target {
+            Some(SyncTarget::Lan) => self.lan_cycle_lock.lock().await,
+            Some(SyncTarget::Cloud) => self.cloud_cycle_lock.lock().await,
+            None => bail!("sync cycle target is required"),
+        };
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
         if !settings.enabled {
@@ -1138,20 +1233,26 @@ impl SyncManager {
         }
         let endpoint = self.ensure_endpoint(&settings).await?;
         let pool = self.pool().await;
-        self.backfill_recent_history(&pool, &group).await?;
-        self.repair_history_timestamps(&pool, &group).await?;
+        {
+            let _maintenance_guard = self.maintenance_lock.lock().await;
+            self.backfill_recent_history(&pool, &group).await?;
+            self.repair_history_timestamps(&pool, &group).await?;
+        }
         let mut lan_succeeded = false;
         let mut lan_transfer_error = None;
         let mut lan_connection_error = None;
         let mut lan_attempted = false;
         let mut lan_failed = false;
         if settings.lan_enabled && target != Some(SyncTarget::Cloud) {
-            #[cfg(target_os = "android")]
-            let _lan_discovery_guard = AndroidLanDiscoveryGuard::acquire();
             let retry_peers = self
                 .lan_retry_peers
                 .read()
                 .expect("LAN retry peers poisoned")
+                .clone();
+            let suspended_peers = self
+                .lan_suspended_peers
+                .read()
+                .expect("LAN suspended peers poisoned")
                 .clone();
             let peers = repository::list_peers(&pool)
                 .await?
@@ -1160,6 +1261,7 @@ impl SyncManager {
                 .filter(|peer| {
                     peer_device_id.is_none_or(|device_id| peer.announcement.device_id == device_id)
                 })
+                .filter(|peer| !suspended_peers.contains(&peer.announcement.device_id))
                 .filter(|peer| !retry_only || retry_peers.contains(&peer.announcement.device_id))
                 .collect::<Vec<_>>();
             if peer_device_id.is_some() && peers.is_empty() {
@@ -1172,64 +1274,29 @@ impl SyncManager {
             } else {
                 self.set_channel_status(SyncTarget::Lan, SyncChannelState::Connecting, None, false);
             }
-            for peer in peers {
-                lan_attempted = true;
-                let device_id = peer.announcement.device_id.clone();
-                let target_id = format!("peer:{device_id}");
-                let address = match peer_endpoint_addr(&peer.announcement) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        log::debug!("ignore invalid cached peer route: {error}");
-                        let message = error.to_string();
-                        repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                        self.mark_peer_retry(&device_id);
-                        lan_failed = true;
-                        lan_connection_error.get_or_insert(message);
-                        continue;
-                    }
-                };
-                repository::mark_peer_connecting(&pool, &device_id).await?;
-                match connect_peer(&endpoint, address, lan_connect_timeout).await {
-                    Ok(connection) => {
-                        match self
-                            .sync_connection(
-                                &connection,
-                                &target_id,
-                                peer.pull_cursor,
-                                &group,
-                                &endpoint,
-                            )
-                            .await
-                        {
-                            Ok(latest) => {
-                                repository::set_peer_cursor(&pool, &device_id, latest).await?;
-                                let (connected_address, transport) = connection_path(&connection);
-                                repository::mark_peer_online(
-                                    &pool,
-                                    &device_id,
-                                    connected_address.as_deref(),
-                                    transport,
-                                )
-                                .await?;
-                                self.clear_peer_retry(&device_id);
-                                lan_succeeded = true;
-                            }
-                            Err(error) => {
-                                let message = error.to_string();
-                                repository::mark_peer_error(&pool, &device_id, &message).await?;
-                                self.mark_peer_retry(&device_id);
-                                lan_failed = true;
-                                lan_transfer_error = Some(message);
-                            }
+            lan_attempted = !peers.is_empty();
+            for batch in peers.chunks(3) {
+                let mut tasks = tokio::task::JoinSet::new();
+                for peer in batch.iter().cloned() {
+                    tasks.spawn(self.clone().sync_lan_peer(
+                        pool.clone(),
+                        group.clone(),
+                        endpoint.clone(),
+                        peer,
+                        lan_connect_timeout,
+                    ));
+                }
+                while let Some(result) = tasks.join_next().await {
+                    match result.context("LAN peer sync task failed")?? {
+                        LanPeerSyncOutcome::Succeeded => lan_succeeded = true,
+                        LanPeerSyncOutcome::ConnectionFailed(message) => {
+                            lan_failed = true;
+                            lan_connection_error.get_or_insert(message);
                         }
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        log::debug!("LAN peer {device_id} unavailable: {message}");
-                        repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                        self.mark_peer_retry(&device_id);
-                        lan_failed = true;
-                        lan_connection_error.get_or_insert(message);
+                        LanPeerSyncOutcome::TransferFailed(message) => {
+                            lan_failed = true;
+                            lan_transfer_error = Some(message);
+                        }
                     }
                 }
             }
@@ -1303,9 +1370,10 @@ impl SyncManager {
                             true,
                         );
                     } else {
-                        let pending = repository::pending_events_for_target(
+                        let pending = repository::pending_origin_events_for_target(
                             &pool,
                             CLOUD_TARGET,
+                            &identity.device_id,
                             MAX_EVENTS_PER_BATCH,
                         )
                         .await?;
@@ -1380,6 +1448,63 @@ impl SyncManager {
         Ok(())
     }
 
+    async fn sync_lan_peer(
+        self: Arc<Self>,
+        pool: SqlitePool,
+        group: GroupSecrets,
+        endpoint: Endpoint,
+        peer: SyncPeer,
+        connect_timeout: Duration,
+    ) -> Result<LanPeerSyncOutcome> {
+        let device_id = peer.announcement.device_id.clone();
+        let target_id = format!("peer:{device_id}");
+        let address = match peer_endpoint_addr(&peer.announcement) {
+            Ok(value) => value,
+            Err(error) => {
+                log::debug!("ignore invalid cached peer route: {error}");
+                let message = error.to_string();
+                repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
+                self.mark_peer_retry(&device_id);
+                return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
+            }
+        };
+        repository::mark_peer_connecting(&pool, &device_id).await?;
+        let connection = match connect_peer(&endpoint, address, connect_timeout).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let message = error.to_string();
+                log::debug!("LAN peer {device_id} unavailable: {message}");
+                repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
+                self.mark_peer_retry(&device_id);
+                return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
+            }
+        };
+        match self
+            .sync_connection(&connection, &target_id, peer.pull_cursor, &group, &endpoint)
+            .await
+        {
+            Ok(latest) => {
+                repository::set_peer_cursor(&pool, &device_id, latest).await?;
+                let (connected_address, transport) = connection_path(&connection);
+                repository::mark_peer_online(
+                    &pool,
+                    &device_id,
+                    connected_address.as_deref(),
+                    transport,
+                )
+                .await?;
+                self.clear_peer_retry(&device_id);
+                Ok(LanPeerSyncOutcome::Succeeded)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                repository::mark_peer_error(&pool, &device_id, &message).await?;
+                self.mark_peer_retry(&device_id);
+                Ok(LanPeerSyncOutcome::TransferFailed(message))
+            }
+        }
+    }
+
     fn mark_peer_retry(&self, device_id: &str) {
         self.lan_retry_peers
             .write()
@@ -1392,6 +1517,56 @@ impl SyncManager {
             .write()
             .expect("LAN retry peers poisoned")
             .remove(device_id);
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
+            .remove(device_id);
+    }
+
+    fn suspend_peer(&self, device_id: &str) {
+        self.lan_retry_peers
+            .write()
+            .expect("LAN retry peers poisoned")
+            .remove(device_id);
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
+            .insert(device_id.to_owned());
+    }
+
+    fn suspend_retry_peers(&self) {
+        let peers = self
+            .lan_retry_peers
+            .write()
+            .expect("LAN retry peers poisoned")
+            .drain()
+            .collect::<Vec<_>>();
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
+            .extend(peers);
+    }
+
+    fn resume_peer(&self, device_id: &str) {
+        self.lan_retry_peers
+            .write()
+            .expect("LAN retry peers poisoned")
+            .remove(device_id);
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
+            .remove(device_id);
+    }
+
+    fn resume_all_peers(&self) {
+        self.lan_retry_peers
+            .write()
+            .expect("LAN retry peers poisoned")
+            .clear();
+        self.lan_suspended_peers
+            .write()
+            .expect("LAN suspended peers poisoned")
+            .clear();
     }
 
     async fn ensure_cloud_group(
@@ -1424,64 +1599,94 @@ impl SyncManager {
     ) -> Result<u64> {
         let pool = self.pool().await;
         self.sync_removed_devices(connection, group).await?;
-        let pending =
-            repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH).await?;
-        let event_ids = pending
-            .iter()
-            .map(|item| item.event.event_id.clone())
-            .collect::<Vec<_>>();
-        repository::mark_delivery_syncing(&pool, target_id, &event_ids).await?;
-        self.emit_updated();
-        let result = async {
-            for blob in repository::blobs_for_events(&pool, &event_ids).await? {
-                upload_blob(connection, group, &blob).await?;
+        let identity = self.identity.snapshot();
+        let mut cursor = after_cursor;
+        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            let pending = if target_id == CLOUD_TARGET {
+                repository::pending_origin_events_for_target(
+                    &pool,
+                    target_id,
+                    &identity.device_id,
+                    MAX_EVENTS_PER_BATCH,
+                )
+                .await?
+            } else {
+                repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
+                    .await?
+            };
+            let pending_count = pending.len();
+            let event_ids = pending
+                .iter()
+                .map(|item| item.event.event_id.clone())
+                .collect::<Vec<_>>();
+            repository::mark_delivery_syncing(&pool, target_id, &event_ids).await?;
+            self.emit_updated();
+            let result = async {
+                upload_blobs(
+                    connection,
+                    group,
+                    repository::blobs_for_events(&pool, &event_ids).await?,
+                )
+                .await?;
+                call(
+                    connection,
+                    Request::Sync {
+                        group_id: group.group_id.clone(),
+                        access_token: group.access_token_bytes()?,
+                        device: self.device_announcement(endpoint),
+                        after_cursor: cursor,
+                        events: pending.into_iter().map(|item| item.event).collect(),
+                        limit: MAX_EVENTS_PER_BATCH,
+                    },
+                )
+                .await
             }
-            call(
-                connection,
-                Request::Sync {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    device: self.device_announcement(endpoint),
-                    after_cursor,
-                    events: pending.into_iter().map(|item| item.event).collect(),
-                    limit: MAX_EVENTS_PER_BATCH,
-                },
-            )
-            .await
-        }
-        .await;
-        let response = match result {
-            Ok(response) => response,
-            Err(error) => {
-                repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
+            .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    repository::mark_delivery_error(
+                        &pool,
+                        target_id,
+                        &event_ids,
+                        &error.to_string(),
+                    )
                     .await?;
-                self.emit_updated();
-                return Err(error);
+                    self.emit_updated();
+                    return Err(error);
+                }
+            };
+            let Response::Synced {
+                events,
+                peers,
+                latest_cursor,
+                ..
+            } = response
+            else {
+                if let Response::Error { message, .. } = response {
+                    repository::mark_delivery_error(&pool, target_id, &event_ids, &message).await?;
+                    self.emit_updated();
+                    bail!(message);
+                }
+                bail!("同步端返回了无效响应");
+            };
+            let received_count = events.len();
+            repository::mark_delivered(&pool, target_id, &event_ids).await?;
+            for peer in peers {
+                if peer.device_id != identity.device_id {
+                    repository::upsert_peer(&pool, &peer).await?;
+                }
             }
-        };
-        let Response::Synced {
-            events,
-            peers,
-            latest_cursor,
-            ..
-        } = response
-        else {
-            if let Response::Error { message, .. } = response {
-                repository::mark_delivery_error(&pool, target_id, &event_ids, &message).await?;
-                self.emit_updated();
-                bail!(message);
-            }
-            bail!("同步端返回了无效响应");
-        };
-        repository::mark_delivered(&pool, target_id, &event_ids).await?;
-        for peer in peers {
-            if peer.device_id != self.identity.snapshot().device_id {
-                repository::upsert_peer(&pool, &peer).await?;
+            self.accept_remote_events(connection, events, group, target_id)
+                .await?;
+            cursor = latest_cursor;
+            if pending_count < usize::from(MAX_EVENTS_PER_BATCH)
+                && received_count < usize::from(MAX_EVENTS_PER_BATCH)
+            {
+                break;
             }
         }
-        self.accept_remote_events(connection, events, group, target_id)
-            .await?;
-        Ok(latest_cursor)
+        Ok(cursor)
     }
 
     /// Exchanges group-wide removal tombstones before normal events so a removed device leaves
@@ -1561,6 +1766,8 @@ impl SyncManager {
             .iter()
             .map(|cloud_event| cloud_event.event.event_id.clone())
             .collect::<Vec<_>>();
+        let mut remote_event_ids = Vec::new();
+        let mut received_new_events = false;
         for cloud_event in events {
             let event = cloud_event.event;
             if removed_peers.contains(&event.origin_device_id) {
@@ -1570,9 +1777,13 @@ impl SyncManager {
                 repository::insert_event(&pool, &event, true, &[]).await?;
                 continue;
             }
-            repository::insert_event(&pool, &event, false, &[]).await?;
+            remote_event_ids.push(event.event_id.clone());
+            received_new_events |= repository::insert_event(&pool, &event, false, &[]).await?;
         }
         repository::mark_delivered(&pool, source_target, &received_event_ids).await?;
+        if source_target != CLOUD_TARGET {
+            repository::mark_delivered(&pool, CLOUD_TARGET, &remote_event_ids).await?;
+        }
 
         // Replaying every still-unapplied event makes a download/apply interruption
         // recoverable even when the hub no longer returns the duplicate event.
@@ -1610,6 +1821,10 @@ impl SyncManager {
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
         }
+        drop(_apply_guard);
+        if received_new_events && source_target == CLOUD_TARGET {
+            self.wake_lan_transfer();
+        }
         Ok(())
     }
 
@@ -1627,6 +1842,37 @@ impl SyncManager {
         }
         download_blob(connection, group, manifest, &path).await?;
         Ok(path)
+    }
+
+    /// Downloads and decrypts a cloud image into the shared image cache without importing history.
+    async fn cloud_record_image_path(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        envelope: &ClipboardEnvelope,
+    ) -> Result<Option<String>> {
+        let Some(manifest) = envelope
+            .blobs
+            .iter()
+            .find(|blob| blob.role == BlobRole::Image)
+        else {
+            return Ok(None);
+        };
+        let encrypted = self.ensure_blob(connection, group, manifest).await?;
+        let image_name = sanitize_name(&manifest.name);
+        let destination = self.app.state::<ImageStore>().origin_path(&image_name);
+        if !destination.is_file() || destination.metadata()?.len() != manifest.original_size {
+            let destination_for_task = destination.clone();
+            let original_size = manifest.original_size;
+            let key = group.content_key_bytes()?;
+            tauri::async_runtime::spawn_blocking(move || {
+                crypto::decrypt_blob(&encrypted, &destination_for_task, original_size, &key)
+            })
+            .await
+            .context("cloud image decryption task failed")??;
+        }
+
+        Ok(Some(destination.to_string_lossy().into_owned()))
     }
 
     async fn apply_envelope(
@@ -1916,6 +2162,13 @@ impl SyncManager {
         let config = endpoint_runtime_config(settings, relay_token.as_deref());
         let relay_mode = cloud_relay_mode(settings, relay_token.as_deref())?;
         let secret_key = self.identity.secret_key()?;
+        let mut runtime = self.runtime.lock().await;
+        if let Some(runtime) = runtime.as_ref() {
+            if runtime.config == config {
+                self.update_discovery_metadata(&runtime.endpoint, settings.lan_enabled)?;
+                return Ok(runtime.endpoint.clone());
+            }
+        }
         let mdns = if settings.lan_enabled {
             match MdnsAddressLookup::builder()
                 .service_name("ecopaste-v1")
@@ -1931,21 +2184,12 @@ impl SyncManager {
         } else {
             None
         };
-        let mut runtime = self.runtime.lock().await;
-        if let Some(runtime) = runtime.as_ref() {
-            if runtime.config == config {
-                self.update_discovery_metadata(&runtime.endpoint, settings.lan_enabled)?;
-                return Ok(runtime.endpoint.clone());
-            }
-        }
         if let Some(previous) = runtime.take() {
             previous
                 .router
                 .shutdown()
                 .await
                 .context("failed to restart Iroh sync endpoint")?;
-            #[cfg(target_os = "android")]
-            crate::commands::android::set_lan_discovery_enabled(false);
         }
         *self
             .cloud_path
@@ -2008,8 +2252,6 @@ impl SyncManager {
             .cloud_path
             .write()
             .expect("cloud connection route poisoned") = ConnectionRoute::default();
-        #[cfg(target_os = "android")]
-        crate::commands::android::set_lan_discovery_enabled(false);
         Ok(())
     }
 
@@ -2212,40 +2454,99 @@ fn cloud_relay_mode(settings: &SyncSettings, token: Option<&str>) -> Result<Rela
     Ok(RelayMode::Custom(relay_map))
 }
 
-async fn worker(manager: Arc<SyncManager>) {
-    let mut failure_count = 0_usize;
+async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
+    let mut cloud_failure_count = 0_usize;
+    let mut cloud_next_at: Option<Instant> = None;
     loop {
-        let (target, connect_timeout, retry_only) =
-            if manager.app.state::<SettingsStore>().snapshot().sync.enabled {
-                let delay = if failure_count == 0 {
-                    Duration::from_secs(10 * 60)
-                } else {
-                    retry_delay(failure_count)
-                };
-                tokio::select! {
-                    _ = manager.wake.notified() => {
-                        (None, Duration::from_secs(8), false)
-                    },
-                    _ = tokio::time::sleep(delay) => {
-                        (
-                            None,
-                            Duration::from_secs(5),
-                            failure_count > 0,
-                        )
-                    },
-                }
-            } else {
-                manager.wake.notified().await;
-                (None, Duration::from_secs(8), false)
-            };
+        if let Some(next_at) = cloud_next_at {
+            tokio::select! {
+                _ = manager.cloud_transfer_wake.notified() => {},
+                _ = tokio::time::sleep_until(next_at.into()) => {},
+            }
+        } else {
+            manager.cloud_transfer_wake.notified().await;
+        }
+
+        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !server_is_configured(&settings) {
+            manager.set_channel_status(SyncTarget::Cloud, SyncChannelState::Disabled, None, false);
+            cloud_failure_count = 0;
+            cloud_next_at = None;
+            continue;
+        }
         match manager
-            .run_cycle(target, None, connect_timeout, retry_only)
+            .run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false)
             .await
         {
-            Ok(()) => failure_count = 0,
+            Ok(()) => {
+                cloud_failure_count = 0;
+                cloud_next_at = None;
+            }
+            Err(error) => {
+                cloud_failure_count = cloud_failure_count.saturating_add(1);
+                cloud_next_at = Some(Instant::now() + retry_delay(cloud_failure_count));
+                log::warn!("cloud clipboard sync cycle failed: {error}");
+                manager.emit_updated();
+            }
+        }
+    }
+}
+
+async fn lan_transfer_worker(manager: Arc<SyncManager>) {
+    let mut failure_count = 0_usize;
+    let mut next_at: Option<Instant> = None;
+    loop {
+        let retry_only = if let Some(deadline) = next_at {
+            tokio::select! {
+                _ = manager.lan_transfer_wake.notified() => {
+                    failure_count = 0;
+                    false
+                },
+                _ = tokio::time::sleep_until(deadline.into()) => failure_count > 0,
+            }
+        } else {
+            manager.lan_transfer_wake.notified().await;
+            false
+        };
+        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !settings.lan_enabled {
+            manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Disabled, None, false);
+            failure_count = 0;
+            next_at = None;
+            if !settings.enabled || !server_is_configured(&settings) {
+                if let Err(error) = manager.stop_runtime().await {
+                    log::warn!("stop disabled sync runtime failed: {error}");
+                }
+            }
+            continue;
+        }
+        match manager
+            .run_cycle(
+                Some(SyncTarget::Lan),
+                None,
+                if retry_only {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(8)
+                },
+                retry_only,
+            )
+            .await
+        {
+            Ok(()) => {
+                failure_count = 0;
+                next_at = None;
+            }
             Err(error) => {
                 failure_count = failure_count.saturating_add(1);
-                log::warn!("clipboard sync cycle failed: {error}");
+                if failure_count > RETRY_SECONDS.len() {
+                    manager.suspend_retry_peers();
+                    next_at = None;
+                    log::debug!("LAN peers remain offline; wait for rediscovery: {error}");
+                } else {
+                    next_at = Some(Instant::now() + retry_delay(failure_count));
+                    log::warn!("LAN clipboard sync cycle failed: {error}");
+                }
                 manager.emit_updated();
             }
         }
@@ -2307,11 +2608,26 @@ fn spawn_endpoint_watchers(
             let endpoint_info = match event {
                 DiscoveryEvent::Discovered { endpoint_info, .. } => endpoint_info,
                 DiscoveryEvent::Expired { endpoint_id } => {
+                    let endpoint_id = endpoint_id.to_string();
                     manager
                         .nearby_devices
                         .write()
                         .expect("nearby devices poisoned")
-                        .remove(&endpoint_id.to_string());
+                        .remove(&endpoint_id);
+                    let pool = manager.pool().await;
+                    match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
+                        Ok(Some(device_id)) => {
+                            manager.suspend_peer(&device_id);
+                            if let Err(error) =
+                                repository::mark_peer_offline(&pool, &device_id, None).await
+                            {
+                                log::debug!("mark expired LAN peer offline failed: {error}");
+                            }
+                            manager.emit_updated();
+                        }
+                        Ok(None) => {}
+                        Err(error) => log::debug!("resolve expired LAN peer failed: {error}"),
+                    }
                     continue;
                 }
                 _ => continue,
@@ -2322,8 +2638,8 @@ fn spawn_endpoint_watchers(
                 .and_then(|value| DiscoveryMetadata::decode(value).ok());
             let endpoint_id = endpoint_info.endpoint_id.to_string();
             let address: EndpointAddr = endpoint_info.into();
-            if let Some(metadata) = discovery_metadata {
-                manager
+            let newly_discovered = if let Some(metadata) = discovery_metadata {
+                let previous = manager
                     .nearby_devices
                     .write()
                     .expect("nearby devices poisoned")
@@ -2336,16 +2652,34 @@ fn spawn_endpoint_watchers(
                         },
                     );
                 manager.nearby_wake.notify_waiters();
-            }
+                previous.is_none()
+            } else {
+                false
+            };
             let direct_addresses = address
                 .ip_addrs()
                 .filter(|address| is_lan_ip(address.ip()))
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             let pool = manager.pool().await;
-            match repository::update_peer_routes(&pool, &endpoint_id, &direct_addresses).await {
-                Ok(true) => manager.wake_transfer(),
-                Ok(false) => {}
+            match repository::update_peer_routes(
+                &pool,
+                &endpoint_id,
+                &direct_addresses,
+                newly_discovered,
+            )
+            .await
+            {
+                Ok(routes_changed) => {
+                    match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
+                        Ok(Some(device_id)) if routes_changed || newly_discovered => {
+                            manager.resume_peer(&device_id);
+                            manager.wake_lan_transfer();
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::debug!("resolve discovered LAN peer failed: {error}"),
+                    }
+                }
                 Err(error) => log::debug!("refresh discovered peer route failed: {error}"),
             }
         }
@@ -2401,55 +2735,7 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
             manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
             manager.emit_updated();
             let pool = manager.pool().await;
-            let cursor = repository::cloud_cursor(&pool).await?;
-            let removed_at_ms = repository::latest_removed_at_ms(&pool).await?;
-            let response = call(
-                &connection,
-                Request::WatchGroup {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    after_cursor: cursor,
-                    after_removed_at_ms: removed_at_ms,
-                },
-            )
-            .await;
-            match response {
-                Ok(Response::GroupChanged {
-                    latest_cursor,
-                    latest_removed_at_ms,
-                }) => {
-                    if latest_cursor > cursor || latest_removed_at_ms > removed_at_ms {
-                        manager.wake.notify_one();
-                    }
-                    Ok(())
-                }
-                Ok(Response::Changed { latest_cursor }) => {
-                    if latest_cursor > cursor {
-                        manager.wake.notify_one();
-                    }
-                    Ok(())
-                }
-                Ok(Response::Error { .. }) | Err(_) => match call(
-                    &connection,
-                    Request::Watch {
-                        group_id: group.group_id.clone(),
-                        access_token: group.access_token_bytes()?,
-                        after_cursor: cursor,
-                    },
-                )
-                .await?
-                {
-                    Response::Changed { latest_cursor } => {
-                        if latest_cursor > cursor {
-                            manager.wake.notify_one();
-                        }
-                        Ok(())
-                    }
-                    Response::Error { message, .. } => bail!(message),
-                    _ => bail!("云端返回了无效的订阅响应"),
-                },
-                Ok(_) => bail!("云端返回了无效的订阅响应"),
-            }
+            watch_cloud_group(&manager, &connection, &group, &pool).await
         }
         .await;
         match result {
@@ -2471,8 +2757,135 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
     }
 }
 
+/// Watches one cloud group on a persistent response stream and falls back for older hubs.
+async fn watch_cloud_group(
+    manager: &SyncManager,
+    connection: &Connection,
+    group: &GroupSecrets,
+    pool: &SqlitePool,
+) -> Result<()> {
+    let mut cursor = repository::cloud_cursor(pool).await?;
+    let mut removed_at_ms = repository::latest_removed_at_ms(pool).await?;
+    let access_token = group.access_token_bytes()?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(
+        &mut send,
+        &Request::WatchGroupStream {
+            group_id: group.group_id.clone(),
+            access_token: access_token.clone(),
+            after_cursor: cursor,
+            after_removed_at_ms: removed_at_ms,
+        },
+    )
+    .await?;
+    send.finish()?;
+
+    let first_response = tokio::select! {
+        _ = manager.watch_wake.notified() => return Ok(()),
+        response = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv)) => {
+            response.context("读取云端持续订阅首帧超时")??
+        },
+    };
+    if matches!(first_response, Response::Error { .. }) {
+        return watch_cloud_group_legacy(
+            manager,
+            connection,
+            group,
+            access_token,
+            cursor,
+            removed_at_ms,
+        )
+        .await;
+    }
+    apply_cloud_watch_response(manager, first_response, &mut cursor, &mut removed_at_ms)?;
+
+    loop {
+        let response = tokio::select! {
+            _ = manager.watch_wake.notified() => return Ok(()),
+            response = tokio::time::timeout(Duration::from_secs(90), read_frame(&mut recv)) => {
+                response.context("等待云端持续订阅心跳超时")??
+            },
+        };
+        apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+    }
+}
+
+/// Retains event-driven long watches when connecting to a hub without stream-watch support.
+async fn watch_cloud_group_legacy(
+    manager: &SyncManager,
+    connection: &Connection,
+    group: &GroupSecrets,
+    access_token: Vec<u8>,
+    mut cursor: u64,
+    mut removed_at_ms: i64,
+) -> Result<()> {
+    loop {
+        let response = tokio::select! {
+            _ = manager.watch_wake.notified() => return Ok(()),
+            response = call(
+                connection,
+                Request::WatchGroup {
+                    group_id: group.group_id.clone(),
+                    access_token: access_token.clone(),
+                    after_cursor: cursor,
+                    after_removed_at_ms: removed_at_ms,
+                },
+            ) => response,
+        };
+        match response {
+            Ok(response @ Response::GroupChanged { .. }) => {
+                apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+            }
+            Ok(Response::Error { .. }) | Err(_) => {
+                let response = tokio::select! {
+                    _ = manager.watch_wake.notified() => return Ok(()),
+                    response = call(
+                        connection,
+                        Request::Watch {
+                            group_id: group.group_id.clone(),
+                            access_token: access_token.clone(),
+                            after_cursor: cursor,
+                        },
+                    ) => response?,
+                };
+                apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+            }
+            Ok(_) => bail!("云端返回了无效的订阅响应"),
+        }
+    }
+}
+
+fn apply_cloud_watch_response(
+    manager: &SyncManager,
+    response: Response,
+    cursor: &mut u64,
+    removed_at_ms: &mut i64,
+) -> Result<()> {
+    match response {
+        Response::GroupChanged {
+            latest_cursor,
+            latest_removed_at_ms,
+        } => {
+            if latest_cursor > *cursor || latest_removed_at_ms > *removed_at_ms {
+                manager.wake_cloud_transfer();
+            }
+            *cursor = (*cursor).max(latest_cursor);
+            *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
+            Ok(())
+        }
+        Response::Changed { latest_cursor } => {
+            if latest_cursor > *cursor {
+                manager.wake_cloud_transfer();
+            }
+            *cursor = (*cursor).max(latest_cursor);
+            Ok(())
+        }
+        Response::Error { message, .. } => bail!(message),
+        _ => bail!("云端返回了无效的订阅响应"),
+    }
+}
+
 fn retry_delay(failure_count: usize) -> Duration {
-    const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
     let index = failure_count.saturating_sub(1).min(RETRY_SECONDS.len() - 1);
     let base = RETRY_SECONDS[index];
     let jitter = (Utc::now().timestamp_subsec_millis() as u64) % (base / 4 + 1);
@@ -2515,8 +2928,12 @@ impl ProtocolHandler for JoinService {
 
 /// Completes a four-step handshake before allowing Iroh's close-on-drop to release the connection.
 async fn handle_join_connection(manager: Arc<SyncManager>, connection: Connection) -> Result<()> {
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    let request: JoinRequest = read_frame(&mut recv).await?;
+    let (mut send, mut recv) = tokio::time::timeout(JOIN_HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await
+        .context("等待局域网加入请求超时")??;
+    let request: JoinRequest = tokio::time::timeout(JOIN_HANDSHAKE_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("读取局域网加入请求超时")??;
     let request_id = request.request_id.clone();
     let response = process_join_request(&manager, &connection, request).await;
     let (response, approved_peer) = match response {
@@ -2705,15 +3122,40 @@ impl ProtocolHandler for PeerService {
             log::warn!("rejected non-LAN sync connection: {error}");
             return Ok(());
         }
+        let connection_admission = Arc::new(Semaphore::new(8));
+        let connection_blobs = Arc::new(Semaphore::new(2));
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(value) => value,
                 Err(_) => break,
             };
+            let global_admission = match manager
+                .inbound_stream_admission
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let connection_admission = match connection_admission.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
             let manager = manager.clone();
             let connection = connection.clone();
+            let connection_blobs = connection_blobs.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_peer_stream(manager, connection, send, recv).await {
+                if let Err(error) = handle_peer_stream(
+                    manager,
+                    connection,
+                    send,
+                    recv,
+                    (global_admission, connection_admission),
+                    connection_blobs,
+                )
+                .await
+                {
                     log::warn!("LAN sync request failed: {error}");
                 }
             });
@@ -2727,8 +3169,25 @@ async fn handle_peer_stream(
     connection: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
+    admission_permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    connection_blobs: Arc<Semaphore>,
 ) -> Result<()> {
-    let request: Request = read_frame(&mut recv).await?;
+    let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("LAN request frame timeout")??;
+    let _blob_permits = if matches!(&request, Request::PutBlob { .. } | Request::GetBlob { .. }) {
+        Some((
+            manager
+                .inbound_blob_concurrency
+                .clone()
+                .acquire_owned()
+                .await?,
+            connection_blobs.acquire_owned().await?,
+        ))
+    } else {
+        None
+    };
+    drop(admission_permits);
     let result = dispatch_peer(&manager, &connection, &mut send, &mut recv, request).await;
     if let Err(error) = result {
         write_frame(
@@ -2814,6 +3273,11 @@ async fn dispatch_peer(
                 .iter()
                 .map(|event| event.event_id.clone())
                 .collect::<Vec<_>>();
+            let remote_event_ids = events
+                .iter()
+                .filter(|event| event.origin_device_id != manager.identity.snapshot().device_id)
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>();
             let mut accepted = Vec::new();
             for event in events {
                 if repository::insert_event(&pool, &event, false, &[]).await? {
@@ -2827,6 +3291,7 @@ async fn dispatch_peer(
                 &incoming_event_ids,
             )
             .await?;
+            repository::mark_delivered(&pool, CLOUD_TARGET, &remote_event_ids).await?;
             let outgoing = repository::events_after_cursor(
                 &pool,
                 after_cursor,
@@ -2914,7 +3379,7 @@ async fn dispatch_peer(
             }
             drop(apply_guard);
             if received_new_events {
-                manager.wake_transfer();
+                manager.wake_lan_transfer();
             }
         }
         Request::SyncRemovedDevices {
@@ -2991,11 +3456,12 @@ async fn dispatch_peer(
             let size = path.metadata()?.len();
             write_frame(send, &Response::BlobReady { size }).await?;
             let mut file = tokio::fs::File::open(path).await?;
-            tokio::io::copy(&mut file, send).await?;
+            copy_with_idle_timeout(&mut file, send, BLOB_IDLE_TIMEOUT).await?;
         }
         Request::CreateGroup { .. }
         | Request::Watch { .. }
         | Request::WatchGroup { .. }
+        | Request::WatchGroupStream { .. }
         | Request::ListEvents { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
@@ -3063,7 +3529,9 @@ async fn upload_blob(
     group: &GroupSecrets,
     blob: &StoredBlob,
 ) -> Result<()> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
+        .await
+        .context("open blob upload stream timeout")??;
     write_frame(
         &mut send,
         &Request::PutBlob {
@@ -3074,7 +3542,10 @@ async fn upload_blob(
         },
     )
     .await?;
-    match read_frame::<_, Response>(&mut recv).await? {
+    match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame::<_, Response>(&mut recv))
+        .await
+        .context("wait for blob upload readiness timeout")??
+    {
         Response::BlobStored => {
             send.finish()?;
             return Ok(());
@@ -3084,13 +3555,36 @@ async fn upload_blob(
         _ => bail!("invalid blob upload response"),
     }
     let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
-    tokio::io::copy(&mut file, &mut send).await?;
+    copy_with_idle_timeout(&mut file, &mut send, BLOB_IDLE_TIMEOUT).await?;
     send.finish()?;
-    match read_frame(&mut recv).await? {
+    match tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("wait for blob storage confirmation timeout")??
+    {
         Response::BlobStored => Ok(()),
         Response::Error { message, .. } => bail!(message),
         _ => bail!("invalid blob stored response"),
     }
+}
+
+/// Uploads independent encrypted blobs over a small number of parallel QUIC streams.
+async fn upload_blobs(
+    connection: &Connection,
+    group: &GroupSecrets,
+    blobs: Vec<StoredBlob>,
+) -> Result<()> {
+    for batch in blobs.chunks(MAX_CONCURRENT_BLOB_TRANSFERS) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for blob in batch.iter().cloned() {
+            let connection = connection.clone();
+            let group = group.clone();
+            tasks.spawn(async move { upload_blob(&connection, &group, &blob).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.context("blob upload task failed")??;
+        }
+    }
+    Ok(())
 }
 
 async fn download_blob(
@@ -3099,7 +3593,9 @@ async fn download_blob(
     manifest: &BlobManifest,
     destination: &Path,
 ) -> Result<()> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
+        .await
+        .context("open blob download stream timeout")??;
     write_frame(
         &mut send,
         &Request::GetBlob {
@@ -3110,7 +3606,10 @@ async fn download_blob(
     )
     .await?;
     send.finish()?;
-    let Response::BlobReady { size } = read_frame(&mut recv).await? else {
+    let response = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("wait for blob download response timeout")??;
+    let Response::BlobReady { size } = response else {
         bail!("blob is unavailable");
     };
     if size != manifest.encrypted_size {
@@ -3128,6 +3627,10 @@ async fn receive_blob(
     let parent = destination.parent().context("blob path has no parent")?;
     tokio::fs::create_dir_all(parent).await?;
     let temporary = destination.with_extension(format!("part-{}", uuid::Uuid::new_v4()));
+    let mut cleanup = TemporaryBlobCleanup {
+        path: temporary.clone(),
+        armed: true,
+    };
     let result = async {
         let mut file = tokio::fs::File::create(&temporary).await?;
         let mut remaining = size;
@@ -3136,9 +3639,9 @@ async fn receive_blob(
         while remaining > 0 {
             let requested =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = recv
-                .read(&mut buffer[..requested])
-                .await?
+            let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
+                .await
+                .context("blob download idle timeout")??
                 .context("blob ended early")?;
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
@@ -3150,13 +3653,51 @@ async fn receive_blob(
             bail!("blob hash mismatch");
         }
         tokio::fs::rename(&temporary, destination).await?;
+        cleanup.armed = false;
         Ok(())
     }
     .await;
-    if result.is_err() {
-        tokio::fs::remove_file(&temporary).await.ok();
-    }
     result
+}
+
+struct TemporaryBlobCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TemporaryBlobCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn copy_with_idle_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = tokio::time::timeout(idle_timeout, reader.read(&mut buffer))
+            .await
+            .context("blob read idle timeout")??;
+        if read == 0 {
+            break;
+        }
+        tokio::time::timeout(idle_timeout, writer.write_all(&buffer[..read]))
+            .await
+            .context("blob write idle timeout")??;
+        copied += read as u64;
+    }
+    writer.flush().await?;
+    Ok(copied)
 }
 
 fn connection_path(connection: &Connection) -> (Option<String>, Option<&'static str>) {
@@ -3283,6 +3824,7 @@ fn cloud_record(
     event: EncryptedEvent,
     envelope: ClipboardEnvelope,
     device_name: String,
+    image_path: Option<String>,
 ) -> CloudRecord {
     let is_sensitive = envelope.item.is_sensitive;
     let file_count = envelope.blobs.len().try_into().unwrap_or(u32::MAX);
@@ -3292,7 +3834,6 @@ fn cloud_record(
             .blobs
             .iter()
             .map(|blob| blob.name.as_str())
-            .take(3)
             .collect::<Vec<_>>()
             .join("、"),
         "image" => envelope
@@ -3302,9 +3843,9 @@ fn cloud_record(
             .unwrap_or_else(|| "图片".to_owned()),
         _ => envelope
             .item
-            .summary
+            .search_text
             .clone()
-            .or(envelope.item.search_text.clone())
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| envelope.item.content.clone()),
     };
     CloudRecord {
@@ -3312,11 +3853,8 @@ fn cloud_record(
         event_id: event.event_id,
         device_name,
         kind: envelope.item.kind,
-        preview: if is_sensitive {
-            String::new()
-        } else {
-            truncate_preview(&preview)
-        },
+        preview,
+        image_path,
         file_count,
         total_size,
         created_at: Utc
@@ -3325,17 +3863,6 @@ fn cloud_record(
             .unwrap_or_else(Utc::now)
             .to_rfc3339(),
         is_sensitive,
-    }
-}
-
-fn truncate_preview(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let preview = chars.by_ref().take(160).collect::<String>();
-    if chars.next().is_some() {
-        format!("{preview}…")
-    } else {
-        preview
     }
 }
 
@@ -3513,5 +4040,50 @@ mod tests {
             ensure_lan_transport_addr(&public).unwrap_err().to_string(),
             "局域网同步禁止使用公网地址"
         );
+    }
+
+    #[test]
+    fn cloud_record_keeps_complete_sensitive_content_and_image_path() {
+        let content = "secret-token-".repeat(20);
+        let event = EncryptedEvent {
+            event_id: "event".into(),
+            origin_device_id: "device".into(),
+            origin_sequence: 1,
+            created_at_ms: 1_700_000_000_000,
+            nonce: vec![0; 24],
+            ciphertext: vec![1],
+        };
+        let envelope = ClipboardEnvelope {
+            version: 1,
+            item: SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: content.clone(),
+                search_text: Some(content.clone()),
+                summary: Some("short summary".into()),
+                file_types: None,
+                size: Some(content.len() as i64),
+                width: None,
+                height: None,
+                is_sensitive: true,
+                source_platform: "android".into(),
+                created_at_ms: 1_700_000_000_000,
+                content_hash: "hash".into(),
+                updated_at_ms: Some(1_700_000_000_000),
+            },
+            blobs: Vec::new(),
+        };
+
+        let record = cloud_record(
+            1,
+            event,
+            envelope,
+            "Android".into(),
+            Some("/tmp/image.png".into()),
+        );
+
+        assert!(record.is_sensitive);
+        assert_eq!(record.preview, content);
+        assert_eq!(record.image_path.as_deref(), Some("/tmp/image.png"));
     }
 }

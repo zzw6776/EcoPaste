@@ -15,7 +15,9 @@ pub use state::WindowStateStore;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow, Window};
+#[cfg(not(target_os = "android"))]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use crate::core::Result;
 use crate::settings::{SettingsStore, WindowPosition};
@@ -55,6 +57,7 @@ pub fn is_clipboard_window_pinned() -> bool {
 }
 
 /// 判断剪贴板窗口当前是否允许因失焦或外部点击自动隐藏。
+#[cfg(not(target_os = "android"))]
 pub fn should_auto_hide_clipboard_window() -> bool {
     !CLIPBOARD_WINDOW_PINNED.load(Ordering::Relaxed)
         && !CLIPBOARD_WINDOW_AUTO_HIDE_SUSPENDED.load(Ordering::Relaxed)

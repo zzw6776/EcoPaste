@@ -8,9 +8,13 @@ pub fn label(key: Key) -> &'static str {
         Key::AndroidFileOpenFailed => "无法打开文件",
         Key::AndroidFileOpenUnavailable => "没有可用于打开该文件的应用",
         Key::AndroidFileSaveFailed => "无法保存文件",
+        #[cfg(not(target_os = "android"))]
         Key::DragSourceFilesMissing => "拖拽源文件已不存在",
+        #[cfg(not(target_os = "android"))]
         Key::DragImageMissing => "图片文件已不存在",
+        #[cfg(not(target_os = "android"))]
         Key::DragTextEmpty => "文本内容为空",
         Key::ExternalUrlUnsupported => "只能打开 http 或 https 开头的链接",
+        Key::SaveImage => "保存图片",
     }
 }

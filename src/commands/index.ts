@@ -188,6 +188,7 @@ export interface CloudRecord {
   deviceName: string;
   kind: string;
   preview: string;
+  imagePath: string | null;
   fileCount: number;
   totalSize: number;
   createdAt: string;

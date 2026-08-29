@@ -261,7 +261,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
 }
 
 #[cfg(target_os = "android")]
-fn load_overlay_cloud_records_json() -> Result<String> {
+fn load_overlay_cloud_records_json(before_cursor: Option<u64>, limit: u16) -> Result<String> {
     let app = APP_HANDLE
         .get()
         .cloned()
@@ -271,10 +271,12 @@ fn load_overlay_cloud_records_json() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("sync manager is not ready"))?
         .inner()
         .clone();
-    tauri::async_runtime::block_on(async move {
-        let page = manager.cloud_records(None, 50).await?;
-        serde_json::to_string(&page).map_err(|error| anyhow::anyhow!(error).into())
-    })
+    Ok(tauri::async_runtime::block_on(async move {
+        let page = manager
+            .cloud_records(before_cursor, limit.clamp(1, 30))
+            .await?;
+        serde_json::to_string(&page).map_err(anyhow::Error::from)
+    })?)
 }
 
 #[cfg(target_os = "android")]
@@ -493,14 +495,18 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlay
 pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_loadOverlayCloudRecordsJson(
     raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
+    before_cursor: jni::sys::jlong,
+    limit: jni::sys::jint,
 ) -> jni::sys::jstring {
     let Ok(env) = jni::JNIEnv::from_raw(raw_env) else {
         return std::ptr::null_mut();
     };
-    let json = load_overlay_cloud_records_json().unwrap_or_else(|error| {
-        log::error!("load Android overlay cloud records failed: {error}");
-        serde_json::json!({ "error": error.to_string() }).to_string()
-    });
+    let before_cursor = (before_cursor >= 0).then_some(before_cursor as u64);
+    let json = load_overlay_cloud_records_json(before_cursor, u16::try_from(limit).unwrap_or(30))
+        .unwrap_or_else(|error| {
+            log::error!("load Android overlay cloud records failed: {error}");
+            serde_json::json!({ "error": error.to_string() }).to_string()
+        });
     env.new_string(json)
         .map(jni::objects::JString::into_raw)
         .unwrap_or(std::ptr::null_mut())
@@ -875,25 +881,6 @@ mod jni_bridge {
         file_action("saveClipboardFile", path)
     }
 
-    pub fn log_file_action(stage: &str, message: &str) -> Result<()> {
-        with_jni_env(|env, _context, bridge_class| {
-            let stage = env
-                .new_string(stage)
-                .map_err(|e| anyhow!("create file action log stage failed: {e}"))?;
-            let message = env
-                .new_string(message)
-                .map_err(|e| anyhow!("create file action log message failed: {e}"))?;
-            env.call_static_method(
-                bridge_class,
-                "logFileAction",
-                "(Ljava/lang/String;Ljava/lang/String;)V",
-                &[JValue::Object(&stage), JValue::Object(&message)],
-            )
-            .map_err(|e| anyhow!("write Android file action log failed: {e}"))?;
-            Ok(())
-        })
-    }
-
     pub fn apply_gesture_settings(settings: &crate::settings::AndroidGesture) -> Result<()> {
         with_jni_env(|env, context, bridge_class| {
             env.call_static_method(
@@ -928,6 +915,22 @@ mod jni_bridge {
                 .map_err(|e| anyhow!("extract bool failed: {e}"))?;
 
             Ok(val)
+        })
+    }
+
+    pub fn write_clipboard_text(text: &str) -> Result<()> {
+        with_jni_env(|env, context, bridge_class| {
+            let text = env
+                .new_string(text)
+                .map_err(|error| anyhow!("create Android clipboard text failed: {error}"))?;
+            env.call_static_method(
+                bridge_class,
+                "writeClipboardText",
+                "(Landroid/content/Context;Ljava/lang/String;)V",
+                &[JValue::Object(context), JValue::Object(&text)],
+            )
+            .map_err(|error| anyhow!("write Android clipboard text failed: {error}"))?;
+            Ok(())
         })
     }
 
@@ -1027,6 +1030,11 @@ pub(crate) fn notify_overlay_sync_status_changed() {
 }
 
 #[cfg(target_os = "android")]
+pub(crate) fn write_android_clipboard_text(text: &str) -> Result<()> {
+    jni_bridge::write_clipboard_text(text)
+}
+
+#[cfg(target_os = "android")]
 pub(crate) fn set_lan_discovery_enabled(enabled: bool) {
     if let Err(error) = jni_bridge::set_lan_discovery_enabled(enabled) {
         log::debug!("update Android LAN discovery lock failed: {error}");
@@ -1062,7 +1070,9 @@ pub(crate) fn android_device_fallback_name() -> Option<String> {
 pub async fn get_android_permissions_status() -> Result<AndroidPermissionsStatus> {
     #[cfg(target_os = "android")]
     {
-        jni_bridge::get_permissions_status()
+        tauri::async_runtime::spawn_blocking(jni_bridge::get_permissions_status)
+            .await
+            .map_err(|error| anyhow::anyhow!("Android permission check task failed: {error}"))?
     }
     #[cfg(not(target_os = "android"))]
     {

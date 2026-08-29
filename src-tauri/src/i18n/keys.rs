@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy)]
 pub enum ClipboardMenuKey {
     Paste,
@@ -26,12 +27,17 @@ pub enum CommandKey {
     AndroidFileOpenFailed,
     AndroidFileOpenUnavailable,
     AndroidFileSaveFailed,
+    #[cfg(not(target_os = "android"))]
     DragSourceFilesMissing,
+    #[cfg(not(target_os = "android"))]
     DragImageMissing,
+    #[cfg(not(target_os = "android"))]
     DragTextEmpty,
     ExternalUrlUnsupported,
+    SaveImage,
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy)]
 pub enum TrayKey {
     Preference,

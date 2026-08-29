@@ -3,6 +3,7 @@ package com.ayangweb.eco_paste
 import android.accessibilityservice.AccessibilityService
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -19,13 +20,14 @@ class EcoPasteAccessibilityService : AccessibilityService() {
     private var clipboardManager: ClipboardManager? = null
     private val clipChangedListener = ClipboardManager.OnPrimaryClipChangedListener {
         if (EcoPasteBridge.currentEngineMode == "accessibility") {
-            readAndDispatchClipboard()
+            EcoPasteBridge.captureClipboardChange(clipboardManager, true)
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        EcoPasteBridge.initialize(applicationContext)
         Log.i(TAG, "EcoPasteAccessibilityService connected")
 
         try {
@@ -43,23 +45,9 @@ class EcoPasteAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_FOCUSED -> readAndDispatchClipboard()
-        }
-    }
-
-    private fun readAndDispatchClipboard() {
-        try {
-            val manager = clipboardManager
-                ?: (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
-            val clip = manager?.primaryClip ?: return
-            if (clip.itemCount <= 0) return
-
-            val text = clip.getItemAt(0).coerceToText(this)?.toString()
-            if (!text.isNullOrBlank()) {
-                EcoPasteBridge.onClipboardCaptured(text)
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                EcoPasteBridge.captureClipboardChange(clipboardManager, false)
             }
-        } catch (error: Exception) {
-            Log.d(TAG, "read clipboard in accessibility failed: ${error.message}")
         }
     }
 
@@ -70,19 +58,19 @@ class EcoPasteAccessibilityService : AccessibilityService() {
             val focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             if (focusedNode != null && focusedNode.isEditable) {
                 val success = focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                focusedNode.recycle()
-                root.recycle()
+                recycleNode(focusedNode)
+                if (focusedNode !== root) recycleNode(root)
                 return success
             }
 
             val targetNode = findEditableNode(root)
             if (targetNode != null) {
                 val success = targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                targetNode.recycle()
-                root.recycle()
+                recycleNode(targetNode)
+                if (targetNode !== root) recycleNode(root)
                 return success
             }
-            root.recycle()
+            recycleNode(root)
         } catch (error: Exception) {
             Log.e(TAG, "performPaste failed: ${error.message}", error)
         }
@@ -99,9 +87,17 @@ class EcoPasteAccessibilityService : AccessibilityService() {
             if (result != null) {
                 return result
             }
-            child.recycle()
+            recycleNode(child)
         }
         return null
+    }
+
+    /** Android 13 以前需要显式回收节点；新版本由系统自动管理。 */
+    @Suppress("DEPRECATION")
+    private fun recycleNode(node: AccessibilityNodeInfo) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            node.recycle()
+        }
     }
 
     override fun onInterrupt() {
