@@ -806,6 +806,8 @@
       },
       "relayUrls": "Hub Relay addresses (optional)",
       "save": "Save cloud settings",
+      "serverVersion": "Server version: v{{version}}",
+      "serverVersionUnknown": "Server version: Unknown",
       "title": "Cloud Hub settings"
     },
     "conflict": {

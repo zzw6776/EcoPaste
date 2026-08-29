@@ -15,6 +15,7 @@ dist-ssr
 /sync-server/protocol/target/
 /sync-server/protocol/Cargo.lock
 /src-tauri/vendor/**/target/
+/src-tauri/gen/android/.kotlin/
 *.local
 /signing.properties
 

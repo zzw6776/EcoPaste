@@ -13,6 +13,8 @@ import {
 import Popover from "@/components/Popover";
 import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
+import { WINDOW_LABEL } from "@/constants/windows";
+import { useTauriListen } from "@/hooks/useTauriListen";
 import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
@@ -20,6 +22,11 @@ import CloudRecordsDrawer from "./CloudRecordsDrawer";
 
 interface SyncStatusIconsProps {
   compact?: boolean;
+}
+
+interface WindowVisibilityPayload {
+  label: string;
+  visible: boolean;
 }
 
 const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
@@ -66,6 +73,25 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     unlistenRef.current?.();
   });
 
+  function handleWindowVisibility(event: {
+    payload: WindowVisibilityPayload;
+  }) {
+    if (
+      event.payload.label !== WINDOW_LABEL.CLIPBOARD ||
+      event.payload.visible
+    ) {
+      return;
+    }
+
+    setDetailsTarget(null);
+    setRecordsOpen(false);
+  }
+
+  useTauriListen<WindowVisibilityPayload>(
+    TAURI_EVENT.WINDOW_VISIBILITY,
+    handleWindowVisibility,
+  );
+
   async function handleReconnect(deviceId?: string) {
     setReconnectingKey(deviceId ?? "all");
     try {
@@ -92,6 +118,22 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
   function handleOpenCloudDetails() {
     setDetailsTarget("cloud");
+  }
+
+  function handleLanDetailsOpenChange(open: boolean) {
+    setDetailsTarget((current) => {
+      if (open) return "lan";
+
+      return current === "lan" ? null : current;
+    });
+  }
+
+  function handleCloudDetailsOpenChange(open: boolean) {
+    setDetailsTarget((current) => {
+      if (open) return "cloud";
+
+      return current === "cloud" ? null : current;
+    });
   }
 
   function handleCloseDetails() {
@@ -147,6 +189,8 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
                   status={status}
                 />
               }
+              onOpenChange={handleLanDetailsOpenChange}
+              open={detailsTarget === "lan"}
               placement="bottomRight"
               tooltip={lanLabel}
               trigger="click"
@@ -161,6 +205,8 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
             <Popover
               content={cloudDetails}
+              onOpenChange={handleCloudDetailsOpenChange}
+              open={detailsTarget === "cloud"}
               placement="bottomRight"
               tooltip={cloudLabel}
               trigger="click"
@@ -487,6 +533,15 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
             ),
           })}
         </div>
+      ) : null}
+      {status?.cloudEnabled ? (
+        <span className="text-ant-secondary text-xs">
+          {status.cloudServerVersion
+            ? t("syncStatus.cloud.serverVersion", {
+                version: status.cloudServerVersion,
+              })
+            : t("syncStatus.cloud.serverVersionUnknown")}
+        </span>
       ) : null}
       {cloud?.lastSuccessAt ? (
         <span className="text-ant-secondary text-xs">

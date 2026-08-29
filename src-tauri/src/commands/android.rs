@@ -43,6 +43,8 @@ static GLOBAL_CONTEXT: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync:
 #[cfg(target_os = "android")]
 static BRIDGE_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
 #[cfg(target_os = "android")]
+static IROH_ANDROID_CONTEXT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+#[cfg(target_os = "android")]
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 #[cfg(any(target_os = "android", test))]
 #[derive(Default)]
@@ -415,6 +417,14 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_initNdkCont
                     let _ = BRIDGE_CLASS.set(global_cls);
                 }
             }
+            if let (Some(vm), Some(context)) = (GLOBAL_VM.get(), GLOBAL_CONTEXT.get()) {
+                IROH_ANDROID_CONTEXT.get_or_init(|| unsafe {
+                    iroh::dns::install_android_jni_context(
+                        vm.get_java_vm_pointer().cast(),
+                        context.as_obj().as_raw().cast(),
+                    );
+                });
+            }
         }
     }));
 }
@@ -583,17 +593,19 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_captureClip
     raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
     text: jni::sys::jstring,
-) {
+) -> jni::sys::jboolean {
     let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
-        return;
+        return 0;
     };
     let text = jni::objects::JString::from_raw(text);
     let Ok(text) = env.get_string(&text).map(String::from) else {
-        return;
+        return 0;
     };
     if let Some(app) = APP_HANDLE.get() {
         crate::clipboard::capture_android_text(app, text);
+        return 1;
     }
+    0
 }
 
 #[cfg(target_os = "android")]

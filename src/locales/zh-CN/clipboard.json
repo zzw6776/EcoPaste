@@ -144,6 +144,8 @@
       "idle": "云端未连接",
       "online": "云端连接正常",
       "pending": "{{count}} 条事件等待上传",
+      "serverVersion": "服务端版本：v{{version}}",
+      "serverVersionUnknown": "服务端版本：未知",
       "title": "云端"
     },
     "lan": {

@@ -620,6 +620,15 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
               })}
             </div>
           ) : null}
+          {status?.cloudEnabled ? (
+            <div className="mt-1 text-ant-secondary text-xs">
+              {status.cloudServerVersion
+                ? t("sync.cloud.serverVersion", {
+                    version: status.cloudServerVersion,
+                  })
+                : t("sync.cloud.serverVersionUnknown")}
+            </div>
+          ) : null}
           {status?.cloudEnabled && status.cloud.lastSuccessAt ? (
             <div className="mt-2 text-ant-secondary text-xs">
               {t("sync.lastSuccess", {

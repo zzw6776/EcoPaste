@@ -179,6 +179,7 @@ export interface SyncStatus {
   cloudWatch: SyncChannelStatus;
   cloudConnectedAddress: string | null;
   cloudTransport: string | null;
+  cloudServerVersion: string | null;
   peers: SyncPeerStatus[];
 }
 

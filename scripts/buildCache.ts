@@ -36,16 +36,23 @@ async function getPathSize(path: string): Promise<number> {
   return size;
 }
 
+/** 汇总多个缓存目录，供清理前决策和清理失败后的结果复核共用。 */
+async function getPathsSize(paths: string[]): Promise<number> {
+  let size = 0;
+  for (const path of paths) {
+    size += await getPathSize(path);
+  }
+
+  return size;
+}
+
 /** 检查构建缓存是否越过阈值，并输出本次决策。 */
 async function isCacheLimitExceeded(
   label: string,
   paths: string[],
   limit: number,
 ) {
-  let size = 0;
-  for (const path of paths) {
-    size += await getPathSize(path);
-  }
+  const size = await getPathsSize(paths);
 
   const sizeGiB = (size / GIBIBYTE).toFixed(2);
   const limitGiB = (limit / GIBIBYTE).toFixed(0);
@@ -103,9 +110,13 @@ function cleanCargoProfiles(
 /** 桌面缓存超过 6 GiB 时，在构建前清理 host dev/release 并保留旧 bundle。 */
 export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
   const targetRoot = resolve(projectRoot, "src-tauri/target");
+  const cachePaths = [
+    resolve(targetRoot, "debug"),
+    resolve(targetRoot, "release"),
+  ];
   const shouldClean = await isCacheLimitExceeded(
     "Desktop",
-    [resolve(targetRoot, "debug"), resolve(targetRoot, "release")],
+    cachePaths,
     DESKTOP_CACHE_LIMIT,
   );
   if (!shouldClean) {
@@ -124,8 +135,11 @@ export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
     }
   }
 
+  let cargoError: unknown;
   try {
     cleanCargoProfiles(projectRoot, ["dev", "release"]);
+  } catch (error) {
+    cargoError = error;
   } finally {
     if (bundleBackupRoot) {
       await mkdir(resolve(targetRoot, "release"), { recursive: true });
@@ -136,6 +150,16 @@ export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
       await rm(bundleBackupRoot, { recursive: true });
     }
   }
+
+  if (cargoError) {
+    const remainingSize = await getPathsSize(cachePaths);
+    if (remainingSize > DESKTOP_CACHE_LIMIT) {
+      throw cargoError;
+    }
+    process.stderr.write(
+      `Cargo cache cleanup was interrupted, but the remaining desktop cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
+    );
+  }
 }
 
 /** Android 缓存超过 3 GiB 时，在构建前清理 arm64 Cargo 与 Gradle 产物。 */
@@ -143,12 +167,13 @@ export async function cleanAndroidCacheIfNeeded(
   projectRoot: string,
   cleanGradle: () => Promise<void>,
 ) {
+  const cachePaths = [
+    resolve(projectRoot, "src-tauri/target/aarch64-linux-android"),
+    resolve(projectRoot, "src-tauri/gen/android"),
+  ];
   const shouldClean = await isCacheLimitExceeded(
     "Android arm64",
-    [
-      resolve(projectRoot, "src-tauri/target/aarch64-linux-android"),
-      resolve(projectRoot, "src-tauri/gen/android"),
-    ],
+    cachePaths,
     ANDROID_CACHE_LIMIT,
   );
   if (!shouldClean) {
@@ -171,6 +196,16 @@ export async function cleanAndroidCacheIfNeeded(
     );
   } catch (error) {
     cargoError = error;
+  }
+
+  if (cargoError) {
+    const remainingSize = await getPathsSize(cachePaths);
+    if (remainingSize <= ANDROID_CACHE_LIMIT) {
+      process.stderr.write(
+        `Cargo cache cleanup was interrupted, but the remaining Android cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
+      );
+      cargoError = void 0;
+    }
   }
 
   if (gradleError && cargoError) {
