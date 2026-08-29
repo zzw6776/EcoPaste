@@ -50,6 +50,7 @@ object EcoPasteBridge {
     private var applicationContext: Context? = null
     private var clipboardManager: ClipboardManager? = null
     private var clipboardListenerRegistered = false
+    private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
     var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
         private set
@@ -93,7 +94,7 @@ object EcoPasteBridge {
     external fun reconnectOverlayPeer(deviceId: String): Boolean
 
     @JvmStatic
-    external fun captureClipboardText(text: String)
+    external fun captureClipboardText(text: String): Boolean
 
     @JvmStatic
     external fun pasteOverlayItem(id: String): Boolean
@@ -263,8 +264,12 @@ object EcoPasteBridge {
     fun setForegroundCaptureActive(active: Boolean) {
         foregroundCaptureActive = active
         refreshClipboardListener()
-        if (active && currentEngineMode == "foreground") {
-            captureClipboardChange(clipboardManager, false)
+        if (active) {
+            if (currentEngineMode == "root") {
+                rootClipboardMonitor?.requestCapture()
+            } else if (currentEngineMode == "foreground") {
+                captureClipboardChange(clipboardManager, false)
+            }
         }
     }
 
@@ -676,6 +681,7 @@ object EcoPasteBridge {
             .apply()
         applicationContext = context.applicationContext
         refreshClipboardListener()
+        ensureGestureService(context)
         return engineResult(true, mode, mode != "root" || isRootClipboardGranted(context), "")
     }
 
@@ -766,7 +772,7 @@ object EcoPasteBridge {
     @JvmStatic
     fun ensureGestureService(context: Context) {
         val config = getGestureConfig(context)
-        if (config.enabled && checkRootAvailable()) {
+        if (currentEngineMode == "root" || (config.enabled && checkRootAvailable())) {
             startLegacyOverlayService(context)
         } else {
             stopLegacyOverlayService(context)
@@ -780,7 +786,7 @@ object EcoPasteBridge {
         clipboardChangeListeners.add(listener)
     }
 
-    /** Registers one system callback for root and foreground capture modes. */
+    /** Reconciles the foreground callback and the privileged event-driven root helper. */
     @Synchronized
     private fun refreshClipboardListener() {
         val context = applicationContext ?: return
@@ -788,19 +794,30 @@ object EcoPasteBridge {
             ?: (context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager).also {
                 clipboardManager = it
             }
-        val shouldListen = currentEngineMode == "root" ||
-            (currentEngineMode == "foreground" && foregroundCaptureActive)
-        if (shouldListen == clipboardListenerRegistered || manager == null) return
-
-        try {
-            if (shouldListen) {
-                manager.addPrimaryClipChangedListener(clipChangedListener)
-            } else {
-                manager.removePrimaryClipChangedListener(clipChangedListener)
+        val shouldListen = currentEngineMode == "foreground" && foregroundCaptureActive
+        if (shouldListen != clipboardListenerRegistered && manager != null) {
+            try {
+                if (shouldListen) {
+                    manager.addPrimaryClipChangedListener(clipChangedListener)
+                } else {
+                    manager.removePrimaryClipChangedListener(clipChangedListener)
+                }
+                clipboardListenerRegistered = shouldListen
+            } catch (error: Exception) {
+                Log.w(TAG, "update clipboard listener failed: ${error.message}")
             }
-            clipboardListenerRegistered = shouldListen
-        } catch (error: Exception) {
-            Log.w(TAG, "update clipboard listener failed: ${error.message}")
+        }
+
+        if (currentEngineMode == "root") {
+            val monitor = rootClipboardMonitor ?: RootClipboardMonitor(context) { text, timestamp ->
+                onClipboardCaptured(text, timestamp, true)
+            }.also {
+                rootClipboardMonitor = it
+            }
+            monitor.start()
+        } else {
+            rootClipboardMonitor?.stop()
+            rootClipboardMonitor = null
         }
     }
 
@@ -854,13 +871,14 @@ object EcoPasteBridge {
             else -> lastCapturedTimestamp
         }
         if (text == lastCapturedText && captureTimestamp == lastCapturedTimestamp) return
-        lastCapturedText = text
-        lastCapturedTimestamp = captureTimestamp
         try {
-            captureClipboardText(text)
+            if (!captureClipboardText(text)) return
         } catch (error: Throwable) {
             Log.w(TAG, "send clipboard capture to Rust failed: ${error.message}")
+            return
         }
+        lastCapturedText = text
+        lastCapturedTimestamp = captureTimestamp
         for (listener in clipboardChangeListeners) {
             try {
                 listener(text)

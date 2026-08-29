@@ -944,6 +944,21 @@ pub async fn mark_peer_online(
     .await
 }
 
+/// Returns the last direct route that completed a synchronization with this peer.
+pub async fn preferred_peer_address(pool: &SqlitePool, device_id: &str) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT connected_address
+        FROM sync_peer_connections
+        WHERE device_id = ? AND transport = 'direct' AND connected_address IS NOT NULL
+        "#,
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .context("load preferred sync peer address")
+}
+
 async fn set_peer_connection(
     pool: &SqlitePool,
     device_id: &str,

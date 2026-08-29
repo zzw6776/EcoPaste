@@ -20,6 +20,7 @@
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
 -keep class com.ayangweb.eco_paste.RootInputMonitorDaemon { *; }
+-keep class com.ayangweb.eco_paste.RootClipboardMonitorDaemon { *; }
 
 # Rust resolves this bridge's static methods by their exact JVM names and signatures.
 -keep class com.ayangweb.eco_paste.EcoPasteBridge { *; }

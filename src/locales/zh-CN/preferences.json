@@ -806,6 +806,8 @@
       },
       "relayUrls": "Hub Relay 地址（可选）",
       "save": "保存云端配置",
+      "serverVersion": "服务端版本：v{{version}}",
+      "serverVersionUnknown": "服务端版本：未知",
       "title": "云端 Hub 配置"
     },
     "conflict": {

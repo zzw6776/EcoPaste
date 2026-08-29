@@ -307,12 +307,35 @@ pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<Endp
 
 /// 局域网同步只接收局域网 IP 路由，Relay 和公网直连地址不会进入拨号集合。
 pub fn peer_endpoint_addr(peer: &ecopaste_sync_protocol::PeerAnnouncement) -> Result<EndpointAddr> {
+    peer_endpoint_addr_with_preferred(peer, None)
+}
+
+/// Keeps the last proven mDNS route first while retaining current LAN fallbacks.
+pub fn peer_endpoint_addr_with_preferred(
+    peer: &ecopaste_sync_protocol::PeerAnnouncement,
+    preferred: Option<&str>,
+) -> Result<EndpointAddr> {
     let endpoint_id =
         EndpointId::from_str(peer.endpoint_id.trim()).context("invalid Iroh endpoint id")?;
+    let parsed = peer
+        .direct_addresses
+        .iter()
+        .map(|direct| {
+            direct
+                .parse::<SocketAddr>()
+                .context("invalid Iroh direct address")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let preferred = preferred
+        .map(|value| value.strip_prefix("ip:").unwrap_or(value))
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .filter(|address| parsed.contains(address) && is_lan_ip(address.ip()));
     let mut addresses = Vec::new();
-    for direct in &peer.direct_addresses {
-        let address: SocketAddr = direct.parse().context("invalid Iroh direct address")?;
-        if is_lan_ip(address.ip()) {
+    if let Some(preferred) = preferred {
+        addresses.push(TransportAddr::Ip(preferred));
+    }
+    for address in parsed {
+        if is_lan_ip(address.ip()) && Some(address) != preferred {
             addresses.push(TransportAddr::Ip(address));
         }
     }

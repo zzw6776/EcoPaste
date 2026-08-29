@@ -220,6 +220,9 @@ pub enum Response {
         protocol_version: u16,
         #[n(1)]
         server_time_ms: i64,
+        #[n(2)]
+        #[cbor(default)]
+        server_version: Option<String>,
     },
     #[n(1)]
     GroupCreated,
@@ -273,6 +276,9 @@ pub enum Response {
         latest_cursor: u64,
         #[n(1)]
         latest_removed_at_ms: i64,
+        #[n(2)]
+        #[cbor(default)]
+        server_version: Option<String>,
     },
 }
 

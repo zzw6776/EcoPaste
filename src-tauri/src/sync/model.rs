@@ -119,6 +119,7 @@ pub struct SyncStatus {
     pub cloud_watch: SyncChannelStatus,
     pub cloud_connected_address: Option<String>,
     pub cloud_transport: Option<String>,
+    pub cloud_server_version: Option<String>,
     pub peers: Vec<SyncPeerStatus>,
 }
 

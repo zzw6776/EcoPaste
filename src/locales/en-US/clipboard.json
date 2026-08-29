@@ -144,6 +144,8 @@
       "idle": "Cloud is disconnected",
       "online": "Cloud is connected",
       "pending": "{{count}} events waiting to upload",
+      "serverVersion": "Server version: v{{version}}",
+      "serverVersionUnknown": "Server version: Unknown",
       "title": "Cloud"
     },
     "lan": {

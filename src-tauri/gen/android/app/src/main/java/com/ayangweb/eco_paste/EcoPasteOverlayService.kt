@@ -103,6 +103,7 @@ class EcoPasteOverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        EcoPasteBridge.initialize(applicationContext)
         instance = this
         windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
         overlayPanel = windowManager?.let { manager ->

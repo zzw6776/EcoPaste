@@ -183,6 +183,7 @@ impl HubService {
                     &Response::Health {
                         protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
                         server_time_ms: now_ms(),
+                        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     },
                 )
                 .await?;
@@ -337,6 +338,7 @@ impl HubService {
                     &Response::GroupChanged {
                         latest_cursor,
                         latest_removed_at_ms,
+                        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     },
                 )
                 .await?;
@@ -366,6 +368,7 @@ impl HubService {
                             &Response::GroupChanged {
                                 latest_cursor,
                                 latest_removed_at_ms,
+                                server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                             },
                         ),
                     )
@@ -393,6 +396,7 @@ impl HubService {
                                     latest_cursor: latest_cursor.max(after_cursor),
                                     latest_removed_at_ms: latest_removed_at_ms
                                         .max(after_removed_at_ms),
+                                    server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                                 },
                             ),
                         )
