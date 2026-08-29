@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -210,6 +210,20 @@ pub enum Request {
         #[n(3)]
         after_removed_at_ms: i64,
     },
+    /// Keeps a version-aware response stream without changing legacy watch frames.
+    #[n(10)]
+    WatchGroupStreamV2 {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        after_cursor: u64,
+        #[n(3)]
+        after_removed_at_ms: i64,
+    },
+    #[n(11)]
+    HealthV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -220,9 +234,6 @@ pub enum Response {
         protocol_version: u16,
         #[n(1)]
         server_time_ms: i64,
-        #[n(2)]
-        #[cbor(default)]
-        server_version: Option<String>,
     },
     #[n(1)]
     GroupCreated,
@@ -276,9 +287,24 @@ pub enum Response {
         latest_cursor: u64,
         #[n(1)]
         latest_removed_at_ms: i64,
+    },
+    #[n(10)]
+    GroupChangedV2 {
+        #[n(0)]
+        latest_cursor: u64,
+        #[n(1)]
+        latest_removed_at_ms: i64,
         #[n(2)]
-        #[cbor(default)]
-        server_version: Option<String>,
+        server_version: String,
+    },
+    #[n(11)]
+    HealthV2 {
+        #[n(0)]
+        protocol_version: u16,
+        #[n(1)]
+        server_time_ms: i64,
+        #[n(2)]
+        server_version: String,
     },
 }
 

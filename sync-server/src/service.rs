@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    ErrorCode, MAX_EVENTS_PER_BATCH, Request, Response, read_frame, write_frame,
+    ErrorCode, FrameError, MAX_EVENTS_PER_BATCH, Request, Response, read_frame, write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -135,7 +135,10 @@ impl HubService {
             .await
             .context("read request frame timeout")?
             .context("read request frame")?;
-        let _request_permits = if matches!(&request, Request::WatchGroupStream { .. }) {
+        let _request_permits = if matches!(
+            &request,
+            Request::WatchGroupStream { .. } | Request::WatchGroupStreamV2 { .. }
+        ) {
             Some((
                 self.watch_concurrency.clone().acquire_owned().await?,
                 connection_watches.acquire_owned().await?,
@@ -156,6 +159,10 @@ impl HubService {
             .dispatch(remote_endpoint_id, &mut send, &mut recv, request)
             .await
         {
+            if is_frame_io_error(&error) {
+                debug!(?error, "sync stream disconnected");
+                return Ok(());
+            }
             warn!(?error, "sync request failed");
             tokio::time::timeout(
                 FRAME_WRITE_TIMEOUT,
@@ -176,6 +183,7 @@ impl HubService {
         recv: &mut RecvStream,
         request: Request,
     ) -> Result<()> {
+        let versioned_watch = matches!(&request, Request::WatchGroupStreamV2 { .. });
         match request {
             Request::Health => {
                 write_frame(
@@ -183,7 +191,17 @@ impl HubService {
                     &Response::Health {
                         protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
                         server_time_ms: now_ms(),
-                        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    },
+                )
+                .await?;
+            }
+            Request::HealthV2 => {
+                write_frame(
+                    send,
+                    &Response::HealthV2 {
+                        protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
+                        server_time_ms: now_ms(),
+                        server_version: env!("CARGO_PKG_VERSION").to_owned(),
                     },
                 )
                 .await?;
@@ -338,12 +356,17 @@ impl HubService {
                     &Response::GroupChanged {
                         latest_cursor,
                         latest_removed_at_ms,
-                        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     },
                 )
                 .await?;
             }
             Request::WatchGroupStream {
+                group_id,
+                access_token,
+                after_cursor,
+                after_removed_at_ms,
+            }
+            | Request::WatchGroupStreamV2 {
                 group_id,
                 access_token,
                 after_cursor,
@@ -365,11 +388,11 @@ impl HubService {
                         FRAME_WRITE_TIMEOUT,
                         write_frame(
                             send,
-                            &Response::GroupChanged {
+                            &group_changed_response(
+                                versioned_watch,
                                 latest_cursor,
                                 latest_removed_at_ms,
-                                server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                            },
+                            ),
                         ),
                     )
                     .await
@@ -392,12 +415,11 @@ impl HubService {
                             FRAME_WRITE_TIMEOUT,
                             write_frame(
                                 send,
-                                &Response::GroupChanged {
-                                    latest_cursor: latest_cursor.max(after_cursor),
-                                    latest_removed_at_ms: latest_removed_at_ms
-                                        .max(after_removed_at_ms),
-                                    server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                                },
+                                &group_changed_response(
+                                    versioned_watch,
+                                    latest_cursor.max(after_cursor),
+                                    latest_removed_at_ms.max(after_removed_at_ms),
+                                ),
                             ),
                         )
                         .await
@@ -633,4 +655,29 @@ fn response_for_error(error: &anyhow::Error) -> Response {
         ErrorCode::InvalidRequest
     };
     Response::Error { code, message }
+}
+
+fn group_changed_response(
+    versioned: bool,
+    latest_cursor: u64,
+    latest_removed_at_ms: i64,
+) -> Response {
+    if versioned {
+        return Response::GroupChangedV2 {
+            latest_cursor,
+            latest_removed_at_ms,
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+    }
+
+    Response::GroupChanged {
+        latest_cursor,
+        latest_removed_at_ms,
+    }
+}
+
+fn is_frame_io_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref::<FrameError>(), Some(FrameError::Io(_))))
 }

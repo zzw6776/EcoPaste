@@ -258,6 +258,7 @@ class EcoPasteOverlayPanel(
             activeSessionId = sessionId
             onSessionChanged(sessionId)
             EcoPasteBridge.setSyncStatusChangedListener { requestSyncStatus() }
+            EcoPasteBridge.setClipboardDataChangedListener { requestVisibleItems() }
             installBottomSystemInset(root, content)
             installSystemGestureExclusion(outside, preserveBottomSystemArea = false)
             installSystemGestureExclusion(root, preserveBottomSystemArea = true)
@@ -334,6 +335,7 @@ class EcoPasteOverlayPanel(
         searchInput = null
         searchMode = false
         EcoPasteBridge.setSyncStatusChangedListener(null)
+        EcoPasteBridge.setClipboardDataChangedListener(null)
         panelView = null
         outsideView = null
         activeSessionId = null
@@ -369,6 +371,12 @@ class EcoPasteOverlayPanel(
                 }
             }
         }
+    }
+
+    /** Reloads the current native view only after Rust has committed a clipboard change. */
+    private fun requestVisibleItems() {
+        if (panelView == null || showingCloudRecords) return
+        requestItems(searchInput?.text?.toString().orEmpty())
     }
 
     private fun requestSyncStatus() {
