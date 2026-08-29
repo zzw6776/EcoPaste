@@ -71,6 +71,7 @@ object EcoPasteBridge {
     private var lastCapturedTimestamp = Long.MIN_VALUE
     private var legacyClipboardSequence = 0L
     private var syncStatusChangedListener: (() -> Unit)? = null
+    private var clipboardDataChangedListener: (() -> Unit)? = null
     private val clipChangedListener = ClipboardManager.OnPrimaryClipChangedListener {
         captureClipboardChange(clipboardManager, true)
     }
@@ -116,6 +117,16 @@ object EcoPasteBridge {
     @JvmStatic
     fun onSyncStatusChanged() {
         Handler(Looper.getMainLooper()).post { syncStatusChangedListener?.invoke() }
+    }
+
+    @JvmStatic
+    fun setClipboardDataChangedListener(listener: (() -> Unit)?) {
+        clipboardDataChangedListener = listener
+    }
+
+    @JvmStatic
+    fun onClipboardDataChanged() {
+        Handler(Looper.getMainLooper()).post { clipboardDataChangedListener?.invoke() }
     }
 
     @JvmStatic

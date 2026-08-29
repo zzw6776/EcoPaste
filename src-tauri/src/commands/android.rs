@@ -954,6 +954,14 @@ mod jni_bridge {
         })
     }
 
+    pub fn notify_overlay_clipboard_changed() -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            env.call_static_method(bridge_class, "onClipboardDataChanged", "()V", &[])
+                .map_err(|e| anyhow!("call onClipboardDataChanged failed: {e}"))?;
+            Ok(())
+        })
+    }
+
     pub fn set_lan_discovery_enabled(enabled: bool) -> Result<()> {
         with_jni_env(|env, context, bridge_class| {
             env.call_static_method(
@@ -1038,6 +1046,13 @@ pub fn log_android_file_action(stage: &str, message: impl AsRef<str>) {
 pub(crate) fn notify_overlay_sync_status_changed() {
     if let Err(error) = jni_bridge::notify_overlay_sync_status_changed() {
         log::debug!("notify Android overlay sync status failed: {error}");
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn notify_overlay_clipboard_changed() {
+    if let Err(error) = jni_bridge::notify_overlay_clipboard_changed() {
+        log::debug!("notify Android overlay clipboard change failed: {error}");
     }
 }
 

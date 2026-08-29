@@ -128,6 +128,7 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
       open={open}
       placement="right"
       size={isAndroid ? "large" : "default"}
+      styles={{ body: { overflow: "hidden" } }}
       title={
         <div className="flex items-center gap-2">
           <i className="i-lucide:cloud size-4 text-ant-info" />
@@ -138,7 +139,11 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
         </div>
       }
     >
-      <Spin className="h-full" spinning={loading && records.length === 0}>
+      <Spin
+        className="h-full"
+        classNames={{ container: "h-full" }}
+        spinning={loading && records.length === 0}
+      >
         {records.length ? (
           <Virtuoso
             className="h-full"

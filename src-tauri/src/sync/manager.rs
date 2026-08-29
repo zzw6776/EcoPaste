@@ -70,6 +70,7 @@ const JOIN_REQUESTED_EVENT: &str = "sync://join-requested";
 const JOIN_ATTEMPT_UPDATED_EVENT: &str = "sync://join-attempt-updated";
 const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
@@ -143,7 +144,9 @@ struct EndpointRuntime {
 
 struct LanPeerActor {
     wake: Notify,
+    pending_work: AtomicBool,
     force_retry: AtomicBool,
+    connection_ready: AtomicBool,
     stopped: AtomicBool,
 }
 
@@ -151,17 +154,25 @@ impl LanPeerActor {
     fn new() -> Self {
         Self {
             wake: Notify::new(),
+            pending_work: AtomicBool::new(false),
             force_retry: AtomicBool::new(false),
+            connection_ready: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         }
     }
 
     fn notify(&self) {
+        self.pending_work.store(true, Ordering::Release);
         self.wake.notify_one();
     }
 
     fn resume(&self) {
         self.force_retry.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    fn connection_ready(&self) {
+        self.connection_ready.store(true, Ordering::Release);
         self.wake.notify_one();
     }
 
@@ -873,18 +884,15 @@ impl SyncManager {
             .await?
             .context("请先完成云端 Hub 配置")?;
         let endpoint = self.ensure_endpoint(&settings).await?;
-        let connection = self.connect_cloud(&endpoint, server).await?;
-        self.ensure_cloud_group(&connection, &group).await?;
-        let response = call(
-            &connection,
-            Request::ListEvents {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                before_cursor,
-                limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
-            },
-        )
-        .await?;
+        let request = Request::ListEvents {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            before_cursor,
+            limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
+        };
+        let (connection, response) = self
+            .request_cloud_records_page(&endpoint, &server, &group, &request)
+            .await?;
         let Response::EventsPage {
             events,
             next_before_cursor,
@@ -949,6 +957,42 @@ impl SyncManager {
             next_before_cursor,
             total,
         })
+    }
+
+    /// Retries one idempotent history read after evicting a stale shared cloud connection.
+    async fn request_cloud_records_page(
+        self: &Arc<Self>,
+        endpoint: &Endpoint,
+        server: &EndpointAddr,
+        group: &GroupSecrets,
+        request: &Request,
+    ) -> Result<(Connection, Response)> {
+        for attempt in 0..2 {
+            let connection = self.connect_cloud(endpoint, server.clone()).await?;
+            let result: Result<Response> = async {
+                self.ensure_cloud_group(&connection, group).await?;
+                tokio::time::timeout(
+                    CLOUD_RECORD_REQUEST_TIMEOUT,
+                    call(&connection, request.clone()),
+                )
+                .await
+                .context("读取云端记录超时")?
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok((connection, response)),
+                Err(error) if attempt == 0 => {
+                    self.invalidate_cloud_connection(connection.stable_id());
+                    log::debug!("retry cloud records on a fresh connection: {error}");
+                }
+                Err(error) => {
+                    self.invalidate_cloud_connection(connection.stable_id());
+                    return Err(error);
+                }
+            }
+        }
+
+        unreachable!("cloud records retry loop always returns")
     }
 
     async fn enqueue_item_inner(
@@ -1619,16 +1663,10 @@ impl SyncManager {
     }
 
     fn store_lan_connection(&self, device_id: &str, connection: Connection) {
-        let mut connections = self
-            .lan_connections
+        self.lan_connections
             .write()
-            .expect("LAN connection cache poisoned");
-        if connections
-            .get(device_id)
-            .is_none_or(|current| current.close_reason().is_some())
-        {
-            connections.insert(device_id.to_owned(), connection);
-        }
+            .expect("LAN connection cache poisoned")
+            .insert(device_id.to_owned(), connection);
     }
 
     fn invalidate_lan_connection(&self, device_id: &str, stable_id: usize) {
@@ -1713,6 +1751,19 @@ impl SyncManager {
             .get(device_id)
         {
             actor.resume();
+        }
+    }
+
+    /// Records a proven live inbound connection without starting a reciprocal empty sync.
+    fn peer_connection_ready(&self, device_id: &str) {
+        self.clear_peer_retry(device_id);
+        if let Some(actor) = self
+            .lan_peer_actors
+            .read()
+            .expect("LAN peer actors poisoned")
+            .get(device_id)
+        {
+            actor.connection_ready();
         }
     }
 
@@ -1957,6 +2008,8 @@ impl SyncManager {
         // 否则同一远端事件会被并发写入剪贴板历史两次。
         let _apply_guard = self.apply_lock.lock().await;
         let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
+        #[cfg(target_os = "android")]
+        let mut applied_any = false;
         for stored in pending_apply {
             let event = stored.event;
             let envelope = match crypto::decrypt_event(&group.content_key_bytes()?, &event)
@@ -1986,8 +2039,16 @@ impl SyncManager {
             self.reconcile_item_timestamps(&pool, group, &item_id)
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
+            #[cfg(target_os = "android")]
+            {
+                applied_any = true;
+            }
         }
         drop(_apply_guard);
+        #[cfg(target_os = "android")]
+        if applied_any {
+            crate::commands::android::notify_overlay_clipboard_changed();
+        }
         if received_new_events && source_target == CLOUD_TARGET {
             self.wake_lan_transfer();
         }
@@ -2531,9 +2592,10 @@ impl SyncManager {
     /// Reads Hub metadata once for each newly established cloud connection.
     async fn refresh_cloud_server_version(&self, connection: Connection) {
         let response =
-            tokio::time::timeout(Duration::from_secs(3), call(&connection, Request::Health)).await;
+            tokio::time::timeout(Duration::from_secs(3), call(&connection, Request::HealthV2))
+                .await;
         let version = match response {
-            Ok(Ok(Response::Health { server_version, .. })) => server_version,
+            Ok(Ok(Response::HealthV2 { server_version, .. })) => Some(server_version),
             Ok(Ok(_)) => {
                 log::debug!("cloud Hub returned an invalid health response");
                 None
@@ -2858,17 +2920,52 @@ async fn lan_peer_worker(manager: Arc<SyncManager>, device_id: String, actor: Ar
         let retry_only = if let Some(deadline) = next_at {
             tokio::select! {
                 _ = actor.wake.notified() => {
-                    if !actor.force_retry.swap(false, Ordering::AcqRel) {
+                    let force_retry = actor.force_retry.swap(false, Ordering::AcqRel);
+                    let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
+                    let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
+                    if actor.stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if connection_ready {
+                        failure_count = 0;
+                        next_at = None;
+                    }
+                    if !force_retry && !connection_ready {
+                        if pending_work {
+                            actor.pending_work.store(true, Ordering::Release);
+                        }
                         continue;
                     }
-                    failure_count = 0;
+                    if !force_retry && !pending_work {
+                        continue;
+                    }
+                    if force_retry {
+                        failure_count = 0;
+                    }
                     false
                 },
-                _ = tokio::time::sleep_until(deadline.into()) => true,
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    actor.pending_work.store(false, Ordering::Release);
+                    true
+                },
             }
         } else {
             actor.wake.notified().await;
-            actor.force_retry.store(false, Ordering::Release);
+            let force_retry = actor.force_retry.swap(false, Ordering::AcqRel);
+            let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
+            let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
+            if actor.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            if connection_ready {
+                failure_count = 0;
+            }
+            if !force_retry && !pending_work {
+                continue;
+            }
+            if force_retry {
+                failure_count = 0;
+            }
             false
         };
         if actor.stopped.load(Ordering::Acquire) {
@@ -3187,7 +3284,7 @@ async fn watch_cloud_group(
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
-        &Request::WatchGroupStream {
+        &Request::WatchGroupStreamV2 {
             group_id: group.group_id.clone(),
             access_token: access_token.clone(),
             after_cursor: cursor,
@@ -3200,8 +3297,24 @@ async fn watch_cloud_group(
     let first_response = tokio::select! {
         _ = manager.watch_wake.notified() => return Ok(()),
         response = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv)) => {
-            response.context("读取云端持续订阅首帧超时")??
+            response
         },
+    };
+    let first_response = match first_response {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            log::debug!("Hub does not support versioned stream watch: {error}");
+            return watch_cloud_group_legacy(
+                manager,
+                connection,
+                group,
+                access_token,
+                cursor,
+                removed_at_ms,
+            )
+            .await;
+        }
+        Err(error) => return Err(error).context("读取云端持续订阅首帧超时"),
     };
     if matches!(first_response, Response::Error { .. }) {
         return watch_cloud_group_legacy(
@@ -3282,9 +3395,20 @@ fn apply_cloud_watch_response(
         Response::GroupChanged {
             latest_cursor,
             latest_removed_at_ms,
+        } => {
+            if latest_cursor > *cursor || latest_removed_at_ms > *removed_at_ms {
+                manager.wake_cloud_transfer();
+            }
+            *cursor = (*cursor).max(latest_cursor);
+            *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
+            Ok(())
+        }
+        Response::GroupChangedV2 {
+            latest_cursor,
+            latest_removed_at_ms,
             server_version,
         } => {
-            manager.update_cloud_server_version(server_version);
+            manager.update_cloud_server_version(Some(server_version));
             if latest_cursor > *cursor || latest_removed_at_ms > *removed_at_ms {
                 manager.wake_cloud_transfer();
             }
@@ -3640,7 +3764,6 @@ async fn dispatch_peer(
                 &Response::Health {
                     protocol_version: PROTOCOL_VERSION,
                     server_time_ms: Utc::now().timestamp_millis(),
-                    server_version: None,
                 },
             )
             .await?
@@ -3687,7 +3810,7 @@ async fn dispatch_peer(
             )
             .await?;
             manager.store_lan_connection(&device.device_id, connection.clone());
-            manager.clear_peer_retry(&device.device_id);
+            manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
             let incoming_event_ids = events
@@ -3742,6 +3865,8 @@ async fn dispatch_peer(
             .await?;
             let apply_guard = manager.apply_lock.lock().await;
             let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
+            #[cfg(target_os = "android")]
+            let mut applied_any = false;
             for stored in pending_apply {
                 let envelope =
                     match crypto::decrypt_event(&group.content_key_bytes()?, &stored.event)
@@ -3795,10 +3920,18 @@ async fn dispatch_peer(
                         repository::mark_applied(&pool, &stored.event.event_id)
                             .await
                             .ok();
+                        #[cfg(target_os = "android")]
+                        {
+                            applied_any = true;
+                        }
                     }
                 }
             }
             drop(apply_guard);
+            #[cfg(target_os = "android")]
+            if applied_any {
+                crate::commands::android::notify_overlay_clipboard_changed();
+            }
             if received_new_events {
                 manager.wake_lan_transfer();
             }
@@ -3880,9 +4013,11 @@ async fn dispatch_peer(
             copy_with_idle_timeout(&mut file, send, BLOB_IDLE_TIMEOUT).await?;
         }
         Request::CreateGroup { .. }
+        | Request::HealthV2
         | Request::Watch { .. }
         | Request::WatchGroup { .. }
         | Request::WatchGroupStream { .. }
+        | Request::WatchGroupStreamV2 { .. }
         | Request::ListEvents { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }

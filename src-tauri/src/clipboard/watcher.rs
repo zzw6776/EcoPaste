@@ -160,6 +160,8 @@ pub async fn persist_and_notify(
     ) {
         log::warn!("emit {CLIPBOARD_UPDATED_EVENT} failed: {err}");
     }
+    #[cfg(target_os = "android")]
+    crate::commands::android::notify_overlay_clipboard_changed();
     item_to_write.id = result.id.clone();
     crate::sync::enqueue_local_item(app, item_to_write);
     Ok(result)
