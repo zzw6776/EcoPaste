@@ -310,7 +310,7 @@ pub fn peer_endpoint_addr(peer: &ecopaste_sync_protocol::PeerAnnouncement) -> Re
     peer_endpoint_addr_with_preferred(peer, None)
 }
 
-/// Keeps the last proven mDNS route first while retaining current LAN fallbacks.
+/// Keeps the last proven LAN route first while retaining current mDNS fallbacks.
 pub fn peer_endpoint_addr_with_preferred(
     peer: &ecopaste_sync_protocol::PeerAnnouncement,
     preferred: Option<&str>,
@@ -329,7 +329,7 @@ pub fn peer_endpoint_addr_with_preferred(
     let preferred = preferred
         .map(|value| value.strip_prefix("ip:").unwrap_or(value))
         .and_then(|value| value.parse::<SocketAddr>().ok())
-        .filter(|address| parsed.contains(address) && is_lan_ip(address.ip()));
+        .filter(|address| is_lan_ip(address.ip()));
     let mut addresses = Vec::new();
     if let Some(preferred) = preferred {
         addresses.push(TransportAddr::Ip(preferred));

@@ -9,6 +9,11 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -50,6 +55,8 @@ object EcoPasteBridge {
     private var applicationContext: Context? = null
     private var clipboardManager: ClipboardManager? = null
     private var clipboardListenerRegistered = false
+    private var syncNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var syncNetworkFingerprint: String? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
     var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
@@ -267,6 +274,73 @@ object EcoPasteBridge {
             ?.takeIf { it == "accessibility" || it == "root" || it == "foreground" }
             ?: "accessibility"
         refreshClipboardListener()
+        registerSyncNetworkCallback(context.applicationContext)
+    }
+
+    /** Wakes native synchronization only when the active Wi-Fi route appears or changes. */
+    @Synchronized
+    private fun registerSyncNetworkCallback(context: Context) {
+        if (syncNetworkCallback != null) return
+
+        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                connectivityManager.getLinkProperties(network)?.let { properties ->
+                    notifySyncRouteChanged(network, properties)
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
+                notifySyncRouteChanged(network, properties)
+            }
+
+            override fun onLost(network: Network) {
+                synchronized(this@EcoPasteBridge) {
+                    if (syncNetworkFingerprint?.startsWith("$network:") == true) {
+                        syncNetworkFingerprint = null
+                    }
+                }
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        try {
+            connectivityManager.registerNetworkCallback(request, callback)
+            syncNetworkCallback = callback
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "register sync network callback failed: ${error.message}")
+        }
+    }
+
+    /** Coalesces the paired callbacks Android emits for the same Wi-Fi route. */
+    private fun notifySyncRouteChanged(network: Network, properties: LinkProperties) {
+        val addresses = properties.linkAddresses
+            .map { it.address.hostAddress.orEmpty() }
+            .filter { it.isNotEmpty() }
+            .sorted()
+        if (addresses.isEmpty()) return
+
+        val fingerprint = buildString {
+            append(network)
+            append(':')
+            append(addresses.joinToString(","))
+        }
+        synchronized(this) {
+            if (syncNetworkFingerprint == fingerprint) return
+            syncNetworkFingerprint = fingerprint
+        }
+        notifySyncNetworkChangedSafely("route:$fingerprint")
+    }
+
+    /** Keeps callbacks safe when an Android service starts before the Tauri runtime is ready. */
+    private fun notifySyncNetworkChangedSafely(reason: String) {
+        try {
+            notifySyncNetworkChanged()
+        } catch (error: Throwable) {
+            Log.w(TAG, "notify sync network change failed ($reason): ${error.message}")
+        }
     }
 
     /** Foreground mode listens only while EcoPaste owns a visible activity. */

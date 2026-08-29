@@ -109,7 +109,7 @@ const List: FC = () => {
   const reloadCurrentRangeRef = useRef<() => void>(() => {});
   const deferredReloadRef = useRef(false);
   // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
-  // dormant（隐藏）期间到达的剪贴板更新一律延后，不 reload 隐藏窗口。
+  // 隐藏期间在 WebView 内预刷新当前可视范围，避免 show 后才用新数据挤开旧卡片。
   // Android 移动端与 Web 预览模式下首屏直接处于激活态，初值置为 true。
   const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
 
@@ -279,9 +279,10 @@ const List: FC = () => {
    * 用 ref 读取最新滚动位置，规避闭包陷旧值（事件订阅只挂载一次）。
    */
   const handleClipboardUpdated = (payload: ClipboardUpdatedPayload) => {
-    // 剪贴板窗口隐藏（冻结态）期间不立即 reload：只记 pending，避免隐藏期间频繁复制触发反复 IPC + 重渲染。
+    // 隐藏期间直接在不可见 WebView 内重建当前范围；查询返回前缓存已清空，
+    // 即使用户立即唤起窗口，也不会先展示旧卡片再把新记录插到头部。
     if (!clipboardWindowVisibleRef.current) {
-      deferredReloadRef.current = true;
+      refreshHiddenRange();
       return;
     }
 
@@ -359,7 +360,12 @@ const List: FC = () => {
     if (label !== WINDOW_LABEL.CLIPBOARD) return;
 
     clipboardWindowVisibleRef.current = visible;
-    if (!visible) return;
+    if (!visible) {
+      // 窗口可见且离开顶部时可能累积 pending；趁 hide 后预刷新，
+      // 确保下次 show 的首帧已经是最新数据。
+      if (deferredReloadRef.current) refreshHiddenRange();
+      return;
+    }
 
     const {
       scrollToTopOnOpen,
@@ -941,6 +947,14 @@ const List: FC = () => {
 
     deferredReloadRef.current = false;
     reload();
+  }
+
+  /**
+   * 在隐藏的 WebView 内重建当前查询范围，避免窗口显示后再替换旧列表。
+   */
+  function refreshHiddenRange() {
+    deferredReloadRef.current = false;
+    reloadCurrentRange();
   }
 
   /**

@@ -41,7 +41,9 @@ pub fn notify_settings_changed(app: &AppHandle) {
 
 /// Reconnects promptly when the user brings any EcoPaste window to the foreground.
 pub fn notify_foreground(app: &AppHandle) {
-    wake_manager(app);
+    if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
+        manager.notify_connectivity_changed();
+    }
 }
 
 fn wake_manager(app: &AppHandle) {
