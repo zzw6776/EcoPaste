@@ -22,6 +22,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.AlphaAnimation
+import android.view.animation.Animation
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -35,6 +37,10 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.DateFormat
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import kotlin.math.abs
@@ -93,6 +99,8 @@ class EcoPasteOverlayPanel(
         val connectedAddress: String,
         val directAddresses: List<String>,
         val transport: String,
+        val lastSeenAt: String,
+        val lastError: String,
     )
 
     private data class OverlaySyncStatus(
@@ -105,6 +113,7 @@ class EcoPasteOverlayPanel(
         val cloudRelayUrls: List<String>,
         val cloudConnectedAddress: String,
         val cloudTransport: String,
+        val cloudServerVersion: String,
         val cloudError: String,
         val cloudLastSuccessAt: String,
         val pendingEvents: Int,
@@ -139,9 +148,12 @@ class EcoPasteOverlayPanel(
     private var searchMode = false
     private var searchRunnable: Runnable? = null
     private var syncDetailsContainer: LinearLayout? = null
+    private var syncDetailsCard: ScrollView? = null
+    private var syncDetailsScrim: View? = null
     private var lanStatusButton: ImageButton? = null
     private var cloudStatusButton: ImageButton? = null
     private var expandedSyncTarget: String? = null
+    private var cloudConnectionDetailsOpen = false
     private var syncStatus: OverlaySyncStatus? = null
     private var showingCloudRecords = false
     private var cloudRecords = emptyList<CloudRecord>()
@@ -193,12 +205,60 @@ class EcoPasteOverlayPanel(
 
         content.addView(createDragHandle(initialHeightPercent, bounds.height()))
         content.addView(createHeader())
-        syncDetailsContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
+
+        syncDetailsScrim = View(context).apply {
             visibility = View.GONE
-            setPadding(dp(12), 0, dp(12), dp(8))
+            isClickable = true
+            elevation = dp(20).toFloat()
+            setOnClickListener { closeSyncDetails() }
         }
-        content.addView(syncDetailsContainer)
+        root.addView(
+            syncDetailsScrim,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ).apply {
+                topMargin = dp(64)
+            },
+        )
+
+        val detailsContent = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        syncDetailsContainer = detailsContent
+        syncDetailsCard = ScrollView(context).apply {
+            visibility = View.GONE
+            isVerticalScrollBarEnabled = false
+            clipToOutline = true
+            elevation = dp(24).toFloat()
+            background = borderedRoundedBackground(
+                cardColor(),
+                borderColor(),
+                dp(12).toFloat(),
+            )
+            addView(
+                detailsContent,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        val detailsRightMargin = dp(52)
+        val detailsWidth = minOf(dp(288), bounds.width() - detailsRightMargin - dp(12))
+        root.addView(
+            syncDetailsCard,
+            FrameLayout.LayoutParams(
+                detailsWidth,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.END,
+            ).apply {
+                topMargin = dp(64)
+                rightMargin = detailsRightMargin
+                bottomMargin = dp(8)
+            },
+        )
 
         val filters = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -293,6 +353,10 @@ class EcoPasteOverlayPanel(
             closeCloudImagePreview()
             return true
         }
+        if (expandedSyncTarget != null) {
+            closeSyncDetails()
+            return true
+        }
         if (showingCloudRecords) {
             closeCloudRecords()
             return true
@@ -342,9 +406,14 @@ class EcoPasteOverlayPanel(
         itemContainer = null
         filterContainer = null
         syncDetailsContainer = null
+        syncDetailsCard = null
+        syncDetailsScrim = null
+        lanStatusButton?.clearAnimation()
+        cloudStatusButton?.clearAnimation()
         lanStatusButton = null
         cloudStatusButton = null
         expandedSyncTarget = null
+        cloudConnectionDetailsOpen = false
         syncStatus = null
         cloudImagePreview = null
         loadedItems = emptyList()
@@ -422,9 +491,11 @@ class EcoPasteOverlayPanel(
                         deviceName = peer.optString("deviceName", "EcoPaste"),
                         platform = peer.optString("platform"),
                         state = peer.optString("state", "idle"),
-                        connectedAddress = peer.optString("connectedAddress"),
+                        connectedAddress = optionalJsonString(peer, "connectedAddress"),
                         directAddresses = addresses,
-                        transport = peer.optString("transport"),
+                        transport = optionalJsonString(peer, "transport"),
+                        lastSeenAt = optionalJsonString(peer, "lastSeenAt"),
+                        lastError = optionalJsonString(peer, "lastError"),
                     ),
                 )
             }
@@ -439,14 +510,11 @@ class EcoPasteOverlayPanel(
             cloudEndpointId = root.optString("cloudEndpointId"),
             cloudDirectAddresses = jsonStrings(root.optJSONArray("cloudDirectAddresses")),
             cloudRelayUrls = jsonStrings(root.optJSONArray("cloudRelayUrls")),
-            cloudConnectedAddress = root.optString("cloudConnectedAddress")
-                .takeUnless { it == "null" }
-                .orEmpty(),
-            cloudTransport = root.optString("cloudTransport")
-                .takeUnless { it == "null" }
-                .orEmpty(),
-            cloudError = cloud.optString("lastError"),
-            cloudLastSuccessAt = cloud.optString("lastSuccessAt"),
+            cloudConnectedAddress = optionalJsonString(root, "cloudConnectedAddress"),
+            cloudTransport = optionalJsonString(root, "cloudTransport"),
+            cloudServerVersion = optionalJsonString(root, "cloudServerVersion"),
+            cloudError = optionalJsonString(cloud, "lastError"),
+            cloudLastSuccessAt = optionalJsonString(cloud, "lastSuccessAt"),
             pendingEvents = root.optInt("pendingEvents"),
             peers = peers,
         )
@@ -461,145 +529,464 @@ class EcoPasteOverlayPanel(
         }
     }
 
+    private fun optionalJsonString(value: JSONObject, key: String): String {
+        return value.optString(key).takeUnless { it == "null" }.orEmpty()
+    }
+
     private fun renderTopSyncStatus() {
         val status = syncStatus
-        lanStatusButton?.imageTintList = ColorStateList.valueOf(syncStateColor(status?.lanState))
-        cloudStatusButton?.imageTintList = ColorStateList.valueOf(syncStateColor(status?.cloudState))
+        renderTopSyncButton(
+            lanStatusButton,
+            "lan",
+            status?.lanState,
+            "局域网同步",
+        )
+        renderTopSyncButton(
+            cloudStatusButton,
+            "cloud",
+            status?.cloudState,
+            "云端同步",
+        )
     }
 
     private fun toggleSyncDetails(target: String) {
         expandedSyncTarget = if (expandedSyncTarget == target) null else target
+        if (expandedSyncTarget != "cloud") cloudConnectionDetailsOpen = false
+        renderTopSyncStatus()
+        renderSyncDetails()
+    }
+
+    private fun closeSyncDetails() {
+        if (expandedSyncTarget == null) return
+        expandedSyncTarget = null
+        cloudConnectionDetailsOpen = false
+        renderTopSyncStatus()
         renderSyncDetails()
     }
 
     private fun renderSyncDetails() {
         val container = syncDetailsContainer ?: return
+        val card = syncDetailsCard ?: return
         val target = expandedSyncTarget
         if (target == null) {
-            container.visibility = View.GONE
             container.removeAllViews()
+            card.visibility = View.GONE
+            syncDetailsScrim?.visibility = View.GONE
             return
         }
-        container.visibility = View.VISIBLE
+
+        syncDetailsScrim?.apply {
+            visibility = View.VISIBLE
+            bringToFront()
+        }
+        card.visibility = View.VISIBLE
+        card.bringToFront()
         container.removeAllViews()
         val status = syncStatus
         val state = if (target == "lan") status?.lanState else status?.cloudState
-        container.addView(LinearLayout(context).apply {
+        container.addView(createSyncDetailsHeader(target, state, status))
+
+        if (target == "lan") {
+            renderLanSyncDetails(container, status)
+        } else {
+            renderCloudSyncDetails(container, status)
+        }
+        card.scrollTo(0, 0)
+    }
+
+    private fun createSyncDetailsHeader(
+        target: String,
+        state: String?,
+        status: OverlaySyncStatus?,
+    ): View {
+        val iconRes = if (target == "lan") R.drawable.ic_sync_lan else R.drawable.ic_sync_cloud
+        return LinearLayout(context).apply {
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(12), dp(6), dp(4), dp(2))
-            addView(TextView(context).apply {
-                text = "${if (target == "lan") "局域网" else "云端"} · ${syncStateLabel(state)}"
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(syncStateColor(state))
-            }, LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+            addView(ImageView(context).apply {
+                setImageResource(iconRes)
+                imageTintList = ColorStateList.valueOf(syncStateColor(state))
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+            }, LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                marginEnd = dp(8)
             })
+            addView(TextView(context).apply {
+                text = if (target == "lan") "局域网" else "云端"
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(primaryTextColor())
+            })
+            addView(TextView(context).apply {
+                text = syncStateLabel(state)
+                textSize = 11f
+                setTextColor(syncStateColor(state))
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                marginStart = dp(8)
+            })
+
+            addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
             if (target == "lan" && status?.lanEnabled == true) {
                 addView(reconnectButton("重新连接全部设备") { reconnectPeer(null) })
             }
-        })
-        if (target == "lan") {
-            if (status?.peers.isNullOrEmpty()) {
-                container.addView(detailText("暂无已配对设备"))
-            } else {
-                status?.peers?.forEach { peer ->
-                    val address = peer.connectedAddress.ifBlank {
-                        peer.directAddresses.firstOrNull().orEmpty()
-                    }
-                    val route = when (peer.transport) {
-                        "direct" -> "直连"
-                        "relay" -> "中继"
-                        else -> ""
-                    }
-                    container.addView(LinearLayout(context).apply {
-                        gravity = Gravity.CENTER_VERTICAL
-                        orientation = LinearLayout.HORIZONTAL
-                        addView(
-                            detailText(
-                                buildString {
-                                    append(peer.deviceName)
-                                    append(" · ")
-                                    append(syncStateLabel(peer.state))
-                                    if (peer.platform.isNotBlank()) append(" · ${peer.platform}")
-                                    if (route.isNotBlank()) append(" · $route")
-                                    if (address.isNotBlank()) append("\n$address")
-                                },
-                            ),
-                            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-                        )
-                        if (status.lanEnabled) {
-                            addView(
-                                reconnectButton("重新连接 ${peer.deviceName}") {
-                                    reconnectPeer(peer.deviceId)
-                                },
-                            )
-                        }
-                    })
-                }
-            }
+        }
+    }
+
+    private fun renderLanSyncDetails(
+        container: LinearLayout,
+        status: OverlaySyncStatus?,
+    ) {
+        val peers = status?.peers.orEmpty()
+        if (peers.isEmpty()) {
+            container.addView(emptySyncDetails("暂无已配对设备"))
+            return
+        }
+
+        peers.forEach { peer ->
+            container.addView(
+                createLanPeerCard(peer, status?.lanEnabled == true),
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    bottomMargin = dp(8)
+                },
+            )
+        }
+    }
+
+    private fun createLanPeerCard(peer: OverlayPeerStatus, lanEnabled: Boolean): View {
+        val isOnline = peer.state == "online"
+        val address = if (isOnline) {
+            peer.connectedAddress
         } else {
-            if (status?.cloudEnabled != true) {
-                container.addView(detailText("云端同步未启用"))
-            } else {
-                if (status.cloudEndpointId.isNotBlank()) {
-                    container.addView(detailText(status.cloudEndpointId))
-                }
-                status.cloudDirectAddresses.forEach { address ->
-                    container.addView(detailText(address))
-                }
-                if (status.cloudConnectedAddress.isNotBlank()) {
-                    val transport = when (status.cloudTransport) {
-                        "direct" -> "直连"
-                        "relay" -> "中继"
-                        else -> "未知"
-                    }
-                    container.addView(detailText("最近成功路径（$transport）：${status.cloudConnectedAddress}"))
-                }
-                if (status.cloudError.isNotBlank()) {
-                    container.addView(detailText(status.cloudError, error = true))
-                }
-                if (status.cloudLastSuccessAt.isNotBlank()) {
-                    container.addView(detailText("最近成功：${status.cloudLastSuccessAt}"))
-                }
-                if (status.pendingEvents > 0) {
-                    container.addView(detailText("${status.pendingEvents} 条事件等待上传"))
-                }
-            }
-            if (status?.cloudEnabled == true && status.cloudEndpointId.isNotBlank()) {
-                container.addView(TextView(context).apply {
-                    text = "☁  查看云端记录"
+            peer.directAddresses.firstOrNull().orEmpty()
+        }
+        val transport = transportLabel(peer.transport)
+
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(9), dp(8), dp(9))
+            background = roundedBackground(subtleFillColor(), dp(10).toFloat())
+
+            addView(LinearLayout(context).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.HORIZONTAL
+                addView(TextView(context).apply {
+                    text = peer.deviceName
                     textSize = 12f
-                    gravity = Gravity.CENTER
+                    maxLines = 1
                     typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(Color.rgb(0, 122, 255))
-                    setPadding(dp(12), dp(8), dp(12), dp(8))
-                    setOnClickListener { requestCloudRecords() }
+                    setTextColor(primaryTextColor())
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                addView(TextView(context).apply {
+                    text = syncStateLabel(peer.state)
+                    textSize = 10f
+                    setTextColor(syncStateColor(peer.state))
                 })
+                if (lanEnabled) {
+                    addView(
+                        reconnectButton("重新连接 ${peer.deviceName}") {
+                            reconnectPeer(peer.deviceId)
+                        },
+                    )
+                }
+            })
+
+            val platformAndTransport = listOf(peer.platform, transport)
+                .filter { it.isNotBlank() }
+                .joinToString(" · ")
+            if (platformAndTransport.isNotBlank()) {
+                addView(detailLine(platformAndTransport))
+            }
+            if (address.isNotBlank()) {
+                addView(detailLine(address, monospace = true))
+            }
+            if (peer.lastSeenAt.isNotBlank()) {
+                addView(detailLine("最近在线：${formatSyncTimestamp(peer.lastSeenAt)}"))
+            }
+            if (peer.lastError.isNotBlank()) {
+                addView(errorDetails(peer.lastError))
             }
         }
-        container.background = roundedBackground(cardColor(), dp(12).toFloat())
+    }
+
+    private fun renderCloudSyncDetails(
+        container: LinearLayout,
+        status: OverlaySyncStatus?,
+    ) {
+        if (status?.cloudEnabled != true) {
+            container.addView(emptySyncDetails("云端同步未启用"))
+            return
+        }
+
+        container.addView(
+            createInfoRow(
+                "Hub 版本",
+                status.cloudServerVersion.ifBlank { "版本未知" },
+                emphasize = status.cloudServerVersion.isNotBlank(),
+            ),
+        )
+        container.addView(
+            createInfoRow(
+                "连接方式",
+                if (status.cloudConnectedAddress.isBlank()) {
+                    "尚未连接"
+                } else {
+                    transportLabel(status.cloudTransport).ifBlank { "未知" }
+                },
+            ),
+        )
+        if (status.cloudConnectedAddress.isNotBlank()) {
+            container.addView(
+                createInfoRow(
+                    "当前路径",
+                    status.cloudConnectedAddress,
+                    monospace = true,
+                ),
+            )
+        }
+        if (status.cloudLastSuccessAt.isNotBlank()) {
+            container.addView(
+                createInfoRow(
+                    "最近成功",
+                    formatSyncTimestamp(status.cloudLastSuccessAt),
+                ),
+            )
+        }
+        container.addView(
+            createInfoRow(
+                "待同步",
+                if (status.pendingEvents > 0) "${status.pendingEvents} 条" else "无",
+                warning = status.pendingEvents > 0,
+            ),
+        )
+
+        if (status.cloudError.isNotBlank()) {
+            container.addView(errorDetails(status.cloudError))
+        }
+
+        val hasConnectionDetails = status.cloudEndpointId.isNotBlank() ||
+            status.cloudDirectAddresses.isNotEmpty() ||
+            status.cloudRelayUrls.isNotEmpty()
+        if (hasConnectionDetails) {
+            container.addView(createConnectionDetailsToggle())
+            if (cloudConnectionDetailsOpen) {
+                container.addView(createCloudConnectionDetails(status))
+            }
+        }
+
+        container.addView(
+            createCloudRecordsButton(status.cloudEndpointId.isNotBlank()),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(36),
+            ).apply {
+                topMargin = dp(10)
+            },
+        )
     }
 
     private fun detailText(value: String, error: Boolean = false): TextView {
         return TextView(context).apply {
             text = value
             textSize = 11f
-            setTextColor(if (error) Color.rgb(255, 69, 58) else secondaryTextColor())
+            setTextColor(if (error) syncStateColor("error") else secondaryTextColor())
             setPadding(dp(12), dp(3), dp(12), dp(3))
+        }
+    }
+
+    private fun detailLine(value: String, monospace: Boolean = false): TextView {
+        return TextView(context).apply {
+            text = value
+            textSize = if (monospace) 10f else 11f
+            setTextColor(secondaryTextColor())
+            setPadding(0, dp(3), 0, 0)
+            if (monospace) typeface = Typeface.MONOSPACE
+        }
+    }
+
+    private fun createInfoRow(
+        label: String,
+        value: String,
+        emphasize: Boolean = false,
+        monospace: Boolean = false,
+        warning: Boolean = false,
+    ): View {
+        return LinearLayout(context).apply {
+            gravity = Gravity.TOP
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(5), 0, dp(5))
+            addView(TextView(context).apply {
+                text = label
+                textSize = 11f
+                setTextColor(secondaryTextColor())
+            }, LinearLayout.LayoutParams(dp(68), LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(TextView(context).apply {
+                text = value
+                textSize = if (monospace) 10f else 11f
+                gravity = Gravity.END
+                setTextColor(
+                    when {
+                        warning -> syncStateColor("degraded")
+                        emphasize -> primaryTextColor()
+                        else -> secondaryTextColor()
+                    },
+                )
+                if (emphasize) typeface = Typeface.DEFAULT_BOLD
+                if (monospace) typeface = Typeface.MONOSPACE
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+    }
+
+    private fun emptySyncDetails(value: String): View {
+        return TextView(context).apply {
+            text = value
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setTextColor(secondaryTextColor())
+            setPadding(dp(8), dp(18), dp(8), dp(18))
+            background = roundedBackground(subtleFillColor(), dp(10).toFloat())
+        }
+    }
+
+    private fun errorDetails(value: String): View {
+        return TextView(context).apply {
+            text = value
+            textSize = 10f
+            setTextColor(syncStateColor("error"))
+            setPadding(dp(8), dp(7), dp(8), dp(7))
+            background = roundedBackground(errorFillColor(), dp(8).toFloat())
+        }.also {
+            it.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(6)
+            }
+        }
+    }
+
+    private fun createConnectionDetailsToggle(): View {
+        return LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, dp(4))
+            isClickable = true
+            contentDescription = if (cloudConnectionDetailsOpen) "收起连接详情" else "展开连接详情"
+            addView(TextView(context).apply {
+                text = "连接详情"
+                textSize = 11f
+                setTextColor(primaryTextColor())
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(ImageView(context).apply {
+                setImageResource(R.drawable.ic_chevron_right)
+                imageTintList = ColorStateList.valueOf(secondaryTextColor())
+                rotation = if (cloudConnectionDetailsOpen) 90f else 0f
+            }, LinearLayout.LayoutParams(dp(16), dp(16)))
+            setOnClickListener {
+                cloudConnectionDetailsOpen = !cloudConnectionDetailsOpen
+                renderSyncDetails()
+            }
+        }
+    }
+
+    private fun createCloudConnectionDetails(status: OverlaySyncStatus): View {
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(9), dp(8), dp(9), dp(8))
+            background = roundedBackground(subtleFillColor(), dp(9).toFloat())
+
+            if (status.cloudEndpointId.isNotBlank()) {
+                addView(technicalDetail("Endpoint ID", status.cloudEndpointId))
+            }
+            status.cloudDirectAddresses.forEach { address ->
+                addView(technicalDetail("直连地址", address))
+            }
+            status.cloudRelayUrls.forEach { address ->
+                addView(technicalDetail("Relay", address))
+            }
+        }
+    }
+
+    private fun technicalDetail(label: String, value: String): View {
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(context).apply {
+                text = label
+                textSize = 9f
+                setTextColor(tertiaryTextColor())
+            })
+            addView(TextView(context).apply {
+                text = value
+                textSize = 9f
+                typeface = Typeface.MONOSPACE
+                setTextColor(secondaryTextColor())
+            })
+        }.also {
+            it.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                bottomMargin = dp(6)
+            }
+        }
+    }
+
+    private fun createCloudRecordsButton(enabled: Boolean): View {
+        return LinearLayout(context).apply {
+            gravity = Gravity.CENTER
+            orientation = LinearLayout.HORIZONTAL
+            isEnabled = enabled
+            alpha = if (enabled) 1f else 0.45f
+            background = borderedRoundedBackground(
+                subtleFillColor(),
+                borderColor(),
+                dp(9).toFloat(),
+            )
+            addView(ImageView(context).apply {
+                setImageResource(R.drawable.ic_cloud_download)
+                imageTintList = ColorStateList.valueOf(Color.rgb(22, 119, 255))
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+            }, LinearLayout.LayoutParams(dp(16), dp(16)).apply {
+                marginEnd = dp(6)
+            })
+            addView(TextView(context).apply {
+                text = "查看云端记录"
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(22, 119, 255))
+            })
+            setOnClickListener {
+                if (enabled) {
+                    closeSyncDetails()
+                    requestCloudRecords()
+                }
+            }
         }
     }
 
     private fun reconnectButton(label: String, reconnect: () -> Unit): ImageButton {
         return ImageButton(context).apply {
-            setImageResource(android.R.drawable.ic_popup_sync)
+            setImageResource(R.drawable.ic_sync_refresh)
             imageTintList = ColorStateList.valueOf(secondaryTextColor())
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
             background = null
             contentDescription = label
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(7), dp(7), dp(7), dp(7))
             setOnClickListener { reconnect() }
-            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+        }
+    }
+
+    private fun transportLabel(transport: String): String {
+        return when (transport) {
+            "direct" -> "直连"
+            "relay" -> "中继"
+            else -> ""
         }
     }
 
@@ -990,15 +1377,19 @@ class EcoPasteOverlayPanel(
                 LinearLayout.LayoutParams(0, dp(36), 1f),
             )
 
-            lanStatusButton = createTopSyncButton("lan", R.drawable.ic_sync_lan)
-            addView(lanStatusButton, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
-                marginStart = dp(8)
-            })
+            addView(
+                createTopSyncButton("lan", R.drawable.ic_sync_lan),
+                LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                    marginStart = dp(8)
+                },
+            )
 
-            cloudStatusButton = createTopSyncButton("cloud", R.drawable.ic_sync_cloud)
-            addView(cloudStatusButton, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
-                marginStart = dp(4)
-            })
+            addView(
+                createTopSyncButton("cloud", R.drawable.ic_sync_cloud),
+                LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                    marginStart = dp(4)
+                },
+            )
 
             addView(TextView(context).apply {
                 text = "⋮"
@@ -1007,6 +1398,7 @@ class EcoPasteOverlayPanel(
                 setTextColor(primaryTextColor())
                 background = roundedBackground(cardColor(), dp(12).toFloat())
                 setOnClickListener { anchor ->
+                    closeSyncDetails()
                     PopupMenu(context, anchor).apply {
                         menu.add("关闭悬浮窗")
                         setOnMenuItemClickListener {
@@ -1026,16 +1418,46 @@ class EcoPasteOverlayPanel(
         return ImageButton(context).apply {
             setImageResource(iconRes)
             imageTintList = ColorStateList.valueOf(tertiaryTextColor())
-            scaleType = android.widget.ImageView.ScaleType.CENTER
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(dp(8), dp(8), dp(8), dp(8))
-            background = roundedBackground(cardColor(), dp(12).toFloat())
+            background = null
             contentDescription = if (target == "lan") "局域网同步状态" else "云端同步状态"
             setOnClickListener { toggleSyncDetails(target) }
+            if (target == "lan") {
+                lanStatusButton = this
+            } else {
+                cloudStatusButton = this
+            }
+        }
+    }
+
+    private fun renderTopSyncButton(
+        button: ImageButton?,
+        target: String,
+        state: String?,
+        label: String,
+    ) {
+        button ?: return
+        button.imageTintList = ColorStateList.valueOf(syncStateColor(state))
+        button.contentDescription = "$label，${syncStateLabel(state)}"
+        button.background = if (expandedSyncTarget == target) {
+            roundedBackground(selectedFillColor(), dp(18).toFloat())
+        } else {
+            null
+        }
+        button.clearAnimation()
+        if (state == "connecting") {
+            button.startAnimation(AlphaAnimation(0.45f, 1f).apply {
+                duration = 700L
+                repeatCount = Animation.INFINITE
+                repeatMode = Animation.REVERSE
+            })
         }
     }
 
     private fun enterSearchMode(input: EditText) {
         if (searchMode) return
+        closeSyncDetails()
         val current = panelView ?: return
         val params = current.layoutParams as? WindowManager.LayoutParams ?: return
         searchMode = true
@@ -1319,17 +1741,22 @@ class EcoPasteOverlayPanel(
         return ImageButton(context).apply {
             setImageResource(iconRes)
             imageTintList = ColorStateList.valueOf(itemSyncStateColor(channel.state))
-            scaleType = android.widget.ImageView.ScaleType.CENTER
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(dp(6), dp(6), dp(6), dp(6))
             background = null
             isEnabled = actionable
-            alpha = if (actionable) 1f else 0.82f
             contentDescription = itemSyncDescription(target, channel)
             setOnClickListener {
                 if (actionable) synchronizeItem(item.id, target)
             }
-        }.also {
-            it.layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
+            if (channel.state == "syncing") {
+                startAnimation(AlphaAnimation(0.45f, 1f).apply {
+                    duration = 700L
+                    repeatCount = Animation.INFINITE
+                    repeatMode = Animation.REVERSE
+                })
+            }
         }
     }
 
@@ -1595,6 +2022,19 @@ class EcoPasteOverlayPanel(
         }
     }
 
+    private fun borderedRoundedBackground(
+        color: Int,
+        strokeColor: Int,
+        radius: Float,
+    ): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            setStroke(dp(1), strokeColor)
+            cornerRadius = radius
+        }
+    }
+
     private fun headerColor(sourceAppName: String, kind: String): Int {
         val palette = when (kind) {
             "image" -> intArrayOf(Color.rgb(76, 175, 128), Color.rgb(53, 149, 141))
@@ -1619,6 +2059,18 @@ class EcoPasteOverlayPanel(
 
     private fun cardColor(): Int = if (isDarkMode()) Color.rgb(38, 38, 40) else Color.WHITE
 
+    private fun subtleFillColor(): Int =
+        if (isDarkMode()) Color.rgb(48, 48, 50) else Color.rgb(247, 247, 249)
+
+    private fun selectedFillColor(): Int =
+        if (isDarkMode()) Color.rgb(54, 54, 57) else Color.rgb(232, 232, 237)
+
+    private fun borderColor(): Int =
+        if (isDarkMode()) Color.rgb(62, 62, 66) else Color.rgb(225, 225, 230)
+
+    private fun errorFillColor(): Int =
+        if (isDarkMode()) Color.rgb(62, 39, 40) else Color.rgb(255, 241, 240)
+
     private fun primaryTextColor(): Int = if (isDarkMode()) Color.rgb(245, 245, 247) else Color.rgb(30, 30, 30)
 
     private fun secondaryTextColor(): Int = if (isDarkMode()) Color.rgb(196, 196, 200) else Color.rgb(92, 92, 96)
@@ -1627,20 +2079,20 @@ class EcoPasteOverlayPanel(
 
     private fun syncStateColor(state: String?): Int {
         return when (state) {
-            "online" -> Color.rgb(52, 199, 89)
-            "connecting" -> Color.rgb(0, 122, 255)
-            "degraded" -> Color.rgb(255, 159, 10)
-            "error" -> Color.rgb(255, 69, 58)
+            "online" -> Color.rgb(82, 196, 26)
+            "connecting" -> Color.rgb(22, 119, 255)
+            "degraded" -> Color.rgb(250, 173, 20)
+            "error" -> Color.rgb(255, 77, 79)
             else -> tertiaryTextColor()
         }
     }
 
     private fun itemSyncStateColor(state: String): Int {
         return when (state) {
-            "success" -> Color.rgb(52, 199, 89)
-            "syncing" -> Color.rgb(0, 122, 255)
-            "manual" -> Color.rgb(255, 159, 10)
-            "error" -> Color.rgb(255, 69, 58)
+            "success" -> Color.rgb(82, 196, 26)
+            "syncing" -> Color.rgb(22, 119, 255)
+            "manual" -> Color.rgb(250, 173, 20)
+            "error" -> Color.rgb(255, 77, 79)
             else -> tertiaryTextColor()
         }
     }
@@ -1654,6 +2106,15 @@ class EcoPasteOverlayPanel(
             "disabled" -> "未启用"
             else -> "离线"
         }
+    }
+
+    private fun formatSyncTimestamp(value: String): String {
+        val parsed = runCatching {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.parse(value.take(19))
+        }.getOrNull() ?: return value
+        return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(parsed)
     }
 
     private fun formatBytes(bytes: Long): String {

@@ -70,6 +70,7 @@ const JOIN_REQUESTED_EVENT: &str = "sync://join-requested";
 const JOIN_ATTEMPT_UPDATED_EVENT: &str = "sync://join-attempt-updated";
 const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -90,6 +91,7 @@ pub struct SyncManager {
     lan_cycle_lock: AsyncRwLock<()>,
     cloud_cycle_lock: Mutex<()>,
     cloud_connect_lock: Mutex<()>,
+    cloud_force_reconnect: AtomicBool,
     maintenance_lock: Mutex<()>,
     apply_lock: Mutex<()>,
     inbound_stream_admission: Arc<Semaphore>,
@@ -103,7 +105,6 @@ pub struct SyncManager {
     lan_connections: RwLock<HashMap<String, Connection>>,
     lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
     lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    lan_retry_peers: RwLock<HashSet<String>>,
     lan_suspended_peers: RwLock<HashSet<String>>,
     nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
     incoming_join_requests: Mutex<HashMap<String, PendingIncomingJoinRequest>>,
@@ -145,7 +146,7 @@ struct EndpointRuntime {
 struct LanPeerActor {
     wake: Notify,
     pending_work: AtomicBool,
-    force_retry: AtomicBool,
+    force_connect: AtomicBool,
     connection_ready: AtomicBool,
     stopped: AtomicBool,
 }
@@ -155,7 +156,7 @@ impl LanPeerActor {
         Self {
             wake: Notify::new(),
             pending_work: AtomicBool::new(false),
-            force_retry: AtomicBool::new(false),
+            force_connect: AtomicBool::new(false),
             connection_ready: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         }
@@ -167,11 +168,12 @@ impl LanPeerActor {
     }
 
     fn resume(&self) {
-        self.force_retry.store(true, Ordering::Release);
+        self.force_connect.store(true, Ordering::Release);
         self.wake.notify_one();
     }
 
     fn connection_ready(&self) {
+        self.force_connect.store(false, Ordering::Release);
         self.connection_ready.store(true, Ordering::Release);
         self.wake.notify_one();
     }
@@ -271,6 +273,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_cycle_lock: AsyncRwLock::new(()),
         cloud_cycle_lock: Mutex::new(()),
         cloud_connect_lock: Mutex::new(()),
+        cloud_force_reconnect: AtomicBool::new(false),
         maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
         inbound_stream_admission: Arc::new(Semaphore::new(128)),
@@ -284,7 +287,6 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_connections: RwLock::new(HashMap::new()),
         lan_peer_actors: RwLock::new(HashMap::new()),
         lan_peer_locks: RwLock::new(HashMap::new()),
-        lan_retry_peers: RwLock::new(HashSet::new()),
         lan_suspended_peers: RwLock::new(HashSet::new()),
         nearby_devices: RwLock::new(HashMap::new()),
         incoming_join_requests: Mutex::new(HashMap::new()),
@@ -302,8 +304,25 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
 
 impl SyncManager {
     pub fn wake(&self) {
+        self.cloud_force_reconnect.store(true, Ordering::Release);
         self.wake_transfer();
         self.watch_wake.notify_one();
+    }
+
+    /// Reconnects LAN peers and disconnected cloud work after a real network lifecycle event.
+    pub fn notify_connectivity_changed(&self) {
+        self.resume_all_peers();
+        self.cloud_force_reconnect.store(true, Ordering::Release);
+        self.wake_transfer();
+        let watch_online = self
+            .cloud_watch_status
+            .read()
+            .expect("cloud watch status poisoned")
+            .state
+            == SyncChannelState::Online;
+        if !watch_online || self.cached_cloud_connection().is_none() {
+            self.watch_wake.notify_one();
+        }
     }
 
     fn wake_transfer(&self) {
@@ -317,6 +336,11 @@ impl SyncManager {
 
     fn wake_cloud_transfer(&self) {
         self.cloud_transfer_wake.notify_one();
+    }
+
+    fn notify_cloud_connected(&self) {
+        self.cloud_force_reconnect.store(true, Ordering::Release);
+        self.wake_cloud_transfer();
     }
 
     /// Android 原生 Context 晚于 Rust setup 就绪，完成注入后刷新自动设备名。
@@ -386,7 +410,7 @@ impl SyncManager {
         if repository::remove_peer(&pool, device_id).await?.is_none() {
             bail!("未找到指定的已配对设备");
         }
-        self.clear_peer_retry(device_id);
+        self.clear_peer_suspension(device_id);
 
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let group = self.identity.snapshot().group;
@@ -419,10 +443,6 @@ impl SyncManager {
         self.identity.set_group(None)?;
         let pool = self.pool().await;
         repository::clear_group_state(&pool).await?;
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .clear();
         self.lan_suspended_peers
             .write()
             .expect("LAN suspended peers poisoned")
@@ -777,17 +797,17 @@ impl SyncManager {
         match (cloud_enabled, settings.lan_enabled) {
             (true, true) => {
                 let (cloud, lan) = tokio::join!(
-                    self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false,),
-                    self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8), false,),
+                    self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8)),
+                    self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8)),
                 );
                 cloud.and(lan)
             }
             (true, false) => {
-                self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false)
+                self.run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8))
                     .await
             }
             (false, true) => {
-                self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8), false)
+                self.run_cycle(Some(SyncTarget::Lan), None, Duration::from_secs(8))
                     .await
             }
             (false, false) => Ok(()),
@@ -816,7 +836,6 @@ impl SyncManager {
             Some(SyncTarget::Lan),
             device_id.as_deref(),
             Duration::from_secs(8),
-            false,
         )
         .await
     }
@@ -851,7 +870,7 @@ impl SyncManager {
         self.enqueue_item_inner(item.clone(), true, false, false)
             .await?
             .context("此记录未满足当前同步策略")?;
-        self.run_cycle(Some(target), None, Duration::from_secs(8), false)
+        self.run_cycle(Some(target), None, Duration::from_secs(8))
             .await?;
         let pool = self.pool().await;
         repository::item_statuses(&pool, &[item.id])
@@ -1298,17 +1317,16 @@ impl SyncManager {
         target: Option<SyncTarget>,
         peer_device_id: Option<&str>,
         lan_connect_timeout: Duration,
-        retry_only: bool,
     ) -> Result<()> {
         match target {
             Some(SyncTarget::Lan) => {
                 let _guard = self.lan_cycle_lock.read().await;
-                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout, retry_only)
+                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout)
                     .await
             }
             Some(SyncTarget::Cloud) => {
                 let _guard = self.cloud_cycle_lock.lock().await;
-                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout, retry_only)
+                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout)
                     .await
             }
             None => bail!("sync cycle target is required"),
@@ -1320,7 +1338,6 @@ impl SyncManager {
         target: Option<SyncTarget>,
         peer_device_id: Option<&str>,
         lan_connect_timeout: Duration,
-        retry_only: bool,
     ) -> Result<()> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
@@ -1361,11 +1378,6 @@ impl SyncManager {
         let mut lan_attempted = false;
         let mut lan_failed = false;
         if settings.lan_enabled && target != Some(SyncTarget::Cloud) {
-            let retry_peers = self
-                .lan_retry_peers
-                .read()
-                .expect("LAN retry peers poisoned")
-                .clone();
             let suspended_peers = self
                 .lan_suspended_peers
                 .read()
@@ -1378,20 +1390,16 @@ impl SyncManager {
                 .filter(|peer| {
                     peer_device_id.is_none_or(|device_id| peer.announcement.device_id == device_id)
                 })
-                .filter(|peer| !suspended_peers.contains(&peer.announcement.device_id))
                 .filter(|peer| {
                     peer_device_id.is_some()
-                        || !retry_only
-                        || retry_peers.contains(&peer.announcement.device_id)
+                        || !suspended_peers.contains(&peer.announcement.device_id)
                 })
                 .collect::<Vec<_>>();
             if peer_device_id.is_some() && peers.is_empty() {
                 bail!("未找到指定的已配对设备");
             }
             if peers.is_empty() {
-                if !retry_only {
-                    self.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false);
-                }
+                self.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false);
             } else {
                 self.set_channel_status(SyncTarget::Lan, SyncChannelState::Connecting, None, false);
             }
@@ -1586,7 +1594,6 @@ impl SyncManager {
                     log::debug!("ignore invalid cached peer route: {error}");
                     let message = error.to_string();
                     repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                    self.mark_peer_retry(&device_id);
                     return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
                 }
             };
@@ -1602,7 +1609,6 @@ impl SyncManager {
                     let message = error.to_string();
                     log::debug!("LAN peer {device_id} unavailable: {message}");
                     repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                    self.mark_peer_retry(&device_id);
                     return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
                 }
             },
@@ -1621,14 +1627,13 @@ impl SyncManager {
                     transport,
                 )
                 .await?;
-                self.clear_peer_retry(&device_id);
+                self.clear_peer_suspension(&device_id);
                 Ok(LanPeerSyncOutcome::Succeeded)
             }
             Err(error) => {
-                self.invalidate_lan_connection(&device_id, connection.stable_id());
+                let _ = self.invalidate_lan_connection(&device_id, connection.stable_id());
                 let message = error.to_string();
                 repository::mark_peer_error(&pool, &device_id, &message).await?;
-                self.mark_peer_retry(&device_id);
                 Ok(LanPeerSyncOutcome::TransferFailed(message))
             }
         }
@@ -1662,14 +1667,85 @@ impl SyncManager {
         connection.filter(|connection| connection.close_reason().is_none())
     }
 
-    fn store_lan_connection(&self, device_id: &str, connection: Connection) {
-        self.lan_connections
-            .write()
-            .expect("LAN connection cache poisoned")
-            .insert(device_id.to_owned(), connection);
+    fn store_lan_connection(self: &Arc<Self>, device_id: &str, connection: Connection) {
+        let stable_id = connection.stable_id();
+        let should_watch = {
+            let mut connections = self
+                .lan_connections
+                .write()
+                .expect("LAN connection cache poisoned");
+            if connections
+                .get(device_id)
+                .is_some_and(|current| current.stable_id() == stable_id)
+            {
+                false
+            } else {
+                connections.insert(device_id.to_owned(), connection.clone());
+                true
+            }
+        };
+        if !should_watch {
+            return;
+        }
+
+        let manager = Arc::downgrade(self);
+        let device_id = device_id.to_owned();
+        tauri::async_runtime::spawn(async move {
+            let reason = connection.closed().await.to_string();
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            manager
+                .handle_lan_connection_closed(&device_id, stable_id, &reason)
+                .await;
+        });
     }
 
-    fn invalidate_lan_connection(&self, device_id: &str, stable_id: usize) {
+    /// Applies one connection-close event without letting an old path overwrite a replacement.
+    async fn handle_lan_connection_closed(&self, device_id: &str, stable_id: usize, reason: &str) {
+        if !self.invalidate_lan_connection(device_id, stable_id) {
+            return;
+        }
+        self.suspend_peer(device_id);
+        if self.cached_lan_connection(device_id).is_some() {
+            self.clear_peer_suspension(device_id);
+            return;
+        }
+
+        let pool = self.pool().await;
+        if let Err(error) = repository::mark_peer_offline(&pool, device_id, Some(reason)).await {
+            log::debug!("mark closed LAN peer offline failed: {error}");
+        }
+        if let Some(connection) = self.cached_lan_connection(device_id) {
+            let (connected_address, transport) = connection_path(&connection);
+            if let Err(error) = repository::mark_peer_online(
+                &pool,
+                device_id,
+                connected_address.as_deref(),
+                transport,
+            )
+            .await
+            {
+                log::debug!("restore replaced LAN peer status failed: {error}");
+            }
+            self.clear_peer_suspension(device_id);
+            self.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
+        } else {
+            match repository::list_peer_statuses(&pool).await {
+                Ok(peers)
+                    if peers
+                        .iter()
+                        .any(|peer| peer.state == SyncChannelState::Online) => {}
+                Ok(_) => {
+                    self.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false)
+                }
+                Err(error) => log::debug!("refresh closed LAN channel status failed: {error}"),
+            }
+        }
+        self.emit_updated();
+    }
+
+    fn invalidate_lan_connection(&self, device_id: &str, stable_id: usize) -> bool {
         let mut connections = self
             .lan_connections
             .write()
@@ -1679,7 +1755,9 @@ impl SyncManager {
             .is_some_and(|connection| connection.stable_id() == stable_id)
         {
             connections.remove(device_id);
+            return true;
         }
+        false
     }
 
     fn invalidate_lan_connection_by_device(&self, device_id: &str) {
@@ -1706,18 +1784,7 @@ impl SyncManager {
             .clear();
     }
 
-    fn mark_peer_retry(&self, device_id: &str) {
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .insert(device_id.to_owned());
-    }
-
-    fn clear_peer_retry(&self, device_id: &str) {
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .remove(device_id);
+    fn clear_peer_suspension(&self, device_id: &str) {
         self.lan_suspended_peers
             .write()
             .expect("LAN suspended peers poisoned")
@@ -1725,10 +1792,6 @@ impl SyncManager {
     }
 
     fn suspend_peer(&self, device_id: &str) {
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .remove(device_id);
         self.lan_suspended_peers
             .write()
             .expect("LAN suspended peers poisoned")
@@ -1736,14 +1799,7 @@ impl SyncManager {
     }
 
     fn resume_peer(&self, device_id: &str) {
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .remove(device_id);
-        self.lan_suspended_peers
-            .write()
-            .expect("LAN suspended peers poisoned")
-            .remove(device_id);
+        self.clear_peer_suspension(device_id);
         if let Some(actor) = self
             .lan_peer_actors
             .read()
@@ -1754,9 +1810,28 @@ impl SyncManager {
         }
     }
 
+    /// Reconnects a suspended peer once when mDNS proves that it is reachable again.
+    fn resume_peer_from_discovery(&self, device_id: &str) {
+        if self.cached_lan_connection(device_id).is_some() {
+            return;
+        }
+        let actor = self
+            .lan_peer_actors
+            .read()
+            .expect("LAN peer actors poisoned")
+            .get(device_id)
+            .cloned();
+        let Some(actor) = actor else {
+            self.wake_lan_transfer();
+            return;
+        };
+        self.clear_peer_suspension(device_id);
+        actor.resume();
+    }
+
     /// Records a proven live inbound connection without starting a reciprocal empty sync.
     fn peer_connection_ready(&self, device_id: &str) {
-        self.clear_peer_retry(device_id);
+        self.clear_peer_suspension(device_id);
         if let Some(actor) = self
             .lan_peer_actors
             .read()
@@ -1768,10 +1843,6 @@ impl SyncManager {
     }
 
     fn resume_all_peers(&self) {
-        self.lan_retry_peers
-            .write()
-            .expect("LAN retry peers poisoned")
-            .clear();
         self.lan_suspended_peers
             .write()
             .expect("LAN suspended peers poisoned")
@@ -1946,7 +2017,7 @@ impl SyncManager {
         });
         repository::merge_removed_devices(&pool, &devices).await?;
         for device in &devices {
-            self.clear_peer_retry(&device.device_id);
+            self.clear_peer_suspension(&device.device_id);
         }
         self.emit_updated();
         if removed_self {
@@ -2812,12 +2883,21 @@ async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
     let mut cloud_next_at: Option<Instant> = None;
     loop {
         if let Some(next_at) = cloud_next_at {
-            tokio::select! {
-                _ = manager.cloud_transfer_wake.notified() => {},
-                _ = tokio::time::sleep_until(next_at.into()) => {},
+            loop {
+                tokio::select! {
+                    _ = manager.cloud_transfer_wake.notified() => {
+                        if manager.cloud_force_reconnect.swap(false, Ordering::AcqRel) {
+                            break;
+                        }
+                    },
+                    _ = tokio::time::sleep_until(next_at.into()) => break,
+                }
             }
         } else {
             manager.cloud_transfer_wake.notified().await;
+            manager
+                .cloud_force_reconnect
+                .store(false, Ordering::Release);
         }
 
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
@@ -2828,7 +2908,7 @@ async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
             continue;
         }
         match manager
-            .run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8), false)
+            .run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8))
             .await
         {
             Ok(()) => {
@@ -2905,7 +2985,8 @@ async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Result<()> {
         manager.invalidate_lan_connection_by_device(&device_id);
     }
     for (device_id, actor) in started {
-        tauri::async_runtime::spawn(lan_peer_worker(manager.clone(), device_id, actor));
+        tauri::async_runtime::spawn(lan_peer_worker(manager.clone(), device_id, actor.clone()));
+        actor.resume();
     }
     for actor in actors {
         actor.notify();
@@ -2914,106 +2995,46 @@ async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Result<()> {
 }
 
 async fn lan_peer_worker(manager: Arc<SyncManager>, device_id: String, actor: Arc<LanPeerActor>) {
-    let mut failure_count = 0_usize;
-    let mut next_at: Option<Instant> = None;
     loop {
-        let retry_only = if let Some(deadline) = next_at {
-            tokio::select! {
-                _ = actor.wake.notified() => {
-                    let force_retry = actor.force_retry.swap(false, Ordering::AcqRel);
-                    let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
-                    let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
-                    if actor.stopped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if connection_ready {
-                        failure_count = 0;
-                        next_at = None;
-                    }
-                    if !force_retry && !connection_ready {
-                        if pending_work {
-                            actor.pending_work.store(true, Ordering::Release);
-                        }
-                        continue;
-                    }
-                    if !force_retry && !pending_work {
-                        continue;
-                    }
-                    if force_retry {
-                        failure_count = 0;
-                    }
-                    false
-                },
-                _ = tokio::time::sleep_until(deadline.into()) => {
-                    actor.pending_work.store(false, Ordering::Release);
-                    true
-                },
-            }
-        } else {
-            actor.wake.notified().await;
-            let force_retry = actor.force_retry.swap(false, Ordering::AcqRel);
-            let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
-            let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
-            if actor.stopped.load(Ordering::Acquire) {
-                break;
-            }
-            if connection_ready {
-                failure_count = 0;
-            }
-            if !force_retry && !pending_work {
-                continue;
-            }
-            if force_retry {
-                failure_count = 0;
-            }
-            false
-        };
+        actor.wake.notified().await;
+        let force_connect = actor.force_connect.swap(false, Ordering::AcqRel);
+        let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
+        let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
         if actor.stopped.load(Ordering::Acquire) {
             break;
         }
-        if manager
+        if connection_ready && !force_connect && !pending_work {
+            continue;
+        }
+        if !force_connect && !pending_work {
+            continue;
+        }
+        let suspended = manager
             .lan_suspended_peers
             .read()
             .expect("LAN suspended peers poisoned")
-            .contains(&device_id)
-        {
-            next_at = None;
-            continue;
-        }
+            .contains(&device_id);
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled {
-            next_at = None;
             continue;
+        }
+        if suspended {
+            manager.clear_peer_suspension(&device_id);
         }
         match manager
             .run_cycle(
                 Some(SyncTarget::Lan),
                 Some(&device_id),
-                if retry_only {
-                    Duration::from_secs(5)
-                } else {
-                    Duration::from_secs(8)
-                },
-                retry_only,
+                LAN_EVENT_CONNECT_TIMEOUT,
             )
             .await
         {
             Ok(()) => {
-                failure_count = 0;
-                next_at = None;
+                actor.force_connect.store(false, Ordering::Release);
             }
             Err(error) => {
-                failure_count = failure_count.saturating_add(1);
-                if failure_count > RETRY_SECONDS.len() {
-                    manager.suspend_peer(&device_id);
-                    next_at = None;
-                    log::debug!(
-                        "LAN peer {device_id} remains offline; wait for rediscovery: {error}"
-                    );
-                } else {
-                    next_at = Some(Instant::now() + retry_delay(failure_count));
-                    log::warn!("LAN peer {device_id} sync failed: {error}");
-                }
+                manager.suspend_peer(&device_id);
+                log::debug!("LAN peer {device_id} is offline; wait for an online event: {error}");
                 manager.emit_updated();
             }
         }
@@ -3058,7 +3079,7 @@ fn spawn_endpoint_watchers(
             let Some(manager) = address_manager.upgrade() else {
                 break;
             };
-            manager.wake();
+            manager.notify_connectivity_changed();
         }
     }));
 
@@ -3126,25 +3147,13 @@ fn spawn_endpoint_watchers(
 async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent) {
     match event {
         PendingMdnsEvent::Expired { endpoint_id } => {
+            // Discovery presence is not connection liveness. Android may filter multicast while
+            // a direct QUIC path remains healthy, so only the connection watcher marks it offline.
             manager
                 .nearby_devices
                 .write()
                 .expect("nearby devices poisoned")
                 .remove(&endpoint_id);
-            let pool = manager.pool().await;
-            match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
-                Ok(Some(device_id)) => {
-                    manager.suspend_peer(&device_id);
-                    manager.invalidate_lan_connection_by_device(&device_id);
-                    if let Err(error) = repository::mark_peer_offline(&pool, &device_id, None).await
-                    {
-                        log::debug!("mark expired LAN peer offline failed: {error}");
-                    }
-                    manager.emit_updated();
-                }
-                Ok(None) => {}
-                Err(error) => log::debug!("resolve expired LAN peer failed: {error}"),
-            }
         }
         PendingMdnsEvent::Discovered {
             endpoint_id,
@@ -3186,8 +3195,7 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
                 Ok(routes_changed) => {
                     match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
                         Ok(Some(device_id)) if routes_changed || newly_discovered => {
-                            manager.resume_peer(&device_id);
-                            manager.wake_lan_transfer();
+                            manager.resume_peer_from_discovery(&device_id);
                         }
                         Ok(_) => {}
                         Err(error) => log::debug!("resolve discovered LAN peer failed: {error}"),
@@ -3242,6 +3250,7 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
             let connection = manager.connect_cloud(&endpoint, server).await?;
             manager.ensure_cloud_group(&connection, &group).await?;
             manager.set_cloud_path(&connection);
+            manager.notify_cloud_connected();
             manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
             manager.emit_updated();
             let pool = manager.pool().await;
@@ -3802,6 +3811,7 @@ async fn dispatch_peer(
             )
             .await?;
             let (connected_address, transport) = connection_path(connection);
+            manager.store_lan_connection(&device.device_id, connection.clone());
             repository::mark_peer_online(
                 &pool,
                 &device.device_id,
@@ -3809,7 +3819,6 @@ async fn dispatch_peer(
                 transport,
             )
             .await?;
-            manager.store_lan_connection(&device.device_id, connection.clone());
             manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
@@ -3952,7 +3961,7 @@ async fn dispatch_peer(
             if !remote_was_removed {
                 repository::merge_removed_devices(&pool, &devices).await?;
                 for device in &devices {
-                    manager.clear_peer_retry(&device.device_id);
+                    manager.clear_peer_suspension(&device.device_id);
                 }
             }
             let removed = repository::removed_devices(&pool).await?;
