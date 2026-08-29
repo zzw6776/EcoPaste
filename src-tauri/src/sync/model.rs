@@ -213,6 +213,7 @@ pub struct CloudRecord {
     pub device_name: String,
     pub kind: String,
     pub preview: String,
+    pub image_path: Option<String>,
     pub file_count: u32,
     pub total_size: u64,
     pub created_at: String,

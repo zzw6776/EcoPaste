@@ -386,6 +386,7 @@ pub fn mark_app_ready(app: &AppHandle) {
 }
 
 /// 从进程参数中查找 `.ecopastebak` 路径，供 Windows 文件关联和第二实例回调使用。
+#[cfg(not(target_os = "android"))]
 pub fn backup_path_from_args(args: &[String]) -> Option<PathBuf> {
     args.iter()
         .map(PathBuf::from)

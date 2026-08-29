@@ -1,30 +1,46 @@
 #[cfg(not(target_os = "android"))]
 use std::sync::Mutex;
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
+#[cfg(not(target_os = "android"))]
 use anyhow::Context;
+#[cfg(not(target_os = "android"))]
 use chrono::{DateTime, Utc};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Emitter;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_updater::{Update as TauriUpdate, UpdaterExt};
+#[cfg(not(target_os = "android"))]
 use url::Url;
 
 use crate::core::{AppError, Result};
+#[cfg(not(target_os = "android"))]
 use crate::settings::{SettingsStore, Update as UpdateSettings, UpdateFrequency};
 
+#[cfg(not(target_os = "android"))]
 const UPDATE_PROGRESS_EVENT: &str = "update://progress";
+#[cfg(not(target_os = "android"))]
 const STABLE_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_ENDPOINT";
+#[cfg(not(target_os = "android"))]
 const BETA_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_BETA_ENDPOINT";
+#[cfg(not(target_os = "android"))]
 const NIGHTLY_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_NIGHTLY_ENDPOINT";
+#[cfg(not(target_os = "android"))]
 const DEFAULT_STABLE_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=stable";
+#[cfg(not(target_os = "android"))]
 const DEFAULT_BETA_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=beta";
+#[cfg(not(target_os = "android"))]
 const DEFAULT_NIGHTLY_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=nightly";
+#[cfg(not(target_os = "android"))]
 const AUTO_CHECK_INITIAL_DELAY_SECONDS: u64 = 8;
+#[cfg(not(target_os = "android"))]
 const AUTO_CHECK_SETTINGS_REFRESH_SECONDS: u64 = 60 * 60;
+#[cfg(not(target_os = "android"))]
 const AUTO_CHECK_FAILURE_RETRY_SECONDS: u64 = 60 * 60;
-
-#[cfg(target_os = "android")]
-pub struct UpdateState;
 
 #[cfg(not(target_os = "android"))]
 pub struct UpdateState {
@@ -40,9 +56,6 @@ struct PendingUpdate {
 
 #[cfg(target_os = "android")]
 pub fn init(_app: &AppHandle) {}
-
-#[cfg(target_os = "android")]
-pub fn schedule_auto_check(_app: &AppHandle) {}
 
 #[cfg(target_os = "android")]
 pub async fn status(app: &AppHandle) -> AppUpdateStatus {
@@ -100,6 +113,7 @@ pub struct UpdateMetadata {
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(not(target_os = "android"))]
 pub struct UpdateDownloadProgress {
     pub downloaded: u64,
     pub total: Option<u64>,
@@ -109,6 +123,7 @@ pub struct UpdateDownloadProgress {
 #[derive(Clone, Copy)]
 pub enum CheckMode {
     Manual,
+    #[cfg(not(target_os = "android"))]
     Auto,
 }
 
@@ -367,6 +382,7 @@ fn metadata_from_update(update: &TauriUpdate) -> UpdateMetadata {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn update_endpoints(include_beta: bool, include_nightly: bool) -> Result<Vec<Url>> {
     let stable_endpoint =
         std::env::var(STABLE_ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_STABLE_ENDPOINT.to_owned());
@@ -384,6 +400,7 @@ fn update_endpoints(include_beta: bool, include_nightly: bool) -> Result<Vec<Url
     )
 }
 
+#[cfg(not(target_os = "android"))]
 fn update_endpoints_from_values(
     include_beta: bool,
     include_nightly: bool,
@@ -403,22 +420,26 @@ fn update_endpoints_from_values(
     Ok(endpoints)
 }
 
+#[cfg(not(target_os = "android"))]
 fn parse_endpoint(endpoint: &str) -> Result<Url> {
     endpoint
         .parse::<Url>()
         .map_err(|err| AppError::Other(anyhow::anyhow!("update endpoint is invalid: {err}")))
 }
 
+#[cfg(not(target_os = "android"))]
 fn should_auto_check(app: &AppHandle) -> bool {
     next_auto_check_delay(app).is_zero()
 }
 
+#[cfg(not(target_os = "android"))]
 fn next_auto_check_delay(app: &AppHandle) -> Duration {
     let settings = app.state::<SettingsStore>().snapshot();
 
     next_auto_check_delay_for_settings(&settings.update, Utc::now())
 }
 
+#[cfg(not(target_os = "android"))]
 fn next_auto_check_delay_for_settings(settings: &UpdateSettings, now: DateTime<Utc>) -> Duration {
     let settings_refresh = Duration::from_secs(AUTO_CHECK_SETTINGS_REFRESH_SECONDS);
 
@@ -444,6 +465,7 @@ fn next_auto_check_delay_for_settings(settings: &UpdateSettings, now: DateTime<U
     Duration::from_secs(remaining as u64).min(settings_refresh)
 }
 
+#[cfg(not(target_os = "android"))]
 fn frequency_seconds(frequency: UpdateFrequency) -> i64 {
     match frequency {
         UpdateFrequency::Daily => 24 * 60 * 60,
@@ -452,6 +474,7 @@ fn frequency_seconds(frequency: UpdateFrequency) -> i64 {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn persist_last_checked_at(app: &AppHandle) {
     let patch = serde_json::json!({
         "update": {
@@ -465,6 +488,7 @@ fn persist_last_checked_at(app: &AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn emit_progress(app: &AppHandle, downloaded: u64, total: Option<u64>) {
     let progress = total.filter(|value| *value > 0).map(|value| {
         let ratio = downloaded as f64 / value as f64;

@@ -56,11 +56,6 @@ const MENU_RELAUNCH: &str = "tray::relaunch";
 const MENU_EXIT: &str = "tray::exit";
 
 #[cfg(target_os = "android")]
-pub fn init(_app: &AppHandle, _settings: &Settings) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
 pub fn apply(_app: &AppHandle, _settings: &Settings) -> Result<()> {
     Ok(())
 }

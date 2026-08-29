@@ -7,19 +7,26 @@
 
 #![allow(clippy::unused_unit)]
 
+#[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_os = "android"))]
 use std::sync::{LazyLock, Mutex};
+#[cfg(not(target_os = "android"))]
 use std::thread;
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalRect, PhysicalSize, WebviewUrl,
-    WebviewWindow, WebviewWindowBuilder,
+    Emitter, Manager, PhysicalPosition, PhysicalRect, PhysicalSize, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 
 use crate::core::Result;
 
+#[cfg(not(target_os = "android"))]
 use super::{get_window, lifecycle, CLIPBOARD_PREVIEW_WINDOW_LABEL, CLIPBOARD_WINDOW_LABEL};
 
 #[cfg(target_os = "macos")]
@@ -32,22 +39,34 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
 };
 
+#[cfg(not(target_os = "android"))]
 const PREVIEW_UPDATED_EVENT: &str = "preview://updated";
+#[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_WIDTH: f64 = 680.0;
+#[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_HEIGHT: f64 = 600.0;
+#[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_GAP: f64 = 40.0;
+#[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_MARGIN: f64 = 32.0;
+#[cfg(not(target_os = "android"))]
 const PREVIEW_POINTER_ANCHOR_SIZE: f64 = 1.0;
+#[cfg(not(target_os = "android"))]
 const PREVIEW_HIDE_DELAY_MS: u64 = 180;
 
+#[cfg(not(target_os = "android"))]
 static PREVIEW_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(target_os = "android"))]
 static PREVIEW_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(target_os = "android"))]
 static PREVIEW_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(target_os = "android"))]
 static PREVIEW_STATE: LazyLock<Mutex<Option<ClipboardPreviewState>>> =
     LazyLock::new(|| Mutex::new(None));
 /// 串行化建窗：多个预览请求（如连续 hover）可能并发走到「检查不存在 → 建窗」，
 /// 都过了存在性检查会触发重复 label 建窗报错。建窗都来自命令/后台线程、主线程从不持锁，
 /// 不会与 builder 内部的主线程派发互锁。
+#[cfg(not(target_os = "android"))]
 static PREVIEW_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -101,9 +120,13 @@ pub struct PreviewRect {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewPlacement {
+    #[cfg(not(target_os = "android"))]
     Right,
+    #[cfg(not(target_os = "android"))]
     Left,
+    #[cfg(not(target_os = "android"))]
     Bottom,
+    #[cfg(not(target_os = "android"))]
     Top,
 }
 
@@ -144,11 +167,6 @@ pub fn close_clipboard_preview(_app: &AppHandle) -> Result<()> {
 }
 
 #[cfg(target_os = "android")]
-pub fn close_clipboard_preview_now(_app: &AppHandle) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
 pub fn suppress_for_clipboard_hide(_app: &AppHandle) {}
 
 #[cfg(target_os = "android")]
@@ -157,6 +175,11 @@ pub fn resume_after_clipboard_show(_app: &AppHandle) {}
 #[cfg(target_os = "android")]
 pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
     Ok(None)
+}
+
+#[cfg(target_os = "android")]
+pub fn build_clipboard_preview_window(_app: &AppHandle) -> Result<()> {
+    Ok(())
 }
 
 /// 打开或重定向预览窗口，并把最新预览状态广播到预览 webview。
@@ -272,11 +295,6 @@ pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
     Ok(guard.clone())
 }
 
-#[cfg(target_os = "android")]
-pub fn build_clipboard_preview_window(_app: &AppHandle) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(not(target_os = "android"))]
 /// 按需重建预览窗口。预览窗口不再由 Tauri 配置预创建（改为空闲销毁 + 按需重建），
 /// 所有选项必须在此用 builder 完整复刻原 `tauri.conf.json` 声明，否则重建后行为漂移。
@@ -372,6 +390,7 @@ fn preview_session_id_for_show() -> u64 {
     PREVIEW_SESSION_ID.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+#[cfg(not(target_os = "android"))]
 fn validate_anchor(anchor: &PreviewAnchorRect) -> Result<()> {
     let values = [anchor.left, anchor.top, anchor.width, anchor.height];
     if !values.iter().all(|value| value.is_finite()) || anchor.width <= 0.0 || anchor.height <= 0.0
@@ -652,6 +671,7 @@ fn preview_window_size(work_area: &PhysicalRect<i32, u32>) -> PhysicalSize<u32> 
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn build_preview_layout(
     anchor: &PreviewAnchorRect,
     scale_factor: f64,
@@ -681,6 +701,7 @@ fn build_preview_layout(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn resolve_source_rect(
     anchor: &PreviewAnchorRect,
     scale_factor: f64,
@@ -719,6 +740,7 @@ fn resolve_source_rect(
     intersect_rect(source, overlay_rect).unwrap_or_else(|| clamp_rect(source, overlay_rect))
 }
 
+#[cfg(not(target_os = "android"))]
 fn resolve_pointer_anchor_rect(source: PreviewRect, pointer_y: Option<f64>) -> PreviewRect {
     let Some(pointer_y) = pointer_y else {
         return source;
@@ -734,6 +756,7 @@ fn resolve_pointer_anchor_rect(source: PreviewRect, pointer_y: Option<f64>) -> P
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn resolve_panel_rect(
     source_rect: PreviewRect,
     overlay_rect: PreviewRect,
@@ -774,6 +797,7 @@ fn resolve_panel_rect(
     )
 }
 
+#[cfg(not(target_os = "android"))]
 fn raw_panel_rect(
     source_rect: PreviewRect,
     placement: PreviewPlacement,
@@ -810,6 +834,7 @@ fn raw_panel_rect(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn clamp_rect(rect: PreviewRect, bounds: PreviewRect) -> PreviewRect {
     let max_left = (bounds.right() - rect.width).max(bounds.left);
     let max_top = (bounds.bottom() - rect.height).max(bounds.top);
@@ -822,6 +847,7 @@ fn clamp_rect(rect: PreviewRect, bounds: PreviewRect) -> PreviewRect {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn intersect_rect(a: PreviewRect, b: PreviewRect) -> Option<PreviewRect> {
     let left = a.left.max(b.left);
     let top = a.top.max(b.top);
@@ -840,6 +866,7 @@ fn intersect_rect(a: PreviewRect, b: PreviewRect) -> Option<PreviewRect> {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 fn inset_rect(rect: PreviewRect, amount: f64) -> PreviewRect {
     PreviewRect {
         left: rect.left + amount,
@@ -850,6 +877,7 @@ fn inset_rect(rect: PreviewRect, amount: f64) -> PreviewRect {
 }
 
 /// 返回剪贴板窗口内容区的屏幕几何，用于映射 WebView DOM rect 到预览 overlay 坐标。
+#[cfg(not(target_os = "android"))]
 fn clipboard_window_rect(app: &AppHandle) -> Option<PreviewClipboardWindowRect> {
     let window = app.get_webview_window(CLIPBOARD_WINDOW_LABEL)?;
     let pos = window.inner_position().ok()?;
@@ -863,6 +891,7 @@ fn clipboard_window_rect(app: &AppHandle) -> Option<PreviewClipboardWindowRect> 
     })
 }
 
+#[cfg(not(target_os = "android"))]
 impl PreviewRect {
     fn right(self) -> f64 {
         self.left + self.width

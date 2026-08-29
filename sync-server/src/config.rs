@@ -22,6 +22,6 @@ pub struct Config {
     pub max_blob_bytes: u64,
 
     /// Disable the public Iroh relay network. Direct LAN/public-IP access remains available.
-    #[arg(long, env = "ECOPASTE_NO_RELAY", default_value_t = false)]
+    #[arg(long, env = "ECOPASTE_NO_RELAY", default_value_t = true)]
     pub no_relay: bool,
 }

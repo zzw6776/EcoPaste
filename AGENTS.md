@@ -172,7 +172,6 @@ cargo test --workspace
 - 不写历史残留注释，不引用 TODO 阶段号或外部行号。
 - 不做超出当前需求的抽象、兼容垫片或提前优化；React hook / 工具函数遇到真实复杂度再抽象。
 - 提交信息用单行 Conventional Commits，如 `feat:`、`fix:`、`refactor:`、`docs:`。
-- 改 UI 后必须实际操作验证主路径与边界，不只靠类型检查。
 
 ## 外部文档
 

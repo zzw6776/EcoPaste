@@ -15,8 +15,6 @@ import { log } from "@/utils/log";
 import type { PreferenceSetting } from "../../types/preferences";
 import ControlFrame from "./ControlFrame";
 
-const PERMISSION_POLL_INTERVAL_MS = 1_500;
-
 type PermissionKind = NonNullable<
   Extract<PreferenceSetting["control"], { type: "permission" }>["kind"]
 >;
@@ -131,12 +129,17 @@ const PermissionControl: FC<PermissionControlProps> = (props) => {
     if (!isPermissionControl) return;
     if (permissionState.status === "granted") return;
 
-    const timer = window.setInterval(() => {
-      void checkPermission();
-    }, PERMISSION_POLL_INTERVAL_MS);
+    const handleResume = () => {
+      if (document.visibilityState === "visible") {
+        void checkPermission();
+      }
+    };
+    window.addEventListener("focus", handleResume);
+    document.addEventListener("visibilitychange", handleResume);
 
     return () => {
-      window.clearInterval(timer);
+      window.removeEventListener("focus", handleResume);
+      document.removeEventListener("visibilitychange", handleResume);
     };
   }, [checkPermission, isPermissionControl, permissionState.status]);
 

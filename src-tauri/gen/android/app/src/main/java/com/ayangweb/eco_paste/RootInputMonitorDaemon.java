@@ -54,7 +54,8 @@ public final class RootInputMonitorDaemon {
             File owner = new File("/proc/" + ownerPid);
             while (owner.exists()) {
                 try {
-                    Thread.sleep(1_000L);
+                    // stdin EOF is the primary shutdown signal; this is only an orphan fallback.
+                    Thread.sleep(30_000L);
                 } catch (InterruptedException ignored) {
                     Thread.currentThread().interrupt();
                     break;

@@ -5,6 +5,7 @@ mod clipboard;
 mod commands;
 mod core;
 mod db;
+#[cfg(not(target_os = "android"))]
 mod drag_out;
 mod i18n;
 #[cfg(target_os = "windows")]
@@ -395,6 +396,7 @@ pub fn run() {
         });
 }
 
+#[cfg(not(target_os = "android"))]
 fn show_default_foreground_window(app_handle: &tauri::AppHandle) -> core::Result<()> {
     if let Some(settings_store) = app_handle.try_state::<settings::SettingsStore>() {
         if !settings_store.snapshot().onboarding.completed {

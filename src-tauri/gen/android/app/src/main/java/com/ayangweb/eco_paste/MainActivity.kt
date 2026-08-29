@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,6 +15,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : TauriActivity() {
+    override val handleBackNavigation: Boolean = false
+
     private var createDocumentCallback: ((Uri?) -> Unit)? = null
     private val createDocumentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -29,6 +32,22 @@ class MainActivity : TauriActivity() {
     }
 
     private external fun initNdkContext(context: Context)
+
+    override fun onWebViewCreate(webView: WebView) {
+        super.onWebViewCreate(webView)
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (webView.canGoBack()) {
+                        webView.goBack()
+                    } else {
+                        minimizeToBackground()
+                    }
+                }
+            },
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -59,23 +78,23 @@ class MainActivity : TauriActivity() {
             )
         }
 
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                minimizeToBackground()
-            }
-        })
-
         EcoPasteBridge.ensureGestureService(this)
     }
 
     override fun onResume() {
         super.onResume()
         EcoPasteBridge.setCurrentActivity(this)
+        EcoPasteBridge.setForegroundCaptureActive(true)
         try {
             EcoPasteBridge.notifySyncNetworkChanged()
         } catch (error: Throwable) {
             android.util.Log.w("MainActivity", "notify sync foreground warning: ${error.message}")
         }
+    }
+
+    override fun onPause() {
+        EcoPasteBridge.setForegroundCaptureActive(false)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -121,4 +140,5 @@ class MainActivity : TauriActivity() {
         @Suppress("DEPRECATION")
         overridePendingTransition(0, 0)
     }
+
 }

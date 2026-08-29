@@ -3,7 +3,9 @@
 //! 运行中应用只进缓存；复制捕获、手动添加和默认忽略物化的应用才写入 `clipboard_apps` 表。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::anyhow;
@@ -235,6 +237,7 @@ fn app_meta_from_id(id: &str) -> Option<ScannedAppMeta> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn validate_existing_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Err(AppError::Clipboard("app path does not exist".to_owned()));

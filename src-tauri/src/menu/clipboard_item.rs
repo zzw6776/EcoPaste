@@ -16,6 +16,7 @@ use tauri::{AppHandle, State};
 
 use crate::core::Result;
 use crate::db::DatabaseState;
+#[cfg(not(target_os = "android"))]
 use crate::settings::Language;
 
 /// 前端订阅事件：携带 `{action, itemId}`，由 `List.tsx` 派发到现有处理逻辑。
@@ -42,6 +43,7 @@ pub enum ClipboardMenuAction {
     Delete,
 }
 
+#[cfg(not(target_os = "android"))]
 impl ClipboardMenuAction {
     /// 返回当前语言下的菜单文案；切换类动作按当前状态翻转。
     pub(super) fn label(
@@ -111,6 +113,7 @@ impl ClipboardMenuAction {
 }
 
 /// 视觉分组：组间插入分隔线，组内顺序与组顺序即菜单展示顺序。两端共用。
+#[cfg(not(target_os = "android"))]
 pub(super) const ACTION_GROUPS: &[&[ClipboardMenuAction]] = &[
     &[
         ClipboardMenuAction::Paste,
@@ -135,6 +138,7 @@ pub(super) const ACTION_GROUPS: &[&[ClipboardMenuAction]] = &[
 ];
 
 /// 右键菜单里的可选自定义分组；由命令入口从数据库实时读取。
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ClipboardMenuGroup {
@@ -155,6 +159,7 @@ pub struct PopupClipboardItemMenuInput {
 }
 
 /// 构建右键菜单所需的完整上下文，包含命令参数与实时读取的分组列表。
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone)]
 pub(super) struct ClipboardItemMenuRequest {
     pub item_id: String,
@@ -478,7 +483,7 @@ mod native {
 
 /// setup 阶段调用：macOS 注册 muda 菜单状态；Windows 由 [`super::context_window::init`]
 /// 单独建窗，这里 no-op。
-#[allow(unused_variables)]
+#[cfg(not(target_os = "android"))]
 pub fn init(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     native::init(app);
@@ -487,6 +492,7 @@ pub fn init(app: &AppHandle) {
 /// 在当前光标处弹出列表项右键菜单。`available_actions` / `is_favorite` 由
 /// 前端传入（来自 `ClipboardItem.availableActions` 与当前状态字段）。
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub async fn popup_clipboard_item_menu(
     app: AppHandle,
     db: State<'_, DatabaseState>,
@@ -529,8 +535,34 @@ pub async fn popup_clipboard_item_menu(
     }
 }
 
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn popup_clipboard_item_menu(
+    _app: AppHandle,
+    _db: State<'_, DatabaseState>,
+    input: PopupClipboardItemMenuInput,
+) -> Result<()> {
+    let PopupClipboardItemMenuInput {
+        item_id,
+        available_actions,
+        current_group_id,
+        is_favorite,
+        is_pinned,
+        has_note,
+    } = input;
+    let _ = (
+        item_id,
+        available_actions,
+        current_group_id,
+        is_favorite,
+        is_pinned,
+        has_note,
+    );
+    Ok(())
+}
+
 /// 全局菜单事件分发入口（注册在 `on_menu_event` 上）。Windows 不经此路径。
-#[allow(unused_variables)]
+#[cfg(not(target_os = "android"))]
 pub fn handle_menu_event(app: &AppHandle, menu_id: &str) {
     #[cfg(target_os = "macos")]
     native::handle_event(app, menu_id);

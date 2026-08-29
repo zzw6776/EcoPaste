@@ -1,8 +1,8 @@
-import { useInterval, useMount } from "ahooks";
+import { useMount } from "ahooks";
 import type { RadioChangeEvent } from "antd";
 import { Button, Modal, Radio, Tag } from "antd";
 import type { FC } from "react";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type AndroidPermissionsStatus,
   getAndroidPermissionsStatus,
@@ -39,10 +39,12 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   >("accessibility");
   const [loading, setLoading] = useState(false);
   const [engineLoading, setEngineLoading] = useState(false);
+  const fetchingRef = useRef(false);
   const mobile = isAndroid || isMobile();
 
-  const fetchStatus = async () => {
-    if (!isAndroid) return;
+  const fetchStatus = useCallback(async () => {
+    if (!isAndroid || fetchingRef.current) return;
+    fetchingRef.current = true;
     try {
       const res = await getAndroidPermissionsStatus();
       setStatus(res);
@@ -55,19 +57,32 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
       }
     } catch {
       // ignore
+    } finally {
+      fetchingRef.current = false;
     }
-  };
+  }, []);
 
   useMount(() => {
     void fetchStatus();
   });
 
-  // 当弹窗打开时，每 1.5 秒自动刷新一次权限状态，方便用户从系统设置返回时自动更新
-  useInterval(() => {
-    if (open) {
-      void fetchStatus();
-    }
-  }, 1500);
+  useEffect(() => {
+    if (!open) return;
+
+    const handleResume = () => {
+      if (document.visibilityState === "visible") {
+        void fetchStatus();
+      }
+    };
+    handleResume();
+    window.addEventListener("focus", handleResume);
+    document.addEventListener("visibilitychange", handleResume);
+
+    return () => {
+      window.removeEventListener("focus", handleResume);
+      document.removeEventListener("visibilitychange", handleResume);
+    };
+  }, [fetchStatus, open]);
 
   const handleRequest = async (
     kind: "overlay" | "accessibility" | "battery" | "notification",

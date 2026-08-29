@@ -3,36 +3,42 @@
 //! 配置来自 `settings::Shortcuts`。本模块只负责 OS 级注册——`paste_plain`
 //! 是窗口内交互（前端 `useKeyPress`），不在这里处理。
 
+#[cfg(not(target_os = "android"))]
 use std::sync::Mutex;
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
+#[cfg(not(target_os = "android"))]
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::{Emitter, Manager};
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
-use crate::core::{AppError, Result};
-use crate::settings::{SettingsStore, Shortcuts};
+#[cfg(not(target_os = "android"))]
+use crate::core::AppError;
+use crate::core::Result;
+#[cfg(not(target_os = "android"))]
+use crate::settings::SettingsStore;
+use crate::settings::Shortcuts;
 #[cfg(not(target_os = "android"))]
 use crate::window::{self, CLIPBOARD_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
 
 #[cfg(target_os = "windows")]
 mod win_v;
 
+#[cfg(not(target_os = "android"))]
 pub const CONFLICT_EVENT: &str = "shortcut://conflict";
 #[cfg(not(target_os = "android"))]
 const RESUME_DEBOUNCE: Duration = Duration::from_millis(160);
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Serialize)]
 pub struct ShortcutConflict {
     pub action: &'static str,
     pub binding: String,
     pub reason: String,
-}
-
-#[cfg(target_os = "android")]
-pub fn init(_app: &AppHandle, _shortcuts: &Shortcuts) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -57,12 +63,14 @@ pub struct ShortcutManager {
     pause: Mutex<ShortcutPause>,
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Default)]
 struct ShortcutPause {
     resume_epoch: u64,
     suspend_count: usize,
 }
 
+#[cfg(not(target_os = "android"))]
 impl ShortcutPause {
     /// 记录一次暂停请求，并返回是否需要实际注销已注册快捷键。
     fn suspend(&mut self) -> bool {

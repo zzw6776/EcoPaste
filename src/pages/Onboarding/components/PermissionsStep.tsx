@@ -1,7 +1,7 @@
-import { useInterval, useMount } from "ahooks";
+import { useMount } from "ahooks";
 import { Button, Tag } from "antd";
 import type { FC } from "react";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import {
@@ -33,26 +33,41 @@ const PermissionsStep: FC = () => {
   const settings = useSnapshot(settingsState) as Settings;
   const [androidStatus, setAndroidStatus] =
     useState<AndroidPermissionsStatus | null>(null);
+  const fetchingRef = useRef(false);
 
-  const fetchAndroidStatus = async () => {
-    if (!isAndroid) return;
+  const fetchAndroidStatus = useCallback(async () => {
+    if (!isAndroid || fetchingRef.current) return;
+    fetchingRef.current = true;
     try {
       const res = await getAndroidPermissionsStatus();
       setAndroidStatus(res);
     } catch {
       // ignore
+    } finally {
+      fetchingRef.current = false;
     }
-  };
+  }, []);
 
   useMount(() => {
     void fetchAndroidStatus();
   });
 
-  useInterval(() => {
-    if (isAndroid) {
-      void fetchAndroidStatus();
-    }
-  }, 1500);
+  useEffect(() => {
+    if (!isAndroid) return;
+
+    const handleResume = () => {
+      if (document.visibilityState === "visible") {
+        void fetchAndroidStatus();
+      }
+    };
+    window.addEventListener("focus", handleResume);
+    document.addEventListener("visibilitychange", handleResume);
+
+    return () => {
+      window.removeEventListener("focus", handleResume);
+      document.removeEventListener("visibilitychange", handleResume);
+    };
+  }, [fetchAndroidStatus]);
 
   const handleChange = async (
     setting: PreferenceSetting,

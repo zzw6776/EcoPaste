@@ -627,7 +627,10 @@ fn legacy_data_candidates_from_defaults(
 }
 
 fn default_legacy_data_candidates() -> Vec<PathBuf> {
+    #[cfg(not(target_os = "android"))]
     let mut candidates = Vec::new();
+    #[cfg(target_os = "android")]
+    let candidates = Vec::new();
 
     #[cfg(target_os = "macos")]
     {

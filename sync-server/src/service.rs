@@ -16,20 +16,52 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tracing::{debug, warn};
 
 use crate::repository::{Repository, now_ms, validate_identifier};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const GLOBAL_STREAM_ADMISSION: usize = 256;
+const GLOBAL_REQUEST_CONCURRENCY: usize = 128;
+const GLOBAL_BLOB_CONCURRENCY: usize = 8;
+const GLOBAL_WATCH_CONCURRENCY: usize = 512;
+
+#[derive(Debug)]
+struct ActiveWatch {
+    generation: u64,
+    cancel: oneshot::Sender<()>,
+}
+
+struct TemporaryFileCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TemporaryFileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HubService {
     repository: Repository,
     blob_root: Arc<PathBuf>,
     max_blob_bytes: u64,
-    group_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    group_notifications: Arc<Mutex<HashMap<String, watch::Sender<u64>>>>,
+    stream_admission: Arc<Semaphore>,
+    request_concurrency: Arc<Semaphore>,
+    blob_concurrency: Arc<Semaphore>,
+    watch_concurrency: Arc<Semaphore>,
+    active_watches: Arc<Mutex<HashMap<(String, String), ActiveWatch>>>,
 }
 
 impl HubService {
@@ -39,15 +71,54 @@ impl HubService {
             blob_root: Arc::new(blob_root),
             max_blob_bytes,
             group_notifications: Arc::new(Mutex::new(HashMap::new())),
+            stream_admission: Arc::new(Semaphore::new(GLOBAL_STREAM_ADMISSION)),
+            request_concurrency: Arc::new(Semaphore::new(GLOBAL_REQUEST_CONCURRENCY)),
+            blob_concurrency: Arc::new(Semaphore::new(GLOBAL_BLOB_CONCURRENCY)),
+            watch_concurrency: Arc::new(Semaphore::new(GLOBAL_WATCH_CONCURRENCY)),
+            active_watches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn group_notification(&self, group_id: &str) -> Arc<Notify> {
+    async fn group_changes(&self, group_id: &str) -> watch::Receiver<u64> {
         let mut notifications = self.group_notifications.lock().await;
         notifications
             .entry(group_id.to_owned())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe()
+    }
+
+    async fn notify_group_change(&self, group_id: &str) {
+        let mut notifications = self.group_notifications.lock().await;
+        notifications
+            .entry(group_id.to_owned())
+            .or_insert_with(|| watch::channel(0).0)
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    async fn register_watch(
+        &self,
+        group_id: &str,
+        endpoint_id: &str,
+    ) -> (u64, oneshot::Receiver<()>) {
+        let key = (group_id.to_owned(), endpoint_id.to_owned());
+        let generation = WATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let (cancel, receiver) = oneshot::channel();
+        let mut watches = self.active_watches.lock().await;
+        if let Some(previous) = watches.insert(key, ActiveWatch { generation, cancel }) {
+            let _ = previous.cancel.send(());
+        }
+        (generation, receiver)
+    }
+
+    async fn unregister_watch(&self, group_id: &str, endpoint_id: &str, generation: u64) {
+        let key = (group_id.to_owned(), endpoint_id.to_owned());
+        let mut watches = self.active_watches.lock().await;
+        if watches
+            .get(&key)
+            .is_some_and(|watch| watch.generation == generation)
+        {
+            watches.remove(&key);
+        }
     }
 
     async fn handle_stream(
@@ -55,15 +126,44 @@ impl HubService {
         remote_endpoint_id: &str,
         mut send: SendStream,
         mut recv: RecvStream,
+        admission_permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+        connection_requests: Arc<Semaphore>,
+        connection_blobs: Arc<Semaphore>,
+        connection_watches: Arc<Semaphore>,
     ) -> Result<()> {
+        let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+            .await
+            .context("read request frame timeout")?
+            .context("read request frame")?;
+        let _request_permits = if matches!(&request, Request::WatchGroupStream { .. }) {
+            Some((
+                self.watch_concurrency.clone().acquire_owned().await?,
+                connection_watches.acquire_owned().await?,
+            ))
+        } else if matches!(&request, Request::PutBlob { .. } | Request::GetBlob { .. }) {
+            Some((
+                self.blob_concurrency.clone().acquire_owned().await?,
+                connection_blobs.acquire_owned().await?,
+            ))
+        } else {
+            Some((
+                self.request_concurrency.clone().acquire_owned().await?,
+                connection_requests.acquire_owned().await?,
+            ))
+        };
+        drop(admission_permits);
         if let Err(error) = self
-            .dispatch(remote_endpoint_id, &mut send, &mut recv)
+            .dispatch(remote_endpoint_id, &mut send, &mut recv, request)
             .await
         {
             warn!(?error, "sync request failed");
-            write_frame(&mut send, &response_for_error(&error))
-                .await
-                .context("write error response")?;
+            tokio::time::timeout(
+                FRAME_WRITE_TIMEOUT,
+                write_frame(&mut send, &response_for_error(&error)),
+            )
+            .await
+            .context("write error response timeout")?
+            .context("write error response")?;
         }
         send.finish().context("finish response stream")?;
         Ok(())
@@ -74,8 +174,8 @@ impl HubService {
         remote_endpoint_id: &str,
         send: &mut SendStream,
         recv: &mut RecvStream,
+        request: Request,
     ) -> Result<()> {
-        let request: Request = read_frame(recv).await.context("read request frame")?;
         match request {
             Request::Health => {
                 write_frame(
@@ -116,7 +216,7 @@ impl HubService {
                 self.repository.upsert_device(&group_id, &device).await?;
                 let accepted_event_ids = self.repository.insert_events(&group_id, &events).await?;
                 if !accepted_event_ids.is_empty() {
-                    self.group_notification(&group_id).await.notify_waiters();
+                    self.notify_group_change(&group_id).await;
                 }
                 let events = self
                     .repository
@@ -192,7 +292,7 @@ impl HubService {
                 let mut file = tokio::fs::File::open(source)
                     .await
                     .context("open encrypted blob")?;
-                tokio::io::copy(&mut file, send)
+                copy_with_idle_timeout(&mut file, send, BLOB_IDLE_TIMEOUT)
                     .await
                     .context("send encrypted blob")?;
             }
@@ -206,12 +306,10 @@ impl HubService {
                     .await?;
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
-                let notification = self.group_notification(&group_id).await;
-                let notified = notification.notified();
-                tokio::pin!(notified);
+                let mut changes = self.group_changes(&group_id).await;
                 let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
                 if latest_cursor <= after_cursor {
-                    let _ = tokio::time::timeout(Duration::from_secs(60), &mut notified).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(60), changes.changed()).await;
                     latest_cursor = self.repository.latest_cursor(&group_id).await?;
                 }
                 write_frame(send, &Response::Changed { latest_cursor }).await?;
@@ -225,14 +323,12 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
-                let notification = self.group_notification(&group_id).await;
-                let notified = notification.notified();
-                tokio::pin!(notified);
+                let mut changes = self.group_changes(&group_id).await;
                 let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
                 let mut latest_removed_at_ms =
                     self.repository.latest_removed_at_ms(&group_id).await?;
                 if latest_cursor <= after_cursor && latest_removed_at_ms <= after_removed_at_ms {
-                    let _ = tokio::time::timeout(Duration::from_secs(60), &mut notified).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(60), changes.changed()).await;
                     latest_cursor = self.repository.latest_cursor(&group_id).await?;
                     latest_removed_at_ms = self.repository.latest_removed_at_ms(&group_id).await?;
                 }
@@ -244,6 +340,70 @@ impl HubService {
                     },
                 )
                 .await?;
+            }
+            Request::WatchGroupStream {
+                group_id,
+                access_token,
+                after_cursor,
+                after_removed_at_ms,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
+                let mut changes = self.group_changes(&group_id).await;
+                let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
+                let mut latest_removed_at_ms =
+                    self.repository.latest_removed_at_ms(&group_id).await?;
+                let (watch_generation, mut cancelled) =
+                    self.register_watch(&group_id, remote_endpoint_id).await;
+                let watch_result: Result<()> = async {
+                    tokio::time::timeout(
+                        FRAME_WRITE_TIMEOUT,
+                        write_frame(
+                            send,
+                            &Response::GroupChanged {
+                                latest_cursor,
+                                latest_removed_at_ms,
+                            },
+                        ),
+                    )
+                    .await
+                    .context("write initial watch response timeout")??;
+
+                    loop {
+                        let changed = tokio::select! {
+                            _ = &mut cancelled => return Ok(()),
+                            result = tokio::time::timeout(
+                                Duration::from_secs(60),
+                                changes.changed(),
+                            ) => matches!(result, Ok(Ok(()))),
+                        };
+                        if changed {
+                            latest_cursor = self.repository.latest_cursor(&group_id).await?;
+                            latest_removed_at_ms =
+                                self.repository.latest_removed_at_ms(&group_id).await?;
+                        }
+                        tokio::time::timeout(
+                            FRAME_WRITE_TIMEOUT,
+                            write_frame(
+                                send,
+                                &Response::GroupChanged {
+                                    latest_cursor: latest_cursor.max(after_cursor),
+                                    latest_removed_at_ms: latest_removed_at_ms
+                                        .max(after_removed_at_ms),
+                                },
+                            ),
+                        )
+                        .await
+                        .context("write watch response timeout")??;
+                    }
+                }
+                .await;
+                self.unregister_watch(&group_id, remote_endpoint_id, watch_generation)
+                    .await;
+                watch_result?;
             }
             Request::ListEvents {
                 group_id,
@@ -290,12 +450,12 @@ impl HubService {
                 {
                     self.repository.list_removed_devices(&group_id).await?
                 } else {
-                    let removed = self
+                    let (removed, changed) = self
                         .repository
                         .merge_removed_devices(&group_id, &devices)
                         .await?;
-                    if !devices.is_empty() {
-                        self.group_notification(&group_id).await.notify_waiters();
+                    if changed {
+                        self.notify_group_change(&group_id).await;
                     }
                     removed
                 };
@@ -321,15 +481,41 @@ impl ProtocolHandler for HubService {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote_endpoint_id = connection.remote_id().to_string();
         debug!(remote = %remote_endpoint_id, "accepted sync connection");
+        let connection_admission = Arc::new(Semaphore::new(8));
+        let connection_requests = Arc::new(Semaphore::new(16));
+        let connection_blobs = Arc::new(Semaphore::new(2));
+        let connection_watches = Arc::new(Semaphore::new(4));
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
                 Err(_) => break,
             };
+            let global_admission = match self.stream_admission.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let connection_admission = match connection_admission.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
             let service = self.clone();
             let remote_endpoint_id = remote_endpoint_id.clone();
+            let connection_requests = connection_requests.clone();
+            let connection_blobs = connection_blobs.clone();
+            let connection_watches = connection_watches.clone();
             tokio::spawn(async move {
-                if let Err(error) = service.handle_stream(&remote_endpoint_id, send, recv).await {
+                if let Err(error) = service
+                    .handle_stream(
+                        &remote_endpoint_id,
+                        send,
+                        recv,
+                        (global_admission, connection_admission),
+                        connection_requests,
+                        connection_blobs,
+                        connection_watches,
+                    )
+                    .await
+                {
                     warn!(?error, "sync stream failed");
                 }
             });
@@ -366,6 +552,10 @@ async fn receive_blob(
         .context("create blob directory")?;
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = destination.with_extension(format!("part-{}-{sequence}", now_ms()));
+    let mut cleanup = TemporaryFileCleanup {
+        path: temporary.clone(),
+        armed: true,
+    };
     let result = async {
         let mut file = tokio::fs::File::create(&temporary)
             .await
@@ -376,9 +566,9 @@ async fn receive_blob(
         while remaining > 0 {
             let requested =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = recv
-                .read(&mut buffer[..requested])
-                .await?
+            let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
+                .await
+                .context("blob upload idle timeout")??
                 .context("blob ended early")?;
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
@@ -393,13 +583,38 @@ async fn receive_blob(
         tokio::fs::rename(&temporary, destination)
             .await
             .context("commit encrypted blob")?;
+        cleanup.armed = false;
         Ok(())
     }
     .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&temporary).await;
-    }
     result
+}
+
+async fn copy_with_idle_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = tokio::time::timeout(idle_timeout, reader.read(&mut buffer))
+            .await
+            .context("blob read idle timeout")??;
+        if read == 0 {
+            break;
+        }
+        tokio::time::timeout(idle_timeout, writer.write_all(&buffer[..read]))
+            .await
+            .context("blob write idle timeout")??;
+        copied += read as u64;
+    }
+    writer.flush().await?;
+    Ok(copied)
 }
 
 fn response_for_error(error: &anyhow::Error) -> Response {

@@ -3,11 +3,16 @@
 //!
 //! 启动参数固定追加 `--auto-launch`，用于识别本次启动来源。
 
+#[cfg(not(target_os = "android"))]
 use std::env;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 
-use crate::core::{AppError, Result};
+#[cfg(not(target_os = "android"))]
+use crate::core::AppError;
+use crate::core::Result;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -19,28 +24,15 @@ use macos::PlatformAutostart;
 #[cfg(target_os = "windows")]
 use windows::PlatformAutostart;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-struct PlatformAutostart;
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-impl PlatformAutostart {
-    fn new(_name: &str, _path: &str) -> Result<Self> {
-        Ok(Self)
-    }
-    fn is_enabled(&self) -> Result<bool> {
-        Ok(false)
-    }
-    fn set_enabled(&self, _enabled: bool) -> Result<()> {
-        Ok(())
-    }
-}
-
+#[cfg(not(target_os = "android"))]
 pub(super) const AUTO_LAUNCH_ARG: &str = "--auto-launch";
 
+#[cfg(not(target_os = "android"))]
 pub struct AutostartManager {
     platform: PlatformAutostart,
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn init(app: &AppHandle) -> Result<()> {
     let exe = env::current_exe().map_err(|err| {
         log::error!("autostart init: current_exe failed: {err}");
@@ -56,27 +48,41 @@ pub fn init(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn is_enabled(app: &AppHandle) -> Result<bool> {
     let manager = app.state::<AutostartManager>();
     manager.platform.is_enabled()
 }
 
+#[cfg(target_os = "android")]
+pub fn is_enabled(_app: &AppHandle) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn set_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
     let manager = app.state::<AutostartManager>();
     manager.platform.set_enabled(enabled)
 }
 
+#[cfg(target_os = "android")]
+pub fn set_enabled(_app: &AppHandle, _enabled: bool) -> Result<()> {
+    Ok(())
+}
+
 /// Align the OS autostart entry with the persisted setting during startup.
+#[cfg(not(target_os = "android"))]
 pub fn sync_enabled(app: &AppHandle, enabled: bool) -> Result<()> {
     set_enabled(app, enabled)
 }
 
 /// 判断进程参数是否来自 EcoPaste 注册的系统自启动项。
+#[cfg(not(target_os = "android"))]
 pub fn is_autostart_launch(args: &[String]) -> bool {
     args.iter().any(|arg| arg == AUTO_LAUNCH_ARG)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::is_autostart_launch;
 

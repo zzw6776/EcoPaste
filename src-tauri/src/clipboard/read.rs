@@ -11,9 +11,15 @@ use clipboard_rs::common::RustImage;
 #[cfg(not(target_os = "android"))]
 use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
 
-use super::payload::{ClipboardPayload, ImagePayload, TextPayload};
-use crate::core::{AppError, Result};
-use crate::settings::{Capture, CaptureKind};
+#[cfg(not(target_os = "android"))]
+use super::payload::ImagePayload;
+use super::payload::{ClipboardPayload, TextPayload};
+#[cfg(not(target_os = "android"))]
+use crate::core::AppError;
+use crate::core::Result;
+use crate::settings::Capture;
+#[cfg(not(target_os = "android"))]
+use crate::settings::CaptureKind;
 
 /// 持有一个 [`ClipboardContext`] 的读取器。轻量，可按需创建；
 /// 监听线程（2.2）会持有一个长生命周期实例复用。
@@ -29,10 +35,6 @@ pub struct ClipboardReader;
 impl ClipboardReader {
     pub fn new() -> Result<Self> {
         Ok(Self)
-    }
-
-    pub fn read_with_capture(&self, _capture: &Capture) -> Result<Option<ClipboardPayload>> {
-        Ok(None)
     }
 
     pub fn read_with_app(
@@ -195,6 +197,7 @@ const PNG_FORMAT: &str = "PNG";
 ///
 /// PNG 布局固定：8 字节签名 + 4 字节 IHDR 长度 + 4 字节 "IHDR" + 宽(大端 u32) + 高(大端 u32)。
 /// 宽高位于偏移 16..24。校验签名与 IHDR 标记，任一不符返回 `None`（交回退路径处理）。
+#[cfg(not(target_os = "android"))]
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if bytes.len() < 24 || bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
@@ -222,6 +225,7 @@ fn read_optional(
 }
 
 /// 判断文本载荷中是否实际带有指定文本族表示。
+#[cfg(not(target_os = "android"))]
 fn text_contains_kind(text: &TextPayload, kind: CaptureKind) -> bool {
     let has_plain = !text.text.trim().is_empty();
 

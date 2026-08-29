@@ -21,6 +21,7 @@ use clipboard_rs::common::RustImage;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 use super::guard::WritebackGuard;
+#[cfg(not(target_os = "android"))]
 use super::storage::ImageStore;
 use crate::core::{AppError, Result};
 use crate::db::items::content_hash;
@@ -49,30 +50,18 @@ pub fn write_to_clipboard(
 }
 
 #[cfg(target_os = "android")]
-pub fn write_to_clipboard(
-    _store: &ImageStore,
-    _guard: &WritebackGuard,
-    _item: &ClipboardItem,
-    _plain: bool,
-) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
 pub fn write_to_clipboard_app(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     guard: &WritebackGuard,
     item: &ClipboardItem,
 ) -> Result<()> {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
     let text = item.search_text.as_deref().unwrap_or(&item.content);
     if !text.is_empty() {
-        // Android 只能写纯文本。HTML/RTF 条目会写入 search_text，因此必须登记
-        // 实际写入文本的哈希，才能与轮询监听器重新读取后计算出的哈希一致。
+        // Android 只能写纯文本。原生写入同时携带本机回环标记，
+        // 事件监听器可在入口直接忽略，guard 仍作为跨平台最后一层保护。
         guard.suppress(content_hash(ClipboardKind::Text, text));
-        app.clipboard()
-            .write_text(text)
-            .map_err(|e| AppError::Clipboard(e.to_string()))?;
+        crate::commands::android::write_android_clipboard_text(text)
+            .map_err(|error| AppError::Clipboard(error.to_string()))?;
     }
     Ok(())
 }

@@ -1,20 +1,32 @@
 //! 拖拽相关命令：把条目作为 OS 级 drag-out 拖出剪贴板窗口到外部应用。
 
+#[cfg(not(target_os = "android"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_os = "android"))]
 use sqlx::SqlitePool;
 use tauri::{AppHandle, State};
 
-use crate::clipboard::{icon_png, FileIconStore, ImageStore};
-use crate::core::{AppError, Result};
+#[cfg(not(target_os = "android"))]
+use crate::clipboard::icon_png;
+use crate::clipboard::{FileIconStore, ImageStore};
+#[cfg(not(target_os = "android"))]
+use crate::core::AppError;
+use crate::core::Result;
+#[cfg(not(target_os = "android"))]
 use crate::db::items::find_item_by_id;
+#[cfg(not(target_os = "android"))]
 use crate::db::models::{ClipboardItem, ClipboardKind, ClipboardSubKind, Platform};
 use crate::db::DatabaseState;
+#[cfg(not(target_os = "android"))]
 use crate::drag_out;
+#[cfg(not(target_os = "android"))]
 use crate::settings::Language;
+#[cfg(not(target_os = "android"))]
 use crate::window::{self, CLIPBOARD_WINDOW_LABEL};
 
 /// 拖拽载荷：按 kind 解析成统一表示，再分派到对应的 drag-out 实现。
+#[cfg(not(target_os = "android"))]
 enum DragPayload {
     /// 文件路径列表（Files / Image kind）。
     Files(Vec<PathBuf>),
@@ -41,6 +53,7 @@ enum DragPayload {
 /// - Windows：`DoDragDrop` 必须在拥有窗口的线程（= Tauri 主线程）跑，否则 `QueryContinueDrag`
 ///   立刻 `DRAGDROP_S_CANCEL`；这里用 `run_on_main_thread` + `mpsc` 同步等待。
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub async fn start_drag_clipboard_item(
     app: AppHandle,
     db: State<'_, DatabaseState>,
@@ -86,7 +99,20 @@ pub async fn start_drag_clipboard_item(
     Ok(())
 }
 
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn start_drag_clipboard_item(
+    _app: AppHandle,
+    _db: State<'_, DatabaseState>,
+    _store: State<'_, ImageStore>,
+    _file_icon_store: State<'_, FileIconStore>,
+    _id: String,
+) -> Result<()> {
+    Ok(())
+}
+
 /// 把 DragPayload 派发到对应的 drag_out::* 实现。
+#[cfg(not(target_os = "android"))]
 fn dispatch_drag(
     window: &tauri::WebviewWindow,
     payload: DragPayload,
@@ -101,6 +127,7 @@ fn dispatch_drag(
 }
 
 /// 解析为统一的拖拽载荷。
+#[cfg(not(target_os = "android"))]
 fn resolve_drag_payload(
     item: &ClipboardItem,
     store: &ImageStore,
@@ -172,6 +199,7 @@ fn resolve_drag_payload(
 ///   退回 [`icon_png`] 做一次性 OS 图标抽取（默认 256px，与缓存一致），不写回 DB。
 /// - Text：返回 None，由 drag_out 平台层基于文本内容现场渲染（保证有辨识度），
 ///   避免用「来源 app 图标」这种所有文本长一样的兜底。
+#[cfg(not(target_os = "android"))]
 async fn build_preview(
     item: &ClipboardItem,
     payload: &DragPayload,
@@ -197,6 +225,7 @@ async fn build_preview(
 
 /// 读 `<thumbnails>/<hash[..2]>/<hash>.png` 字节。首次拖拽且前端未浏览过时缩略图可能不存在，
 /// 此时返回 None 让上层走 icon 回退——不要在这里同步生成（解码大图会卡住拖拽启动）。
+#[cfg(not(target_os = "android"))]
 fn read_image_thumbnail(store: &ImageStore, file_name: &str) -> Option<Vec<u8>> {
     let path = store.thumbnail_path(file_name);
     match std::fs::read(&path) {
@@ -209,6 +238,7 @@ fn read_image_thumbnail(store: &ImageStore, file_name: &str) -> Option<Vec<u8>> 
 }
 
 /// 按文件路径的 cache_key + 当前平台查 `file_type_icons`，命中则读对应 PNG。
+#[cfg(not(target_os = "android"))]
 async fn read_cached_file_icon(
     pool: &SqlitePool,
     store: &FileIconStore,
@@ -237,6 +267,7 @@ async fn read_cached_file_icon(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn current_platform() -> Platform {
     #[cfg(target_os = "macos")]
     {
