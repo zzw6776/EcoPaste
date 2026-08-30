@@ -97,12 +97,12 @@ impl Default for AndroidGesture {
     fn default() -> Self {
         Self {
             enabled: false,
-            hide_overlay: false,
-            popup_height_percent: 60,
-            left_width_dp: 144,
-            left_height_dp: 56,
-            right_width_dp: 144,
-            right_height_dp: 56,
+            hide_overlay: true,
+            popup_height_percent: 64,
+            left_width_dp: 109,
+            left_height_dp: 18,
+            right_width_dp: 106,
+            right_height_dp: 18,
         }
     }
 }

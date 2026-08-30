@@ -789,12 +789,12 @@ object EcoPasteBridge {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return GestureConfig(
             enabled = prefs.getBoolean(KEY_GESTURE_ENABLED, false),
-            hideOverlay = prefs.getBoolean(KEY_GESTURE_HIDE_OVERLAY, false),
-            popupHeightPercent = prefs.getInt(KEY_GESTURE_POPUP_HEIGHT_PERCENT, 60),
-            leftWidthDp = prefs.getInt(KEY_GESTURE_LEFT_WIDTH_DP, 144),
-            leftHeightDp = prefs.getInt(KEY_GESTURE_LEFT_HEIGHT_DP, 56),
-            rightWidthDp = prefs.getInt(KEY_GESTURE_RIGHT_WIDTH_DP, 144),
-            rightHeightDp = prefs.getInt(KEY_GESTURE_RIGHT_HEIGHT_DP, 56),
+            hideOverlay = prefs.getBoolean(KEY_GESTURE_HIDE_OVERLAY, true),
+            popupHeightPercent = prefs.getInt(KEY_GESTURE_POPUP_HEIGHT_PERCENT, 64),
+            leftWidthDp = prefs.getInt(KEY_GESTURE_LEFT_WIDTH_DP, 109),
+            leftHeightDp = prefs.getInt(KEY_GESTURE_LEFT_HEIGHT_DP, 18),
+            rightWidthDp = prefs.getInt(KEY_GESTURE_RIGHT_WIDTH_DP, 106),
+            rightHeightDp = prefs.getInt(KEY_GESTURE_RIGHT_HEIGHT_DP, 18),
         )
     }
 

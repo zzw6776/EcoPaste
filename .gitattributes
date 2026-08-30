@@ -10,6 +10,9 @@
 gradlew text eol=lf
 src-tauri/gen/android/gradlew text eol=lf
 
+# SQLx 按原始字节校验 migration，禁止因平台换行差异改变校验和
+src-tauri/migrations/*.sql text eol=lf
+
 # 二进制不做换行转换
 *.png binary
 *.jpg binary

@@ -666,7 +666,7 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncN
         return;
     };
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
-        manager.notify_connectivity_changed();
+        manager.notify_network_changed();
     }
 }
 

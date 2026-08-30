@@ -372,6 +372,12 @@ mod tests {
         assert!(parsed.general.auto_start);
         assert!(!parsed.general.run_as_admin);
         assert!(!parsed.android.gesture.enabled);
+        assert!(parsed.android.gesture.hide_overlay);
+        assert_eq!(parsed.android.gesture.popup_height_percent, 64);
+        assert_eq!(parsed.android.gesture.left_width_dp, 109);
+        assert_eq!(parsed.android.gesture.left_height_dp, 18);
+        assert_eq!(parsed.android.gesture.right_width_dp, 106);
+        assert_eq!(parsed.android.gesture.right_height_dp, 18);
         assert!(parsed.sync.lan_enabled);
         assert_eq!(
             parsed.sync.cloud_relay_mode,

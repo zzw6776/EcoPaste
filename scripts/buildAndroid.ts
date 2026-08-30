@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { cleanAndroidCacheIfNeeded } from "./buildCache";
 
@@ -23,6 +29,42 @@ const artifactApk = resolve(
 );
 const RETRYABLE_NETWORK_ERROR =
   /Could not (?:GET|download)|Remote host terminated the handshake|Connection reset|Read timed out|Connection timed out/i;
+
+/** 防止 WSL 把宿主相关的构建产物写入 Windows 共享工作区。 */
+function assertWslBuildMounts() {
+  if (process.platform !== "linux") {
+    return;
+  }
+
+  const projectDevice = statSync(projectRoot).dev;
+  if (projectDevice === statSync("/").dev) {
+    return;
+  }
+
+  const isolatedPaths = [
+    resolve(projectRoot, "node_modules"),
+    resolve(projectRoot, "src-tauri/target"),
+    resolve(projectRoot, "src-tauri/gen/android/.gradle"),
+    resolve(projectRoot, "src-tauri/gen/android/build"),
+    resolve(projectRoot, "src-tauri/gen/android/buildSrc/.gradle"),
+    resolve(projectRoot, "src-tauri/gen/android/buildSrc/build"),
+    resolve(projectRoot, "src-tauri/gen/android/app/build"),
+    resolve(projectRoot, "src-tauri/gen/android/hidden-api-stubs/build"),
+    resolve(projectRoot, "src-tauri/gen/android/app/src/main/jniLibs"),
+  ];
+  const sharedPaths = isolatedPaths.filter((path) => {
+    return !existsSync(path) || statSync(path).dev === projectDevice;
+  });
+  if (sharedPaths.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    `WSL Android build directories are not isolated with bind mounts:\n${sharedPaths.join("\n")}\nRun "mount -a" in WSL before building.`,
+  );
+}
+
+assertWslBuildMounts();
 
 /** 运行 pnpm 子命令，并保留终端中的原始构建输出。 */
 async function runPnpm(
