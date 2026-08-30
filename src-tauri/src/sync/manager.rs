@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -323,6 +324,23 @@ impl SyncManager {
         if !watch_online || self.cached_cloud_connection().is_none() {
             self.watch_wake.notify_one();
         }
+    }
+
+    /// Refreshes Iroh before reconnecting after an externally observed network change.
+    pub fn notify_network_changed(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let endpoint = manager
+                .runtime
+                .lock()
+                .await
+                .as_ref()
+                .map(|runtime| runtime.endpoint.clone());
+            if let Some(endpoint) = endpoint {
+                endpoint.network_change().await;
+            }
+            manager.notify_connectivity_changed();
+        });
     }
 
     fn wake_transfer(&self) {
@@ -2509,6 +2527,10 @@ impl SyncManager {
             .bind()
             .await
             .context("failed to bind Iroh sync endpoint")?;
+        if let Some(mdns) = mdns.as_ref() {
+            mdns.set_multicast_interfaces_v4(lan_multicast_interfaces_v4(&endpoint.addr()))
+                .await;
+        }
         self.update_discovery_metadata(&endpoint, settings.lan_enabled)?;
         let router = Router::builder(endpoint.clone())
             .accept(
@@ -3069,9 +3091,14 @@ fn spawn_endpoint_watchers(
     let mut address_stream = endpoint.watch_addr().stream();
     let address_closed = endpoint.closed();
     let address_manager = manager.clone();
+    let address_mdns = mdns.clone();
     tauri::async_runtime::spawn(address_closed.run_until(async move {
         let mut initial = true;
-        while address_stream.next().await.is_some() {
+        while let Some(address) = address_stream.next().await {
+            if let Some(mdns) = address_mdns.as_ref() {
+                mdns.set_multicast_interfaces_v4(lan_multicast_interfaces_v4(&address))
+                    .await;
+            }
             if initial {
                 initial = false;
                 continue;
@@ -3205,6 +3232,23 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
             }
         }
     }
+}
+
+/// Returns every private or link-local IPv4 address on which mDNS should operate.
+fn lan_multicast_interfaces_v4(address: &EndpointAddr) -> BTreeSet<Ipv4Addr> {
+    collect_lan_multicast_interfaces_v4(address.ip_addrs().map(|address| address.ip()))
+}
+
+fn collect_lan_multicast_interfaces_v4(
+    addresses: impl IntoIterator<Item = IpAddr>,
+) -> BTreeSet<Ipv4Addr> {
+    addresses
+        .into_iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(ip) if !ip.is_loopback() && is_lan_ip(ip.into()) => Some(ip),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn cloud_watch_worker(manager: Arc<SyncManager>) {
@@ -4516,6 +4560,27 @@ fn parse_platform(value: &str) -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_multicast_uses_all_private_ipv4_interfaces() {
+        let interfaces = collect_lan_multicast_interfaces_v4([
+            "192.168.50.84".parse().unwrap(),
+            "172.31.128.1".parse().unwrap(),
+            "198.18.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ]);
+
+        assert_eq!(
+            interfaces,
+            [
+                Ipv4Addr::new(172, 31, 128, 1),
+                Ipv4Addr::new(192, 168, 50, 84),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
 
     fn channel(state: SyncChannelState, error: Option<&str>) -> SyncChannelStatus {
         SyncChannelStatus {

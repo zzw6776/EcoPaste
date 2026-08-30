@@ -9,12 +9,12 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
   android: {
     gesture: {
       enabled: false,
-      hideOverlay: false,
-      leftHeightDp: 56,
-      leftWidthDp: 144,
-      popupHeightPercent: 60,
-      rightHeightDp: 56,
-      rightWidthDp: 144,
+      hideOverlay: true,
+      leftHeightDp: 18,
+      leftWidthDp: 109,
+      popupHeightPercent: 64,
+      rightHeightDp: 18,
+      rightWidthDp: 106,
     },
   },
   appearance: {
