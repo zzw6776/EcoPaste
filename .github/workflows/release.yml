@@ -195,10 +195,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Generate Tauri icons
-        run: pnpm build:icon
-        env:
-          PLATFORM: ${{ matrix.os }}
+      - name: Check Tauri icons
+        run: pnpm icons:check
 
       - name: Determine Cargo cache save policy
         id: cargo-cache-policy
