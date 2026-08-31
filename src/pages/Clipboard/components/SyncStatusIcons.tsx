@@ -73,9 +73,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     unlistenRef.current?.();
   });
 
-  function handleWindowVisibility(event: {
-    payload: WindowVisibilityPayload;
-  }) {
+  function handleWindowVisibility(event: { payload: WindowVisibilityPayload }) {
     if (
       event.payload.label !== WINDOW_LABEL.CLIPBOARD ||
       event.payload.visible

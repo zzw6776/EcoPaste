@@ -119,6 +119,9 @@ struct AndroidOverlayClipboardItem {
     preview: String,
     detail: String,
     source_app_name: String,
+    source_app_icon_path: Option<String>,
+    source_app_accent_start: Option<String>,
+    source_app_accent_end: Option<String>,
     display_created_at: String,
     is_favorite: bool,
     is_pinned: bool,
@@ -161,6 +164,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
             .clipboard
             .sensitive
             .redact_secrets;
+        let app_icon_store = app.state::<crate::clipboard::AppIconStore>();
         let items = items
             .into_iter()
             .map(|item| {
@@ -231,6 +235,10 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     .source_app_name
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| "EcoPaste".to_owned());
+                let source_app_icon_path = item
+                    .source_app_icon_file
+                    .as_deref()
+                    .and_then(|name| app_icon_store.icon_path(name).to_str().map(str::to_owned));
                 let detail = match item.kind {
                     ClipboardKind::Image => match (item.width, item.height) {
                         (Some(width), Some(height)) => format!("{width} × {height}"),
@@ -250,6 +258,9 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     preview,
                     detail,
                     source_app_name,
+                    source_app_icon_path,
+                    source_app_accent_start: item.source_app_accent_start,
+                    source_app_accent_end: item.source_app_accent_end,
                     display_created_at,
                     is_favorite: item.is_favorite,
                     is_pinned: item.is_pinned,
@@ -593,6 +604,9 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_captureClip
     raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
     text: jni::sys::jstring,
+    package_name: jni::sys::jstring,
+    app_name: jni::sys::jstring,
+    icon_png: jni::sys::jbyteArray,
 ) -> jni::sys::jboolean {
     let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
         return 0;
@@ -601,8 +615,36 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_captureClip
     let Ok(text) = env.get_string(&text).map(String::from) else {
         return 0;
     };
+    let package_name = jni::objects::JString::from_raw(package_name);
+    let app_name = jni::objects::JString::from_raw(app_name);
+    let package_name = env
+        .get_string(&package_name)
+        .map(String::from)
+        .unwrap_or_default();
+    let app_name = env
+        .get_string(&app_name)
+        .map(String::from)
+        .unwrap_or_default();
+    let icon_png = if icon_png.is_null() {
+        None
+    } else {
+        let icon_png = jni::objects::JByteArray::from_raw(icon_png);
+        env.convert_byte_array(&icon_png)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+    };
+    let source = (!package_name.trim().is_empty()).then(|| crate::clipboard::FrontmostApp {
+        id: package_name.clone(),
+        name: if app_name.trim().is_empty() {
+            package_name
+        } else {
+            app_name
+        },
+        icon_png,
+        platform: crate::db::models::Platform::Android,
+    });
     if let Some(app) = APP_HANDLE.get() {
-        crate::clipboard::capture_android_text(app, text);
+        crate::clipboard::capture_android_text(app, text, source);
         return 1;
     }
     0
@@ -667,6 +709,20 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncN
     };
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
         manager.notify_network_changed();
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncForeground(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.notify_foreground();
     }
 }
 

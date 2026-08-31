@@ -15,7 +15,7 @@ mod storage;
 mod watcher;
 mod write;
 
-pub use app_store::AppIconStore;
+pub use app_store::{fallback_accent_colors, AppIconStore, MAX_APP_ICON_BYTES};
 pub use apps_registry::{
     add_app_from_path, delete_unreferenced_apps, refresh_running_apps, AppsRegistry,
 };
@@ -30,10 +30,13 @@ pub use payload::{ClipboardPayload, ImagePayload, TextPayload};
 pub use read::ClipboardReader;
 pub use sound::play_copy_sound;
 pub use source::detect_frontmost;
+#[cfg(target_os = "android")]
+pub use source::FrontmostApp;
 pub use storage::ImageStore;
 #[cfg(target_os = "android")]
 pub use watcher::capture_android_text;
 pub(crate) use watcher::CLIPBOARD_UPDATED_EVENT;
+pub(crate) const SOURCE_APP_UPDATED_EVENT: &str = "source-app://updated";
 pub use watcher::{init, materialize_source, persist_and_notify, WatcherPause};
 #[cfg(not(target_os = "android"))]
 pub use write::write_to_clipboard;

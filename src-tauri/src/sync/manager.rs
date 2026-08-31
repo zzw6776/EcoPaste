@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock, Weak,
     },
     time::{Duration, Instant},
@@ -37,10 +37,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    clipboard::{ImageStore, WritebackGuard},
+    clipboard::{fallback_accent_colors, AppIconStore, ImageStore, WritebackGuard},
     db::{
         self,
-        models::{ClipboardItem, ClipboardKind, ClipboardSubKind, Platform},
+        models::{ClipboardApp, ClipboardItem, ClipboardKind, ClipboardSubKind, Platform},
     },
     settings::{CloudRelayMode, SettingsStore, SyncSettings},
 };
@@ -54,8 +54,9 @@ use super::{
     model::{
         BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage,
         IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice,
-        NearbySyncSpace, StoredBlob, SyncChannelState, SyncChannelStatus, SyncItemStatus,
-        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
+        NearbySyncSpace, SourceAppRef, SourceIconRef, StoredBlob, StoredSyncEvent,
+        SyncChannelState, SyncChannelStatus, SyncItemStatus, SyncPairingPreview, SyncPeer,
+        SyncStatus, SyncTarget, SyncedClipboardItem,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -72,6 +73,7 @@ const JOIN_ATTEMPT_UPDATED_EVENT: &str = "sync://join-attempt-updated";
 const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -107,6 +109,7 @@ pub struct SyncManager {
     lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
     lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     lan_suspended_peers: RwLock<HashSet<String>>,
+    lan_presence_nonce: AtomicU64,
     nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
     incoming_join_requests: Mutex<HashMap<String, PendingIncomingJoinRequest>>,
     outgoing_join_attempts: RwLock<HashMap<String, NearbyJoinAttempt>>,
@@ -263,6 +266,8 @@ impl Drop for AndroidLanDiscoveryGuard {
 
 pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
     let identity = Arc::new(IdentityStore::load_or_create(app)?);
+    let mut presence_nonce = [0_u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut presence_nonce);
     let manager = Arc::new(SyncManager {
         app: app.clone(),
         identity,
@@ -289,6 +294,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_peer_actors: RwLock::new(HashMap::new()),
         lan_peer_locks: RwLock::new(HashMap::new()),
         lan_suspended_peers: RwLock::new(HashSet::new()),
+        lan_presence_nonce: AtomicU64::new(u64::from_le_bytes(presence_nonce)),
         nearby_devices: RwLock::new(HashMap::new()),
         incoming_join_requests: Mutex::new(HashMap::new()),
         outgoing_join_attempts: RwLock::new(HashMap::new()),
@@ -313,8 +319,13 @@ impl SyncManager {
     /// Reconnects LAN peers and disconnected cloud work after a real network lifecycle event.
     pub fn notify_connectivity_changed(&self) {
         self.resume_all_peers();
+        self.wake_lan_transfer();
+        self.notify_cloud_connectivity_changed();
+    }
+
+    fn notify_cloud_connectivity_changed(&self) {
         self.cloud_force_reconnect.store(true, Ordering::Release);
-        self.wake_transfer();
+        self.wake_cloud_transfer();
         let watch_online = self
             .cloud_watch_status
             .read()
@@ -326,7 +337,35 @@ impl SyncManager {
         }
     }
 
+    /// Refreshes our routes and publishes a new presence without dialing suspended LAN peers.
+    pub fn notify_foreground(self: &Arc<Self>) {
+        self.notify_cloud_connectivity_changed();
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+            if !settings.enabled
+                || !settings.lan_enabled
+                || manager.identity.snapshot().group.is_none()
+            {
+                return;
+            }
+            let endpoint = match manager.ensure_endpoint(&settings).await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    log::debug!("refresh foreground LAN presence failed: {error}");
+                    return;
+                }
+            };
+            endpoint.network_change().await;
+            manager.advance_presence_nonce();
+            if let Err(error) = manager.update_discovery_metadata(&endpoint, true) {
+                log::debug!("publish foreground LAN presence failed: {error}");
+            }
+        });
+    }
+
     /// Refreshes Iroh before reconnecting after an externally observed network change.
+    #[cfg(target_os = "android")]
     pub fn notify_network_changed(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
@@ -338,9 +377,20 @@ impl SyncManager {
                 .map(|runtime| runtime.endpoint.clone());
             if let Some(endpoint) = endpoint {
                 endpoint.network_change().await;
+                let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                if settings.enabled && settings.lan_enabled {
+                    manager.advance_presence_nonce();
+                    if let Err(error) = manager.update_discovery_metadata(&endpoint, true) {
+                        log::debug!("publish changed Android LAN route failed: {error}");
+                    }
+                }
             }
             manager.notify_connectivity_changed();
         });
+    }
+
+    fn advance_presence_nonce(&self) {
+        self.lan_presence_nonce.fetch_add(1, Ordering::AcqRel);
     }
 
     fn wake_transfer(&self) {
@@ -653,13 +703,13 @@ impl SyncManager {
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
             let response = async {
-                let connection = tokio::time::timeout(
-                    Duration::from_secs(8),
-                    endpoint.connect(join_address, JOIN_ALPN),
-                )
+                let connection = tokio::time::timeout(Duration::from_secs(8), async {
+                    let connection = endpoint.connect(join_address, JOIN_ALPN).await?;
+                    ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await?;
+                    Ok::<_, anyhow::Error>(connection)
+                })
                 .await
                 .context("连接附近设备超时")??;
-                ensure_lan_connection(&connection)?;
                 tokio::time::timeout(
                     Duration::from_secs(JOIN_TIMEOUT_SECS) + JOIN_HANDSHAKE_TIMEOUT * 2,
                     call_join(&connection, request),
@@ -1197,6 +1247,9 @@ impl SyncManager {
                 }
             }
         }
+        let source_app = self
+            .build_source_app_ref(item, group, &blob_root, &mut stored_blobs)
+            .await?;
         Ok(Some((
             ClipboardEnvelope {
                 version: 1,
@@ -1215,11 +1268,84 @@ impl SyncManager {
                     created_at_ms: item.created_at.timestamp_millis(),
                     content_hash: item.content_hash.clone(),
                     updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                    source_revision: Some(item.source_revision.clone()),
                 },
                 blobs: manifests,
+                source_app,
             },
             stored_blobs,
         )))
+    }
+
+    /// Builds a privacy-preserving source reference and reuses the existing blob transport.
+    async fn build_source_app_ref(
+        &self,
+        item: &ClipboardItem,
+        group: &GroupSecrets,
+        blob_root: &Path,
+        stored_blobs: &mut Vec<StoredBlob>,
+    ) -> Result<Option<SourceAppRef>> {
+        let Some(app_id) = item.source_app_id.as_deref() else {
+            return Ok(None);
+        };
+        let pool = self.pool().await;
+        let Some(mut app) = db::apps::find_app_by_id(&pool, app_id).await? else {
+            return Ok(None);
+        };
+        let key = group.content_key_bytes()?;
+        let source_key = source_app_key(&key, app.platform, &app.id);
+        let mut icon_ref = None;
+        if let Some(icon_file) = app.icon_file.clone() {
+            let store = self.app.state::<AppIconStore>();
+            match store.refresh_metadata(&icon_file) {
+                Ok(metadata) => {
+                    app.icon_file = Some(metadata.file_name.clone());
+                    app.icon_hash = Some(metadata.icon_hash.clone());
+                    app.accent_start = Some(metadata.accent_start.clone());
+                    app.accent_end = Some(metadata.accent_end.clone());
+                    if let Err(error) = db::apps::upsert_app(&pool, &app).await {
+                        log::warn!("persist normalized source app icon metadata failed: {error}");
+                    }
+                    let source = store.icon_path(&metadata.file_name);
+                    let root = blob_root.to_path_buf();
+                    let hash = metadata.icon_hash.clone();
+                    let encrypted = tauri::async_runtime::spawn_blocking(move || {
+                        crypto::encrypt_stable_blob(&source, &root, &key, &hash)
+                    })
+                    .await;
+                    match encrypted {
+                        Ok(Ok(blob)) => {
+                            icon_ref = Some(SourceIconRef {
+                                icon_hash: metadata.icon_hash,
+                                blob_id: blob.blob_id.clone(),
+                                original_size: metadata.original_size,
+                                encrypted_size: blob.size,
+                            });
+                            stored_blobs.push(blob);
+                        }
+                        Ok(Err(error)) => {
+                            log::warn!("encrypt source app icon failed: {error}");
+                        }
+                        Err(error) => {
+                            log::warn!("source app icon encryption task failed: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!("normalize source app icon {icon_file} failed: {error}");
+                }
+            }
+        }
+        let (fallback_start, fallback_end) = fallback_accent_colors(&source_key);
+        Ok(Some(SourceAppRef {
+            version: 1,
+            source_key,
+            platform: platform_string(app.platform).to_owned(),
+            display_name: sanitize_source_app_name(&app.name),
+            icon: icon_ref,
+            accent_start: Some(app.accent_start.unwrap_or(fallback_start)),
+            accent_end: Some(app.accent_end.unwrap_or(fallback_end)),
+        }))
     }
 
     /// Creates sync events for the latest local history once per sync space.
@@ -1925,15 +2051,17 @@ impl SyncManager {
                 .iter()
                 .map(|item| item.event.event_id.clone())
                 .collect::<Vec<_>>();
+            let source_icon_blob_ids = source_icon_blob_ids(&pending, &group.content_key_bytes()?);
             repository::mark_delivery_syncing(&pool, target_id, &event_ids).await?;
             self.emit_updated();
             let result = async {
-                upload_blobs(
-                    connection,
-                    group,
-                    repository::blobs_for_events(&pool, &event_ids).await?,
-                )
-                .await?;
+                let blobs = repository::blobs_for_events(&pool, &event_ids).await?;
+                let (required_blobs, source_icon_blobs) =
+                    split_source_icon_blobs(blobs, &source_icon_blob_ids);
+                upload_blobs(connection, group, required_blobs).await?;
+                if let Err(error) = upload_blobs(connection, group, source_icon_blobs).await {
+                    log::warn!("publish optional source app icons failed: {error}");
+                }
                 call(
                     connection,
                     Request::Sync {
@@ -1992,6 +2120,8 @@ impl SyncManager {
                 break;
             }
         }
+        self.refresh_source_app_assets(Some(connection), group)
+            .await?;
         Ok(cursor)
     }
 
@@ -2123,11 +2253,31 @@ impl SyncManager {
                 });
             }
             repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
+            let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
             let item_id = self.apply_envelope(&event, envelope, group).await?;
             repository::link_event_to_item(&pool, &item_id, &event.event_id, "remote").await?;
             self.reconcile_item_timestamps(&pool, group, &item_id)
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
+            if let Some(icon) = source_icon {
+                match self
+                    .ensure_source_icon_blob(Some(connection), group, &icon)
+                    .await
+                {
+                    Ok(blob) => {
+                        repository::attach_event_blobs(&pool, &event.event_id, &[blob]).await?;
+                    }
+                    Err(error) => {
+                        log::warn!("source app icon blob remains pending: {error}");
+                    }
+                }
+                if let Err(error) = self
+                    .refresh_source_app_assets(Some(connection), group)
+                    .await
+                {
+                    log::warn!("refresh source app icons failed: {error}");
+                }
+            }
             #[cfg(target_os = "android")]
             {
                 applied_any = true;
@@ -2264,6 +2414,26 @@ impl SyncManager {
             }
         };
         let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
+        let source_revision = envelope
+            .item
+            .source_revision
+            .clone()
+            .unwrap_or_else(|| event.event_id.clone());
+        let pool = self.pool().await;
+        let source_app_id = if let Some(source_app) = envelope.source_app.as_ref() {
+            match self
+                .resolve_received_source_app(&pool, group, source_app, updated_at, &source_revision)
+                .await
+            {
+                Ok(app_id) => Some(app_id),
+                Err(error) => {
+                    log::warn!("ignore invalid synchronized source app: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let item = ClipboardItem {
             id: uuid::Uuid::new_v4().to_string(),
             kind,
@@ -2274,7 +2444,8 @@ impl SyncManager {
                 .map(parse_sub_kind)
                 .transpose()?,
             group_id: None,
-            source_app_id: None,
+            source_app_id,
+            source_revision,
             content_hash: if kind == ClipboardKind::Files {
                 db::items::content_hash(kind, &content)
             } else {
@@ -2298,6 +2469,8 @@ impl SyncManager {
             source_app_name: None,
             source_app_icon_file: None,
             source_app_icon_path: None,
+            source_app_accent_start: None,
+            source_app_accent_end: None,
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
@@ -2305,7 +2478,6 @@ impl SyncManager {
             color_preview: None,
             display_created_at: String::new(),
         };
-        let pool = self.pool().await;
         let result = db::items::upsert_synced_item(&pool, &item).await?;
         self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
         if self
@@ -2329,6 +2501,209 @@ impl SyncManager {
             )?;
         }
         Ok(result.id)
+    }
+
+    /// Creates or refreshes the local alias before the clipboard row references it.
+    async fn resolve_received_source_app(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        source: &SourceAppRef,
+        source_updated_at: chrono::DateTime<Utc>,
+        source_revision: &str,
+    ) -> Result<String> {
+        validate_source_app_ref(source)?;
+        let icon = source
+            .icon
+            .as_ref()
+            .filter(|icon| validate_source_icon_ref(icon).is_ok());
+        let icon_file = icon.and_then(|icon| {
+            self.app
+                .state::<AppIconStore>()
+                .icon_file_for_hash(&icon.icon_hash)
+        });
+        let icon_hash = icon_file
+            .as_ref()
+            .and_then(|_| icon.map(|icon| icon.icon_hash.clone()));
+        let now = Utc::now();
+        let app = ClipboardApp {
+            id: String::new(),
+            name: sanitize_source_app_name(&source.display_name),
+            icon_file,
+            icon_hash,
+            accent_start: source.accent_start.clone(),
+            accent_end: source.accent_end.clone(),
+            platform: parse_platform(&source.platform),
+            created_at: now,
+            updated_at: now,
+        };
+        let icon = icon.map(|icon| {
+            (
+                icon.icon_hash.as_str(),
+                icon.blob_id.as_str(),
+                icon.original_size,
+                icon.encrypted_size,
+            )
+        });
+        let app = db::apps::resolve_synced_app(
+            pool,
+            &group.group_id,
+            &source.source_key,
+            app,
+            icon,
+            source_updated_at,
+            source_revision,
+        )
+        .await?;
+        Ok(app.id)
+    }
+
+    /// Retries all missing source icons through the currently available peer or Hub connection.
+    async fn refresh_source_app_assets(
+        &self,
+        connection: Option<&Connection>,
+        group: &GroupSecrets,
+    ) -> Result<()> {
+        let pool = self.pool().await;
+        let store = self.app.state::<AppIconStore>();
+        for asset in db::apps::source_app_assets(&pool, &group.group_id).await? {
+            if asset.is_attached && store.icon_file_for_hash(&asset.icon_hash).is_some() {
+                continue;
+            }
+            if let Err(error) = self
+                .refresh_source_app_asset(connection, group, &pool, &asset)
+                .await
+            {
+                log::debug!(
+                    "source app icon {} remains pending: {error}",
+                    asset.icon_hash
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_source_app_asset(
+        &self,
+        connection: Option<&Connection>,
+        group: &GroupSecrets,
+        pool: &SqlitePool,
+        asset: &db::apps::SourceAppAsset,
+    ) -> Result<()> {
+        let icon = SourceIconRef {
+            icon_hash: asset.icon_hash.clone(),
+            blob_id: asset.blob_id.clone(),
+            original_size: asset.original_size,
+            encrypted_size: asset.encrypted_size,
+        };
+        let blob = self
+            .ensure_source_icon_blob(connection, group, &icon)
+            .await?;
+        let encrypted = PathBuf::from(&blob.encrypted_path);
+
+        let store = self.app.state::<AppIconStore>();
+        let metadata = match store.synced_metadata_for_hash(&asset.icon_hash) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                let temporary = tempfile::tempdir()?;
+                let destination = temporary.path().join("source-icon.png");
+                let encrypted_for_task = encrypted.clone();
+                let destination_for_task = destination.clone();
+                let key = group.content_key_bytes()?;
+                let original_size = asset.original_size;
+                tauri::async_runtime::spawn_blocking(move || {
+                    crypto::decrypt_blob(
+                        &encrypted_for_task,
+                        &destination_for_task,
+                        original_size,
+                        &key,
+                    )
+                })
+                .await
+                .context("source app icon decryption task failed")??;
+                let bytes = fs::read(destination)?;
+                store.store_synced_png(&bytes, &asset.icon_hash)?
+            }
+        };
+        let updated = db::apps::update_synced_app_icon(
+            pool,
+            &asset.app_id,
+            &metadata.file_name,
+            &metadata.icon_hash,
+            &metadata.accent_start,
+            &metadata.accent_end,
+        )
+        .await?;
+        if !updated {
+            return Ok(());
+        }
+        if let Err(error) = self.app.emit(
+            crate::clipboard::SOURCE_APP_UPDATED_EVENT,
+            serde_json::json!({ "appId": asset.app_id }),
+        ) {
+            log::warn!("emit source app update failed: {error}");
+        }
+        #[cfg(target_os = "android")]
+        crate::commands::android::notify_overlay_clipboard_changed();
+        Ok(())
+    }
+
+    async fn ensure_source_icon_blob(
+        &self,
+        connection: Option<&Connection>,
+        group: &GroupSecrets,
+        icon: &SourceIconRef,
+    ) -> Result<StoredBlob> {
+        validate_source_icon_ref(icon)?;
+        let manifest = BlobManifest {
+            blob_id: icon.blob_id.clone(),
+            name: format!("{}.png", icon.icon_hash),
+            original_size: icon.original_size,
+            encrypted_size: icon.encrypted_size,
+            role: BlobRole::Image,
+            file_index: None,
+            is_directory_archive: false,
+        };
+        let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
+        let encrypted = crypto::blob_path(&root, &icon.blob_id)?;
+        if encrypted.is_file() {
+            let is_valid = encrypted.metadata()?.len() == icon.encrypted_size
+                && crypto::hash_file(&encrypted)? == icon.blob_id;
+            if is_valid {
+                return Ok(StoredBlob {
+                    blob_id: icon.blob_id.clone(),
+                    encrypted_path: encrypted.to_string_lossy().into_owned(),
+                    size: icon.encrypted_size,
+                });
+            }
+            fs::remove_file(&encrypted)
+                .with_context(|| format!("remove invalid source icon blob {encrypted:?}"))?;
+        }
+
+        let store = self.app.state::<AppIconStore>();
+        if let Some(file_name) = store.icon_file_for_hash(&icon.icon_hash) {
+            let source = store.icon_path(&file_name);
+            let root_for_task = root.clone();
+            let key = group.content_key_bytes()?;
+            let icon_hash = icon.icon_hash.clone();
+            let blob = tauri::async_runtime::spawn_blocking(move || {
+                crypto::encrypt_stable_blob(&source, &root_for_task, &key, &icon_hash)
+            })
+            .await
+            .context("cached source app icon encryption task failed")??;
+            if blob.blob_id == icon.blob_id && blob.size == icon.encrypted_size {
+                return Ok(blob);
+            }
+            log::warn!("cached source app icon does not match synchronized blob reference");
+        }
+
+        let connection = connection.context("source app icon blob is unavailable")?;
+        download_blob(connection, group, &manifest, &encrypted).await?;
+        Ok(StoredBlob {
+            blob_id: icon.blob_id.clone(),
+            encrypted_path: encrypted.to_string_lossy().into_owned(),
+            size: icon.encrypted_size,
+        })
     }
 
     fn announcement(&self, endpoint: &Endpoint) -> PeerAnnouncement {
@@ -2369,6 +2744,7 @@ impl SyncManager {
                 space_id: discovery_space_id(group)?,
                 device_name: identity.device_name.clone(),
                 platform: std::env::consts::OS.into(),
+                presence_nonce: Some(self.lan_presence_nonce.load(Ordering::Acquire)),
             }),
             _ => None,
         };
@@ -3028,19 +3404,19 @@ async fn lan_peer_worker(manager: Arc<SyncManager>, device_id: String, actor: Ar
         if connection_ready && !force_connect && !pending_work {
             continue;
         }
-        if !force_connect && !pending_work {
-            continue;
-        }
         let suspended = manager
             .lan_suspended_peers
             .read()
             .expect("LAN suspended peers poisoned")
             .contains(&device_id);
+        if !should_run_lan_peer_cycle(force_connect, pending_work, suspended) {
+            continue;
+        }
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled {
             continue;
         }
-        if suspended {
+        if force_connect {
             manager.clear_peer_suspension(&device_id);
         }
         match manager
@@ -3063,6 +3439,11 @@ async fn lan_peer_worker(manager: Arc<SyncManager>, device_id: String, actor: Ar
     }
 }
 
+/// Pending clipboard work must not turn an offline peer back into a polling loop.
+fn should_run_lan_peer_cycle(force_connect: bool, pending_work: bool, suspended: bool) -> bool {
+    (force_connect || pending_work) && (!suspended || force_connect)
+}
+
 /// Connects only to the explicit LAN routes supplied by mDNS/cached peer metadata.
 async fn connect_peer(
     endpoint: &Endpoint,
@@ -3072,12 +3453,15 @@ async fn connect_peer(
     if cached_address.is_empty() {
         bail!("当前没有可用的局域网地址");
     }
-    match tokio::time::timeout(total_timeout, endpoint.connect(cached_address, ALPN)).await {
-        Ok(Ok(connection)) => {
-            ensure_lan_connection(&connection)?;
-            Ok(connection)
-        }
-        Ok(Err(error)) => Err(error.into()),
+    match tokio::time::timeout(total_timeout, async {
+        let connection = endpoint.connect(cached_address, ALPN).await?;
+        ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await?;
+        Ok::<_, anyhow::Error>(connection)
+    })
+    .await
+    {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(error),
         Err(_) => bail!("连接超时"),
     }
 }
@@ -3187,7 +3571,8 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
             metadata,
             address,
         } => {
-            let newly_discovered = if let Some(metadata) = metadata {
+            let (newly_discovered, presence_changed) = if let Some(metadata) = metadata {
+                let presence_nonce = metadata.presence_nonce;
                 let previous = manager
                     .nearby_devices
                     .write()
@@ -3201,9 +3586,12 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
                         },
                     );
                 manager.nearby_wake.notify_waiters();
-                previous.is_none()
+                let presence_changed = previous.as_ref().is_some_and(|entry| {
+                    presence_nonce_changed(entry.metadata.presence_nonce, presence_nonce)
+                });
+                (previous.is_none(), presence_changed)
             } else {
-                false
+                (false, false)
             };
             let direct_addresses = address
                 .ip_addrs()
@@ -3215,13 +3603,15 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
                 &pool,
                 &endpoint_id,
                 &direct_addresses,
-                newly_discovered,
+                newly_discovered || presence_changed,
             )
             .await
             {
                 Ok(routes_changed) => {
                     match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
-                        Ok(Some(device_id)) if routes_changed || newly_discovered => {
+                        Ok(Some(device_id))
+                            if routes_changed || newly_discovered || presence_changed =>
+                        {
                             manager.resume_peer_from_discovery(&device_id);
                         }
                         Ok(_) => {}
@@ -3232,6 +3622,10 @@ async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent)
             }
         }
     }
+}
+
+fn presence_nonce_changed(previous: Option<u64>, current: Option<u64>) -> bool {
+    current.is_some() && previous != current
 }
 
 /// Returns every private or link-local IPv4 address on which mDNS should operate.
@@ -3511,7 +3905,7 @@ impl ProtocolHandler for JoinService {
         let Some(manager) = self.manager.upgrade() else {
             return Ok(());
         };
-        if let Err(error) = ensure_lan_connection(&connection) {
+        if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
             log::warn!("rejected non-LAN join connection: {error}");
             return Ok(());
         }
@@ -3714,7 +4108,7 @@ impl ProtocolHandler for PeerService {
         let Some(manager) = self.manager.upgrade() else {
             return Ok(());
         };
-        if let Err(error) = ensure_lan_connection(&connection) {
+        if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
             log::warn!("rejected non-LAN sync connection: {error}");
             return Ok(());
         }
@@ -3953,6 +4347,7 @@ async fn dispatch_peer(
                     });
                 }
                 if all_blobs_available {
+                    let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
                     repository::attach_event_blobs(&pool, &stored.event.event_id, &blobs).await?;
                     if let Ok(item_id) = manager
                         .apply_envelope(&stored.event, envelope, &group)
@@ -3973,6 +4368,20 @@ async fn dispatch_peer(
                         repository::mark_applied(&pool, &stored.event.event_id)
                             .await
                             .ok();
+                        if let Some(icon) = source_icon {
+                            if let Ok(blob) =
+                                manager.ensure_source_icon_blob(None, &group, &icon).await
+                            {
+                                repository::attach_event_blobs(
+                                    &pool,
+                                    &stored.event.event_id,
+                                    &[blob],
+                                )
+                                .await
+                                .ok();
+                            }
+                            manager.refresh_source_app_assets(None, &group).await.ok();
+                        }
                         #[cfg(target_os = "android")]
                         {
                             applied_any = true;
@@ -4176,6 +4585,25 @@ async fn upload_blob(
     }
 }
 
+/// Separates best-effort source icons from blobs required to apply clipboard content.
+fn split_source_icon_blobs(
+    blobs: Vec<StoredBlob>,
+    source_icon_blob_ids: &HashSet<String>,
+) -> (Vec<StoredBlob>, Vec<StoredBlob>) {
+    blobs
+        .into_iter()
+        .partition(|blob| !source_icon_blob_ids.contains(&blob.blob_id))
+}
+
+fn source_icon_blob_ids(events: &[StoredSyncEvent], key: &[u8; 32]) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|stored| crypto::decrypt_event(key, &stored.event).ok())
+        .filter_map(|envelope| envelope.source_app.as_ref().and_then(valid_source_icon))
+        .map(|icon| icon.blob_id)
+        .collect()
+}
+
 /// Uploads independent encrypted blobs over a small number of parallel QUIC streams.
 async fn upload_blobs(
     connection: &Connection,
@@ -4329,14 +4757,20 @@ fn connection_path(connection: &Connection) -> (Option<String>, Option<&'static 
     (Some(path.remote_addr().to_string()), Some(transport))
 }
 
-fn ensure_lan_connection(connection: &Connection) -> Result<()> {
-    let paths = connection.paths();
-    let path = paths
-        .iter()
-        .find(|path| path.is_selected())
-        .context("连接没有可用路径")?;
+async fn ensure_lan_connection(connection: &Connection, selection_timeout: Duration) -> Result<()> {
+    let mut paths = connection.paths_stream();
+    tokio::time::timeout(selection_timeout, async {
+        while let Some(paths) = paths.next().await {
+            let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+                continue;
+            };
 
-    ensure_lan_transport_addr(path.remote_addr())
+            return ensure_lan_transport_addr(path.remote_addr());
+        }
+        bail!("连接已关闭")
+    })
+    .await
+    .context("连接没有可用路径")?
 }
 
 /// 校验 Iroh 的结构化传输地址，避免把 `ip:地址` 展示文本误当作 SocketAddr 解析。
@@ -4427,6 +4861,84 @@ fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_source_app_ref(source: &SourceAppRef) -> Result<()> {
+    if source.version != 1
+        || !is_hex_identifier(&source.source_key)
+        || source.display_name.trim().is_empty()
+        || source.display_name.chars().count() > 100
+        || source.display_name.chars().any(char::is_control)
+    {
+        bail!("invalid synchronized source app");
+    }
+    if !matches!(source.platform.as_str(), "macos" | "windows" | "android") {
+        bail!("invalid synchronized source app platform");
+    }
+    for accent in [source.accent_start.as_deref(), source.accent_end.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !is_hex_color(accent) {
+            bail!("invalid synchronized source app accent");
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_icon_ref(icon: &SourceIconRef) -> Result<()> {
+    if !is_hex_identifier(&icon.icon_hash)
+        || !is_hex_identifier(&icon.blob_id)
+        || icon.original_size == 0
+        || icon.original_size > crate::clipboard::MAX_APP_ICON_BYTES as u64
+        || icon.encrypted_size == 0
+        || icon.encrypted_size > crate::clipboard::MAX_APP_ICON_BYTES as u64 + 128
+    {
+        bail!("invalid synchronized source app icon");
+    }
+    Ok(())
+}
+
+fn valid_source_icon(source: &SourceAppRef) -> Option<SourceIconRef> {
+    validate_source_app_ref(source).ok()?;
+    let icon = source.icon.as_ref()?;
+    validate_source_icon_ref(icon).ok()?;
+    Some(icon.clone())
+}
+
+fn is_hex_identifier(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn source_app_key(key: &[u8; 32], platform: Platform, local_id: &str) -> String {
+    let source_key_key = blake3::derive_key("EcoPaste source application key v1", key);
+    let mut input = Vec::with_capacity(local_id.len() + 16);
+    input.extend_from_slice(platform_string(platform).as_bytes());
+    input.push(0);
+    input.extend_from_slice(local_id.as_bytes());
+    blake3::keyed_hash(&source_key_key, &input)
+        .to_hex()
+        .to_string()
+}
+
+fn sanitize_source_app_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(100)
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        "Unknown".to_owned()
+    } else {
+        sanitized.to_owned()
+    }
 }
 
 fn cloud_record(
@@ -4674,6 +5186,71 @@ mod tests {
     }
 
     #[test]
+    fn suspended_lan_peer_requires_an_explicit_wake_event() {
+        assert!(!should_run_lan_peer_cycle(false, true, true));
+        assert!(should_run_lan_peer_cycle(true, false, true));
+        assert!(should_run_lan_peer_cycle(false, true, false));
+        assert!(!should_run_lan_peer_cycle(false, false, false));
+    }
+
+    #[test]
+    fn only_a_new_presence_nonce_wakes_an_existing_peer() {
+        assert!(presence_nonce_changed(Some(1), Some(2)));
+        assert!(presence_nonce_changed(None, Some(1)));
+        assert!(!presence_nonce_changed(Some(1), Some(1)));
+        assert!(!presence_nonce_changed(Some(1), None));
+    }
+
+    #[test]
+    fn source_icon_is_used_only_when_the_complete_source_reference_is_valid() {
+        let icon = SourceIconRef {
+            icon_hash: "1".repeat(64),
+            blob_id: "2".repeat(64),
+            original_size: 128,
+            encrypted_size: 192,
+        };
+        let mut source = SourceAppRef {
+            version: 1,
+            source_key: "3".repeat(64),
+            platform: "macos".into(),
+            display_name: "Example".into(),
+            icon: Some(icon.clone()),
+            accent_start: Some("#112233".into()),
+            accent_end: Some("#445566".into()),
+        };
+
+        assert_eq!(valid_source_icon(&source), Some(icon));
+
+        source.display_name.clear();
+        assert_eq!(valid_source_icon(&source), None);
+    }
+
+    #[test]
+    fn source_icon_blobs_are_separated_from_required_content() {
+        let required = StoredBlob {
+            blob_id: "required".into(),
+            encrypted_path: "required.bin".into(),
+            size: 10,
+        };
+        let source_icon = StoredBlob {
+            blob_id: "source-icon".into(),
+            encrypted_path: "source-icon.bin".into(),
+            size: 20,
+        };
+        let source_icon_ids = HashSet::from([source_icon.blob_id.clone()]);
+
+        let (required_blobs, source_icon_blobs) = split_source_icon_blobs(
+            vec![required.clone(), source_icon.clone()],
+            &source_icon_ids,
+        );
+
+        assert_eq!(required_blobs.len(), 1);
+        assert_eq!(required_blobs[0].blob_id, required.blob_id);
+        assert_eq!(source_icon_blobs.len(), 1);
+        assert_eq!(source_icon_blobs[0].blob_id, source_icon.blob_id);
+    }
+
+    #[test]
     fn cloud_record_keeps_complete_sensitive_content_and_image_path() {
         let content = "secret-token-".repeat(20);
         let event = EncryptedEvent {
@@ -4701,8 +5278,10 @@ mod tests {
                 created_at_ms: 1_700_000_000_000,
                 content_hash: "hash".into(),
                 updated_at_ms: Some(1_700_000_000_000),
+                source_revision: Some("revision".into()),
             },
             blobs: Vec::new(),
+            source_app: None,
         };
 
         let record = cloud_record(

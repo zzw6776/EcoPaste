@@ -43,6 +43,8 @@ pub struct ClipboardItem {
     /// 监听 / 命令链路若未能取到前台应用则为 `None`。引用 `clipboard_apps(id)`，
     /// 删除应用记录时置 NULL，不会级联删条目。
     pub source_app_id: Option<String>,
+    /// 同内容多来源冲突的稳定决胜字段；同步事件必须原样携带。
+    pub source_revision: String,
     pub content: String,
     /// 去重指纹：`blake3(kind:content)`，由 `db::items::content_hash` 计算并在入库前比对。
     pub content_hash: String,
@@ -82,6 +84,13 @@ pub struct ClipboardItem {
     #[sqlx(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_app_icon_path: Option<String>,
+    /// Rust 统一计算的来源应用渐变色；Web 与 Android 原生层只负责应用。
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_app_accent_start: Option<String>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_app_accent_end: Option<String>,
     /// Image 类型条目的缩略图绝对路径；命令层按需确保缩略图存在后回填，
     /// 前端可直接 `convertFileSrc` 渲染，避免逐条再发取图命令。
     #[sqlx(default)]
@@ -181,6 +190,9 @@ pub struct ClipboardApp {
     pub name: String,
     /// `app-icons/<hash>.png` 形式的文件名（无分片目录前缀）；无图标则 `None`。
     pub icon_file: Option<String>,
+    pub icon_hash: Option<String>,
+    pub accent_start: Option<String>,
+    pub accent_end: Option<String>,
     pub platform: Platform,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

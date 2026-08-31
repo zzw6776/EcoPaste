@@ -19,6 +19,7 @@ export const LOCAL_SVG_ICONS: Record<string, string> = {
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="22" height="22" x="1" y="1" rx="5.5" fill="%23A855F7"/><circle cx="12" cy="12" r="3.5" fill="white"/></svg>',
   finder:
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="22" height="22" x="1" y="1" rx="5.5" fill="%233B82F6"/><path d="M8 8v4c0 2 4 2 4 0V8m4 0v4c0 2-4 2-4 0" stroke="white" stroke-width="2" fill="none"/></svg>',
+  link: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="%232B8FF7"/><path d="M10.2 13.8l3.6-3.6m-5.7 6.3-1.2 1.2a3.4 3.4 0 0 1-4.8-4.8l3-3a3.4 3.4 0 0 1 4.8 0m4.2 4.2a3.4 3.4 0 0 0 4.8 0l3-3a3.4 3.4 0 0 0-4.8-4.8l-1.2 1.2" stroke="white" stroke-width="2" fill="none" stroke-linecap="round"/></svg>',
   notes:
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="22" height="22" x="1" y="1" rx="5.5" fill="%23F59E0B"/><path d="M6 8h12M6 12h12M6 16h8" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>',
   safari:
@@ -47,9 +48,8 @@ export function parseUrlInfo(urlStr?: string | null) {
       return {
         headerBg: "linear-gradient(135deg, #10B981 0%, #059669 100%)",
         host,
-        iconUrl: LOCAL_SVG_ICONS.yuque,
+        iconUrl: LOCAL_SVG_ICONS.link,
         name: "语雀文档",
-        pathname: parsed.pathname + parsed.search,
       };
     }
 
@@ -57,18 +57,16 @@ export function parseUrlInfo(urlStr?: string | null) {
       return {
         headerBg: "linear-gradient(135deg, #24292F 0%, #0D1117 100%)",
         host,
-        iconUrl: LOCAL_SVG_ICONS.chatgpt,
+        iconUrl: LOCAL_SVG_ICONS.link,
         name: "GitHub",
-        pathname: parsed.pathname + parsed.search,
       };
     }
 
     return {
       headerBg: "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
       host,
-      iconUrl: LOCAL_SVG_ICONS.chrome,
+      iconUrl: LOCAL_SVG_ICONS.link,
       name: host,
-      pathname: parsed.pathname + parsed.search,
     };
   } catch {
     return null;
@@ -133,7 +131,7 @@ export function getAppTheme(
       headerBg:
         urlInfo?.headerBg ??
         "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
-      iconUrl: urlInfo?.iconUrl ?? LOCAL_SVG_ICONS.chrome,
+      iconUrl: urlInfo?.iconUrl ?? LOCAL_SVG_ICONS.link,
       isPreset: true,
       tag,
     };

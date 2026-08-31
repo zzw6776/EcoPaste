@@ -15,6 +15,10 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(not(target_os = "android"))]
         Key::DragTextEmpty => "文本内容为空",
         Key::ExternalUrlUnsupported => "只能打开 http 或 https 开头的链接",
+        #[cfg(target_os = "macos")]
+        Key::PasteAccessibilityRequired => {
+            "请在“系统设置 → 隐私与安全性 → 辅助功能”中允许 EcoPaste，然后重新粘贴"
+        }
         Key::SaveImage => "保存图片",
     }
 }

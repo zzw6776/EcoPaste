@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::anyhow;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::app_store::AppIconStore;
 use crate::core::{AppError, Result};
@@ -43,11 +43,44 @@ impl AppsRegistry {
     /// 把 DB 中已有的应用全部装进缓存。启动期调用一次，覆盖任何旧缓存内容。
     pub async fn load_from_db(&self) -> Result<()> {
         let pool = self.pool().await;
-        let all = apps::list_all_apps(&pool).await?;
+        let mut all = apps::list_all_apps(&pool).await?;
+        let mut refreshed = false;
+        for app in &mut all {
+            if app.icon_hash.is_some() && app.accent_start.is_some() && app.accent_end.is_some() {
+                continue;
+            }
+            let Some(icon_file) = app.icon_file.as_deref() else {
+                continue;
+            };
+            match self.icon_store.refresh_metadata(icon_file) {
+                Ok(metadata) => {
+                    app.icon_file = Some(metadata.file_name);
+                    app.icon_hash = Some(metadata.icon_hash);
+                    app.accent_start = Some(metadata.accent_start);
+                    app.accent_end = Some(metadata.accent_end);
+                    apps::upsert_app(&pool, app).await?;
+                    refreshed = true;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "refresh cached app icon metadata for {} failed: {error}",
+                        app.id
+                    );
+                }
+            }
+        }
         let mut cache = self.cache.write().expect("apps registry cache poisoned");
         cache.clear();
         for app in all {
             cache.insert(app.id.clone(), app);
+        }
+        drop(cache);
+        if refreshed {
+            if let Err(error) = self.app.emit(super::SOURCE_APP_UPDATED_EVENT, ()) {
+                log::warn!("emit source app metadata backfill update failed: {error}");
+            }
+            #[cfg(target_os = "android")]
+            crate::commands::android::notify_overlay_clipboard_changed();
         }
         Ok(())
     }
@@ -136,26 +169,43 @@ fn materialize_metas(registry: &AppsRegistry, metas: Vec<ScannedAppMeta>) -> Vec
     let mut apps_out = Vec::with_capacity(metas.len());
 
     for meta in metas {
-        let existing_icon = registry.get(&meta.id).and_then(|app| app.icon_file);
-        let icon_file = match existing_icon {
-            Some(icon_file) => Some(icon_file),
+        let existing = registry.get(&meta.id);
+        let icon = match existing.as_ref().and_then(|app| app.icon_file.as_ref()) {
+            Some(_) => None,
             None => meta
                 .path
                 .as_deref()
                 .and_then(|path| super::icon::icon_png(path, None))
                 .as_deref()
-                .and_then(|bytes| match registry.icon_store.store(bytes) {
-                    Ok(name) => Some(name),
-                    Err(err) => {
-                        log::warn!("app icon store failed for {}: {err}", meta.id);
-                        None
-                    }
-                }),
+                .and_then(
+                    |bytes| match registry.icon_store.store_with_metadata(bytes) {
+                        Ok(icon) => Some(icon),
+                        Err(err) => {
+                            log::warn!("app icon store failed for {}: {err}", meta.id);
+                            None
+                        }
+                    },
+                ),
         };
         let app = ClipboardApp {
             id: meta.id,
             name: meta.name,
-            icon_file,
+            icon_file: icon
+                .as_ref()
+                .map(|value| value.file_name.clone())
+                .or_else(|| existing.as_ref().and_then(|app| app.icon_file.clone())),
+            icon_hash: icon
+                .as_ref()
+                .map(|value| value.icon_hash.clone())
+                .or_else(|| existing.as_ref().and_then(|app| app.icon_hash.clone())),
+            accent_start: icon
+                .as_ref()
+                .map(|value| value.accent_start.clone())
+                .or_else(|| existing.as_ref().and_then(|app| app.accent_start.clone())),
+            accent_end: icon
+                .as_ref()
+                .map(|value| value.accent_end.clone())
+                .or_else(|| existing.as_ref().and_then(|app| app.accent_end.clone())),
             platform: meta.platform,
             created_at: now,
             updated_at: now,
