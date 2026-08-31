@@ -39,13 +39,6 @@ pub fn notify_settings_changed(app: &AppHandle) {
     wake_manager(app);
 }
 
-/// Reannounces this device so the peer receiving the presence event can connect back.
-pub fn notify_foreground(app: &AppHandle) {
-    if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
-        manager.notify_foreground();
-    }
-}
-
 fn wake_manager(app: &AppHandle) {
     if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
         manager.wake();

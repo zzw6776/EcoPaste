@@ -74,10 +74,10 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   });
 
   function handleWindowVisibility(event: { payload: WindowVisibilityPayload }) {
-    if (
-      event.payload.label !== WINDOW_LABEL.CLIPBOARD ||
-      event.payload.visible
-    ) {
+    if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
+
+    if (event.payload.visible) {
+      void refresh();
       return;
     }
 

@@ -337,33 +337,6 @@ impl SyncManager {
         }
     }
 
-    /// Refreshes our routes and publishes a new presence without dialing suspended LAN peers.
-    pub fn notify_foreground(self: &Arc<Self>) {
-        self.notify_cloud_connectivity_changed();
-        let manager = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
-            let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-            if !settings.enabled
-                || !settings.lan_enabled
-                || manager.identity.snapshot().group.is_none()
-            {
-                return;
-            }
-            let endpoint = match manager.ensure_endpoint(&settings).await {
-                Ok(endpoint) => endpoint,
-                Err(error) => {
-                    log::debug!("refresh foreground LAN presence failed: {error}");
-                    return;
-                }
-            };
-            endpoint.network_change().await;
-            manager.advance_presence_nonce();
-            if let Err(error) = manager.update_discovery_metadata(&endpoint, true) {
-                log::debug!("publish foreground LAN presence failed: {error}");
-            }
-        });
-    }
-
     /// Refreshes Iroh before reconnecting after an externally observed network change.
     #[cfg(target_os = "android")]
     pub fn notify_network_changed(self: &Arc<Self>) {
@@ -387,6 +360,59 @@ impl SyncManager {
             }
             manager.notify_connectivity_changed();
         });
+    }
+
+    /// Invalidates LAN connectivity immediately when Android reports that its active Wi-Fi route
+    /// disappeared, instead of waiting for QUIC keepalive or a transfer timeout.
+    #[cfg(target_os = "android")]
+    pub fn notify_network_lost(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let connections = manager
+                .lan_connections
+                .write()
+                .expect("LAN connection cache poisoned")
+                .drain()
+                .map(|(_, connection)| connection)
+                .collect::<Vec<_>>();
+            for connection in connections {
+                connection.close(0_u32.into(), b"Android Wi-Fi route lost");
+            }
+
+            manager
+                .nearby_devices
+                .write()
+                .expect("nearby devices poisoned")
+                .clear();
+            let pool = manager.pool().await;
+            let own_device_id = manager.identity.snapshot().device_id;
+            match repository::list_peers(&pool).await {
+                Ok(peers) => {
+                    for peer in peers {
+                        let device_id = peer.announcement.device_id;
+                        if device_id == own_device_id {
+                            continue;
+                        }
+                        manager.suspend_peer(&device_id);
+                        if let Err(error) =
+                            repository::mark_peer_offline(&pool, &device_id, None).await
+                        {
+                            log::debug!("mark peer offline after Android Wi-Fi loss failed: {error}");
+                        }
+                    }
+                }
+                Err(error) => log::debug!("load peers after Android Wi-Fi loss failed: {error}"),
+            }
+            manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false);
+            manager.emit_updated();
+            manager.notify_cloud_connectivity_changed();
+        });
+    }
+
+    /// Makes visible Android surfaces reread committed status without changing network state.
+    #[cfg(target_os = "android")]
+    pub fn notify_status_refresh(&self) {
+        self.emit_updated();
     }
 
     fn advance_presence_nonce(&self) {
@@ -788,6 +814,16 @@ impl SyncManager {
                 peer.connected_address = None;
                 peer.transport = None;
             }
+            if let Some(connection) = self.cached_lan_connection(&peer.device_id) {
+                let (connected_address, transport) = connection_path(&connection);
+                peer.state = SyncChannelState::Online;
+                peer.connected_address = connected_address;
+                peer.transport = transport;
+            } else if peer.state == SyncChannelState::Online {
+                peer.state = SyncChannelState::Idle;
+                peer.connected_address = None;
+                peer.transport = None;
+            }
         }
         if !settings.enabled || identity.group.is_none() {
             lan = SyncChannelStatus::new(SyncChannelState::Disabled);
@@ -802,6 +838,15 @@ impl SyncManager {
                 for peer in &mut peers {
                     peer.state = SyncChannelState::Disabled;
                 }
+            } else if peers
+                .iter()
+                .any(|peer| peer.state == SyncChannelState::Online)
+            {
+                lan.state = SyncChannelState::Online;
+                lan.last_error = None;
+            } else if lan.state == SyncChannelState::Online {
+                lan.state = SyncChannelState::Idle;
+                lan.last_error = None;
             }
             if !server_is_configured(&settings) {
                 cloud_transfer = SyncChannelStatus::new(SyncChannelState::Disabled);
@@ -1551,9 +1596,13 @@ impl SyncManager {
             if peer_device_id.is_some() && peers.is_empty() {
                 bail!("未找到指定的已配对设备");
             }
+            let has_live_connection = peers.iter().any(|peer| {
+                self.cached_lan_connection(&peer.announcement.device_id)
+                    .is_some()
+            });
             if peers.is_empty() {
                 self.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false);
-            } else {
+            } else if !has_live_connection {
                 self.set_channel_status(SyncTarget::Lan, SyncChannelState::Connecting, None, false);
             }
             lan_attempted = !peers.is_empty();
@@ -1605,12 +1654,14 @@ impl SyncManager {
         if target != Some(SyncTarget::Lan) {
             match server_endpoint_addr(&settings).await {
                 Ok(Some(server)) => {
-                    self.set_channel_status(
-                        SyncTarget::Cloud,
-                        SyncChannelState::Connecting,
-                        None,
-                        false,
-                    );
+                    if self.cached_cloud_connection().is_none() {
+                        self.set_channel_status(
+                            SyncTarget::Cloud,
+                            SyncChannelState::Connecting,
+                            None,
+                            false,
+                        );
+                    }
                     match self.connect_cloud(&endpoint, server).await {
                         Ok(connection) => {
                             let result = async {
@@ -1750,21 +1801,23 @@ impl SyncManager {
                     return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
                 }
             };
-        repository::mark_peer_connecting(&pool, &device_id).await?;
         let connection = match self.cached_lan_connection(&device_id) {
             Some(connection) => connection,
-            None => match connect_peer(&endpoint, address, connect_timeout).await {
-                Ok(connection) => {
-                    self.store_lan_connection(&device_id, connection.clone());
-                    connection
+            None => {
+                repository::mark_peer_connecting(&pool, &device_id).await?;
+                match connect_peer(&endpoint, address, connect_timeout).await {
+                    Ok(connection) => {
+                        self.store_lan_connection(&device_id, connection.clone());
+                        connection
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        log::debug!("LAN peer {device_id} unavailable: {message}");
+                        repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
+                        return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
+                    }
                 }
-                Err(error) => {
-                    let message = error.to_string();
-                    log::debug!("LAN peer {device_id} unavailable: {message}");
-                    repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                    return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
-                }
-            },
+            }
         };
         match self
             .sync_connection(&connection, &target_id, peer.pull_cursor, &group, &endpoint)
@@ -1784,9 +1837,10 @@ impl SyncManager {
                 Ok(LanPeerSyncOutcome::Succeeded)
             }
             Err(error) => {
-                let _ = self.invalidate_lan_connection(&device_id, connection.stable_id());
                 let message = error.to_string();
-                repository::mark_peer_error(&pool, &device_id, &message).await?;
+                if self.invalidate_lan_connection(&device_id, connection.stable_id()) {
+                    repository::mark_peer_error(&pool, &device_id, &message).await?;
+                }
                 Ok(LanPeerSyncOutcome::TransferFailed(message))
             }
         }
