@@ -808,6 +808,12 @@ impl SyncManager {
                 cloud_watch = SyncChannelStatus::new(SyncChannelState::Disabled);
             }
         }
+        for peer in &mut peers {
+            if peer.state != SyncChannelState::Error {
+                peer.last_error = None;
+            }
+        }
+        peers.sort_by_key(|peer| peer.state != SyncChannelState::Online);
         let cloud = merge_cloud_status(&cloud_transfer, &cloud_watch);
         let cloud_path = self
             .cloud_path
