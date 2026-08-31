@@ -22,6 +22,13 @@ const HISTORY_BACKFILL_VERSION: u8 = 2;
 const HISTORY_TIMESTAMP_REPAIR_GROUP_KEY: &str = "history_timestamp_repair_group_id";
 const LAST_SUCCESS_KEY: &str = "last_success_at";
 
+/// Distinguishes an inserted/idempotent event from a reused origin sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertEventResult {
+    pub inserted: bool,
+    pub stored: bool,
+}
+
 /// Allocates a monotonically increasing sequence for this device.
 pub async fn next_origin_sequence(pool: &SqlitePool) -> Result<u64> {
     let mut transaction = pool
@@ -38,7 +45,8 @@ pub async fn next_origin_sequence(pool: &SqlitePool) -> Result<u64> {
         .unwrap_or("0")
         .parse::<u64>()
         .context("invalid sync origin sequence")?
-        .saturating_add(1);
+        .saturating_add(1)
+        .max(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(1));
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -66,7 +74,7 @@ pub async fn insert_event(
     event: &EncryptedEvent,
     applied: bool,
     blobs: &[StoredBlob],
-) -> Result<bool> {
+) -> Result<InsertEventResult> {
     let now = Utc::now();
     let mut transaction = pool.begin().await.context("begin sync event transaction")?;
     let result = sqlx::query(
@@ -89,7 +97,18 @@ pub async fn insert_event(
     .execute(&mut *transaction)
     .await
     .context("insert sync event")?;
-    if result.rows_affected() == 1 {
+    let inserted = result.rows_affected() == 1;
+    let stored = if inserted {
+        true
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM sync_events WHERE event_id = ?)")
+            .bind(&event.event_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("check existing sync event")?
+            != 0
+    };
+    if inserted {
         for blob in blobs {
             sqlx::query(
                 r#"
@@ -110,7 +129,7 @@ pub async fn insert_event(
         }
     }
     transaction.commit().await.context("commit sync event")?;
-    Ok(result.rows_affected() == 1)
+    Ok(InsertEventResult { inserted, stored })
 }
 
 /// Associates a clipboard record with the encrypted event that carries it.
@@ -1268,7 +1287,7 @@ pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
         "DELETE FROM sync_events",
         "DELETE FROM sync_peers",
         "DELETE FROM sync_removed_peers",
-        "DELETE FROM sync_state",
+        "DELETE FROM sync_state WHERE key <> 'origin_sequence'",
         "DELETE FROM sync_pending_items",
     ] {
         sqlx::query(statement)
@@ -1382,6 +1401,53 @@ mod tests {
             .unwrap();
         assert!(history_backfill_completed(&pool, "group-a").await.unwrap());
         assert!(!history_backfill_completed(&pool, "group-b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn group_state_clear_preserves_the_device_sequence() {
+        let pool = memory_pool().await;
+        let first = next_origin_sequence(&pool).await.unwrap();
+
+        clear_group_state(&pool).await.unwrap();
+        let second = next_origin_sequence(&pool).await.unwrap();
+
+        assert!(second > first);
+    }
+
+    #[tokio::test]
+    async fn insert_event_reports_reused_origin_sequences_without_storing_them() {
+        let pool = memory_pool().await;
+        let first = insert_event(&pool, &test_event("event-1", 1), false, &[])
+            .await
+            .unwrap();
+        let duplicate = insert_event(&pool, &test_event("event-1", 1), false, &[])
+            .await
+            .unwrap();
+        let conflict = insert_event(&pool, &test_event("event-2", 1), false, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first,
+            InsertEventResult {
+                inserted: true,
+                stored: true
+            }
+        );
+        assert_eq!(
+            duplicate,
+            InsertEventResult {
+                inserted: false,
+                stored: true
+            }
+        );
+        assert_eq!(
+            conflict,
+            InsertEventResult {
+                inserted: false,
+                stored: false
+            }
+        );
     }
 
     #[tokio::test]
@@ -1547,20 +1613,20 @@ mod tests {
     }
 
     async fn insert_test_event(pool: &SqlitePool, event_id: &str) {
-        insert_event(
-            pool,
-            &EncryptedEvent {
-                event_id: event_id.into(),
-                origin_device_id: "mac".into(),
-                origin_sequence: if event_id == "event-1" { 1 } else { 2 },
-                created_at_ms: 100,
-                nonce: vec![1; 24],
-                ciphertext: vec![2; 32],
-            },
-            true,
-            &[],
-        )
-        .await
-        .unwrap();
+        let sequence = if event_id == "event-1" { 1 } else { 2 };
+        insert_event(pool, &test_event(event_id, sequence), true, &[])
+            .await
+            .unwrap();
+    }
+
+    fn test_event(event_id: &str, origin_sequence: u64) -> EncryptedEvent {
+        EncryptedEvent {
+            event_id: event_id.into(),
+            origin_device_id: "mac".into(),
+            origin_sequence,
+            created_at_ms: 100,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 32],
+        }
     }
 }
