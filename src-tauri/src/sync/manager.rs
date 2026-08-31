@@ -1141,7 +1141,10 @@ impl SyncManager {
             created_at_ms,
             &envelope,
         )?;
-        repository::insert_event(&pool, &event, true, &blobs).await?;
+        let stored = repository::insert_event(&pool, &event, true, &blobs).await?;
+        if !stored.stored {
+            bail!("同步事件序号冲突，请重新复制内容");
+        }
         repository::link_event_to_item(&pool, &item.id, &event.event_id, "local").await?;
         repository::clear_pending_item(&pool, &item.id).await?;
         if should_wake {
@@ -2198,10 +2201,7 @@ impl SyncManager {
     ) -> Result<()> {
         let pool = self.pool().await;
         let removed_peers = repository::removed_peer_ids(&pool).await?;
-        let received_event_ids = events
-            .iter()
-            .map(|cloud_event| cloud_event.event.event_id.clone())
-            .collect::<Vec<_>>();
+        let mut received_event_ids = Vec::new();
         let mut remote_event_ids = Vec::new();
         let mut received_new_events = false;
         for cloud_event in events {
@@ -2209,12 +2209,27 @@ impl SyncManager {
             if removed_peers.contains(&event.origin_device_id) {
                 continue;
             }
+            let result = repository::insert_event(
+                &pool,
+                &event,
+                event.origin_device_id == self.identity.snapshot().device_id,
+                &[],
+            )
+            .await?;
+            if !result.stored {
+                log::warn!(
+                    "ignore sync event {} with a reused origin sequence from {}",
+                    event.event_id,
+                    event.origin_device_id
+                );
+                continue;
+            }
+            received_event_ids.push(event.event_id.clone());
             if event.origin_device_id == self.identity.snapshot().device_id {
-                repository::insert_event(&pool, &event, true, &[]).await?;
                 continue;
             }
             remote_event_ids.push(event.event_id.clone());
-            received_new_events |= repository::insert_event(&pool, &event, false, &[]).await?;
+            received_new_events |= result.inserted;
         }
         repository::mark_delivered(&pool, source_target, &received_event_ids).await?;
         if source_target != CLOUD_TARGET {
@@ -2244,13 +2259,29 @@ impl SyncManager {
                 }
             };
             let mut stored_blobs = Vec::new();
+            let mut all_blobs_available = true;
             for manifest in &envelope.blobs {
-                let path = self.ensure_blob(connection, group, manifest).await?;
-                stored_blobs.push(StoredBlob {
-                    blob_id: manifest.blob_id.clone(),
-                    encrypted_path: path.to_string_lossy().into_owned(),
-                    size: manifest.encrypted_size,
-                });
+                match self.ensure_blob(connection, group, manifest).await {
+                    Ok(path) => {
+                        stored_blobs.push(StoredBlob {
+                            blob_id: manifest.blob_id.clone(),
+                            encrypted_path: path.to_string_lossy().into_owned(),
+                            size: manifest.encrypted_size,
+                        });
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "defer sync event {} until blob {} is available: {error}",
+                            event.event_id,
+                            manifest.blob_id
+                        );
+                        all_blobs_available = false;
+                        break;
+                    }
+                }
+            }
+            if !all_blobs_available {
+                continue;
             }
             repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
@@ -4260,18 +4291,24 @@ async fn dispatch_peer(
             manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
-            let incoming_event_ids = events
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect::<Vec<_>>();
-            let remote_event_ids = events
-                .iter()
-                .filter(|event| event.origin_device_id != manager.identity.snapshot().device_id)
-                .map(|event| event.event_id.clone())
-                .collect::<Vec<_>>();
+            let mut incoming_event_ids = Vec::new();
+            let mut remote_event_ids = Vec::new();
             let mut accepted = Vec::new();
             for event in events {
-                if repository::insert_event(&pool, &event, false, &[]).await? {
+                let result = repository::insert_event(&pool, &event, false, &[]).await?;
+                if !result.stored {
+                    log::warn!(
+                        "ignore LAN sync event {} with a reused origin sequence from {}",
+                        event.event_id,
+                        event.origin_device_id
+                    );
+                    continue;
+                }
+                incoming_event_ids.push(event.event_id.clone());
+                if event.origin_device_id != manager.identity.snapshot().device_id {
+                    remote_event_ids.push(event.event_id.clone());
+                }
+                if result.inserted {
                     accepted.push(event.event_id.clone());
                 }
             }
