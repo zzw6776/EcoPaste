@@ -714,7 +714,7 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncN
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncForeground(
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncNetworkLost(
     _raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
 ) {
@@ -722,7 +722,21 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncF
         return;
     };
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
-        manager.notify_foreground();
+        manager.notify_network_lost();
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncStatusRefresh(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.notify_status_refresh();
     }
 }
 

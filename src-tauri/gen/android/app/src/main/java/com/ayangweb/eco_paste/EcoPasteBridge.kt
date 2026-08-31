@@ -127,7 +127,10 @@ object EcoPasteBridge {
     external fun notifySyncNetworkChanged()
 
     @JvmStatic
-    external fun notifySyncForeground()
+    external fun notifySyncNetworkLost()
+
+    @JvmStatic
+    external fun notifySyncStatusRefresh()
 
     @JvmStatic
     external fun refreshAutomaticDeviceName(name: String)
@@ -312,10 +315,16 @@ object EcoPasteBridge {
             }
 
             override fun onLost(network: Network) {
-                synchronized(this@EcoPasteBridge) {
+                val lostActiveRoute = synchronized(this@EcoPasteBridge) {
                     if (syncNetworkFingerprint?.startsWith("$network:") == true) {
                         syncNetworkFingerprint = null
+                        true
+                    } else {
+                        false
                     }
+                }
+                if (lostActiveRoute) {
+                    notifySyncNetworkLostSafely("route:$network")
                 }
             }
         }
@@ -356,6 +365,15 @@ object EcoPasteBridge {
             notifySyncNetworkChanged()
         } catch (error: Throwable) {
             Log.w(TAG, "notify sync network change failed ($reason): ${error.message}")
+        }
+    }
+
+    /** Marks the current LAN route unavailable without waiting for transport timeout. */
+    private fun notifySyncNetworkLostSafely(reason: String) {
+        try {
+            notifySyncNetworkLost()
+        } catch (error: Throwable) {
+            Log.w(TAG, "notify sync network loss failed ($reason): ${error.message}")
         }
     }
 
