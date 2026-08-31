@@ -9,6 +9,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -21,6 +23,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.PersistableBundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.webkit.MimeTypeMap
@@ -28,6 +31,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.lang.ref.WeakReference
@@ -35,6 +39,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.math.abs
 
 object EcoPasteBridge {
     private const val TAG = "EcoPasteBridge"
@@ -59,6 +64,9 @@ object EcoPasteBridge {
     private var syncNetworkFingerprint: String? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
+    private var lastAccessibilitySourcePackage: String? = null
+    private var lastAccessibilitySourceElapsedRealtime = Long.MIN_VALUE
+    private val sourceAppCache = mutableMapOf<String, SourceAppMetadata>()
     var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
         private set
 
@@ -102,7 +110,12 @@ object EcoPasteBridge {
     external fun reconnectOverlayPeer(deviceId: String): Boolean
 
     @JvmStatic
-    external fun captureClipboardText(text: String): Boolean
+    external fun captureClipboardText(
+        text: String,
+        packageName: String,
+        appName: String,
+        iconPng: ByteArray,
+    ): Boolean
 
     @JvmStatic
     external fun pasteOverlayItem(id: String): Boolean
@@ -112,6 +125,9 @@ object EcoPasteBridge {
 
     @JvmStatic
     external fun notifySyncNetworkChanged()
+
+    @JvmStatic
+    external fun notifySyncForeground()
 
     @JvmStatic
     external fun refreshAutomaticDeviceName(name: String)
@@ -894,8 +910,8 @@ object EcoPasteBridge {
         }
 
         if (currentEngineMode == "root") {
-            val monitor = rootClipboardMonitor ?: RootClipboardMonitor(context) { text, timestamp ->
-                onClipboardCaptured(text, timestamp, true)
+            val monitor = rootClipboardMonitor ?: RootClipboardMonitor(context) { text, timestamp, sourcePackage ->
+                onClipboardCaptured(text, timestamp, true, sourcePackage)
             }.also {
                 rootClipboardMonitor = it
             }
@@ -909,7 +925,11 @@ object EcoPasteBridge {
     /** Reads and dispatches one native clipboard event without any periodic polling. */
     @JvmStatic
     @Synchronized
-    fun captureClipboardChange(manager: ClipboardManager?, confirmedChange: Boolean) {
+    fun captureClipboardChange(
+        manager: ClipboardManager?,
+        confirmedChange: Boolean,
+        sourcePackage: String? = null,
+    ) {
         try {
             val description = manager?.primaryClipDescription ?: return
             if (description.extras?.getBoolean(CLIPBOARD_WRITEBACK_MARKER, false) == true) {
@@ -926,7 +946,16 @@ object EcoPasteBridge {
             if (clip.itemCount <= 0) return
             val context = applicationContext ?: EcoPasteAccessibilityService.instance ?: return
             val text = clip.getItemAt(0).coerceToText(context)?.toString() ?: return
-            onClipboardCaptured(text, timestamp, confirmedChange)
+            val sourceHint = sourcePackage ?: lastAccessibilitySourcePackage
+            val sourceHintIsRecent =
+                SystemClock.elapsedRealtime() - lastAccessibilitySourceElapsedRealtime <= 1_500L
+            val clipboardChangeIsRecent =
+                timestamp > 0L && abs(System.currentTimeMillis() - timestamp) <= 1_500L
+            val trustedSourcePackage = sourceHint.takeIf {
+                currentEngineMode == "accessibility" &&
+                    sourceHintIsRecent && clipboardChangeIsRecent
+            }
+            onClipboardCaptured(text, timestamp, confirmedChange, trustedSourcePackage)
         } catch (error: Exception) {
             Log.d(TAG, "read clipboard change failed: ${error.message}")
         }
@@ -947,7 +976,12 @@ object EcoPasteBridge {
     /** Deduplicates multiple native callbacks for the same system clipboard generation. */
     @JvmStatic
     @Synchronized
-    fun onClipboardCaptured(text: String, timestamp: Long, confirmedChange: Boolean) {
+    fun onClipboardCaptured(
+        text: String,
+        timestamp: Long,
+        confirmedChange: Boolean,
+        sourcePackage: String? = null,
+    ) {
         if (text.isBlank()) return
         val captureTimestamp = when {
             timestamp > 0L -> timestamp
@@ -956,8 +990,9 @@ object EcoPasteBridge {
             else -> lastCapturedTimestamp
         }
         if (text == lastCapturedText && captureTimestamp == lastCapturedTimestamp) return
+        val source = resolveSourceApp(sourcePackage)
         try {
-            if (!captureClipboardText(text)) return
+            if (!captureClipboardText(text, source.packageName, source.appName, source.iconPng)) return
         } catch (error: Throwable) {
             Log.w(TAG, "send clipboard capture to Rust failed: ${error.message}")
             return
@@ -968,6 +1003,51 @@ object EcoPasteBridge {
             try {
                 listener(text)
             } catch (_: Exception) {}
+        }
+    }
+
+    /** Records a short-lived accessibility hint; stale foreground apps must not become sources. */
+    @JvmStatic
+    @Synchronized
+    fun recordAccessibilitySource(packageName: String?) {
+        if (packageName.isNullOrBlank() || packageName == applicationContext?.packageName) return
+        lastAccessibilitySourcePackage = packageName
+        lastAccessibilitySourceElapsedRealtime = SystemClock.elapsedRealtime()
+    }
+
+    private data class SourceAppMetadata(
+        val packageName: String,
+        val appName: String,
+        val iconPng: ByteArray,
+    )
+
+    /** Resolves only an explicitly observed package and falls back to an unknown source. */
+    private fun resolveSourceApp(packageName: String?): SourceAppMetadata {
+        val context = applicationContext
+        if (context == null || packageName.isNullOrBlank()) {
+            return SourceAppMetadata("", "", byteArrayOf())
+        }
+        sourceAppCache[packageName]?.let { return it }
+        return try {
+            val packageManager = context.packageManager
+            val applicationInfo = packageManager.getApplicationInfo(packageName, 0)
+            val appName = packageManager.getApplicationLabel(applicationInfo).toString()
+            val drawable = packageManager.getApplicationIcon(applicationInfo)
+            val bitmap = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, bitmap.width, bitmap.height)
+            drawable.draw(canvas)
+            val iconPng = ByteArrayOutputStream().use { stream ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                stream.toByteArray()
+            }
+            bitmap.recycle()
+            SourceAppMetadata(packageName, appName.ifBlank { packageName }, iconPng).also {
+                sourceAppCache[packageName] = it
+            }
+        } catch (error: Exception) {
+            Log.d(TAG, "resolve clipboard source app failed for $packageName: ${error.message}")
+            SourceAppMetadata(packageName, packageName, byteArrayOf())
         }
     }
 

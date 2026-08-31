@@ -13,6 +13,9 @@ pub struct ClipboardEnvelope {
     pub item: SyncedClipboardItem,
     #[n(2)]
     pub blobs: Vec<BlobManifest>,
+    #[n(3)]
+    #[cbor(default)]
+    pub source_app: Option<SourceAppRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -46,6 +49,41 @@ pub struct SyncedClipboardItem {
     pub content_hash: String,
     #[n(13)]
     pub updated_at_ms: Option<i64>,
+    #[n(14)]
+    #[cbor(default)]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct SourceAppRef {
+    #[n(0)]
+    pub version: u16,
+    #[n(1)]
+    pub source_key: String,
+    #[n(2)]
+    pub platform: String,
+    #[n(3)]
+    pub display_name: String,
+    #[n(4)]
+    pub icon: Option<SourceIconRef>,
+    #[n(5)]
+    pub accent_start: Option<String>,
+    #[n(6)]
+    pub accent_end: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct SourceIconRef {
+    #[n(0)]
+    pub icon_hash: String,
+    #[n(1)]
+    pub blob_id: String,
+    #[n(2)]
+    pub original_size: u64,
+    #[n(3)]
+    pub encrypted_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -264,9 +302,19 @@ mod tests {
         content_hash: String,
     }
 
-    #[test]
-    fn synced_item_defaults_missing_updated_at_for_legacy_events() {
-        let legacy = LegacySyncedClipboardItem {
+    #[derive(Encode, Decode)]
+    #[cbor(map)]
+    struct LegacyClipboardEnvelope {
+        #[n(0)]
+        version: u16,
+        #[n(1)]
+        item: LegacySyncedClipboardItem,
+        #[n(2)]
+        blobs: Vec<BlobManifest>,
+    }
+
+    fn legacy_item() -> LegacySyncedClipboardItem {
+        LegacySyncedClipboardItem {
             kind: "text".into(),
             sub_kind: None,
             content: "hello".into(),
@@ -280,7 +328,12 @@ mod tests {
             source_platform: "macos".into(),
             created_at_ms: 123,
             content_hash: "hash".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn synced_item_defaults_missing_updated_at_for_legacy_events() {
+        let legacy = legacy_item();
 
         let encoded = minicbor::to_vec(legacy).unwrap();
         let decoded: SyncedClipboardItem = minicbor::decode(&encoded).unwrap();
@@ -306,6 +359,7 @@ mod tests {
             created_at_ms: 123,
             content_hash: "hash".into(),
             updated_at_ms: Some(456),
+            source_revision: Some("revision".into()),
         };
 
         let encoded = minicbor::to_vec(current).unwrap();
@@ -313,6 +367,61 @@ mod tests {
 
         assert_eq!(decoded.created_at_ms, 123);
         assert_eq!(decoded.content_hash, "hash");
+    }
+
+    #[test]
+    fn current_envelope_defaults_source_app_from_legacy_event() {
+        let legacy = LegacyClipboardEnvelope {
+            version: 1,
+            item: legacy_item(),
+            blobs: Vec::new(),
+        };
+
+        let encoded = minicbor::to_vec(legacy).unwrap();
+        let decoded: ClipboardEnvelope = minicbor::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.item.content, "hello");
+        assert_eq!(decoded.source_app, None);
+    }
+
+    #[test]
+    fn legacy_envelope_ignores_source_app_from_current_event() {
+        let current = ClipboardEnvelope {
+            version: 1,
+            item: SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: "hello".into(),
+                search_text: None,
+                summary: Some("hello".into()),
+                file_types: None,
+                size: Some(5),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: 123,
+                content_hash: "hash".into(),
+                updated_at_ms: Some(456),
+                source_revision: Some("revision".into()),
+            },
+            blobs: Vec::new(),
+            source_app: Some(SourceAppRef {
+                version: 1,
+                source_key: "a".repeat(64),
+                platform: "macos".into(),
+                display_name: "Example".into(),
+                icon: None,
+                accent_start: Some("#112233".into()),
+                accent_end: Some("#445566".into()),
+            }),
+        };
+
+        let encoded = minicbor::to_vec(current).unwrap();
+        let decoded: LegacyClipboardEnvelope = minicbor::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.item.content, "hello");
+        assert!(decoded.blobs.is_empty());
     }
 }
 

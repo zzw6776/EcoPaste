@@ -1259,6 +1259,7 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
 pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await.context("begin clearing sync state")?;
     for statement in [
+        "DELETE FROM source_app_sync_aliases",
         "DELETE FROM sync_peer_connections",
         "DELETE FROM sync_delivery_states",
         "DELETE FROM sync_item_events",

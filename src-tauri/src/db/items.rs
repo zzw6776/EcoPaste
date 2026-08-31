@@ -9,27 +9,30 @@ use crate::db::models::{
 };
 
 const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clipboard_items.sub_kind, \
-     clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.content, \
+     clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, clipboard_items.content, \
      clipboard_items.content_hash, clipboard_items.search_text, clipboard_items.summary, \
      clipboard_items.file_types, clipboard_items.size, clipboard_items.width, clipboard_items.height, \
      clipboard_items.use_count, clipboard_items.is_favorite, clipboard_items.is_pinned, \
      clipboard_items.is_sensitive, clipboard_items.platform, clipboard_items.note, \
      clipboard_items.created_at, clipboard_items.updated_at, \
      clipboard_apps.name AS source_app_name, \
-     clipboard_apps.icon_file AS source_app_icon_file \
+     clipboard_apps.icon_file AS source_app_icon_file, \
+     clipboard_apps.accent_start AS source_app_accent_start, \
+     clipboard_apps.accent_end AS source_app_accent_end \
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
 
-/// 列表/单条刷新场景的精简 SELECT：text 类型条目的 `content` 与 `search_text` 一律置空，
-/// 由前端用 `summary` 渲染。HTML/RTF/长纯文本可能很大（用户复制整段文档），
-/// 整段过 IPC + 进 DOM 是这条链路最昂贵的一环；image/files 的 content 是
-/// 文件名 / 路径列表，保留原值。预览/写回走 [`find_item_by_id`] 拿完整 content。
+/// 列表/单条刷新场景的精简 SELECT：普通 text 由前端用 `summary` 渲染；URL 保留完整
+/// `content`，避免长地址被摘要截断。HTML/RTF/长纯文本可能很大（用户复制整段文档），
+/// 不应整段过 IPC + 进 DOM；image/files 的 content 是文件名 / 路径列表，同样保留。
+/// 预览/写回走 [`find_item_by_id`] 拿完整 content。
 ///
 /// LEFT JOIN `clipboard_apps` 顺带把来源应用名 / 图标文件名带回，前端直接渲染，
 /// 不再额外发 list_clipboard_apps + get_clipboard_app_icon_path 请求。
 const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, \
-     clipboard_items.sub_kind, clipboard_items.group_id, clipboard_items.source_app_id, \
-     CASE WHEN clipboard_items.kind = 'text' THEN '' ELSE clipboard_items.content END AS content, \
+     clipboard_items.sub_kind, clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, \
+     CASE WHEN clipboard_items.sub_kind = 'url' THEN clipboard_items.content \
+          WHEN clipboard_items.kind = 'text' THEN '' ELSE clipboard_items.content END AS content, \
      clipboard_items.content_hash, \
      CASE WHEN clipboard_items.kind = 'text' THEN NULL ELSE clipboard_items.search_text END AS search_text, \
      clipboard_items.summary, clipboard_items.file_types, clipboard_items.size, \
@@ -39,7 +42,9 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
      clipboard_items.platform, clipboard_items.note, \
      clipboard_items.created_at, clipboard_items.updated_at, \
      clipboard_apps.name AS source_app_name, \
-     clipboard_apps.icon_file AS source_app_icon_file \
+     clipboard_apps.icon_file AS source_app_icon_file, \
+     clipboard_apps.accent_start AS source_app_accent_start, \
+     clipboard_apps.accent_end AS source_app_accent_end \
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
 
@@ -76,7 +81,7 @@ pub fn content_hash(kind: ClipboardKind, content: &str) -> String {
 /// 未命中 → 调用 [`insert_item`] 插入。返回生效行 id 与是否去重。
 pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
     if let Some(existing) = find_item_by_content_hash(pool, &item.content_hash).await? {
-        increment_item_use_count(pool, &existing.id).await?;
+        merge_local_reuse(pool, &existing.id, item).await?;
         return Ok(UpsertResult {
             id: existing.id,
             deduplicated: true,
@@ -97,13 +102,34 @@ pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Resu
             r#"
             UPDATE clipboard_items
             SET created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
-                updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+                updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END,
+                source_app_id = CASE
+                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                    THEN ? ELSE source_app_id END,
+                source_revision = CASE
+                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                    THEN ? ELSE source_revision END,
+                source_updated_at = CASE
+                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                    THEN ? ELSE source_updated_at END
             WHERE id = ?
             "#,
         )
         .bind(item.created_at)
         .bind(item.created_at)
         .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(&item.source_revision)
+        .bind(item.source_app_id.as_deref())
+        .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(&item.source_revision)
+        .bind(&item.source_revision)
+        .bind(item.updated_at)
+        .bind(item.updated_at)
+        .bind(&item.source_revision)
         .bind(item.updated_at)
         .bind(&existing.id)
         .execute(pool)
@@ -161,16 +187,18 @@ pub async fn find_item_by_content_hash(
 pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> {
     sqlx::query(
         "INSERT INTO clipboard_items \
-         (id, kind, sub_kind, group_id, source_app_id, content, content_hash, search_text, \
+         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, search_text, \
           summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
           created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(item.id.as_str())
     .bind(item.kind)
     .bind(item.sub_kind)
     .bind(item.group_id.as_deref())
     .bind(item.source_app_id.as_deref())
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
     .bind(item.content.as_str())
     .bind(item.content_hash.as_str())
     .bind(item.search_text.as_deref())
@@ -190,6 +218,46 @@ pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> 
     .execute(pool)
     .await
     .context("failed to insert clipboard item")?;
+    Ok(())
+}
+
+/// 合并一次本机重新使用，并用捕获时刻与稳定 revision 决定最新来源应用。
+async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE clipboard_items
+        SET use_count = use_count + 1,
+            updated_at = ?,
+            source_app_id = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_app_id END,
+            source_revision = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_revision END,
+            source_updated_at = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_updated_at END
+        WHERE id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_app_id.as_deref())
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("merge local clipboard reuse")?;
     Ok(())
 }
 
@@ -258,7 +326,8 @@ pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<
 }
 
 /// 按 `id` 查找单条记录的「列表视图」副本——与 [`fetch_items`] 走同款 [`LIST_SELECT_ITEM`] 裁剪：
-/// text 类型条目的 `content` / `search_text` 一律置空，由前端用 `summary` 渲染。
+/// URL 保留完整 `content`，其它 text 的 `content` 与全部 text 的 `search_text` 置空，
+/// 由前端用 `summary` 渲染。
 /// 供前端响应 `clipboard://updated` 事件时按 id 拉取使用，避免事件驱动刷新整页 refetch
 /// 时回传整段 HTML/RTF。需要完整 `content` 的写回 / 预览路径请走 [`find_item_by_id`]。
 pub async fn find_item_for_list_by_id(
@@ -649,8 +718,11 @@ fn push_filter_clauses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::apps::upsert_app;
     use crate::db::groups::insert_group;
-    use crate::db::models::{ClipboardGroup, ClipboardKind, Platform};
+    use crate::db::models::{
+        ClipboardApp, ClipboardGroup, ClipboardKind, ClipboardSubKind, Platform,
+    };
     use crate::db::test_support::memory_pool;
     use chrono::DateTime;
 
@@ -663,6 +735,7 @@ mod tests {
             sub_kind: None,
             group_id: None,
             source_app_id: None,
+            source_revision: id.to_owned(),
             content_hash: content_hash(ClipboardKind::Text, &content),
             content,
             search_text: None,
@@ -682,6 +755,8 @@ mod tests {
             source_app_name: None,
             source_app_icon_file: None,
             source_app_icon_path: None,
+            source_app_accent_start: None,
+            source_app_accent_end: None,
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
@@ -693,6 +768,26 @@ mod tests {
 
     fn ids(items: &[ClipboardItem]) -> Vec<&str> {
         items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    async fn insert_source_app(pool: &SqlitePool, id: &str) {
+        let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        upsert_app(
+            pool,
+            &ClipboardApp {
+                id: id.into(),
+                name: id.into(),
+                icon_file: None,
+                icon_hash: None,
+                accent_start: None,
+                accent_end: None,
+                platform: Platform::Macos,
+                created_at: ts,
+                updated_at: ts,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -710,6 +805,29 @@ mod tests {
         assert_eq!(found.use_count, 1);
 
         assert!(find_item_by_id(&pool, "missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_view_keeps_full_url_but_omits_other_text_content() {
+        let pool = memory_pool().await;
+        let mut url = sample_item("url");
+        url.sub_kind = Some(ClipboardSubKind::Url);
+        url.content = "https://example.com/a/complete/path?query=value".to_owned();
+        url.summary = Some("https://example.com/a/complete/path".to_owned());
+        insert_item(&pool, &url).await.unwrap();
+        insert_item(&pool, &sample_item("plain")).await.unwrap();
+
+        let listed_url = find_item_for_list_by_id(&pool, "url")
+            .await
+            .unwrap()
+            .unwrap();
+        let listed_plain = find_item_for_list_by_id(&pool, "plain")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(listed_url.content, url.content);
+        assert!(listed_plain.content.is_empty());
     }
 
     #[tokio::test]
@@ -836,6 +954,64 @@ mod tests {
         assert_eq!(merged.created_at, incoming.created_at);
         assert_eq!(merged.updated_at, incoming.updated_at);
         assert_eq!(merged.use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn synced_upsert_uses_latest_source_and_revision_as_tie_breaker() {
+        let pool = memory_pool().await;
+        insert_source_app(&pool, "old-app").await;
+        insert_source_app(&pool, "new-app").await;
+
+        let mut existing = sample_item("existing");
+        existing.source_app_id = Some("old-app".into());
+        existing.source_revision = "revision-b".into();
+        insert_item(&pool, &existing).await.unwrap();
+
+        let mut older_revision = sample_item("incoming-old");
+        older_revision.content = existing.content.clone();
+        older_revision.content_hash = existing.content_hash.clone();
+        older_revision.source_app_id = Some("new-app".into());
+        older_revision.source_revision = "revision-a".into();
+        upsert_synced_item(&pool, &older_revision).await.unwrap();
+        assert_eq!(
+            find_item_by_id(&pool, "existing")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_app_id
+                .as_deref(),
+            Some("old-app")
+        );
+
+        let mut newer_revision = older_revision;
+        newer_revision.source_revision = "revision-c".into();
+        upsert_synced_item(&pool, &newer_revision).await.unwrap();
+        let merged = find_item_by_id(&pool, "existing").await.unwrap().unwrap();
+        assert_eq!(merged.source_app_id.as_deref(), Some("new-app"));
+        assert_eq!(merged.source_revision, "revision-c");
+    }
+
+    #[tokio::test]
+    async fn local_reuse_replaces_source_with_new_capture() {
+        let pool = memory_pool().await;
+        insert_source_app(&pool, "old-app").await;
+        insert_source_app(&pool, "new-app").await;
+
+        let mut existing = sample_item("existing");
+        existing.source_app_id = Some("old-app".into());
+        insert_item(&pool, &existing).await.unwrap();
+
+        let mut captured = sample_item("captured");
+        captured.content = existing.content.clone();
+        captured.content_hash = existing.content_hash.clone();
+        captured.source_app_id = Some("new-app".into());
+        captured.updated_at = existing.updated_at + chrono::Duration::seconds(1);
+        upsert_item(&pool, &captured).await.unwrap();
+
+        let merged = find_item_by_id(&pool, "existing").await.unwrap().unwrap();
+        assert_eq!(merged.source_app_id.as_deref(), Some("new-app"));
+        assert_eq!(merged.source_revision, "captured");
+        assert_eq!(merged.use_count, 2);
     }
 
     #[tokio::test]

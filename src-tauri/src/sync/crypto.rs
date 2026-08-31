@@ -133,6 +133,41 @@ fn event_aad(
 
 /// Encrypts a file in fixed-size authenticated chunks, keeping memory bounded for large files.
 pub fn encrypt_blob(source: &Path, blob_root: &Path, key: &[u8; 32]) -> Result<StoredBlob> {
+    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
+    encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)
+}
+
+/// Encrypts a small content-addressed asset deterministically inside one sync space.
+/// The nonce is reused only for the same plaintext hash, so equality is intentionally
+/// visible within that space while ciphertext remains unlinkable across spaces.
+pub fn encrypt_stable_blob(
+    source: &Path,
+    blob_root: &Path,
+    key: &[u8; 32],
+    plaintext_hash: &str,
+) -> Result<StoredBlob> {
+    if plaintext_hash.len() != 64
+        || !plaintext_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || hash_file(source)? != plaintext_hash
+    {
+        bail!("source app icon hash mismatch");
+    }
+    let mut nonce_input = Vec::with_capacity(32 + plaintext_hash.len());
+    nonce_input.extend_from_slice(b"ecopaste/source-icon/v1\0");
+    nonce_input.extend_from_slice(plaintext_hash.as_bytes());
+    let digest = blake3::keyed_hash(key, &nonce_input);
+    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
+    stream_nonce.copy_from_slice(&digest.as_bytes()[..STREAM_NONCE_LEN]);
+    encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)
+}
+
+fn encrypt_blob_with_nonce(
+    source: &Path,
+    blob_root: &Path,
+    key: &[u8; 32],
+    stream_nonce: [u8; STREAM_NONCE_LEN],
+) -> Result<StoredBlob> {
     let source_size = source
         .metadata()
         .with_context(|| format!("failed to stat sync source {source:?}"))?
@@ -147,8 +182,6 @@ pub fn encrypt_blob(source: &Path, blob_root: &Path, key: &[u8; 32]) -> Result<S
         .with_context(|| format!("failed to create encrypted sync blob {temporary:?}"))?;
     let mut reader = BufReader::new(input);
     let mut writer = BufWriter::new(output);
-    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
     writer.write_all(BLOB_MAGIC)?;
     writer.write_all(&stream_nonce)?;
 
@@ -387,6 +420,43 @@ mod tests {
     }
 
     #[test]
+    fn stable_blob_is_deduplicated_inside_one_space_and_scoped_between_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        fs::write(&source, b"normalized icon bytes").unwrap();
+        let plaintext_hash = blake3::hash(b"normalized icon bytes").to_hex().to_string();
+
+        let first = encrypt_stable_blob(
+            &source,
+            &directory.path().join("first"),
+            &[1_u8; 32],
+            &plaintext_hash,
+        )
+        .unwrap();
+        let repeated = encrypt_stable_blob(
+            &source,
+            &directory.path().join("second"),
+            &[1_u8; 32],
+            &plaintext_hash,
+        )
+        .unwrap();
+        let other_space = encrypt_stable_blob(
+            &source,
+            &directory.path().join("third"),
+            &[2_u8; 32],
+            &plaintext_hash,
+        )
+        .unwrap();
+
+        assert_eq!(first.blob_id, repeated.blob_id);
+        assert_eq!(
+            fs::read(first.encrypted_path).unwrap(),
+            fs::read(repeated.encrypted_path).unwrap()
+        );
+        assert_ne!(first.blob_id, other_space.blob_id);
+    }
+
+    #[test]
     fn event_metadata_is_authenticated() {
         let key = [9_u8; 32];
         let envelope = ClipboardEnvelope {
@@ -406,8 +476,10 @@ mod tests {
                 created_at_ms: 1,
                 content_hash: "hash".into(),
                 updated_at_ms: Some(2),
+                source_revision: Some("revision".into()),
             },
             blobs: Vec::new(),
+            source_app: None,
         };
         let event = encrypt_event(
             &key,

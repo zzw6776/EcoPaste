@@ -15,6 +15,10 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(not(target_os = "android"))]
         Key::DragTextEmpty => "Text content is empty",
         Key::ExternalUrlUnsupported => "Only links starting with http or https can be opened",
+        #[cfg(target_os = "macos")]
+        Key::PasteAccessibilityRequired => {
+            "Allow EcoPaste in System Settings → Privacy & Security → Accessibility, then paste again"
+        }
         Key::SaveImage => "Save Image",
     }
 }

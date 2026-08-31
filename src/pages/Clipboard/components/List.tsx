@@ -349,6 +349,10 @@ const List: FC = () => {
     },
   );
 
+  useTauriListen(TAURI_EVENT.SOURCE_APP_UPDATED, () => {
+    reloadCurrentRangeRef.current();
+  });
+
   /**
    * 剪贴板窗口显隐变化：更新可见性镜像；显示时按偏好重置分组与滚动位置。
    * 可见性 ref 供 `handleClipboardUpdated` 判断是否处于冻结态——隐藏期间只记 pending，不立即 reload。

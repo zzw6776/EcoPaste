@@ -11,7 +11,7 @@ import kotlin.concurrent.thread
 /** Controls the root clipboard daemon; retries happen only after the daemon exits. */
 class RootClipboardMonitor(
     context: Context,
-    private val onClipboard: (String, Long) -> Unit,
+    private val onClipboard: (String, Long, String?) -> Unit,
 ) {
     companion object {
         private const val TAG = "EcoPasteRootClipboard"
@@ -165,12 +165,16 @@ class RootClipboardMonitor(
     }
 
     private fun dispatchClipboard(line: String) {
-        val parts = line.split(' ', limit = 3)
-        if (parts.size != 3) return
+        val parts = line.split(' ', limit = 4)
+        if (parts.size != 4) return
         val timestamp = parts[1].toLongOrNull() ?: 0L
         try {
-            val text = String(Base64.decode(parts[2], Base64.DEFAULT), StandardCharsets.UTF_8)
-            onClipboard(text, timestamp)
+            val sourcePackage = String(
+                Base64.decode(parts[2], Base64.DEFAULT),
+                StandardCharsets.UTF_8,
+            ).ifBlank { null }
+            val text = String(Base64.decode(parts[3], Base64.DEFAULT), StandardCharsets.UTF_8)
+            onClipboard(text, timestamp, sourcePackage)
         } catch (error: Exception) {
             Log.w(TAG, "decode root clipboard event failed: ${error.message}")
         }

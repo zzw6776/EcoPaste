@@ -73,6 +73,9 @@ class EcoPasteOverlayPanel(
         val preview: String,
         val detail: String,
         val sourceAppName: String,
+        val sourceAppIconPath: String,
+        val sourceAppAccentStart: String,
+        val sourceAppAccentEnd: String,
         val displayCreatedAt: String,
         val isFavorite: Boolean,
         val isPinned: Boolean,
@@ -1577,6 +1580,9 @@ class EcoPasteOverlayPanel(
                         preview = item.optString("preview"),
                         detail = item.optString("detail"),
                         sourceAppName = item.optString("sourceAppName", "EcoPaste"),
+                        sourceAppIconPath = item.optString("sourceAppIconPath"),
+                        sourceAppAccentStart = item.optString("sourceAppAccentStart"),
+                        sourceAppAccentEnd = item.optString("sourceAppAccentEnd"),
                         displayCreatedAt = item.optString("displayCreatedAt"),
                         isFavorite = item.optBoolean("isFavorite"),
                         isPinned = item.optBoolean("isPinned"),
@@ -1665,7 +1671,7 @@ class EcoPasteOverlayPanel(
             gravity = Gravity.CENTER_VERTICAL
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(14), 0, dp(10), 0)
-            setBackgroundColor(headerColor(item.sourceAppName, item.kind))
+            background = headerBackground(item)
 
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1687,14 +1693,25 @@ class EcoPasteOverlayPanel(
                 })
             }, LinearLayout.LayoutParams(0, dp(36), 1f))
 
-            addView(TextView(context).apply {
-                text = item.sourceAppName.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "E"
-                textSize = 14f
-                gravity = Gravity.CENTER
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.WHITE)
-                background = roundedBackground(Color.argb(52, 255, 255, 255), dp(8).toFloat())
-            }, LinearLayout.LayoutParams(dp(28), dp(28)))
+            val iconBitmap = item.sourceAppIconPath
+                .takeIf { it.isNotBlank() }
+                ?.let { path -> BitmapFactory.decodeFile(path) }
+            val iconView: View = if (iconBitmap != null) {
+                ImageView(context).apply {
+                    setImageBitmap(iconBitmap)
+                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                }
+            } else {
+                TextView(context).apply {
+                    text = item.sourceAppName.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "E"
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                    background = roundedBackground(Color.argb(52, 255, 255, 255), dp(8).toFloat())
+                }
+            }
+            addView(iconView, LinearLayout.LayoutParams(dp(32), dp(32)))
         }.also {
             it.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -2048,6 +2065,19 @@ class EcoPasteOverlayPanel(
             )
         }
         return palette[(sourceAppName.hashCode() and Int.MAX_VALUE) % palette.size]
+    }
+
+    /** Applies Rust-provided source colors and keeps the legacy palette as a safe fallback. */
+    private fun headerBackground(item: OverlayItem): GradientDrawable {
+        val start = runCatching { Color.parseColor(item.sourceAppAccentStart) }.getOrNull()
+        val end = runCatching { Color.parseColor(item.sourceAppAccentEnd) }.getOrNull()
+        if (start == null || end == null) {
+            return roundedBackground(headerColor(item.sourceAppName, item.kind), 0f)
+        }
+        return GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(start, end),
+        )
     }
 
     private fun isDarkMode(): Boolean {

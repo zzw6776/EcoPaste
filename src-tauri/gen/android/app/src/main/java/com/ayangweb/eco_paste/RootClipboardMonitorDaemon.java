@@ -1,5 +1,6 @@
 package com.ayangweb.eco_paste;
 
+import android.annotation.SuppressLint;
 import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ClipboardManager;
@@ -113,7 +114,12 @@ public final class RootClipboardMonitorDaemon {
                 value.toString().getBytes(StandardCharsets.UTF_8),
                 Base64.NO_WRAP
             );
-            System.out.println("CLIPBOARD " + timestamp + " " + encoded);
+            String sourcePackage = primaryClipSource(manager);
+            String encodedSource = Base64.encodeToString(
+                sourcePackage.getBytes(StandardCharsets.UTF_8),
+                Base64.NO_WRAP
+            );
+            System.out.println("CLIPBOARD " + timestamp + " " + encodedSource + " " + encoded);
             System.out.flush();
         } catch (Throwable error) {
             System.out.println(
@@ -121,6 +127,22 @@ public final class RootClipboardMonitorDaemon {
                     + String.valueOf(error.getMessage())
             );
             System.out.flush();
+        }
+    }
+
+    /** Reads Android's API 30+ clipboard attribution without making it a hard dependency. */
+    @SuppressLint("BlockedPrivateApi")
+    private static String primaryClipSource(ClipboardManager manager) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return "";
+        }
+        try {
+            Method method = ClipboardManager.class.getDeclaredMethod("getPrimaryClipSource");
+            method.setAccessible(true);
+            Object source = method.invoke(manager);
+            return source instanceof String ? (String) source : "";
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 

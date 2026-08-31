@@ -13,7 +13,7 @@ export type ClipboardSubKind =
   | "color"
   | "path";
 
-export type ClipboardPlatform = "macos" | "windows";
+export type ClipboardPlatform = "macos" | "windows" | "android";
 
 /**
  * 右键菜单可用动作。与 Rust `ClipboardAction` 对应（`serde(rename_all = "camelCase")`）。
@@ -66,6 +66,8 @@ export interface ClipboardItem {
   sourceAppName?: string;
   sourceAppIconFile?: string;
   sourceAppIconPath?: string;
+  sourceAppAccentStart?: string;
+  sourceAppAccentEnd?: string;
   /** image 条目的缩略图绝对路径（后端预处理返回）。 */
   imageThumbnailPath?: string;
   /** files 条目的预处理条目（与 content 中路径顺序一致，数量由 Rust 按设置截断）。 */
@@ -85,6 +87,9 @@ export interface ClipboardApp {
   name: string;
   iconFile: string | null;
   iconPath: string | null;
+  iconHash: string | null;
+  accentStart: string | null;
+  accentEnd: string | null;
   platform: ClipboardPlatform;
   createdAt: string;
   updatedAt: string;

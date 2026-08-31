@@ -1,10 +1,10 @@
 # 来源应用元数据与图标同步设计
 
-> 状态：设计已确认，尚未实现。本文描述后续实现约束，不代表当前版本已经支持跨端来源应用图标同步。
+> 状态：已按本文的优化方案实现，随 1.1.76 交付。Android Root 隐藏接口的来源识别仍需真机覆盖不同系统版本验证。
 
 ## 背景与根因
 
-当前本地剪贴板记录通过 `source_app_id` 关联 `clipboard_apps`，来源应用名称和图标文件只保存在本机。同步事件 `ClipboardEnvelope` 只携带剪贴板内容、内容类型、时间和来源平台，不包含来源应用元数据。接收端因此会把 `source_app_id`、名称和图标全部置空。
+改造前，本地剪贴板记录通过 `source_app_id` 关联 `clipboard_apps`，来源应用名称和图标文件只保存在本机。同步事件 `ClipboardEnvelope` 只携带剪贴板内容、内容类型、时间和来源平台，不包含来源应用元数据。接收端因此会把 `source_app_id`、名称和图标全部置空。
 
 这会产生两个直接结果：
 
@@ -38,8 +38,9 @@ SourceAppRef
 
 SourceIconRef
   icon_hash: string
-  asset_id: string
+  blob_id: string
   original_size: integer
+  encrypted_size: integer
 ```
 
 字段规则：
@@ -47,7 +48,7 @@ SourceIconRef
 - `source_key` 是同步空间内稳定的应用标识。使用从空间内容密钥派生出的专用密钥，对规范化后的平台与本机应用标识做 keyed BLAKE3；不得发送原始标识。
 - `display_name` 是经过长度限制和控制字符清理后的展示名称。
 - `icon_hash` 是规范化 PNG 字节的 BLAKE3，接收端用它检查本地 `AppIconStore` 缓存并校验下载结果。
-- `asset_id` 是由空间专用资源密钥和 `icon_hash` 派生的不可猜测资源标识，用于局域网请求和云端对象寻址。
+- `blob_id` 是规范化图标经空间内容密钥稳定加密后的密文哈希；同空间的同一图标得到相同 ID，不同空间得到不同 ID。
 - `accent_start` 和 `accent_end` 由 Rust 对规范化图标计算并持久化。前端和 Android 原生层只负责应用颜色，不再各自计算。
 
 图标在进入同步链路前统一解码并规范化为 64 × 64 RGBA PNG。这样相同视觉资源能够得到稳定哈希，也限制了解码成本。没有图标时，颜色可以从 `source_key` 在 Rust 中确定性生成。
@@ -58,28 +59,28 @@ SourceIconRef
 
 1. 采集来源应用标识、展示名称和图标。
 2. 规范化图标并写入现有 `AppIconStore`，得到 `icon_hash`。
-3. 计算 `source_key`、`asset_id` 和两端统一使用的强调色。
+3. 计算 `source_key`、稳定 `blob_id` 和两端统一使用的强调色。
 4. 在剪贴板事件中写入 `SourceAppRef`。事件始终只携带图标引用，不携带 PNG 字节。
-5. 图标资源尚未进入当前同步空间的资源缓存时，加密并以 `asset_id` 执行一次幂等发布。
+5. 图标资源尚未进入当前同步空间的 Blob 缓存时，执行稳定加密并复用现有 `PutBlob` 幂等发布。图标 Blob 与正文必需 Blob 分开处理；图标加密或发布失败只记录并继续发送正文事件。
 
 ### 接收端
 
 1. 先正常落库剪贴板内容，不等待图标下载。
 2. 如果 `AppIconStore` 已存在 `<icon_hash>.png`，立即关联缓存，不发起资源请求。
-3. 缓存不存在时，把 `asset_id` 加入去重后的资源下载队列，并暂时显示首字母或内容类型图标。
+3. 缓存不存在时，把 `blob_id` 加入去重后的资源下载队列，并暂时显示首字母或内容类型图标。
 4. 优先从云端资源缓存获取；云端不可用时，向当前在线且属于同一同步空间的设备请求。请求不要求事件原始发送设备在线。
 5. 解密后校验大小、PNG 格式和 `icon_hash`，再原子写入 `AppIconStore`、更新来源应用记录并发送刷新事件。
 
 接收端是否缺少图标只由接收端自己判断。发送端不需要知道其他设备的缓存状态，也不需要同步缓存清单。
 
 ```text
-剪贴板事件到达（包含 icon_hash + asset_id）
+剪贴板事件到达（包含 icon_hash + blob_id）
                     |
           本地是否已有 icon_hash？
                /                \
              有                  无
              |                   |
-        直接关联缓存       下载 asset_id 一次
+        直接关联缓存       下载 blob_id 一次
                                  |
                          校验并写入本地缓存
                                  |
@@ -88,15 +89,14 @@ SourceIconRef
 
 ## 资源传输与去重
 
-来源应用图标必须使用独立的可选资源字段和资源请求协议，不能直接给现有 `BlobRole` 增加枚举值。旧客户端遇到未知枚举可能无法解码整条事件，导致剪贴板正文也无法同步。
+来源应用图标使用独立的可选引用字段，但资源字节复用现有 `PutBlob` / `GetBlob` 协议。图标不加入 `ClipboardEnvelope.blobs`，也不新增 `BlobRole`；旧客户端会忽略 `source_app`，同时仍能解码和同步正文。
 
-当前普通同步 Blob 使用随机 nonce 加密，并按密文字节生成 `blob_id`；同一 PNG 重复加密会得到不同 ID，不能自然去重。来源图标资源需要把“稳定对象身份”和“随机加密结果”分离：
+当前普通内容 Blob 使用随机 nonce 加密，并按密文字节生成 `blob_id`。来源图标是小型、公开可见且已规范化的资源，改用由空间内容密钥与明文哈希确定的流 nonce：
 
-- `asset_id` 由空间密钥和明文哈希确定，作为稳定、空间隔离的对象键。
-- 资源容器内部保存版本、随机 nonce 和密文，服务端只看到不可猜测的 `asset_id` 与密文。
-- 云端采用 put-if-absent 语义；并发上传同一 `asset_id` 时保留任一可正确解密并通过明文哈希校验的对象。
-- 局域网协议提供按 `asset_id` 查询和读取资源的能力，不广播每台设备的完整缓存集合。
-- 下载任务按 `asset_id` 合并，避免多条卡片同时触发重复请求。
+- 相同空间、相同规范化 PNG 产生完全相同的密文和 `blob_id`，直接获得现有 Blob 仓储的幂等去重能力。
+- 不同空间使用不同内容密钥，因此相同图标的密文和 `blob_id` 不同，服务端无法跨空间关联。
+- 该确定性加密只用于以明文哈希为身份的小型来源图标；剪贴板图片、文件等普通内容继续使用随机 nonce。
+- 云端与局域网不增加新消息类型、存储表或服务端发布流程，降低了兼容和运维风险。
 
 资源必须限制为 PNG、64 × 64、合理的最大字节数，并在解码和落盘前校验。失败只影响图标展示，不得使剪贴板事件应用失败。
 
@@ -109,12 +109,18 @@ source_app_sync_aliases
   group_id
   source_key
   app_id
+  icon_hash
+  blob_id
+  icon_original_size
+  icon_encrypted_size
+  source_updated_at
+  source_revision
   created_at
   updated_at
   UNIQUE(group_id, source_key)
 ```
 
-`clipboard_apps` 增加可空的 `accent_start`、`accent_end`。收到来源元数据时，先按 `(group_id, source_key)` 找到或创建来源应用，再写剪贴板记录，保证外键成立。离开同步空间时可清理别名映射，但保留历史记录、应用名称和已落盘图标。
+`clipboard_apps` 增加可空的 `accent_start`、`accent_end`。收到来源元数据时，先按 `(group_id, source_key)` 找到或创建来源应用，再写剪贴板记录，保证外键成立。别名元数据按 `(source_updated_at, source_revision)` 决胜，并在同一事务内更新别名和应用行，避免乱序事件使旧图标覆盖新图标。离开同步空间时可清理别名映射，但保留历史记录、应用名称和已落盘图标。
 
 当前剪贴板按 `content_hash` 去重。相同内容可能先后来自不同应用，因此来源元数据必须遵循与最近使用时间一致的确定性规则：较新的 `updated_at` 对应的同步事件覆盖来源应用；时间相同时按事件的稳定顺序字段决胜。不能只合并时间而永久保留接收端原有来源，否则多端仍会显示不一致。
 
@@ -125,6 +131,8 @@ source_app_sync_aliases
 - Root 模式：通过系统隐藏接口读取准确的剪贴板来源包名，再用 `PackageManager` 读取名称和图标。
 - 无障碍模式：使用相关 `AccessibilityEvent.packageName` 作为尽力结果；事件与剪贴板变化无法可靠关联时返回未知。
 - 普通前台模式：Android 公共 API 无法可靠取得来源包名，保持来源未知。
+
+Android 11+ 会过滤其它应用的包信息查询。Manifest 通过 `MAIN` + `LAUNCHER` intent 的 `<queries>` 范围声明常规可启动应用，不申请 `QUERY_ALL_PACKAGES`；无启动入口或系统限制下仍无法读取的来源只保留包名回退。
 
 JNI 采集契约需要把包名、展示名称和 PNG 一并传给 Rust，由 Rust 完成规范化、哈希、颜色计算、存储和同步。Android 原生弹窗 DTO 增加图标路径与强调色，Kotlin 使用真实 `ImageView` 和统一渐变；只有图标缺失时才显示首字母回退。
 
@@ -140,7 +148,7 @@ JNI 采集契约需要把包名、展示名称和 PNG 一并传给 Rust，由 Ru
 
 1. 增加数据库 migration、Rust 来源应用模型和统一颜色计算。
 2. 增加可选同步契约及双向兼容测试，同时修复 `content_hash` 去重时的来源决胜规则。
-3. 实现本地资源索引、云端按 `asset_id` 存取和局域网按需请求。
+3. 实现本地资源索引，并通过现有 Blob 通道完成云端与局域网按需请求。
 4. 接入桌面来源采集与 Android Root/无障碍分级采集。
 5. Web 卡片和 Android 原生弹窗改用同一图标路径与强调色。
 

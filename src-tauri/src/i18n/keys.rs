@@ -34,6 +34,8 @@ pub enum CommandKey {
     #[cfg(not(target_os = "android"))]
     DragTextEmpty,
     ExternalUrlUnsupported,
+    #[cfg(target_os = "macos")]
+    PasteAccessibilityRequired,
     SaveImage,
 }
 

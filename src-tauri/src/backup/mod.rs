@@ -1101,19 +1101,31 @@ async fn merge_groups(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePoo
 }
 
 async fn merge_apps(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool) -> Result<()> {
+    let has_sync_metadata: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clipboard_apps') WHERE name = 'icon_hash')",
+    )
+    .fetch_one(backup)
+    .await
+    .context("failed to inspect backup app schema")?;
+    let select = if has_sync_metadata == 1 {
+        "SELECT id, name, icon_file, icon_hash, accent_start, accent_end, platform, created_at, updated_at FROM clipboard_apps"
+    } else {
+        "SELECT id, name, icon_file, NULL AS icon_hash, NULL AS accent_start, NULL AS accent_end, platform, created_at, updated_at FROM clipboard_apps"
+    };
     let rows = sqlx::query_as::<
         _,
         (
             String,
             String,
             Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
             String,
             DateTime<Utc>,
             DateTime<Utc>,
         ),
-    >(
-        "SELECT id, name, icon_file, platform, created_at, updated_at FROM clipboard_apps"
-    )
+    >(select)
     .fetch_all(backup)
     .await
     .context("failed to read backup apps")?;
@@ -1121,7 +1133,8 @@ async fn merge_apps(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool)
     for row in rows {
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_apps \
-             (id, name, icon_file, platform, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+             (id, name, icon_file, icon_hash, accent_start, accent_end, platform, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.0)
         .bind(row.1)
@@ -1129,6 +1142,9 @@ async fn merge_apps(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool)
         .bind(row.3)
         .bind(row.4)
         .bind(row.5)
+        .bind(row.6)
+        .bind(row.7)
+        .bind(row.8)
         .execute(&mut **tx)
         .await
         .context("failed to import app")?;
@@ -1197,16 +1213,18 @@ async fn merge_items(
 
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_items \
-             (id, kind, sub_kind, group_id, source_app_id, content, content_hash, search_text, \
+             (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, search_text, \
               summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(row.id)
+        .bind(&row.id)
         .bind(row.kind)
         .bind(row.sub_kind)
         .bind(row.group_id)
         .bind(row.source_app_id)
+        .bind(&row.id)
+        .bind(row.updated_at)
         .bind(row.content)
         .bind(row.content_hash)
         .bind(row.search_text)
@@ -1592,6 +1610,7 @@ mod tests {
             sub_kind: None,
             group_id: None,
             source_app_id: None,
+            source_revision: uuid::Uuid::new_v4().simple().to_string(),
             content_hash: content_hash(ClipboardKind::Text, &content),
             content,
             search_text: None,
@@ -1611,6 +1630,8 @@ mod tests {
             source_app_name: None,
             source_app_icon_file: None,
             source_app_icon_path: None,
+            source_app_accent_start: None,
+            source_app_accent_end: None,
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,

@@ -302,6 +302,25 @@ pub fn resign_clipboard_panel_key(app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// 等待此前投递到 AppKit 主线程的 panel hide / resign 操作真正执行完毕。
+/// `run_on_main_thread` 本身只保证入队；没有这个屏障时，模拟粘贴可能先于 panel 让出焦点。
+pub async fn wait_for_clipboard_panel_focus_release(app_handle: &AppHandle) -> Result<()> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+    app_handle
+        .run_on_main_thread(move || {
+            let _ = ready_tx.send(());
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("wait for clipboard panel focus release timed out"))?
+        .map_err(|_| anyhow::anyhow!("clipboard panel focus release was cancelled"))?;
+
+    Ok(())
+}
+
 /// 粘贴完成后把 key 状态拿回来：固定窗口模式下用户还要继续用键盘 / 列表操作。
 pub fn make_clipboard_panel_key(app_handle: &AppHandle) -> Result<()> {
     let handle = app_handle.clone();

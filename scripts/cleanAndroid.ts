@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { acquireAndroidBuildLock } from "./androidBuildLock";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const androidRoot = resolve(projectRoot, "src-tauri/gen/android");
@@ -69,20 +70,24 @@ function cleanWslBuildDirectories() {
   return true;
 }
 
-if (cleanWslBuildDirectories()) {
-  normalizeGeneratedManifest();
-  process.exit(0);
+const buildLock = await acquireAndroidBuildLock(projectRoot, "cache cleanup");
+try {
+  if (cleanWslBuildDirectories()) {
+    normalizeGeneratedManifest();
+  } else {
+    const result = spawnSync(gradleWrapper, ["clean", "--no-daemon"], {
+      cwd: androidRoot,
+      shell: process.platform === "win32",
+      stdio: "inherit",
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    normalizeGeneratedManifest();
+    process.exitCode = result.status ?? 1;
+  }
+} finally {
+  await buildLock.release();
 }
-
-const result = spawnSync(gradleWrapper, ["clean", "--no-daemon"], {
-  cwd: androidRoot,
-  shell: process.platform === "win32",
-  stdio: "inherit",
-});
-
-if (result.error) {
-  throw result.error;
-}
-
-normalizeGeneratedManifest();
-process.exitCode = result.status ?? 1;

@@ -88,25 +88,54 @@ impl WatcherPause {
 /// 把同步抓到的 [`FrontmostApp`] 落 icon 字节 + 拼成可入库的 [`ClipboardApp`]。
 /// icon 落盘失败不阻断（仍保留应用名），仅 warn。
 ///
-/// `registry` 命中缓存时优先复用，省掉一次 PNG 字节 sha256/IO；
-/// 缓存未命中再走 FrontmostApp.icon_png 路径，
+/// `registry` 命中完整缓存时优先复用；旧缓存缺图标时仍用新采集的 PNG 补齐，
 /// 并把结果回写缓存，让首次见到的应用后续直接命中。
 pub fn materialize_source(
     store: &AppIconStore,
     registry: Option<&AppsRegistry>,
     src: FrontmostApp,
 ) -> ClipboardApp {
-    if let Some(reg) = registry {
-        if let Some(cached) = reg.get(&src.id) {
+    let cached = registry.and_then(|value| value.get(&src.id));
+    if let Some(mut cached) = cached.clone() {
+        if cached.icon_hash.is_none()
+            || cached.accent_start.is_none()
+            || cached.accent_end.is_none()
+        {
+            if let Some(icon_file) = cached.icon_file.as_deref() {
+                match store.refresh_metadata(icon_file) {
+                    Ok(metadata) => {
+                        cached.icon_file = Some(metadata.file_name);
+                        cached.icon_hash = Some(metadata.icon_hash);
+                        cached.accent_start = Some(metadata.accent_start);
+                        cached.accent_end = Some(metadata.accent_end);
+                    }
+                    Err(error) => {
+                        log::warn!("refresh cached app icon for {} failed: {error}", src.id);
+                    }
+                }
+            }
+        }
+        let metadata_complete = cached.icon_file.is_some()
+            && cached.icon_hash.is_some()
+            && cached.accent_start.is_some()
+            && cached.accent_end.is_some();
+        if metadata_complete || src.icon_png.is_none() {
+            if cached.name != src.name {
+                cached.name = src.name;
+                cached.updated_at = Utc::now();
+            }
+            if let Some(registry) = registry {
+                registry.insert_into_cache(cached.clone());
+            }
             return cached;
         }
     }
 
-    let icon_file = src
+    let icon = src
         .icon_png
         .as_deref()
-        .and_then(|bytes| match store.store(bytes) {
-            Ok(name) => Some(name),
+        .and_then(|bytes| match store.store_with_metadata(bytes) {
+            Ok(icon) => Some(icon),
             Err(err) => {
                 log::warn!("app icon store failed for {}: {err}", src.id);
                 None
@@ -116,9 +145,12 @@ pub fn materialize_source(
     let app = ClipboardApp {
         id: src.id,
         name: src.name,
-        icon_file,
+        icon_file: icon.as_ref().map(|value| value.file_name.clone()),
+        icon_hash: icon.as_ref().map(|value| value.icon_hash.clone()),
+        accent_start: icon.as_ref().map(|value| value.accent_start.clone()),
+        accent_end: icon.as_ref().map(|value| value.accent_end.clone()),
         platform: src.platform,
-        created_at: now,
+        created_at: cached.as_ref().map_or(now, |value| value.created_at),
         updated_at: now,
     };
     if let Some(reg) = registry {
@@ -216,13 +248,13 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
 
 /// Receives one deduplicated native Android clipboard-change event.
 #[cfg(target_os = "android")]
-pub fn capture_android_text(app: &AppHandle, text: String) {
+pub fn capture_android_text(app: &AppHandle, text: String, source: Option<FrontmostApp>) {
     let app = app.clone();
     let guard = app.state::<Arc<WritebackGuard>>().inner().clone();
     let store = app.state::<ImageStore>().inner().clone();
     let pause = app.state::<WatcherPause>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        persist_android_text(&app, &guard, &store, &pause, text).await;
+        persist_android_text(&app, &guard, &store, &pause, text, source).await;
     });
 }
 
@@ -233,6 +265,7 @@ async fn persist_android_text(
     store: &ImageStore,
     pause: &WatcherPause,
     text: String,
+    source: Option<FrontmostApp>,
 ) {
     use super::payload::{ClipboardPayload, TextPayload};
 
@@ -248,7 +281,7 @@ async fn persist_android_text(
         html: None,
         rtf: None,
     });
-    let item = match build_item_with_settings(
+    let mut item = match build_item_with_settings(
         store,
         &payload,
         &settings.clipboard.capture,
@@ -261,8 +294,18 @@ async fn persist_android_text(
     if guard.should_skip(&item.content_hash) {
         return;
     }
+    let source_app = source.map(|source| {
+        materialize_source(
+            &app.state::<AppIconStore>(),
+            Some(&app.state::<AppsRegistry>()),
+            source,
+        )
+    });
+    if let Some(source) = source_app.as_ref() {
+        item.source_app_id = Some(source.id.clone());
+    }
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
-    if let Err(error) = persist_and_notify(app, &pool, &item, None).await {
+    if let Err(error) = persist_and_notify(app, &pool, &item, source_app.as_ref()).await {
         log::error!("Android clipboard capture persist failed: {error}");
     }
 }

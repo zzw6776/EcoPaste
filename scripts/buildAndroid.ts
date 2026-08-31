@@ -7,6 +7,7 @@ import {
   statSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import { acquireAndroidBuildLock } from "./androidBuildLock";
 import { cleanAndroidCacheIfNeeded } from "./buildCache";
 
 const projectRoot = resolve(import.meta.dirname, "..");
@@ -130,11 +131,16 @@ if (mode === "debug") {
 }
 buildArgs.push("--target", "aarch64", "--apk", "--ci");
 
-await cleanAndroidCacheIfNeeded(projectRoot, async () => {
-  await runPnpm(["clean:android"]);
-});
-await runPnpm(buildArgs, process.env, true);
-mkdirSync(artifactDirectory, { recursive: true });
-copyFileSync(sourceApk, artifactApk);
+const buildLock = await acquireAndroidBuildLock(projectRoot, `${mode} build`);
+try {
+  await cleanAndroidCacheIfNeeded(projectRoot, async () => {
+    await runPnpm(["clean:android"], buildLock.childEnv);
+  });
+  await runPnpm(buildArgs, process.env, true);
+  mkdirSync(artifactDirectory, { recursive: true });
+  copyFileSync(sourceApk, artifactApk);
 
-process.stdout.write(`Android APK: ${artifactApk}\n`);
+  process.stdout.write(`Android APK: ${artifactApk}\n`);
+} finally {
+  await buildLock.release();
+}

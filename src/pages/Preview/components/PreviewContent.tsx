@@ -97,13 +97,12 @@ export const PreviewHeader: FC<PreviewHeaderProps> = (props) => {
       {/* 右侧：来源 App 真实图标 + 复制操作 */}
       <div className="flex items-center gap-2">
         {/* 真实 App 来源图标（macOS 原生圆角，完全对齐下方卡片） */}
-        {(payload.sourceAppIconPath || theme.iconUrl) && (
+        {payload.sourceAppIconPath && (
           <div className="flex size-[20px] shrink-0 items-center justify-center overflow-hidden rounded-[4.5px]">
             <AssetImage
               alt={payload.sourceAppName ?? "app"}
               className="pointer-events-none size-full object-contain"
-              fallbackSrc={theme.iconUrl}
-              src={payload.sourceAppIconPath || theme.iconUrl}
+              src={payload.sourceAppIconPath}
             />
           </div>
         )}
@@ -205,17 +204,19 @@ const UrlViewer: FC<PayloadViewerProps> = (props) => {
   const urlInfo = parseUrlInfo(payload.text);
 
   return (
-    <div className="flex min-h-48 flex-col items-center justify-center gap-3 bg-white p-6 text-center dark:bg-[#1E1E1E]">
-      <img
-        alt="logo"
-        className="size-16 object-contain"
-        src={urlInfo?.iconUrl}
-      />
-      <div className="font-bold text-base text-neutral-800 dark:text-neutral-100">
-        {urlInfo?.name}
-      </div>
-      <div className="select-text break-all px-4 font-mono text-blue-600 text-xs dark:text-blue-400">
-        {payload.text}
+    <div className="h-full min-h-48 overflow-auto bg-ant-container px-6 py-5">
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
+        <div className="font-semibold text-ant-text text-base">
+          {urlInfo?.name}
+        </div>
+        <div className="flex items-start gap-3 rounded-2.5 border border-ant-border-secondary bg-ant-fill-quaternary px-4 py-3.5">
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-2 bg-ant-container text-ant-primary">
+            <i aria-hidden="true" className="i-lucide:link-2 size-4" />
+          </span>
+          <div className="min-w-0 select-text whitespace-pre-wrap break-all font-mono text-ant-text text-sm leading-relaxed">
+            {payload.text}
+          </div>
+        </div>
       </div>
     </div>
   );

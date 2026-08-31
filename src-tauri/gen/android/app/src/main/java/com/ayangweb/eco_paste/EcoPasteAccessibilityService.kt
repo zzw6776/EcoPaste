@@ -41,12 +41,15 @@ class EcoPasteAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || EcoPasteBridge.currentEngineMode != "accessibility") return
 
+        val sourcePackage = event.packageName?.toString()
+        EcoPasteBridge.recordAccessibilitySource(sourcePackage)
+
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
-                EcoPasteBridge.captureClipboardChange(clipboardManager, false)
+                EcoPasteBridge.captureClipboardChange(clipboardManager, false, sourcePackage)
             }
         }
     }

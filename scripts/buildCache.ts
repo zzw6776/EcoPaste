@@ -167,9 +167,22 @@ export async function cleanAndroidCacheIfNeeded(
   projectRoot: string,
   cleanGradle: () => Promise<void>,
 ) {
+  const androidTargetRoot = resolve(
+    projectRoot,
+    "src-tauri/target/aarch64-linux-android",
+  );
+  const androidRoot = resolve(projectRoot, "src-tauri/gen/android");
+  const debugCachePath = resolve(androidTargetRoot, "debug");
   const cachePaths = [
-    resolve(projectRoot, "src-tauri/target/aarch64-linux-android"),
-    resolve(projectRoot, "src-tauri/gen/android"),
+    debugCachePath,
+    resolve(androidTargetRoot, "release"),
+    resolve(androidRoot, ".gradle"),
+    resolve(androidRoot, "build"),
+    resolve(androidRoot, "buildSrc/.gradle"),
+    resolve(androidRoot, "buildSrc/build"),
+    resolve(androidRoot, "app/build"),
+    resolve(androidRoot, "hidden-api-stubs/build"),
+    resolve(androidRoot, "app/src/main/jniLibs"),
   ];
   const shouldClean = await isCacheLimitExceeded(
     "Android arm64",
@@ -177,6 +190,27 @@ export async function cleanAndroidCacheIfNeeded(
     ANDROID_CACHE_LIMIT,
   );
   if (!shouldClean) {
+    return;
+  }
+
+  let debugError: unknown;
+  try {
+    cleanCargoProfiles(projectRoot, ["dev"], "aarch64-linux-android");
+  } catch (error) {
+    debugError = error;
+  }
+
+  const sizeAfterDebugCleanup = await getPathsSize(cachePaths);
+  if (sizeAfterDebugCleanup <= ANDROID_CACHE_LIMIT) {
+    if (debugError) {
+      process.stderr.write(
+        `Android debug cache cleanup was interrupted, but the remaining cache is ${(sizeAfterDebugCleanup / GIBIBYTE).toFixed(2)} GiB; keeping release cache.\n`,
+      );
+    } else {
+      process.stdout.write(
+        `Android arm64 build cache: removed unused debug profile; ${(sizeAfterDebugCleanup / GIBIBYTE).toFixed(2)} GiB remains, keeping release cache.\n`,
+      );
+    }
     return;
   }
 
@@ -191,33 +225,27 @@ export async function cleanAndroidCacheIfNeeded(
   try {
     cleanCargoProfiles(
       projectRoot,
-      ["dev", "release"],
+      debugError ? ["dev", "release"] : ["release"],
       "aarch64-linux-android",
     );
   } catch (error) {
     cargoError = error;
   }
 
-  if (cargoError) {
+  const cleanupErrors = [debugError, gradleError, cargoError].filter(
+    (error) => error !== void 0,
+  );
+  if (cleanupErrors.length > 0) {
     const remainingSize = await getPathsSize(cachePaths);
     if (remainingSize <= ANDROID_CACHE_LIMIT) {
       process.stderr.write(
-        `Cargo cache cleanup was interrupted, but the remaining Android cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
+        `Android cache cleanup was interrupted, but the remaining cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
       );
-      cargoError = void 0;
+      return;
     }
   }
 
-  if (gradleError && cargoError) {
-    throw new AggregateError(
-      [gradleError, cargoError],
-      "Android Gradle and Cargo cache cleanup both failed",
-    );
-  }
-  if (gradleError) {
-    throw gradleError;
-  }
-  if (cargoError) {
-    throw cargoError;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Android cache cleanup failed");
   }
 }

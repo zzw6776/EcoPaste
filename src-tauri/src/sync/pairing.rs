@@ -21,6 +21,8 @@ pub struct DiscoveryMetadata {
     pub device_name: String,
     #[n(3)]
     pub platform: String,
+    #[n(4)]
+    pub presence_nonce: Option<u64>,
 }
 
 impl DiscoveryMetadata {
@@ -169,6 +171,7 @@ mod tests {
             space_id: "space".into(),
             device_name: "MacBook Pro".into(),
             platform: "macos".into(),
+            presence_nonce: Some(42),
         };
         let encoded = metadata.encode().unwrap();
         assert_eq!(DiscoveryMetadata::decode(&encoded).unwrap(), metadata);
@@ -182,6 +185,7 @@ mod tests {
             space_id: "a".repeat(24),
             device_name: "设备名称".repeat(20),
             platform: "android".into(),
+            presence_nonce: Some(42),
         };
         let encoded = metadata.encode().unwrap();
         let decoded = DiscoveryMetadata::decode(&encoded).unwrap();
@@ -189,6 +193,63 @@ mod tests {
         assert!(decoded.device_name.len() < metadata.device_name.len());
         assert!(metadata.device_name.starts_with(&decoded.device_name));
         assert!(encoded.as_ref().len() <= UserData::MAX_LENGTH);
+    }
+
+    #[test]
+    fn discovery_presence_nonce_is_backward_compatible() {
+        #[derive(Debug, PartialEq, Eq, Encode, Decode)]
+        #[cbor(map)]
+        struct LegacyDiscoveryMetadata {
+            #[n(0)]
+            version: u16,
+            #[n(1)]
+            space_id: String,
+            #[n(2)]
+            device_name: String,
+            #[n(3)]
+            platform: String,
+        }
+
+        let legacy = LegacyDiscoveryMetadata {
+            version: JOIN_PROTOCOL_VERSION,
+            space_id: "space".into(),
+            device_name: "Android".into(),
+            platform: "android".into(),
+        };
+        let legacy_payload = minicbor::to_vec(&legacy).unwrap();
+        let legacy_value = UserData::try_from(format!(
+            "{DISCOVERY_PREFIX}{}",
+            BASE64URL_NOPAD.encode(&legacy_payload)
+        ))
+        .unwrap();
+        assert_eq!(
+            DiscoveryMetadata::decode(&legacy_value)
+                .unwrap()
+                .presence_nonce,
+            None
+        );
+
+        let current = DiscoveryMetadata {
+            version: JOIN_PROTOCOL_VERSION,
+            space_id: legacy.space_id.clone(),
+            device_name: legacy.device_name.clone(),
+            platform: legacy.platform.clone(),
+            presence_nonce: Some(7),
+        };
+        let encoded = current.encode().unwrap();
+        let payload = BASE64URL_NOPAD
+            .decode(
+                encoded
+                    .as_ref()
+                    .strip_prefix(DISCOVERY_PREFIX)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            minicbor::decode::<LegacyDiscoveryMetadata>(&payload).unwrap(),
+            legacy
+        );
     }
 
     #[test]

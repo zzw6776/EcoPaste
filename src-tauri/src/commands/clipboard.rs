@@ -410,6 +410,9 @@ pub struct ClipboardAppView {
     pub name: String,
     pub icon_file: Option<String>,
     pub icon_path: Option<String>,
+    pub icon_hash: Option<String>,
+    pub accent_start: Option<String>,
+    pub accent_end: Option<String>,
     pub platform: Platform,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -568,6 +571,9 @@ pub async fn paste_clipboard_item(
     id: String,
     _plain: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    ensure_macos_paste_permission(&app).await?;
+
     let pool = db.pool().await;
     let item = find_item_by_id(&pool, &id)
         .await?
@@ -607,6 +613,9 @@ pub async fn paste_clipboard_item(
             log::warn!("hide clipboard window before paste failed: {err:?}");
         }
 
+        #[cfg(target_os = "macos")]
+        window::macos::wait_for_clipboard_panel_focus_release(&app).await?;
+
         // hide / resign 都是 run_on_main_thread 异步派发；不等一拍，simulate_paste 的 ⌘V
         // 会赶在 panel 真正 order_out / 让出 key 前命中 panel 自己（webview 吞掉）。
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -627,6 +636,22 @@ pub async fn paste_clipboard_item(
     }
 
     Ok(())
+}
+
+/// macOS 会静默丢弃未获辅助功能授权的 CGEvent；预检并触发系统授权提示，避免假成功。
+#[cfg(target_os = "macos")]
+async fn ensure_macos_paste_permission(app: &AppHandle) -> Result<()> {
+    if tauri_plugin_macos_permissions::check_accessibility_permission().await {
+        return Ok(());
+    }
+
+    tauri_plugin_macos_permissions::request_accessibility_permission().await;
+    let message = crate::i18n::commands::label(
+        crate::i18n::current_language(app),
+        crate::i18n::commands::Key::PasteAccessibilityRequired,
+    );
+
+    Err(AppError::Clipboard(message.to_owned()))
 }
 
 /// 计算复制写回是否强制走纯文本；默认复制纯文本只作用于文本记录。
@@ -824,6 +849,9 @@ fn build_clipboard_app_view(store: &AppIconStore, app: ClipboardApp) -> Clipboar
         name: app.name,
         icon_file: app.icon_file,
         icon_path,
+        icon_hash: app.icon_hash,
+        accent_start: app.accent_start,
+        accent_end: app.accent_end,
         platform: app.platform,
         created_at: app.created_at,
         updated_at: app.updated_at,
@@ -849,6 +877,9 @@ fn redact_sensitive_list_item(item: &mut ClipboardItem, redact_sensitive: bool) 
 
     if let Some(summary) = item.summary.as_mut() {
         *summary = mask_sensitive_text(summary);
+    }
+    if !item.content.is_empty() {
+        item.content = mask_sensitive_text(&item.content);
     }
     item.color_preview = None;
 }
@@ -1745,6 +1776,7 @@ mod tests {
             sub_kind,
             group_id: None,
             source_app_id: None,
+            source_revision: uuid::Uuid::new_v4().simple().to_string(),
             content_hash: content_hash(ClipboardKind::Text, &content),
             content,
             search_text: None,
@@ -1764,6 +1796,8 @@ mod tests {
             source_app_name: None,
             source_app_icon_file: None,
             source_app_icon_path: None,
+            source_app_accent_start: None,
+            source_app_accent_end: None,
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
@@ -1883,10 +1917,12 @@ mod tests {
     #[test]
     fn redact_sensitive_list_item_masks_summary_when_enabled() {
         let mut item = text_item(None, true);
+        item.content = "sk-abcdefghijklmnopqrstuvwxyzABCDE1234567890".to_owned();
         item.summary = Some("sk-abcdefghijklmnopqrstuvwxyzABCDE1234567890".to_owned());
 
         redact_sensitive_list_item(&mut item, true);
 
+        assert_eq!(item.content, "sk-a********7890");
         assert_eq!(item.summary.as_deref(), Some("sk-a********7890"));
     }
 

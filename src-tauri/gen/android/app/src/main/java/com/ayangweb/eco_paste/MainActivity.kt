@@ -86,7 +86,7 @@ class MainActivity : TauriActivity() {
         EcoPasteBridge.setCurrentActivity(this)
         EcoPasteBridge.setForegroundCaptureActive(true)
         try {
-            EcoPasteBridge.notifySyncNetworkChanged()
+            EcoPasteBridge.notifySyncForeground()
         } catch (error: Throwable) {
             android.util.Log.w("MainActivity", "notify sync foreground warning: ${error.message}")
         }

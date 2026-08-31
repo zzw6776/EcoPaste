@@ -157,6 +157,11 @@ impl Subscribers {
     }
 }
 
+/// Compares advertised routes and TXT data while ignoring each response's liveness timestamp.
+fn peer_metadata_eq(left: &Peer, right: &Peer) -> bool {
+    left.addrs() == right.addrs() && left.txt_attributes().eq(right.txt_attributes())
+}
+
 /// Builder for [`MdnsAddressLookup`].
 #[derive(Debug)]
 pub struct MdnsAddressLookupBuilder {
@@ -393,10 +398,10 @@ impl MdnsAddressLookup {
                             continue;
                         }
 
-                        let entry = endpoint_addrs.entry(discovered_endpoint_id);
-                        if let std::collections::hash_map::Entry::Occupied(ref entry) = entry
-                            && entry.get() == &peer_info
-                        {
+                        let unchanged = endpoint_addrs
+                            .insert(discovered_endpoint_id, peer_info.clone())
+                            .is_some_and(|previous| peer_metadata_eq(&previous, &peer_info));
+                        if unchanged {
                             // this is a republish we already know about
                             continue;
                         }
@@ -416,8 +421,6 @@ impl MdnsAddressLookup {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        entry.or_insert(peer_info);
-
                         // only send endpoints to the `subscriber` if they weren't explicitly resolved
                         // in other words, endpoints sent to the `subscribers` should only be the ones that
                         // have been "passively" discovered
@@ -724,6 +727,47 @@ mod tests {
             };
             assert_eq!(s1_endpoint_info.data, endpoint_data);
             assert_eq!(s2_endpoint_info.data, endpoint_data);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn changed_peer_routes_replace_the_resolver_cache() -> Result {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
+            let (endpoint_id_b, address_lookup_b) = make_address_lookup(&mut rng, true)?;
+            let mut events = address_lookup_a
+                .subscribe()
+                .await
+                .filter(|event| match event {
+                    DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                        endpoint_info.endpoint_id == endpoint_id_b
+                    }
+                    _ => false,
+                });
+            let first =
+                EndpointData::from_iter([TransportAddr::Ip("0.0.0.0:11111".parse().unwrap())]);
+            address_lookup_b.publish(&first);
+            tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .std_context("initial discovery timeout")?
+                .expect("discovery stream closed");
+
+            let changed =
+                EndpointData::from_iter([TransportAddr::Ip("0.0.0.0:22222".parse().unwrap())]);
+            address_lookup_b.publish(&changed);
+            tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .std_context("changed route discovery timeout")?
+                .expect("discovery stream closed");
+
+            let mut resolved = address_lookup_a.resolve(endpoint_id_b).unwrap();
+            let item = tokio::time::timeout(Duration::from_secs(2), resolved.next())
+                .await
+                .std_context("updated route resolution timeout")?
+                .expect("resolution stream closed")?;
+            assert_eq!(item.endpoint_info().data, changed);
 
             Ok(())
         }

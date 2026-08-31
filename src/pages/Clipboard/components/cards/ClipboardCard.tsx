@@ -90,6 +90,8 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     sourceAppIconPath,
     sourceAppName,
     sourceAppId,
+    sourceAppAccentStart,
+    sourceAppAccentEnd,
     createdAt,
     displayCreatedAt,
     width,
@@ -108,7 +110,15 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     item.summary,
   );
   const timeText = displayCreatedAt || formatRelativeTime(createdAt);
-  const headerBg = useDynamicHeaderBg(sourceAppIconPath || theme.iconUrl);
+  const dynamicHeaderBg = useDynamicHeaderBg(
+    sourceAppAccentStart && sourceAppAccentEnd
+      ? null
+      : sourceAppIconPath || theme.iconUrl,
+  );
+  const headerBg =
+    sourceAppAccentStart && sourceAppAccentEnd
+      ? `linear-gradient(135deg, ${sourceAppAccentStart} 0%, ${sourceAppAccentEnd} 100%)`
+      : dynamicHeaderBg;
 
   const handleDragStart = async (event: DragEvent) => {
     event.preventDefault();
@@ -186,7 +196,8 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 
   const isImageCard = kind === "image";
   const isUrlCard = subKind === "url";
-  const urlInfo = isUrlCard ? parseUrlInfo(summary || item.content) : null;
+  const urlText = isUrlCard ? item.content || summary : summary;
+  const urlInfo = isUrlCard ? parseUrlInfo(urlText) : null;
 
   // 底部元信息
   const metaText = isImageCard
@@ -194,7 +205,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       ? `${width} × ${height}`
       : "图片"
     : isUrlCard
-      ? urlInfo?.name || "网页"
+      ? urlInfo?.host || "网页"
       : `${summary?.length ?? size ?? 0} 个字符`;
 
   const isMob = isMobile();
@@ -298,25 +309,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
             isMob ? "min-h-[44px] p-2.5" : "p-2.5",
           )}
         >
-          {isUrlCard && urlInfo ? (
-            <div className="flex size-full flex-col justify-between">
-              <div className="flex flex-1 items-center justify-center">
-                <img
-                  alt={urlInfo.name}
-                  className="size-10 object-contain"
-                  src={urlInfo.iconUrl}
-                />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="line-clamp-1 font-bold text-[11.5px] text-neutral-800 dark:text-neutral-100">
-                  {urlInfo.name}
-                </span>
-                <span className="line-clamp-1 font-mono text-[9.5px] text-neutral-400">
-                  {urlInfo.host}
-                </span>
-              </div>
-            </div>
-          ) : item.note ? (
+          {item.note ? (
             <NoteContentSwitcher
               note={item.note}
               showOriginal={hovered && showOriginalOnHover}
@@ -326,6 +319,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                   {...item}
                   isLinkActive={isLinkActive}
                   onOpenLink={onOpenLink}
+                  summary={urlText}
                 />
               )}
               {kind === "image" && <ImageCard {...item} />}
@@ -338,6 +332,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                   {...item}
                   isLinkActive={isLinkActive}
                   onOpenLink={onOpenLink}
+                  summary={urlText}
                 />
               )}
               {kind === "image" && <ImageCard {...item} />}
