@@ -684,7 +684,7 @@ const List: FC<ListProps> = (props) => {
   const handleKeyDown = (event: KeyboardEvent) => {
     if (!active) return;
 
-    const target = event.target as HTMLElement | null;
+    const target = document.activeElement as HTMLElement | null;
     const isInputActive =
       target &&
       (target.tagName === "INPUT" ||

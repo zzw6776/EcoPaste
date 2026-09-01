@@ -21,7 +21,7 @@ use winapi::um::winuser::{
 
 use super::{NAV_EVENT, SEARCH_HANDOFF_EVENT};
 use crate::core::Result;
-use crate::keyboard_search_handoff::{PushResult, SearchHandoffBuffer};
+use crate::keyboard_search_handoff::{should_buffer_physical_key, PushResult, SearchHandoffBuffer};
 
 static NAV_ENABLED: AtomicBool = AtomicBool::new(false);
 static NEXT_HANDOFF_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -320,7 +320,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return 1;
         }
 
-        if is_text_input_intent(vk) && begin_search_handoff(kbd, msg) {
+        if should_buffer_physical_key(kbd.flags, kbd.scanCode, vk)
+            && is_text_input_intent(vk)
+            && begin_search_handoff(kbd, msg)
+        {
             return 1;
         }
     } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
@@ -394,8 +397,6 @@ fn is_text_input_intent(virtual_key: u32) -> bool {
             | 0xBA..=0xC0
             | 0xDB..=0xDF
             | 0xE2
-            | 0xE5
-            | 0xE7
     )
 }
 
@@ -448,10 +449,17 @@ fn begin_search_handoff(kbd: &KBDLLHOOKSTRUCT, message: UINT) -> bool {
 }
 
 fn buffer_active_handoff(kbd: &KBDLLHOOKSTRUCT, message: UINT) -> bool {
-    let result = search_handoff()
-        .lock()
-        .expect("search handoff poisoned")
-        .push(buffered_key_event(kbd, message));
+    let result = {
+        let mut guard = search_handoff().lock().expect("search handoff poisoned");
+        if !guard.has_active() {
+            return false;
+        }
+        if !should_buffer_physical_key(kbd.flags, kbd.scanCode, kbd.vkCode) {
+            return true;
+        }
+
+        guard.push(buffered_key_event(kbd, message))
+    };
     let overflowed_session = match result {
         PushResult::Inactive => return false,
         PushResult::Overflowed(session_id) => Some(session_id),
