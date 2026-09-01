@@ -91,10 +91,20 @@ impl HubService {
 
     async fn notify_group_change(&self, group_id: &str) {
         let mut notifications = self.group_notifications.lock().await;
+        let mut notification_version = 0_u64;
         notifications
             .entry(group_id.to_owned())
             .or_insert_with(|| watch::channel(0).0)
-            .send_modify(|version| *version = version.wrapping_add(1));
+            .send_modify(|version| {
+                *version = version.wrapping_add(1);
+                notification_version = *version;
+            });
+        info!(
+            group_ref = %group_log_ref(group_id),
+            notification_version,
+            published_at_ms = now_ms(),
+            "cloud group change published"
+        );
     }
 
     /// Serializes membership changes and event insertion within one sync group.
@@ -236,6 +246,8 @@ impl HubService {
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
+                let newest_submitted_event_at_ms =
+                    events.iter().map(|event| event.created_at_ms).max();
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
@@ -262,6 +274,11 @@ impl HubService {
                     .last()
                     .map(|item| item.cursor)
                     .unwrap_or(after_cursor);
+                let group_latest_cursor = if events_changed {
+                    self.repository.latest_cursor(&group_id).await?
+                } else {
+                    latest_cursor
+                };
                 let peers = self
                     .repository
                     .list_peers(&group_id, &device.device_id)
@@ -272,9 +289,15 @@ impl HubService {
                 }
                 info!(
                     protocol = "legacy",
+                    group_ref = %group_log_ref(&group_id),
+                    source_endpoint_id = remote_endpoint_id,
                     submitted_events = submitted_event_count,
                     accepted_events = accepted_event_ids.len(),
                     returned_events = events.len(),
+                    latest_cursor,
+                    group_latest_cursor,
+                    newest_submitted_event_at_ms = ?newest_submitted_event_at_ms,
+                    accepted_at_ms = now_ms(),
                     elapsed_ms = started_at.elapsed().as_millis(),
                     "cloud sync request completed"
                 );
@@ -301,6 +324,8 @@ impl HubService {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
                 let submitted_removal_count = removed_devices.len();
+                let newest_submitted_event_at_ms =
+                    events.iter().map(|event| event.created_at_ms).max();
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
@@ -376,6 +401,11 @@ impl HubService {
                     .last()
                     .map(|item| item.cursor)
                     .unwrap_or(after_cursor);
+                let group_latest_cursor = if events_changed {
+                    self.repository.latest_cursor(&group_id).await?
+                } else {
+                    latest_cursor
+                };
                 let peers = self
                     .repository
                     .list_peers(&group_id, &device.device_id)
@@ -386,11 +416,17 @@ impl HubService {
                 }
                 info!(
                     protocol = "v2",
+                    group_ref = %group_log_ref(&group_id),
+                    source_endpoint_id = remote_endpoint_id,
                     submitted_events = submitted_event_count,
                     accepted_events = accepted_event_ids.len(),
                     returned_events = events.len(),
                     submitted_removals = submitted_removal_count,
                     returned_removals = merged_removals.len(),
+                    latest_cursor,
+                    group_latest_cursor,
+                    newest_submitted_event_at_ms = ?newest_submitted_event_at_ms,
+                    accepted_at_ms = now_ms(),
                     elapsed_ms = started_at.elapsed().as_millis(),
                     "cloud sync request completed"
                 );
@@ -525,6 +561,7 @@ impl HubService {
                     self.repository.latest_removed_at_ms(&group_id).await?;
                 let (watch_generation, mut cancelled) =
                     self.register_watch(&group_id, remote_endpoint_id).await;
+                let group_ref = group_log_ref(&group_id);
                 let watch_result: Result<()> = async {
                     tokio::time::timeout(
                         FRAME_WRITE_TIMEOUT,
@@ -539,6 +576,15 @@ impl HubService {
                     )
                     .await
                     .context("write initial watch response timeout")??;
+                    info!(
+                        group_ref = %group_ref,
+                        target_endpoint_id = remote_endpoint_id,
+                        watch_generation,
+                        latest_cursor,
+                        latest_removed_at_ms,
+                        ready_at_ms = now_ms(),
+                        "cloud watch stream ready"
+                    );
 
                     loop {
                         let changed = tokio::select! {
@@ -553,6 +599,7 @@ impl HubService {
                             latest_removed_at_ms =
                                 self.repository.latest_removed_at_ms(&group_id).await?;
                         }
+                        let write_started_at = Instant::now();
                         tokio::time::timeout(
                             FRAME_WRITE_TIMEOUT,
                             write_frame(
@@ -566,6 +613,19 @@ impl HubService {
                         )
                         .await
                         .context("write watch response timeout")??;
+                        if changed {
+                            info!(
+                                group_ref = %group_ref,
+                                target_endpoint_id = remote_endpoint_id,
+                                watch_generation,
+                                notification_version = *changes.borrow(),
+                                latest_cursor,
+                                latest_removed_at_ms,
+                                sent_at_ms = now_ms(),
+                                write_ms = write_started_at.elapsed().as_millis(),
+                                "cloud watch notification sent"
+                            );
+                        }
                     }
                 }
                 .await;
@@ -801,6 +861,10 @@ fn response_for_error(error: &anyhow::Error) -> Response {
         ErrorCode::InvalidRequest
     };
     Response::Error { code, message }
+}
+
+fn group_log_ref(group_id: &str) -> String {
+    blake3::hash(group_id.as_bytes()).to_hex()[..12].to_owned()
 }
 
 fn group_changed_response(

@@ -2453,9 +2453,7 @@ impl SyncManager {
                 && (device.device_id == identity.device_id || device.endpoint_id == endpoint_id)
         });
         repository::merge_removed_devices(pool, &devices).await?;
-        for device in &devices {
-            self.clear_peer_suspension(&device.device_id);
-        }
+        // The full membership ledger is replayed on every cloud cycle; it is not a LAN online event.
         self.emit_updated();
         if removed_self {
             self.leave_after_removal(pool).await?;
@@ -4163,11 +4161,12 @@ fn apply_cloud_watch_response(
             latest_cursor,
             latest_removed_at_ms,
         } => {
+            let received_at_ms = Utc::now().timestamp_millis();
             let events_changed = latest_cursor > *cursor;
             let removals_changed = latest_removed_at_ms > *removed_at_ms;
             if events_changed || removals_changed {
                 log::info!(
-                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed}"
+                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
                 );
                 manager.wake_cloud_transfer();
             }
@@ -4180,12 +4179,13 @@ fn apply_cloud_watch_response(
             latest_removed_at_ms,
             server_version,
         } => {
+            let received_at_ms = Utc::now().timestamp_millis();
             manager.update_cloud_server_version(Some(server_version));
             let events_changed = latest_cursor > *cursor;
             let removals_changed = latest_removed_at_ms > *removed_at_ms;
             if events_changed || removals_changed {
                 log::info!(
-                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed}"
+                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
                 );
                 manager.wake_cloud_transfer();
             }
@@ -4195,7 +4195,10 @@ fn apply_cloud_watch_response(
         }
         Response::Changed { latest_cursor } => {
             if latest_cursor > *cursor {
-                log::info!("cloud watch change received: eventsChanged=true removalsChanged=false");
+                log::info!(
+                    "cloud watch change received: eventsChanged=true removalsChanged=false latestCursor={latest_cursor} receivedAtMs={}",
+                    Utc::now().timestamp_millis()
+                );
                 manager.wake_cloud_transfer();
             }
             *cursor = (*cursor).max(latest_cursor);
@@ -4753,9 +4756,7 @@ async fn dispatch_peer(
                 repository::is_peer_removed(&pool, "", &remote_endpoint_id).await?;
             if !remote_was_removed {
                 repository::merge_removed_devices(&pool, &devices).await?;
-                for device in &devices {
-                    manager.clear_peer_suspension(&device.device_id);
-                }
+                // Membership history alone must not revive a suspended LAN connection attempt.
             }
             let removed = repository::removed_devices(&pool).await?;
             let identity = manager.identity.snapshot();
