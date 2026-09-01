@@ -97,10 +97,14 @@ pub fn materialize_source(
 ) -> ClipboardApp {
     let cached = registry.and_then(|value| value.get(&src.id));
     if let Some(mut cached) = cached.clone() {
-        if cached.icon_hash.is_none()
+        let mut icon_is_current = cached
+            .icon_file
+            .as_deref()
+            .is_some_and(|file_name| store.is_current_format(file_name));
+        let metadata_missing = cached.icon_hash.is_none()
             || cached.accent_start.is_none()
-            || cached.accent_end.is_none()
-        {
+            || cached.accent_end.is_none();
+        if metadata_missing && (icon_is_current || src.icon_png.is_none()) {
             if let Some(icon_file) = cached.icon_file.as_deref() {
                 match store.refresh_metadata(icon_file) {
                     Ok(metadata) => {
@@ -108,6 +112,7 @@ pub fn materialize_source(
                         cached.icon_hash = Some(metadata.icon_hash);
                         cached.accent_start = Some(metadata.accent_start);
                         cached.accent_end = Some(metadata.accent_end);
+                        icon_is_current = true;
                     }
                     Err(error) => {
                         log::warn!("refresh cached app icon for {} failed: {error}", src.id);
@@ -118,7 +123,8 @@ pub fn materialize_source(
         let metadata_complete = cached.icon_file.is_some()
             && cached.icon_hash.is_some()
             && cached.accent_start.is_some()
-            && cached.accent_end.is_some();
+            && cached.accent_end.is_some()
+            && icon_is_current;
         if metadata_complete || src.icon_png.is_none() {
             if cached.name != src.name {
                 cached.name = src.name;
