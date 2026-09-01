@@ -31,41 +31,30 @@ pub struct InsertEventResult {
 
 /// Allocates a monotonically increasing sequence for this device.
 pub async fn next_origin_sequence(pool: &SqlitePool) -> Result<u64> {
-    let mut transaction = pool
-        .begin()
-        .await
-        .context("begin sync sequence transaction")?;
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT value FROM sync_state WHERE key = 'origin_sequence'")
-            .fetch_optional(&mut *transaction)
-            .await
-            .context("read sync origin sequence")?;
-    let next = current
-        .as_deref()
-        .unwrap_or("0")
-        .parse::<u64>()
-        .context("invalid sync origin sequence")?
-        .saturating_add(1)
-        .max(u64::try_from(Utc::now().timestamp_millis()).unwrap_or(1));
+    let floor = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(1);
     let now = Utc::now();
-    sqlx::query(
+    let next: Option<String> = sqlx::query_scalar(
         r#"
         INSERT INTO sync_state (key, value, created_at, updated_at)
         VALUES ('origin_sequence', ?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        ON CONFLICT(key) DO UPDATE SET
+            value = MAX(CAST(sync_state.value AS INTEGER) + 1, CAST(excluded.value AS INTEGER)),
+            updated_at = excluded.updated_at
+        WHERE sync_state.value <> ''
+          AND sync_state.value NOT GLOB '*[^0-9]*'
+          AND CAST(sync_state.value AS INTEGER) < 9223372036854775807
+        RETURNING value
         "#,
     )
-    .bind(next.to_string())
+    .bind(floor.to_string())
     .bind(now)
     .bind(now)
-    .execute(&mut *transaction)
+    .fetch_optional(pool)
     .await
     .context("update sync origin sequence")?;
-    transaction
-        .commit()
-        .await
-        .context("commit sync origin sequence")?;
-    Ok(next)
+    next.context("invalid or exhausted sync origin sequence")?
+        .parse::<u64>()
+        .context("invalid sync origin sequence")
 }
 
 /// Stores an encrypted event in the local append-only log. Duplicate events are idempotent.
@@ -1452,6 +1441,7 @@ async fn set_state_value(pool: &SqlitePool, key: &str, value: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use crate::db::test_support::memory_pool;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     use super::*;
 
@@ -1553,6 +1543,54 @@ mod tests {
         let second = next_origin_sequence(&pool).await.unwrap();
 
         assert!(second > first);
+    }
+
+    #[tokio::test]
+    async fn origin_sequence_allocation_is_atomic_across_wal_connections() {
+        let directory =
+            tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
+        let database_path = directory.path().join("sequence.db");
+        let setup_options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let setup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(setup_options)
+            .await
+            .unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&setup_pool)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        sqlx::migrate!("./migrations")
+            .run(&setup_pool)
+            .await
+            .unwrap();
+        setup_pool.close().await;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(database_path)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let pool = pool.clone();
+            tasks.spawn(async move { next_origin_sequence(&pool).await.unwrap() });
+        }
+        let mut sequences = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            sequences.push(result.unwrap());
+        }
+        sequences.sort_unstable();
+
+        assert_eq!(sequences.len(), 64);
+        assert!(sequences.windows(2).all(|values| values[0] < values[1]));
     }
 
     #[tokio::test]

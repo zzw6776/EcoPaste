@@ -156,9 +156,7 @@ public final class RootInputMonitorDaemon {
                     }
                     pilfered = false;
                     wakeTriggered = false;
-                    if (isBackCandidate()) {
-                        inputMonitor.pilferPointers();
-                    }
+                    // An edge down may still be a panel tap; pilfer only after the move threshold.
                     break;
                 case MotionEvent.ACTION_POINTER_DOWN:
                     candidate = CANDIDATE_NONE;
@@ -167,16 +165,11 @@ public final class RootInputMonitorDaemon {
                     maybePilfer(event);
                     break;
                 case MotionEvent.ACTION_UP:
-                    if (isBackCandidate() && !pilfered) {
-                        emitPanelDismiss("PILFERED_BACK reason=release");
-                    }
                     resetGesture();
                     break;
                 case MotionEvent.ACTION_CANCEL:
                     if (candidate == CANDIDATE_HOME_DISMISS) {
                         emitPanelDismiss("DISMISS_HOME reason=cancel");
-                    } else if (isBackCandidate() && !pilfered) {
-                        emitPanelDismiss("PILFERED_BACK reason=cancel");
                     }
                     resetGesture();
                     break;
