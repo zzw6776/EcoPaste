@@ -20,6 +20,7 @@ dist-ssr
 /signing.properties
 
 # Local AI indexes, package stores, and ad-hoc build outputs
+/.cache/
 /.codegraph/
 /.pnpm-store/
 /.workbuddy-ai/

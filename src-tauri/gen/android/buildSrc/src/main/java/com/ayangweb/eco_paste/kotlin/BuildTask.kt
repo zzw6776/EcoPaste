@@ -8,6 +8,8 @@ import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.TaskAction
 import org.gradle.process.ExecOperations
 
+private const val SKIP_GRADLE_RUST_BUILD_ENV = "ECOPASTE_SKIP_GRADLE_RUST_BUILD"
+
 open class BuildTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {
@@ -20,6 +22,11 @@ open class BuildTask @Inject constructor(
 
     @TaskAction
     fun assemble() {
+        if (System.getenv(SKIP_GRADLE_RUST_BUILD_ENV) == "1") {
+            logger.lifecycle("Skipping duplicate Gradle Rust build; Tauri CLI already built the native library")
+            return
+        }
+
         val executable = """pnpm""";
         try {
             runTauriCli(executable)
