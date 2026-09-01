@@ -448,6 +448,7 @@ impl HubService {
                 blob_id,
                 size,
             } => {
+                let started_at = Instant::now();
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
@@ -455,17 +456,52 @@ impl HubService {
                     .await?;
                 validate_blob(&blob_id, size, self.max_blob_bytes)?;
                 let destination = blob_path(&self.blob_root, &group_id, &blob_id);
-                if self.repository.blob_size(&group_id, &blob_id).await? == Some(size)
-                    && destination.is_file()
-                {
+                let lookup_started_at = Instant::now();
+                let already_stored = self.repository.blob_size(&group_id, &blob_id).await?
+                    == Some(size)
+                    && destination.is_file();
+                let lookup_elapsed = lookup_started_at.elapsed();
+                if already_stored {
+                    let response_started_at = Instant::now();
                     write_frame(send, &Response::BlobStored).await?;
+                    info!(
+                        group_ref = %group_log_ref(&group_id),
+                        source_endpoint_id = remote_endpoint_id,
+                        blob_ref = %blob_log_ref(&blob_id),
+                        outcome = "already-stored",
+                        blob_bytes = size,
+                        uploaded_bytes = 0_u64,
+                        lookup_ms = lookup_elapsed.as_millis(),
+                        response_write_ms = response_started_at.elapsed().as_millis(),
+                        total_ms = started_at.elapsed().as_millis(),
+                        "cloud blob request completed"
+                    );
                 } else {
+                    let readiness_started_at = Instant::now();
                     write_frame(send, &Response::BlobReady { size: 0 }).await?;
+                    let readiness_elapsed = readiness_started_at.elapsed();
+                    let receive_started_at = Instant::now();
                     receive_blob(recv, &destination, &blob_id, size).await?;
+                    let receive_elapsed = receive_started_at.elapsed();
                     self.repository
                         .record_blob(&group_id, &blob_id, size)
                         .await?;
+                    let confirmation_started_at = Instant::now();
                     write_frame(send, &Response::BlobStored).await?;
+                    info!(
+                        group_ref = %group_log_ref(&group_id),
+                        source_endpoint_id = remote_endpoint_id,
+                        blob_ref = %blob_log_ref(&blob_id),
+                        outcome = "uploaded",
+                        blob_bytes = size,
+                        uploaded_bytes = size,
+                        lookup_ms = lookup_elapsed.as_millis(),
+                        response_write_ms = readiness_elapsed.as_millis(),
+                        receive_ms = receive_elapsed.as_millis(),
+                        confirmation_write_ms = confirmation_started_at.elapsed().as_millis(),
+                        total_ms = started_at.elapsed().as_millis(),
+                        "cloud blob request completed"
+                    );
                 }
             }
             Request::GetBlob {
@@ -865,6 +901,10 @@ fn response_for_error(error: &anyhow::Error) -> Response {
 
 fn group_log_ref(group_id: &str) -> String {
     blake3::hash(group_id.as_bytes()).to_hex()[..12].to_owned()
+}
+
+fn blob_log_ref(blob_id: &str) -> &str {
+    blob_id.get(..12).unwrap_or(blob_id)
 }
 
 fn group_changed_response(

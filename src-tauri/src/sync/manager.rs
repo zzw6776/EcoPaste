@@ -22,7 +22,7 @@ use iroh::{
         AddrFilter, AddressLookup, AddressLookupBuilder, AddressLookupBuilderError,
         Error as AddressLookupError, Item as AddressLookupItem, PkarrResolver, UserData,
     },
-    endpoint::{presets, Connection, RecvStream, SendStream},
+    endpoint::{presets, ConnectOptions, Connection, QuicTransportConfig, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, TransportAddr, Watcher,
 };
@@ -83,6 +83,7 @@ const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
+const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
 pub struct SyncManager {
@@ -109,6 +110,7 @@ pub struct SyncManager {
     cloud_server_version: RwLock<Option<String>>,
     cloud_connection: RwLock<Option<Connection>>,
     cloud_session: RwLock<Option<CloudSessionState>>,
+    confirmed_cloud_source_icons: RwLock<ConfirmedCloudSourceIcons>,
     lan_connections: RwLock<HashMap<String, Connection>>,
     lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
     lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -156,6 +158,57 @@ struct CloudSessionState {
     connection_id: usize,
     group_id: String,
     sync_v2_supported: bool,
+}
+
+/// Remembers optional source icons already acknowledged by the current Hub connection.
+#[derive(Default)]
+struct ConfirmedCloudSourceIcons {
+    connection_id: Option<usize>,
+    group_id: Option<String>,
+    blob_ids: HashSet<String>,
+}
+
+impl ConfirmedCloudSourceIcons {
+    /// Drops confirmations whenever either the connection or encrypted sync space changes.
+    fn reset_for(&mut self, connection_id: usize, group_id: &str) {
+        if self.connection_id == Some(connection_id) && self.group_id.as_deref() == Some(group_id) {
+            return;
+        }
+
+        self.connection_id = Some(connection_id);
+        self.group_id = Some(group_id.to_owned());
+        self.blob_ids.clear();
+    }
+
+    /// Returns only icons that still require a remote existence check.
+    fn retain_unconfirmed(
+        &mut self,
+        connection_id: usize,
+        group_id: &str,
+        blobs: Vec<StoredBlob>,
+    ) -> (Vec<StoredBlob>, usize) {
+        self.reset_for(connection_id, group_id);
+        let original_count = blobs.len();
+        let unconfirmed = blobs
+            .into_iter()
+            .filter(|blob| !self.blob_ids.contains(&blob.blob_id))
+            .collect::<Vec<_>>();
+        let cache_hits = original_count.saturating_sub(unconfirmed.len());
+        (unconfirmed, cache_hits)
+    }
+
+    fn confirm(&mut self, connection_id: usize, group_id: &str, blob_ids: &[String]) {
+        self.reset_for(connection_id, group_id);
+        self.blob_ids.extend(blob_ids.iter().cloned());
+    }
+
+    fn clear_connection(&mut self, connection_id: usize) {
+        if self.connection_id != Some(connection_id) {
+            return;
+        }
+
+        *self = Self::default();
+    }
 }
 
 struct LanPeerActor {
@@ -321,6 +374,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         cloud_server_version: RwLock::new(None),
         cloud_connection: RwLock::new(None),
         cloud_session: RwLock::new(None),
+        confirmed_cloud_source_icons: RwLock::new(ConfirmedCloudSourceIcons::default()),
         lan_connections: RwLock::new(HashMap::new()),
         lan_peer_actors: RwLock::new(HashMap::new()),
         lan_peer_locks: RwLock::new(HashMap::new()),
@@ -2271,14 +2325,38 @@ impl SyncManager {
                 split_source_icon_blobs(blobs, &source_icon_blob_ids);
             let required_blob_count = required_blobs.len();
             let source_icon_blob_count = source_icon_blobs.len();
+            let (source_icon_blobs, source_icon_cache_hits) = if target_id == CLOUD_TARGET {
+                self.confirmed_cloud_source_icons
+                    .write()
+                    .expect("confirmed cloud source icons poisoned")
+                    .retain_unconfirmed(connection.stable_id(), &group.group_id, source_icon_blobs)
+            } else {
+                (source_icon_blobs, 0)
+            };
+            let source_icon_blob_checks = source_icon_blobs.len();
+            let checked_source_icon_blob_ids = source_icon_blobs
+                .iter()
+                .map(|blob| blob.blob_id.clone())
+                .collect::<Vec<_>>();
             if let Err(error) = upload_blobs(connection, group, required_blobs).await {
                 repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
                     .await?;
                 self.emit_updated();
                 return Err(error);
             }
-            if let Err(error) = upload_blobs(connection, group, source_icon_blobs).await {
-                log::warn!("publish optional source app icons failed: {error}");
+            match upload_blobs(connection, group, source_icon_blobs).await {
+                Ok(()) if target_id == CLOUD_TARGET => {
+                    self.confirmed_cloud_source_icons
+                        .write()
+                        .expect("confirmed cloud source icons poisoned")
+                        .confirm(
+                            connection.stable_id(),
+                            &group.group_id,
+                            &checked_source_icon_blob_ids,
+                        );
+                }
+                Ok(()) => {}
+                Err(error) => log::warn!("publish optional source app icons failed: {error}"),
             }
             let blob_elapsed = blob_started_at.elapsed();
             let outgoing_events = pending
@@ -2385,7 +2463,7 @@ impl SyncManager {
             cursor = response.latest_cursor;
             if target_id == CLOUD_TARGET {
                 log::info!(
-                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} blobMs={} requestMs={} applyMs={} totalMs={}",
+                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} blobMs={} requestMs={} applyMs={} totalMs={}",
                     blob_elapsed.as_millis(),
                     request_elapsed.as_millis(),
                     apply_elapsed.as_millis(),
@@ -3351,10 +3429,23 @@ impl SyncManager {
         if let Some(connection) = self.cached_cloud_connection() {
             return Ok(connection);
         }
-        let connection =
-            tokio::time::timeout(Duration::from_secs(8), endpoint.connect(server, ALPN))
-                .await
-                .context("云端同步连接超时")??;
+        let transport_config = QuicTransportConfig::builder()
+            .keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
+            .default_path_keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
+            .build();
+        let options = ConnectOptions::new().with_transport_config(transport_config);
+        let connection = tokio::time::timeout(Duration::from_secs(8), async {
+            let connecting = endpoint.connect_with_opts(server, ALPN, options).await?;
+            Ok::<_, anyhow::Error>(connecting.await?)
+        })
+        .await
+        .context("云端同步连接超时")??;
+        log::info!(
+            "cloud connection established: connectionId={} keepAliveMs={} pathKeepAliveMs={}",
+            connection.stable_id(),
+            CLOUD_PATH_KEEP_ALIVE_INTERVAL.as_millis(),
+            CLOUD_PATH_KEEP_ALIVE_INTERVAL.as_millis(),
+        );
         *self
             .cloud_connection
             .write()
@@ -3414,6 +3505,10 @@ impl SyncManager {
             }
         };
         if removed {
+            self.confirmed_cloud_source_icons
+                .write()
+                .expect("confirmed cloud source icons poisoned")
+                .clear_connection(stable_id);
             let mut session = self
                 .cloud_session
                 .write()
@@ -3436,6 +3531,10 @@ impl SyncManager {
             .write()
             .expect("cloud session state poisoned")
             .take();
+        *self
+            .confirmed_cloud_source_icons
+            .write()
+            .expect("confirmed cloud source icons poisoned") = ConfirmedCloudSourceIcons::default();
         self.cloud_server_version
             .write()
             .expect("cloud server version poisoned")
@@ -4908,14 +5007,28 @@ async fn call_join(connection: &Connection, request: JoinRequest) -> Result<Join
     }
 }
 
+#[derive(Default)]
+struct BlobUploadTimings {
+    open: Duration,
+    write: Duration,
+    response: Duration,
+    transfer: Duration,
+    confirmation: Duration,
+    total: Duration,
+}
+
 async fn upload_blob(
     connection: &Connection,
     group: &GroupSecrets,
     blob: &StoredBlob,
 ) -> Result<()> {
+    let total_started_at = Instant::now();
+    let open_started_at = Instant::now();
     let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
         .await
         .context("open blob upload stream timeout")??;
+    let open_elapsed = open_started_at.elapsed();
+    let write_started_at = Instant::now();
     write_frame(
         &mut send,
         &Request::PutBlob {
@@ -4926,29 +5039,99 @@ async fn upload_blob(
         },
     )
     .await?;
+    let write_elapsed = write_started_at.elapsed();
+    let response_started_at = Instant::now();
     match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame::<_, Response>(&mut recv))
         .await
         .context("wait for blob upload readiness timeout")??
     {
         Response::BlobStored => {
+            let response_elapsed = response_started_at.elapsed();
             send.finish()?;
+            log_blob_upload_completed(
+                connection,
+                blob,
+                "already-stored",
+                0,
+                BlobUploadTimings {
+                    open: open_elapsed,
+                    write: write_elapsed,
+                    response: response_elapsed,
+                    total: total_started_at.elapsed(),
+                    ..Default::default()
+                },
+            );
             return Ok(());
         }
         Response::BlobReady { .. } => {}
         Response::Error { message, .. } => bail!(message),
         _ => bail!("invalid blob upload response"),
     }
+    let readiness_elapsed = response_started_at.elapsed();
+    let transfer_started_at = Instant::now();
     let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
     copy_with_idle_timeout(&mut file, &mut send, BLOB_IDLE_TIMEOUT).await?;
     send.finish()?;
+    let transfer_elapsed = transfer_started_at.elapsed();
+    let confirmation_started_at = Instant::now();
     match tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(&mut recv))
         .await
         .context("wait for blob storage confirmation timeout")??
     {
-        Response::BlobStored => Ok(()),
+        Response::BlobStored => {
+            log_blob_upload_completed(
+                connection,
+                blob,
+                "uploaded",
+                blob.size,
+                BlobUploadTimings {
+                    open: open_elapsed,
+                    write: write_elapsed,
+                    response: readiness_elapsed,
+                    transfer: transfer_elapsed,
+                    confirmation: confirmation_started_at.elapsed(),
+                    total: total_started_at.elapsed(),
+                },
+            );
+            Ok(())
+        }
         Response::Error { message, .. } => bail!(message),
         _ => bail!("invalid blob stored response"),
     }
+}
+
+/// Records which stage of a blob existence check or upload consumed the elapsed time.
+fn log_blob_upload_completed(
+    connection: &Connection,
+    blob: &StoredBlob,
+    outcome: &str,
+    uploaded_bytes: u64,
+    timings: BlobUploadTimings,
+) {
+    let (address, transport) = connection_path(connection);
+    let rtt = connection
+        .paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| path.rtt().as_millis().to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    log::info!(
+        "sync blob upload completed: blobRef={} outcome={outcome} blobBytes={} uploadedBytes={uploaded_bytes} openMs={} writeMs={} responseMs={} transferMs={} confirmationMs={} totalMs={} address={} transport={} rttMs={rtt}",
+        blob_log_ref(&blob.blob_id),
+        blob.size,
+        timings.open.as_millis(),
+        timings.write.as_millis(),
+        timings.response.as_millis(),
+        timings.transfer.as_millis(),
+        timings.confirmation.as_millis(),
+        timings.total.as_millis(),
+        address.as_deref().unwrap_or("unknown"),
+        transport.unwrap_or("unknown"),
+    );
+}
+
+fn blob_log_ref(blob_id: &str) -> &str {
+    blob_id.get(..12).unwrap_or(blob_id)
 }
 
 /// Separates best-effort source icons from blobs required to apply clipboard content.
@@ -5614,6 +5797,30 @@ mod tests {
         assert_eq!(required_blobs[0].blob_id, required.blob_id);
         assert_eq!(source_icon_blobs.len(), 1);
         assert_eq!(source_icon_blobs[0].blob_id, source_icon.blob_id);
+    }
+
+    #[test]
+    fn source_icon_confirmation_cache_is_scoped_to_cloud_connection_and_group() {
+        let source_icon = StoredBlob {
+            blob_id: "source-icon".into(),
+            encrypted_path: "source-icon.bin".into(),
+            size: 20,
+        };
+        let mut cache = ConfirmedCloudSourceIcons::default();
+        cache.confirm(7, "group-a", std::slice::from_ref(&source_icon.blob_id));
+
+        let (unconfirmed, hits) = cache.retain_unconfirmed(7, "group-a", vec![source_icon.clone()]);
+        assert!(unconfirmed.is_empty());
+        assert_eq!(hits, 1);
+
+        let (unconfirmed, hits) = cache.retain_unconfirmed(8, "group-a", vec![source_icon.clone()]);
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(hits, 0);
+
+        cache.confirm(8, "group-a", std::slice::from_ref(&source_icon.blob_id));
+        let (unconfirmed, hits) = cache.retain_unconfirmed(8, "group-b", vec![source_icon]);
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(hits, 0);
     }
 
     #[test]
