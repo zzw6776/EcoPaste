@@ -80,11 +80,23 @@ interface ClipboardMenuActionPayload {
   itemId: string;
 }
 
+export interface ClipboardListView {
+  category: ClipboardKind | null;
+  groupId: string | null;
+  range: ClipboardRange;
+}
+
+interface ListProps {
+  active?: boolean;
+  view?: ClipboardListView;
+}
+
 /**
  * 剪贴板历史列表：虚拟滚动 + 分类型卡片 + 可视范围分页加载，
  * 跟随关键词（Header 已防抖）检索。
  */
-const List: FC = () => {
+const List: FC<ListProps> = (props) => {
+  const { active = true, view } = props;
   const { t } = useTranslation("clipboard");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
@@ -107,6 +119,7 @@ const List: FC = () => {
   const displaySettingsMountedRef = useRef(false);
   const keywordRef = useRef("");
   const reloadCurrentRangeRef = useRef<() => void>(() => {});
+  const requestReloadAtTopRef = useRef<() => void>(() => {});
   const deferredReloadRef = useRef(false);
   // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
   // 隐藏期间在 WebView 内预刷新当前可视范围，避免 show 后才用新数据挤开旧卡片。
@@ -137,7 +150,10 @@ const List: FC = () => {
 
   const snapshot = useSnapshot(clipboardViewState);
   const settings = useSnapshot(settingsState);
-  const { category, keyword, groupId, range } = snapshot;
+  const { keyword } = snapshot;
+  const category = view ? view.category : snapshot.category;
+  const groupId = view ? view.groupId : snapshot.groupId;
+  const range = view ? view.range : snapshot.range;
   const autoPaste = settings.clipboard.content.autoPaste;
   const middleClick = settings.clipboard.content.middleClick;
   const display = settings.clipboard.display;
@@ -209,19 +225,20 @@ const List: FC = () => {
   });
   closePreviewRef.current = closePreview;
   reloadCurrentRangeRef.current = reloadCurrentRange;
+  requestReloadAtTopRef.current = requestReloadAtTop;
 
   // 把 Rust 返回的同过滤下总数同步给 Footer（共享 store），避免 Footer 单独 IPC 计数。
   useEffect(() => {
-    if (loadedInitial) clipboardStatsState.total = total;
-  }, [loadedInitial, total]);
+    if (active && loadedInitial) clipboardStatsState.total = total;
+  }, [active, loadedInitial, total]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: snapshot 作触发器，不需在回调内读取
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 所有查询维度变化都必须重置列表交互状态，实际重载由 useClipboardItems 负责
   useEffect(() => {
     setSelectedId(null);
     if (keywordRef.current !== keyword) keywordRef.current = keyword;
     deferredReloadRef.current = false;
-    closePreview("filterChange");
-  }, [snapshot]);
+    closePreviewRef.current("filterChange");
+  }, [category, groupId, keyword, range]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: 仅按影响列表 payload 的展示设置触发重拉，函数引用用 ref 读取最新值
   useEffect(() => {
@@ -248,21 +265,30 @@ const List: FC = () => {
    */
   useMount(() => {
     void loadGroups();
-
-    if (isAndroid) {
-      clipboardWindowVisibleRef.current = true;
-      const handleMobileFocus = () => {
-        clipboardWindowVisibleRef.current = true;
-        requestReloadAtTop();
-      };
-      window.addEventListener("focus", handleMobileFocus);
-      document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) {
-          handleMobileFocus();
-        }
-      });
-    }
   });
+
+  useEffect(() => {
+    if (!isAndroid || !active) return;
+
+    clipboardWindowVisibleRef.current = true;
+    const handleMobileFocus = () => {
+      clipboardWindowVisibleRef.current = true;
+      requestReloadAtTopRef.current();
+    };
+    const handleMobileVisibilityChange = () => {
+      if (!document.hidden) handleMobileFocus();
+    };
+
+    window.addEventListener("focus", handleMobileFocus);
+    document.addEventListener("visibilitychange", handleMobileVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", handleMobileFocus);
+      document.removeEventListener(
+        "visibilitychange",
+        handleMobileVisibilityChange,
+      );
+    };
+  }, [active]);
 
   /**
    * 自定义分组变化后同步刷新空状态文案可用的分组名。
@@ -290,7 +316,7 @@ const List: FC = () => {
       closePreview("cleanup");
       setSelectedId(null);
       deferredReloadRef.current = false;
-      if (clipboardStatsState.total !== null) {
+      if (active && clipboardStatsState.total !== null) {
         clipboardStatsState.total = Math.max(
           clipboardStatsState.total - payload.cleanup,
           0,
@@ -313,14 +339,7 @@ const List: FC = () => {
     }
 
     if (payload.deduplicated) {
-      if (
-        !shouldRefreshCurrentGroup(
-          clipboardViewState.range,
-          clipboardViewState.category,
-          clipboardViewState.groupId,
-          payload.kind,
-        )
-      ) {
+      if (!shouldRefreshCurrentGroup(range, category, groupId, payload.kind)) {
         return;
       }
 
@@ -328,14 +347,7 @@ const List: FC = () => {
       return;
     }
 
-    if (
-      !shouldRefreshCurrentGroup(
-        clipboardViewState.range,
-        clipboardViewState.category,
-        clipboardViewState.groupId,
-        payload.kind,
-      )
-    ) {
+    if (!shouldRefreshCurrentGroup(range, category, groupId, payload.kind)) {
       return;
     }
 
@@ -370,6 +382,8 @@ const List: FC = () => {
       if (deferredReloadRef.current) refreshHiddenRange();
       return;
     }
+
+    if (!active) return;
 
     const {
       scrollToTopOnOpen,
@@ -601,6 +615,8 @@ const List: FC = () => {
     (payload: ClipboardMenuActionPayload) => void
   >(() => {});
   handleMenuActionRef.current = (payload) => {
+    if (!active) return;
+
     const { action, groupId: targetGroupId, itemId } = payload;
     const target = findItemById(itemId);
 
@@ -666,6 +682,8 @@ const List: FC = () => {
   useTauriListen(TAURI_EVENT.CLIPBOARD_MENU_ACTION, handleMenuActionEvent);
 
   const handleKeyDown = (event: KeyboardEvent) => {
+    if (!active) return;
+
     const target = event.target as HTMLElement | null;
     const isInputActive =
       target &&
@@ -837,6 +855,8 @@ const List: FC = () => {
   useKeyboardEvent("keydown", handleKeyDown);
 
   const handleKeyUp = (event: KeyboardEvent) => {
+    if (!active) return;
+
     const eventModifierPressed = isMac ? event.metaKey : event.ctrlKey;
 
     setIsModifierPressed(eventModifierPressed);
@@ -1182,17 +1202,6 @@ const List: FC = () => {
 
       setSelectedId(item.id);
 
-      if (isMobile()) {
-        if (item.kind === "files") {
-          handleMobileFileOpen(item);
-          return;
-        }
-
-        closePreview("mobileSingleClickPaste");
-        pasteClipboardItem(item.id, false);
-        return;
-      }
-
       if (autoPaste === "singleClickPaste") {
         closePreview("singleClickPaste");
         pasteClipboardItem(item.id, false);
@@ -1203,6 +1212,17 @@ const List: FC = () => {
         closePreview("singleClickCopy");
         writeToClipboard(item.id, false);
       }
+    };
+
+    const handleMobileClick = () => {
+      setSelectedId(item.id);
+      if (item.kind === "files") {
+        handleMobileFileOpen(item);
+        return;
+      }
+
+      closePreview("mobileSingleClickPaste");
+      pasteClipboardItem(item.id, false);
     };
 
     const handleAuxClick = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -1256,6 +1276,7 @@ const List: FC = () => {
           mobileFileOpenLabel={t("fileAccess.open")}
           mobileFileSaveLabel={t("fileAccess.saveAs")}
           onAuxClick={handleAuxClick}
+          onClick={isMobile() ? handleMobileClick : void 0}
           onDoubleClick={handleDoubleClick}
           onMobileFileOpen={() => {
             handleMobileFileOpen(item);
@@ -1263,7 +1284,7 @@ const List: FC = () => {
           onMobileFileSave={() => {
             handleMobileFileSave(item);
           }}
-          onMouseDown={handleMouseDown}
+          onMouseDown={isMobile() ? void 0 : handleMouseDown}
           onOpenLink={handleOpenLink}
           onPointerEnter={handlePointerEnter}
           onPointerLeave={handlePointerLeave}

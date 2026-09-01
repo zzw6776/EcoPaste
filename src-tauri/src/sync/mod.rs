@@ -30,7 +30,7 @@ pub fn enqueue_local_item(app: &AppHandle, item: ClipboardItem) {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = manager.enqueue_item(item, false).await {
-            log::warn!("enqueue clipboard sync event failed: {error}");
+            log::warn!("enqueue clipboard sync event failed: {error:#}");
         }
     });
 }

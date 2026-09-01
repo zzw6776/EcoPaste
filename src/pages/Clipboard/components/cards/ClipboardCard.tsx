@@ -31,6 +31,7 @@ interface ClipboardCardProps {
   onPointerEnter?: (event: PointerEvent<HTMLDivElement>) => void;
   onPointerLeave?: () => void;
   onPointerMove?: (event: PointerEvent<HTMLDivElement>) => void;
+  onClick?: (event: MouseEvent<HTMLDivElement>) => void;
   onMouseDown?: (event: MouseEvent<HTMLDivElement>) => void;
   onAuxClick?: (event: MouseEvent<HTMLDivElement>) => void;
   onDoubleClick?: (event: MouseEvent<HTMLDivElement>) => void;
@@ -68,6 +69,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     onPointerEnter,
     onPointerLeave,
     onPointerMove,
+    onClick,
     onMouseDown,
     onAuxClick,
     onDoubleClick,
@@ -211,6 +213,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   const isMob = isMobile();
 
   return (
+    // biome-ignore lint/a11y/useKeyWithClickEvents: 桌面键盘动作由列表级全局导航统一处理，移动端点击仅用于避免按下阶段与分页手势冲突
     <div
       aria-selected={isSelected}
       className={cn(
@@ -220,8 +223,9 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
           : "h-full",
         isSelected && !isMob ? "z-10" : "hover:shadow-md",
       )}
-      draggable
+      draggable={!isMob}
       onAuxClick={onAuxClick}
+      onClick={onClick}
       onContextMenu={handleContextMenu}
       onDoubleClick={onDoubleClick}
       onDragStart={handleDragStart}
