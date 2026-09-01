@@ -4,6 +4,11 @@
 //! macOS 走 NSPanel 自己接管键盘事件，无需本模块——故仅 windows target 启用。
 
 pub const NAV_EVENT: &str = "keyboard://nav";
+pub const SEARCH_HANDOFF_EVENT: &str = "keyboard://search-handoff";
 
 mod windows;
-pub use windows::{disable_navigation_keys, enable_navigation_keys};
+pub use windows::{
+    cancel_search_handoff, cancel_search_handoff_and_suspend, confirm_search_handoff,
+    disable_navigation_keys, enable_navigation_keys, is_search_handoff_active,
+    suspend_navigation_keys,
+};

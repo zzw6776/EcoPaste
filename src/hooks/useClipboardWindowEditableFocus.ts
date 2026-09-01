@@ -1,5 +1,9 @@
 import { useEffect } from "react";
 import { setClipboardWindowEditing } from "@/commands";
+import {
+  SEARCH_HANDOFF_EDITABLE_ATTRIBUTE,
+  SEARCH_HANDOFF_EDITING_EVENT,
+} from "@/constants/searchHandoff";
 import { isWinClipboardWindow } from "@/utils/is";
 
 const EDITABLE_BLUR_RESTORE_DELAY_MS = 80;
@@ -55,6 +59,7 @@ export const useClipboardWindowEditableFocus = () => {
     const handleFocusIn = (event: FocusEvent) => {
       const target = findEditableElement(event.target);
       if (!target) return;
+      if (target.hasAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE)) return;
 
       clearRestoreTimer();
       void setEditing(true);
@@ -71,6 +76,11 @@ export const useClipboardWindowEditableFocus = () => {
       }, EDITABLE_BLUR_RESTORE_DELAY_MS);
     };
 
+    const handleSearchHandoffEditing = () => {
+      clearRestoreTimer();
+      editing = true;
+    };
+
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") return;
 
@@ -82,6 +92,10 @@ export const useClipboardWindowEditableFocus = () => {
     window.addEventListener("focusin", handleFocusIn, true);
     window.addEventListener("focusout", scheduleRestore, true);
     window.addEventListener("blur", scheduleRestore);
+    window.addEventListener(
+      SEARCH_HANDOFF_EDITING_EVENT,
+      handleSearchHandoffEditing,
+    );
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
@@ -90,6 +104,10 @@ export const useClipboardWindowEditableFocus = () => {
       window.removeEventListener("focusin", handleFocusIn, true);
       window.removeEventListener("focusout", scheduleRestore, true);
       window.removeEventListener("blur", scheduleRestore);
+      window.removeEventListener(
+        SEARCH_HANDOFF_EDITING_EVENT,
+        handleSearchHandoffEditing,
+      );
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       void setClipboardWindowEditing(false);
     };

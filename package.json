@@ -1,7 +1,7 @@
 {
   "name": "eco-paste",
   "private": true,
-  "version": "1.1.89",
+  "version": "1.1.90",
   "description": "A local-first clipboard manager for macOS, Windows, and Android.",
   "author": "ayangweb",
   "license": "Apache-2.0",
@@ -29,6 +29,7 @@
     "icons:generate": "tsx scripts/generateIcons.ts",
     "preview": "vite preview",
     "tauri": "tsx scripts/runTauri.ts",
+    "test:unit": "tsx --test src/pages/Clipboard/components/MobileCategoryPager.test.ts",
     "android:build:debug": "tsx scripts/buildAndroid.ts debug",
     "android:build:release": "tsx scripts/buildAndroid.ts release",
     "clean:rust": "tsx scripts/cleanRust.ts",

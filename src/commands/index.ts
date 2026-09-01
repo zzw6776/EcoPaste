@@ -1679,6 +1679,43 @@ export const setClipboardWindowEditing = async (editing: boolean) => {
   }
 };
 
+/** Windows 首字符搜索交接：保持键盘钩子并把剪贴板窗口切到可聚焦状态。 */
+export const prepareClipboardSearchHandoff = async (sessionId: number) => {
+  try {
+    return await invoke<boolean>(
+      TAURI_COMMAND.PREPARE_CLIPBOARD_SEARCH_HANDOFF,
+      { sessionId },
+    );
+  } catch (error) {
+    log.error("prepare clipboard search handoff failed", toAppError(error));
+    return false;
+  }
+};
+
+/** 输入框确认成为活动元素后，通知 Rust 校验窗口并重放缓存按键。 */
+export const confirmClipboardSearchHandoff = async (sessionId: number) => {
+  try {
+    return await invoke<boolean>(
+      TAURI_COMMAND.CONFIRM_CLIPBOARD_SEARCH_HANDOFF,
+      { sessionId },
+    );
+  } catch (error) {
+    log.error("confirm clipboard search handoff failed", toAppError(error));
+    return false;
+  }
+};
+
+/** 焦点交接失败或页面取消时，丢弃缓存并恢复 Windows 导航态。 */
+export const cancelClipboardSearchHandoff = async (sessionId: number) => {
+  try {
+    await invoke<boolean>(TAURI_COMMAND.CANCEL_CLIPBOARD_SEARCH_HANDOFF, {
+      sessionId,
+    });
+  } catch (error) {
+    log.error("cancel clipboard search handoff failed", toAppError(error));
+  }
+};
+
 /**
  * 打开或重定向剪贴板系统级预览 overlay。
  * `anchor` 是剪贴板窗口 webview client 坐标中的列表项矩形。
