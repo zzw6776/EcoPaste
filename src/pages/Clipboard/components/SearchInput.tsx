@@ -12,6 +12,8 @@ import {
 } from "@/constants/searchHandoff";
 import { prepareClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
 
+const IME_FOCUS_SETTLE_FRAMES = 2;
+
 interface SearchInputProps extends Omit<InputProps, "prefix"> {
   blurToken?: number;
   clearToken?: number;
@@ -61,6 +63,13 @@ const SearchInput: FC<SearchInputProps> = (props) => {
       input.setAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE, "true");
       input.focus();
       if (document.activeElement !== input) {
+        input.removeAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE);
+        await cancelClipboardSearchHandoff(handoffSessionId);
+        return;
+      }
+
+      await waitForImeFocus();
+      if (!document.contains(input) || document.activeElement !== input) {
         input.removeAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE);
         await cancelClipboardSearchHandoff(handoffSessionId);
         return;
@@ -117,5 +126,16 @@ const SearchInput: FC<SearchInputProps> = (props) => {
     />
   );
 };
+
+/** 等待 WebView 提交原生焦点与 IME 上下文，再请求 Rust 重放首批物理按键。 */
+async function waitForImeFocus() {
+  for (let frame = 0; frame < IME_FOCUS_SETTLE_FRAMES; frame += 1) {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        resolve();
+      });
+    });
+  }
+}
 
 export default SearchInput;
