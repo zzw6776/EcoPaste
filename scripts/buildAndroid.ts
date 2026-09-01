@@ -6,11 +6,12 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { parse, resolve } from "node:path";
 import { acquireAndroidBuildLock } from "./androidBuildLock";
 import { cleanAndroidCacheIfNeeded } from "./buildCache";
 
 const projectRoot = resolve(import.meta.dirname, "..");
+const SKIP_GRADLE_RUST_BUILD_ENV = "ECOPASTE_SKIP_GRADLE_RUST_BUILD";
 const mode = process.argv[2];
 if (mode !== "debug" && mode !== "release") {
   throw new Error("Android build mode must be debug or release.");
@@ -66,6 +67,24 @@ function assertWslBuildMounts() {
 }
 
 assertWslBuildMounts();
+
+/** 让 Windows Cargo registry 与 Android 工程位于同一盘符，供 Kotlin 使用可迁移的增量路径。 */
+function resolveWindowsAndroidCargoHome() {
+  if (process.platform !== "win32") {
+    return void 0;
+  }
+
+  const configuredCargoHome = process.env.CARGO_HOME;
+  if (
+    configuredCargoHome &&
+    parse(resolve(configuredCargoHome)).root.toLowerCase() ===
+      parse(projectRoot).root.toLowerCase()
+  ) {
+    return resolve(configuredCargoHome);
+  }
+
+  return resolve(projectRoot, ".cache", "windows-android-cargo-home");
+}
 
 /** 运行 pnpm 子命令，并保留终端中的原始构建输出。 */
 async function runPnpm(
@@ -130,13 +149,25 @@ if (mode === "debug") {
   buildArgs.push("--debug");
 }
 buildArgs.push("--target", "aarch64", "--apk", "--ci");
+const buildEnv: NodeJS.ProcessEnv = {
+  ...process.env,
+  [SKIP_GRADLE_RUST_BUILD_ENV]: "1",
+};
+const windowsAndroidCargoHome = resolveWindowsAndroidCargoHome();
+if (windowsAndroidCargoHome) {
+  mkdirSync(windowsAndroidCargoHome, { recursive: true });
+  buildEnv.CARGO_HOME = windowsAndroidCargoHome;
+  process.stdout.write(
+    `Windows Android Cargo home: ${windowsAndroidCargoHome}\n`,
+  );
+}
 
 const buildLock = await acquireAndroidBuildLock(projectRoot, `${mode} build`);
 try {
   await cleanAndroidCacheIfNeeded(projectRoot, async () => {
     await runPnpm(["clean:android"], buildLock.childEnv);
   });
-  await runPnpm(buildArgs, process.env, true);
+  await runPnpm(buildArgs, buildEnv, true);
   mkdirSync(artifactDirectory, { recursive: true });
   copyFileSync(sourceApk, artifactApk);
 
