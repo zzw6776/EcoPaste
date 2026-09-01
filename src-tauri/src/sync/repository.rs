@@ -400,6 +400,109 @@ pub async fn blobs_for_events(pool: &SqlitePool, event_ids: &[String]) -> Result
         .collect()
 }
 
+/// Persists optional source icons until the Hub has acknowledged their storage.
+pub async fn enqueue_source_icon_uploads(
+    pool: &SqlitePool,
+    group_id: &str,
+    blobs: &[StoredBlob],
+) -> Result<()> {
+    if blobs.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin source icon upload transaction")?;
+    for blob in blobs {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_source_icon_uploads (
+                group_id, blob_id, encrypted_path, size, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, blob_id) DO UPDATE SET
+                encrypted_path = excluded.encrypted_path,
+                size = excluded.size,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(group_id)
+        .bind(&blob.blob_id)
+        .bind(&blob.encrypted_path)
+        .bind(i64::try_from(blob.size).context("encrypted source icon is too large")?)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("queue source icon upload")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit source icon uploads")?;
+    Ok(())
+}
+
+/// Lists source icons whose storage has not yet been acknowledged by the Hub.
+pub async fn pending_source_icon_uploads(
+    pool: &SqlitePool,
+    group_id: &str,
+    limit: u16,
+) -> Result<Vec<StoredBlob>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT blob_id, encrypted_path, size
+        FROM sync_source_icon_uploads
+        WHERE group_id = ?
+        ORDER BY created_at ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(group_id)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .context("list pending source icon uploads")?;
+
+    rows.into_iter()
+        .map(|row| {
+            let size: i64 = row.try_get("size")?;
+            Ok(StoredBlob {
+                blob_id: row.try_get("blob_id")?,
+                encrypted_path: row.try_get("encrypted_path")?,
+                size: u64::try_from(size).context("negative source icon size")?,
+            })
+        })
+        .collect()
+}
+
+/// Removes source icon uploads only after the Hub confirms them.
+pub async fn complete_source_icon_uploads(
+    pool: &SqlitePool,
+    group_id: &str,
+    blob_ids: &[String],
+) -> Result<()> {
+    if blob_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut query =
+        sqlx::QueryBuilder::new("DELETE FROM sync_source_icon_uploads WHERE group_id = ");
+    query.push_bind(group_id).push(" AND blob_id IN (");
+    let mut separated = query.separated(", ");
+    for blob_id in blob_ids {
+        separated.push_bind(blob_id);
+    }
+    query.push(")");
+    query
+        .build()
+        .execute(pool)
+        .await
+        .context("complete source icon uploads")?;
+    Ok(())
+}
+
 pub async fn mark_delivered(
     pool: &SqlitePool,
     target_id: &str,
@@ -1279,6 +1382,7 @@ pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await.context("begin clearing sync state")?;
     for statement in [
         "DELETE FROM source_app_sync_aliases",
+        "DELETE FROM sync_source_icon_uploads",
         "DELETE FROM sync_peer_connections",
         "DELETE FROM sync_delivery_states",
         "DELETE FROM sync_item_events",
@@ -1385,6 +1489,43 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn source_icon_uploads_remain_queued_until_confirmed() {
+        let pool = memory_pool().await;
+        let initial = StoredBlob {
+            blob_id: "icon-blob".into(),
+            encrypted_path: "old.bin".into(),
+            size: 12,
+        };
+        let refreshed = StoredBlob {
+            blob_id: initial.blob_id.clone(),
+            encrypted_path: "new.bin".into(),
+            size: 24,
+        };
+
+        enqueue_source_icon_uploads(&pool, "group-a", &[initial])
+            .await
+            .unwrap();
+        enqueue_source_icon_uploads(&pool, "group-a", std::slice::from_ref(&refreshed))
+            .await
+            .unwrap();
+
+        let pending = pending_source_icon_uploads(&pool, "group-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].encrypted_path, refreshed.encrypted_path);
+        assert_eq!(pending[0].size, refreshed.size);
+
+        complete_source_icon_uploads(&pool, "group-a", &[refreshed.blob_id])
+            .await
+            .unwrap();
+        assert!(pending_source_icon_uploads(&pool, "group-a", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

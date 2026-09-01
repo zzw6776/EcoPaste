@@ -118,6 +118,7 @@ struct AndroidOverlayClipboardItem {
     tag: &'static str,
     preview: String,
     detail: String,
+    image_path: Option<String>,
     source_app_name: String,
     source_app_icon_path: Option<String>,
     source_app_accent_start: Option<String>,
@@ -164,6 +165,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
             .clipboard
             .sensitive
             .redact_secrets;
+        let image_store = app.state::<crate::clipboard::ImageStore>();
         let app_icon_store = app.state::<crate::clipboard::AppIconStore>();
         let items = items
             .into_iter()
@@ -250,6 +252,13 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     }
                     ClipboardKind::Text => format!("{} 个字符", preview.chars().count()),
                 };
+                let image_path = if item.kind == ClipboardKind::Image
+                    && !(redact_sensitive && item.is_sensitive)
+                {
+                    overlay_image_path(&image_store, &item.content)
+                } else {
+                    None
+                };
 
                 AndroidOverlayClipboardItem {
                     id: item.id,
@@ -257,6 +266,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     tag,
                     preview,
                     detail,
+                    image_path,
                     source_app_name,
                     source_app_icon_path,
                     source_app_accent_start: item.source_app_accent_start,
@@ -271,6 +281,24 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
 
         serde_json::to_string(&items).map_err(|error| anyhow::anyhow!(error).into())
     })
+}
+
+/// 返回上滑图片卡片可安全读取的本地原图路径；异常文件名和缺失文件降级为无预览。
+#[cfg(target_os = "android")]
+fn overlay_image_path(store: &crate::clipboard::ImageStore, file_name: &str) -> Option<String> {
+    let invalid = file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || !file_name.ends_with(".png");
+    if invalid {
+        return None;
+    }
+
+    let path = store.origin_path(file_name);
+    path.is_file()
+        .then(|| path.to_str().map(str::to_owned))
+        .flatten()
 }
 
 #[cfg(target_os = "android")]

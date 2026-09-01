@@ -14,8 +14,9 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     read_frame, write_frame, CloudEvent, DeviceAnnouncement, EncryptedEvent, ErrorCode,
-    PeerAnnouncement, RemovedDevice, Request, Response, ALPN, MAX_EVENTS_PER_BATCH,
-    PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
+    PeerAnnouncement, RemovedDevice, Request, Response, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
+    MAX_EVENTS_PER_BATCH, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
+    SYNC_V2_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -33,7 +34,7 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore},
+    sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore},
 };
 use uuid::Uuid;
 
@@ -76,13 +77,18 @@ const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const CLOUD_SYNC_HEDGE_DELAY: Duration = Duration::from_millis(300);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CLOUD_WATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+const PRIMARY_CLOUD_WATCH_SLOT: u8 = 0;
+const BACKUP_CLOUD_WATCH_SLOT: u8 = 1;
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
+const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
@@ -93,6 +99,7 @@ pub struct SyncManager {
     lan_transfer_wake: Notify,
     cloud_transfer_wake: Notify,
     watch_wake: Notify,
+    source_asset_wake: Notify,
     nearby_wake: Notify,
     lan_cycle_lock: AsyncRwLock<()>,
     cloud_cycle_lock: Mutex<()>,
@@ -157,10 +164,11 @@ struct EndpointRuntime {
 struct CloudSessionState {
     connection_id: usize,
     group_id: String,
+    protocol_version: u16,
     sync_v2_supported: bool,
 }
 
-/// Remembers optional source icons already acknowledged by the current Hub connection.
+/// Coalesces optional source icons already acknowledged or queued on the current Hub connection.
 #[derive(Default)]
 struct ConfirmedCloudSourceIcons {
     connection_id: Option<usize>,
@@ -180,7 +188,7 @@ impl ConfirmedCloudSourceIcons {
         self.blob_ids.clear();
     }
 
-    /// Returns only icons that still require a remote existence check.
+    /// Returns only icons that still require a remote existence check or upload.
     fn retain_unconfirmed(
         &mut self,
         connection_id: usize,
@@ -357,6 +365,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_transfer_wake: Notify::new(),
         cloud_transfer_wake: Notify::new(),
         watch_wake: Notify::new(),
+        source_asset_wake: Notify::new(),
         nearby_wake: Notify::new(),
         lan_cycle_lock: AsyncRwLock::new(()),
         cloud_cycle_lock: Mutex::new(()),
@@ -390,6 +399,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
     tauri::async_runtime::spawn(lan_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
+    tauri::async_runtime::spawn(source_asset_worker(manager.clone()));
     manager.wake();
     Ok(())
 }
@@ -399,6 +409,7 @@ impl SyncManager {
         self.cloud_force_reconnect.store(true, Ordering::Release);
         self.wake_transfer();
         self.watch_wake.notify_one();
+        self.source_asset_wake.notify_one();
     }
 
     /// Reconnects LAN peers and disconnected cloud work after a real network lifecycle event.
@@ -2211,7 +2222,7 @@ impl SyncManager {
             Response::Error { message, .. } => bail!(message),
             _ => bail!("云端返回了无效的建组响应"),
         }
-        let sync_v2_supported = match metadata_response {
+        let protocol_version = match metadata_response {
             Ok(Response::HealthV2 {
                 protocol_version,
                 server_version,
@@ -2221,15 +2232,15 @@ impl SyncManager {
                     "cloud Hub metadata received: protocolVersion={protocol_version} serverVersion={server_version}"
                 );
                 self.update_cloud_server_version(Some(server_version));
-                protocol_version >= SYNC_V2_PROTOCOL_VERSION
+                protocol_version
             }
             Ok(_) => {
                 log::debug!("cloud Hub returned an invalid health response; using legacy sync");
-                false
+                0
             }
             Err(error) => {
                 log::debug!("query cloud Hub metadata failed; using legacy sync: {error}");
-                false
+                0
             }
         };
         *self
@@ -2238,8 +2249,10 @@ impl SyncManager {
             .expect("cloud session state poisoned") = Some(CloudSessionState {
             connection_id: connection.stable_id(),
             group_id: group.group_id.clone(),
-            sync_v2_supported,
+            protocol_version,
+            sync_v2_supported: protocol_version >= SYNC_V2_PROTOCOL_VERSION,
         });
+        self.source_asset_wake.notify_one();
         Ok(true)
     }
 
@@ -2264,8 +2277,30 @@ impl SyncManager {
             .is_some_and(|session| session.sync_v2_supported)
     }
 
+    fn cloud_async_source_icons_supported(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .filter(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+            .is_some_and(|session| session.protocol_version >= ASYNC_SOURCE_ICON_PROTOCOL_VERSION)
+    }
+
+    fn cloud_redundant_watch_supported(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .filter(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+            .is_some_and(|session| session.protocol_version >= REDUNDANT_WATCH_PROTOCOL_VERSION)
+    }
+
     async fn sync_connection(
-        &self,
+        self: &Arc<Self>,
         connection: &Connection,
         target_id: &str,
         after_cursor: u64,
@@ -2276,6 +2311,8 @@ impl SyncManager {
         let identity = self.identity.snapshot();
         let use_sync_v2 =
             target_id == CLOUD_TARGET && self.cloud_sync_v2_supported(connection, &group.group_id);
+        let publish_source_icons_after_event = target_id == CLOUD_TARGET
+            && self.cloud_async_source_icons_supported(connection, &group.group_id);
         let removed_devices = if use_sync_v2 {
             repository::removed_devices(&pool).await?
         } else {
@@ -2338,27 +2375,43 @@ impl SyncManager {
                 .iter()
                 .map(|blob| blob.blob_id.clone())
                 .collect::<Vec<_>>();
-            if let Err(error) = upload_blobs(connection, group, required_blobs).await {
+            if let Err(error) =
+                upload_blobs(connection, group, required_blobs, BlobUploadKind::Content).await
+            {
                 repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
                     .await?;
                 self.emit_updated();
                 return Err(error);
             }
-            match upload_blobs(connection, group, source_icon_blobs).await {
-                Ok(()) if target_id == CLOUD_TARGET => {
-                    self.confirmed_cloud_source_icons
-                        .write()
-                        .expect("confirmed cloud source icons poisoned")
-                        .confirm(
-                            connection.stable_id(),
-                            &group.group_id,
-                            &checked_source_icon_blob_ids,
-                        );
-                }
-                Ok(()) => {}
-                Err(error) => log::warn!("publish optional source app icons failed: {error}"),
-            }
             let blob_elapsed = blob_started_at.elapsed();
+            let mut deferred_source_icon_blobs = source_icon_blobs;
+            let mut source_icon_elapsed = Duration::ZERO;
+            let mut queued_source_icon_count = 0;
+            if !publish_source_icons_after_event {
+                let source_icon_started_at = Instant::now();
+                match upload_blobs(
+                    connection,
+                    group,
+                    std::mem::take(&mut deferred_source_icon_blobs),
+                    BlobUploadKind::SourceIcon,
+                )
+                .await
+                {
+                    Ok(()) if target_id == CLOUD_TARGET => {
+                        self.confirmed_cloud_source_icons
+                            .write()
+                            .expect("confirmed cloud source icons poisoned")
+                            .confirm(
+                                connection.stable_id(),
+                                &group.group_id,
+                                &checked_source_icon_blob_ids,
+                            );
+                    }
+                    Ok(()) => {}
+                    Err(error) => log::warn!("publish optional source app icons failed: {error}"),
+                }
+                source_icon_elapsed = source_icon_started_at.elapsed();
+            }
             let outgoing_events = pending
                 .iter()
                 .map(|item| item.event.clone())
@@ -2367,7 +2420,7 @@ impl SyncManager {
             let result = async {
                 let mut protocol = "legacy";
                 let response = if use_sync_v2 {
-                    let response = call_cloud(
+                    let response = call_cloud_hedged(
                         connection,
                         Request::SyncV2 {
                             group_id: group.group_id.clone(),
@@ -2450,6 +2503,14 @@ impl SyncManager {
                 self.apply_removed_devices(&pool, response.removed_devices)
                     .await?;
             }
+            if publish_source_icons_after_event && !deferred_source_icon_blobs.is_empty() {
+                repository::enqueue_source_icon_uploads(
+                    &pool,
+                    &group.group_id,
+                    &deferred_source_icon_blobs,
+                )
+                .await?;
+            }
             repository::mark_delivered(&pool, target_id, &event_ids).await?;
             for peer in response.peers {
                 if peer.device_id != identity.device_id {
@@ -2460,13 +2521,20 @@ impl SyncManager {
             self.accept_remote_events(connection, response.events, group, target_id)
                 .await?;
             let apply_elapsed = apply_started_at.elapsed();
+            if publish_source_icons_after_event {
+                queued_source_icon_count = deferred_source_icon_blobs.len();
+                if queued_source_icon_count > 0 {
+                    self.source_asset_wake.notify_one();
+                }
+            }
             cursor = response.latest_cursor;
             if target_id == CLOUD_TARGET {
                 log::info!(
-                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} blobMs={} requestMs={} applyMs={} totalMs={}",
+                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} eventFirstSourceIcons={publish_source_icons_after_event} queuedSourceIcons={queued_source_icon_count} blobMs={} requestMs={} applyMs={} sourceIconMs={} totalMs={}",
                     blob_elapsed.as_millis(),
                     request_elapsed.as_millis(),
                     apply_elapsed.as_millis(),
+                    source_icon_elapsed.as_millis(),
                     batch_started_at.elapsed().as_millis()
                 );
             }
@@ -2476,8 +2544,7 @@ impl SyncManager {
                 break;
             }
         }
-        self.refresh_source_app_assets(Some(connection), group)
-            .await?;
+        self.source_asset_wake.notify_one();
         Ok(cursor)
     }
 
@@ -2604,6 +2671,7 @@ impl SyncManager {
         // 否则同一远端事件会被并发写入剪贴板历史两次。
         let _apply_guard = self.apply_lock.lock().await;
         let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
+        let mut source_assets_pending = false;
         #[cfg(target_os = "android")]
         let mut applied_any = false;
         for stored in pending_apply {
@@ -2653,22 +2721,17 @@ impl SyncManager {
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
             if let Some(icon) = source_icon {
-                match self
-                    .ensure_source_icon_blob(Some(connection), group, &icon)
-                    .await
-                {
+                match self.source_icon_blob_record(&icon) {
                     Ok(blob) => {
-                        repository::attach_event_blobs(&pool, &event.event_id, &[blob]).await?;
+                        if let Err(error) =
+                            repository::attach_event_blobs(&pool, &event.event_id, &[blob]).await
+                        {
+                            log::warn!("attach optional source app icon blob failed: {error}");
+                        } else {
+                            source_assets_pending = true;
+                        }
                     }
-                    Err(error) => {
-                        log::warn!("source app icon blob remains pending: {error}");
-                    }
-                }
-                if let Err(error) = self
-                    .refresh_source_app_assets(Some(connection), group)
-                    .await
-                {
-                    log::warn!("refresh source app icons failed: {error}");
+                    Err(error) => log::warn!("prepare optional source app icon failed: {error}"),
                 }
             }
             #[cfg(target_os = "android")]
@@ -2680,6 +2743,9 @@ impl SyncManager {
         #[cfg(target_os = "android")]
         if applied_any {
             crate::commands::android::notify_overlay_clipboard_changed();
+        }
+        if source_assets_pending {
+            self.source_asset_wake.notify_one();
         }
         if received_new_events && source_target == CLOUD_TARGET {
             self.wake_lan_transfer();
@@ -2956,13 +3022,32 @@ impl SyncManager {
         &self,
         connection: Option<&Connection>,
         group: &GroupSecrets,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let pool = self.pool().await;
         let store = self.app.state::<AppIconStore>();
+        let mut pending_count = 0;
         for asset in db::apps::source_app_assets(&pool, &group.group_id).await? {
-            if asset.is_attached && store.icon_file_for_hash(&asset.icon_hash).is_some() {
+            let icon = SourceIconRef {
+                icon_hash: asset.icon_hash.clone(),
+                blob_id: asset.blob_id.clone(),
+                original_size: asset.original_size,
+                encrypted_size: asset.encrypted_size,
+            };
+            let encrypted_available =
+                self.source_icon_blob_record(&icon)
+                    .ok()
+                    .is_some_and(|encrypted| {
+                        Path::new(&encrypted.encrypted_path)
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() == encrypted.size)
+                    });
+            if encrypted_available
+                && asset.is_attached
+                && store.icon_file_for_hash(&asset.icon_hash).is_some()
+            {
                 continue;
             }
+            pending_count += 1;
             if let Err(error) = self
                 .refresh_source_app_asset(connection, group, &pool, &asset)
                 .await
@@ -2973,7 +3058,50 @@ impl SyncManager {
                 );
             }
         }
-        Ok(())
+        Ok(pending_count)
+    }
+
+    /// Publishes queued local source icons and removes them only after the Hub acknowledges them.
+    async fn publish_pending_source_icons(
+        &self,
+        connection: Option<&Connection>,
+        group: &GroupSecrets,
+    ) -> Result<usize> {
+        let Some(connection) = connection else {
+            return Ok(0);
+        };
+        if !self.cloud_async_source_icons_supported(connection, &group.group_id) {
+            return Ok(0);
+        }
+
+        let pool = self.pool().await;
+        let blobs = repository::pending_source_icon_uploads(
+            &pool,
+            &group.group_id,
+            MAX_SOURCE_ICON_UPLOADS_PER_BATCH,
+        )
+        .await?;
+        if blobs.is_empty() {
+            return Ok(0);
+        }
+
+        let blob_ids = blobs
+            .iter()
+            .map(|blob| blob.blob_id.clone())
+            .collect::<Vec<_>>();
+        upload_blobs(
+            connection,
+            group,
+            blobs,
+            BlobUploadKind::PublishedSourceIcon,
+        )
+        .await?;
+        repository::complete_source_icon_uploads(&pool, &group.group_id, &blob_ids).await?;
+        self.confirmed_cloud_source_icons
+            .write()
+            .expect("confirmed cloud source icons poisoned")
+            .confirm(connection.stable_id(), &group.group_id, &blob_ids);
+        Ok(blob_ids.len())
     }
 
     async fn refresh_source_app_asset(
@@ -3047,7 +3175,7 @@ impl SyncManager {
         group: &GroupSecrets,
         icon: &SourceIconRef,
     ) -> Result<StoredBlob> {
-        validate_source_icon_ref(icon)?;
+        let expected = self.source_icon_blob_record(icon)?;
         let manifest = BlobManifest {
             blob_id: icon.blob_id.clone(),
             name: format!("{}.png", icon.icon_hash),
@@ -3057,17 +3185,12 @@ impl SyncManager {
             file_index: None,
             is_directory_archive: false,
         };
-        let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
-        let encrypted = crypto::blob_path(&root, &icon.blob_id)?;
+        let encrypted = PathBuf::from(&expected.encrypted_path);
         if encrypted.is_file() {
             let is_valid = encrypted.metadata()?.len() == icon.encrypted_size
                 && crypto::hash_file(&encrypted)? == icon.blob_id;
             if is_valid {
-                return Ok(StoredBlob {
-                    blob_id: icon.blob_id.clone(),
-                    encrypted_path: encrypted.to_string_lossy().into_owned(),
-                    size: icon.encrypted_size,
-                });
+                return Ok(expected);
             }
             fs::remove_file(&encrypted)
                 .with_context(|| format!("remove invalid source icon blob {encrypted:?}"))?;
@@ -3076,6 +3199,7 @@ impl SyncManager {
         let store = self.app.state::<AppIconStore>();
         if let Some(file_name) = store.icon_file_for_hash(&icon.icon_hash) {
             let source = store.icon_path(&file_name);
+            let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
             let root_for_task = root.clone();
             let key = group.content_key_bytes()?;
             let icon_hash = icon.icon_hash.clone();
@@ -3092,6 +3216,13 @@ impl SyncManager {
 
         let connection = connection.context("source app icon blob is unavailable")?;
         download_blob(connection, group, &manifest, &encrypted).await?;
+        Ok(expected)
+    }
+
+    fn source_icon_blob_record(&self, icon: &SourceIconRef) -> Result<StoredBlob> {
+        validate_source_icon_ref(icon)?;
+        let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
+        let encrypted = crypto::blob_path(&root, &icon.blob_id)?;
         Ok(StoredBlob {
             blob_id: icon.blob_id.clone(),
             encrypted_path: encrypted.to_string_lossy().into_owned(),
@@ -3450,6 +3581,7 @@ impl SyncManager {
             .cloud_connection
             .write()
             .expect("cloud connection cache poisoned") = Some(connection.clone());
+        self.source_asset_wake.notify_one();
         self.cloud_session
             .write()
             .expect("cloud session state poisoned")
@@ -4059,6 +4191,75 @@ fn collect_lan_multicast_interfaces_v4(
         .collect()
 }
 
+/// Publishes and downloads optional source icons without delaying clipboard event delivery.
+async fn source_asset_worker(manager: Arc<SyncManager>) {
+    let mut upload_failure_count = 0_usize;
+    loop {
+        if upload_failure_count == 0 {
+            manager.source_asset_wake.notified().await;
+        } else {
+            tokio::select! {
+                _ = manager.source_asset_wake.notified() => {},
+                _ = tokio::time::sleep(retry_delay(upload_failure_count)) => {},
+            }
+        }
+        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+        let Some(group) = manager.identity.snapshot().group else {
+            upload_failure_count = 0;
+            continue;
+        };
+        if !settings.enabled {
+            upload_failure_count = 0;
+            continue;
+        }
+
+        let connection = manager.cached_cloud_connection();
+        if settings.cloud_enabled {
+            let publish_started_at = Instant::now();
+            match manager
+                .publish_pending_source_icons(connection.as_ref(), &group)
+                .await
+            {
+                Ok(0) => upload_failure_count = 0,
+                Ok(uploaded_count) => {
+                    upload_failure_count = 0;
+                    log::info!(
+                        "queued source app icon publish completed: icons={uploaded_count} totalMs={}",
+                        publish_started_at.elapsed().as_millis()
+                    );
+                    if uploaded_count == usize::from(MAX_SOURCE_ICON_UPLOADS_PER_BATCH) {
+                        manager.source_asset_wake.notify_one();
+                    }
+                }
+                Err(error) => {
+                    upload_failure_count = upload_failure_count.saturating_add(1);
+                    log::warn!(
+                        "publish queued source app icons failed: attempt={} retryInSecs={} error={error}",
+                        upload_failure_count,
+                        retry_delay(upload_failure_count).as_secs()
+                    );
+                }
+            }
+        } else {
+            upload_failure_count = 0;
+        }
+
+        let started_at = Instant::now();
+        match manager
+            .refresh_source_app_assets(connection.as_ref(), &group)
+            .await
+        {
+            Ok(0) => {}
+            Ok(pending_count) => log::info!(
+                "source app asset refresh completed: pendingAssets={pending_count} cloudConnection={} totalMs={}",
+                connection.is_some(),
+                started_at.elapsed().as_millis()
+            ),
+            Err(error) => log::warn!("refresh source app icons failed: {error}"),
+        }
+    }
+}
+
 async fn cloud_watch_worker(manager: Arc<SyncManager>) {
     let mut failure_count = 0_usize;
     loop {
@@ -4145,6 +4346,18 @@ async fn watch_cloud_group(
     let mut cursor = repository::cloud_cursor(pool).await?;
     let mut removed_at_ms = repository::latest_removed_at_ms(pool).await?;
     let access_token = group.access_token_bytes()?;
+    if manager.cloud_redundant_watch_supported(connection, &group.group_id) {
+        return watch_cloud_group_redundant(
+            manager,
+            connection,
+            group,
+            access_token,
+            cursor,
+            removed_at_ms,
+        )
+        .await;
+    }
+
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -4196,12 +4409,139 @@ async fn watch_cloud_group(
     loop {
         let response = tokio::select! {
             _ = manager.watch_wake.notified() => return Ok(()),
-            response = tokio::time::timeout(Duration::from_secs(90), read_frame(&mut recv)) => {
+            response = tokio::time::timeout(CLOUD_WATCH_RESPONSE_TIMEOUT, read_frame(&mut recv)) => {
                 response.context("等待云端持续订阅心跳超时")??
             },
         };
         apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
     }
+}
+
+/// Keeps two independently framed watch streams so one delayed packet does not gate wake-up.
+async fn watch_cloud_group_redundant(
+    manager: &SyncManager,
+    connection: &Connection,
+    group: &GroupSecrets,
+    access_token: Vec<u8>,
+    mut cursor: u64,
+    mut removed_at_ms: i64,
+) -> Result<()> {
+    let (primary_recv, primary_response) = open_cloud_watch_stream(
+        connection,
+        group,
+        &access_token,
+        cursor,
+        removed_at_ms,
+        PRIMARY_CLOUD_WATCH_SLOT,
+    )
+    .await?;
+    apply_cloud_watch_response(manager, primary_response, &mut cursor, &mut removed_at_ms)?;
+
+    let (backup_recv, backup_response) = open_cloud_watch_stream(
+        connection,
+        group,
+        &access_token,
+        cursor,
+        removed_at_ms,
+        BACKUP_CLOUD_WATCH_SLOT,
+    )
+    .await?;
+    apply_cloud_watch_response(manager, backup_response, &mut cursor, &mut removed_at_ms)?;
+
+    let (responses, mut response_rx) = mpsc::channel(4);
+    let _readers = CloudWatchReaderGuard::new(vec![
+        spawn_cloud_watch_reader(PRIMARY_CLOUD_WATCH_SLOT, primary_recv, responses.clone()),
+        spawn_cloud_watch_reader(BACKUP_CLOUD_WATCH_SLOT, backup_recv, responses),
+    ]);
+    log::info!(
+        "redundant cloud watch ready: connectionId={} slots=2",
+        connection.stable_id()
+    );
+
+    loop {
+        let (watch_slot, response) = tokio::select! {
+            _ = manager.watch_wake.notified() => return Ok(()),
+            response = response_rx.recv() => response.context("云端持续订阅读取任务已结束")?,
+        };
+        let response = response?;
+        log::debug!("cloud watch frame received: slot={watch_slot}");
+        apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+    }
+}
+
+/// Opens one fixed watch slot and confirms that its initial response is readable.
+async fn open_cloud_watch_stream(
+    connection: &Connection,
+    group: &GroupSecrets,
+    access_token: &[u8],
+    after_cursor: u64,
+    after_removed_at_ms: i64,
+    watch_slot: u8,
+) -> Result<(RecvStream, Response)> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(
+        &mut send,
+        &Request::WatchGroupStreamV3 {
+            group_id: group.group_id.clone(),
+            access_token: access_token.to_vec(),
+            after_cursor,
+            after_removed_at_ms,
+            watch_slot,
+        },
+    )
+    .await?;
+    send.finish()?;
+    let response = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv))
+        .await
+        .context("读取云端冗余订阅首帧超时")??;
+    if let Response::Error { message, .. } = &response {
+        bail!("{message}");
+    }
+    Ok((recv, response))
+}
+
+/// Owns watch reader tasks and stops both whenever their shared consumer exits.
+struct CloudWatchReaderGuard {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl CloudWatchReaderGuard {
+    fn new(handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self { handles }
+    }
+}
+
+impl Drop for CloudWatchReaderGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+/// Reads one framed watch stream without cancellation corrupting its frame boundary.
+fn spawn_cloud_watch_reader(
+    watch_slot: u8,
+    mut recv: RecvStream,
+    responses: mpsc::Sender<(u8, Result<Response>)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let response =
+                match tokio::time::timeout(CLOUD_WATCH_RESPONSE_TIMEOUT, read_frame(&mut recv))
+                    .await
+                {
+                    Ok(response) => response.context("读取云端持续订阅响应"),
+                    Err(error) => {
+                        Err(anyhow::Error::new(error).context("等待云端持续订阅心跳超时"))
+                    }
+                };
+            let should_stop = response.is_err();
+            if responses.send((watch_slot, response)).await.is_err() || should_stop {
+                return;
+            }
+        }
+    })
 }
 
 /// Retains event-driven long watches when connecting to a hub without stream-watch support.
@@ -4261,6 +4601,7 @@ fn apply_cloud_watch_response(
             latest_removed_at_ms,
         } => {
             let received_at_ms = Utc::now().timestamp_millis();
+            manager.source_asset_wake.notify_one();
             let events_changed = latest_cursor > *cursor;
             let removals_changed = latest_removed_at_ms > *removed_at_ms;
             if events_changed || removals_changed {
@@ -4280,6 +4621,7 @@ fn apply_cloud_watch_response(
         } => {
             let received_at_ms = Utc::now().timestamp_millis();
             manager.update_cloud_server_version(Some(server_version));
+            manager.source_asset_wake.notify_one();
             let events_changed = latest_cursor > *cursor;
             let removals_changed = latest_removed_at_ms > *removed_at_ms;
             if events_changed || removals_changed {
@@ -4598,7 +4940,10 @@ async fn handle_peer_stream(
     let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
         .await
         .context("LAN request frame timeout")??;
-    let _blob_permits = if matches!(&request, Request::PutBlob { .. } | Request::GetBlob { .. }) {
+    let _blob_permits = if matches!(
+        &request,
+        Request::PutBlob { .. } | Request::PutSourceIcon { .. } | Request::GetBlob { .. }
+    ) {
         Some((
             manager
                 .inbound_blob_concurrency
@@ -4751,6 +5096,7 @@ async fn dispatch_peer(
             .await?;
             let apply_guard = manager.apply_lock.lock().await;
             let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
+            let mut source_assets_pending = false;
             #[cfg(target_os = "android")]
             let mut applied_any = false;
             for stored in pending_apply {
@@ -4808,9 +5154,7 @@ async fn dispatch_peer(
                             .await
                             .ok();
                         if let Some(icon) = source_icon {
-                            if let Ok(blob) =
-                                manager.ensure_source_icon_blob(None, &group, &icon).await
-                            {
+                            if let Ok(blob) = manager.source_icon_blob_record(&icon) {
                                 repository::attach_event_blobs(
                                     &pool,
                                     &stored.event.event_id,
@@ -4818,8 +5162,8 @@ async fn dispatch_peer(
                                 )
                                 .await
                                 .ok();
+                                source_assets_pending = true;
                             }
-                            manager.refresh_source_app_assets(None, &group).await.ok();
                         }
                         #[cfg(target_os = "android")]
                         {
@@ -4832,6 +5176,9 @@ async fn dispatch_peer(
             #[cfg(target_os = "android")]
             if applied_any {
                 crate::commands::android::notify_overlay_clipboard_changed();
+            }
+            if source_assets_pending {
+                manager.source_asset_wake.notify_one();
             }
             if received_new_events {
                 manager.wake_lan_transfer();
@@ -4872,6 +5219,12 @@ async fn dispatch_peer(
             }
         }
         Request::PutBlob {
+            group_id,
+            access_token,
+            blob_id,
+            size,
+        }
+        | Request::PutSourceIcon {
             group_id,
             access_token,
             blob_id,
@@ -4920,6 +5273,7 @@ async fn dispatch_peer(
         | Request::WatchGroup { .. }
         | Request::WatchGroupStream { .. }
         | Request::WatchGroupStreamV2 { .. }
+        | Request::WatchGroupStreamV3 { .. }
         | Request::ListEvents { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
@@ -4971,6 +5325,86 @@ async fn call_cloud(connection: &Connection, request: Request) -> Result<Respons
     minicbor::decode(&encoded).context("decode cloud sync response")
 }
 
+/// Starts a duplicate idempotent sync request only when the primary exceeds the normal tail.
+async fn call_cloud_hedged(connection: &Connection, request: Request) -> Result<Response> {
+    #[derive(Clone, Copy)]
+    enum HedgeRole {
+        Primary,
+        Backup,
+    }
+
+    impl HedgeRole {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Primary => "primary",
+                Self::Backup => "backup",
+            }
+        }
+    }
+
+    let started_at = Instant::now();
+    let stats_before = connection.stats();
+    let mut primary = Box::pin(call_cloud(connection, request.clone()));
+    match tokio::time::timeout(CLOUD_SYNC_HEDGE_DELAY, &mut primary).await {
+        Ok(result) => return result,
+        Err(_) => log::info!(
+            "cloud sync hedge started: connectionId={} delayMs={} lostPackets={}",
+            connection.stable_id(),
+            CLOUD_SYNC_HEDGE_DELAY.as_millis(),
+            stats_before.lost_packets,
+        ),
+    }
+
+    let mut backup = Box::pin(call_cloud(connection, request));
+    let (first_role, first_result) = tokio::select! {
+        result = &mut primary => (HedgeRole::Primary, result),
+        result = &mut backup => (HedgeRole::Backup, result),
+    };
+    let (winner, first_failed, result) = match first_result {
+        Ok(response) => (first_role, false, Ok(response)),
+        Err(first_error) => {
+            log::debug!(
+                "cloud sync hedge first attempt failed: role={} error={first_error}",
+                first_role.as_str()
+            );
+            let (second_role, second_result) = match first_role {
+                HedgeRole::Primary => (HedgeRole::Backup, backup.await),
+                HedgeRole::Backup => (HedgeRole::Primary, primary.await),
+            };
+            (
+                second_role,
+                true,
+                second_result.with_context(|| {
+                    format!(
+                        "cloud sync hedge failed after {} attempt: {first_error}",
+                        first_role.as_str()
+                    )
+                }),
+            )
+        }
+    };
+    let stats_after = connection.stats();
+    log::info!(
+        "cloud sync hedge completed: connectionId={} winner={} firstFailed={} elapsedMs={} lostPacketsDelta={} sentDatagramsDelta={} receivedDatagramsDelta={}",
+        connection.stable_id(),
+        winner.as_str(),
+        first_failed,
+        started_at.elapsed().as_millis(),
+        stats_after
+            .lost_packets
+            .saturating_sub(stats_before.lost_packets),
+        stats_after
+            .udp_tx
+            .datagrams
+            .saturating_sub(stats_before.udp_tx.datagrams),
+        stats_after
+            .udp_rx
+            .datagrams
+            .saturating_sub(stats_before.udp_rx.datagrams),
+    );
+    result
+}
+
 fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
 }
@@ -5017,10 +5451,27 @@ struct BlobUploadTimings {
     total: Duration,
 }
 
+#[derive(Clone, Copy)]
+enum BlobUploadKind {
+    Content,
+    SourceIcon,
+    PublishedSourceIcon,
+}
+
+impl BlobUploadKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::SourceIcon | Self::PublishedSourceIcon => "source-icon",
+        }
+    }
+}
+
 async fn upload_blob(
     connection: &Connection,
     group: &GroupSecrets,
     blob: &StoredBlob,
+    kind: BlobUploadKind,
 ) -> Result<()> {
     let total_started_at = Instant::now();
     let open_started_at = Instant::now();
@@ -5029,16 +5480,21 @@ async fn upload_blob(
         .context("open blob upload stream timeout")??;
     let open_elapsed = open_started_at.elapsed();
     let write_started_at = Instant::now();
-    write_frame(
-        &mut send,
-        &Request::PutBlob {
+    let request = match kind {
+        BlobUploadKind::PublishedSourceIcon => Request::PutSourceIcon {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
             blob_id: blob.blob_id.clone(),
             size: blob.size,
         },
-    )
-    .await?;
+        BlobUploadKind::Content | BlobUploadKind::SourceIcon => Request::PutBlob {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            blob_id: blob.blob_id.clone(),
+            size: blob.size,
+        },
+    };
+    write_frame(&mut send, &request).await?;
     let write_elapsed = write_started_at.elapsed();
     let response_started_at = Instant::now();
     match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame::<_, Response>(&mut recv))
@@ -5051,6 +5507,7 @@ async fn upload_blob(
             log_blob_upload_completed(
                 connection,
                 blob,
+                kind,
                 "already-stored",
                 0,
                 BlobUploadTimings {
@@ -5082,6 +5539,7 @@ async fn upload_blob(
             log_blob_upload_completed(
                 connection,
                 blob,
+                kind,
                 "uploaded",
                 blob.size,
                 BlobUploadTimings {
@@ -5104,6 +5562,7 @@ async fn upload_blob(
 fn log_blob_upload_completed(
     connection: &Connection,
     blob: &StoredBlob,
+    kind: BlobUploadKind,
     outcome: &str,
     uploaded_bytes: u64,
     timings: BlobUploadTimings,
@@ -5116,8 +5575,9 @@ fn log_blob_upload_completed(
         .map(|path| path.rtt().as_millis().to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     log::info!(
-        "sync blob upload completed: blobRef={} outcome={outcome} blobBytes={} uploadedBytes={uploaded_bytes} openMs={} writeMs={} responseMs={} transferMs={} confirmationMs={} totalMs={} address={} transport={} rttMs={rtt}",
+        "sync blob upload completed: blobRef={} kind={} outcome={outcome} blobBytes={} uploadedBytes={uploaded_bytes} openMs={} writeMs={} responseMs={} transferMs={} confirmationMs={} totalMs={} address={} transport={} rttMs={rtt}",
         blob_log_ref(&blob.blob_id),
+        kind.label(),
         blob.size,
         timings.open.as_millis(),
         timings.write.as_millis(),
@@ -5158,6 +5618,7 @@ async fn upload_blobs(
     connection: &Connection,
     group: &GroupSecrets,
     blobs: Vec<StoredBlob>,
+    kind: BlobUploadKind,
 ) -> Result<()> {
     for batch in blobs.chunks(MAX_CONCURRENT_BLOB_TRANSFERS) {
         let mut tasks = tokio::task::JoinSet::new();
@@ -5165,7 +5626,7 @@ async fn upload_blobs(
             let connection = connection.clone();
             let group = group.clone();
             let blob = blob.clone();
-            tasks.spawn(async move { upload_blob(&connection, &group, &blob).await });
+            tasks.spawn(async move { upload_blob(&connection, &group, &blob, kind).await });
         }
         while let Some(result) = tasks.join_next().await {
             result.context("blob upload task failed")??;
