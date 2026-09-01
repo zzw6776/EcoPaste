@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const SYNC_V2_PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = SYNC_V2_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -224,6 +225,24 @@ pub enum Request {
     },
     #[n(11)]
     HealthV2,
+    /// Exchanges membership tombstones and clipboard events in one cloud round trip.
+    #[n(12)]
+    SyncV2 {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        device: DeviceAnnouncement,
+        #[n(3)]
+        after_cursor: u64,
+        #[n(4)]
+        events: Vec<EncryptedEvent>,
+        #[n(5)]
+        removed_devices: Vec<RemovedDevice>,
+        #[n(6)]
+        limit: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -305,6 +324,19 @@ pub enum Response {
         server_time_ms: i64,
         #[n(2)]
         server_version: String,
+    },
+    #[n(12)]
+    SyncedV2 {
+        #[n(0)]
+        accepted_event_ids: Vec<String>,
+        #[n(1)]
+        events: Vec<CloudEvent>,
+        #[n(2)]
+        peers: Vec<PeerAnnouncement>,
+        #[n(3)]
+        latest_cursor: u64,
+        #[n(4)]
+        removed_devices: Vec<RemovedDevice>,
     },
 }
 

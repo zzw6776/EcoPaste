@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +18,7 @@ use iroh::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot, watch};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::repository::{Repository, now_ms, validate_identifier};
 
@@ -57,6 +57,7 @@ pub struct HubService {
     blob_root: Arc<PathBuf>,
     max_blob_bytes: u64,
     group_notifications: Arc<Mutex<HashMap<String, watch::Sender<u64>>>>,
+    group_sync_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     stream_admission: Arc<Semaphore>,
     request_concurrency: Arc<Semaphore>,
     blob_concurrency: Arc<Semaphore>,
@@ -71,6 +72,7 @@ impl HubService {
             blob_root: Arc::new(blob_root),
             max_blob_bytes,
             group_notifications: Arc::new(Mutex::new(HashMap::new())),
+            group_sync_locks: Arc::new(Mutex::new(HashMap::new())),
             stream_admission: Arc::new(Semaphore::new(GLOBAL_STREAM_ADMISSION)),
             request_concurrency: Arc::new(Semaphore::new(GLOBAL_REQUEST_CONCURRENCY)),
             blob_concurrency: Arc::new(Semaphore::new(GLOBAL_BLOB_CONCURRENCY)),
@@ -93,6 +95,15 @@ impl HubService {
             .entry(group_id.to_owned())
             .or_insert_with(|| watch::channel(0).0)
             .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// Serializes membership changes and event insertion within one sync group.
+    async fn group_sync_lock(&self, group_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.group_sync_locks.lock().await;
+        locks
+            .entry(group_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn register_watch(
@@ -223,6 +234,8 @@ impl HubService {
                 events,
                 limit,
             } => {
+                let started_at = Instant::now();
+                let submitted_event_count = events.len();
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
@@ -232,11 +245,11 @@ impl HubService {
                 if events.len() > usize::from(MAX_EVENTS_PER_BATCH) {
                     bail!("too many events");
                 }
+                let group_lock = self.group_sync_lock(&group_id).await;
+                let group_guard = group_lock.lock().await;
                 self.repository.upsert_device(&group_id, &device).await?;
                 let accepted_event_ids = self.repository.insert_events(&group_id, &events).await?;
-                if !accepted_event_ids.is_empty() {
-                    self.notify_group_change(&group_id).await;
-                }
+                let events_changed = !accepted_event_ids.is_empty();
                 let events = self
                     .repository
                     .list_events(
@@ -253,6 +266,18 @@ impl HubService {
                     .repository
                     .list_peers(&group_id, &device.device_id)
                     .await?;
+                drop(group_guard);
+                if events_changed {
+                    self.notify_group_change(&group_id).await;
+                }
+                info!(
+                    protocol = "legacy",
+                    submitted_events = submitted_event_count,
+                    accepted_events = accepted_event_ids.len(),
+                    returned_events = events.len(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "cloud sync request completed"
+                );
                 write_frame(
                     send,
                     &Response::Synced {
@@ -260,6 +285,123 @@ impl HubService {
                         events,
                         peers,
                         latest_cursor,
+                    },
+                )
+                .await?;
+            }
+            Request::SyncV2 {
+                group_id,
+                access_token,
+                device,
+                after_cursor,
+                events,
+                removed_devices,
+                limit,
+            } => {
+                let started_at = Instant::now();
+                let submitted_event_count = events.len();
+                let submitted_removal_count = removed_devices.len();
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                if device.endpoint_id != remote_endpoint_id {
+                    bail!("device endpoint identity does not match the connection");
+                }
+                if events.len() > usize::from(MAX_EVENTS_PER_BATCH) {
+                    bail!("too many events");
+                }
+                if removed_devices.len() > 256 {
+                    bail!("too many removed devices");
+                }
+                let group_lock = self.group_sync_lock(&group_id).await;
+                let group_guard = group_lock.lock().await;
+
+                let remote_was_removed = self
+                    .repository
+                    .is_removed_device(&group_id, &device.device_id, remote_endpoint_id)
+                    .await?;
+                let (merged_removals, removals_changed) = if remote_was_removed {
+                    (
+                        self.repository.list_removed_devices(&group_id).await?,
+                        false,
+                    )
+                } else {
+                    self.repository
+                        .merge_removed_devices(&group_id, &removed_devices)
+                        .await?
+                };
+                let remote_is_removed = self
+                    .repository
+                    .is_removed_device(&group_id, &device.device_id, remote_endpoint_id)
+                    .await?;
+                if remote_is_removed {
+                    drop(group_guard);
+                    if removals_changed {
+                        self.notify_group_change(&group_id).await;
+                    }
+                    info!(
+                        protocol = "v2",
+                        submitted_events = submitted_event_count,
+                        submitted_removals = submitted_removal_count,
+                        returned_removals = merged_removals.len(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        "rejected cloud sync from removed endpoint"
+                    );
+                    write_frame(
+                        send,
+                        &Response::SyncedV2 {
+                            accepted_event_ids: Vec::new(),
+                            events: Vec::new(),
+                            peers: Vec::new(),
+                            latest_cursor: after_cursor,
+                            removed_devices: merged_removals,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                self.repository.upsert_device(&group_id, &device).await?;
+                let accepted_event_ids = self.repository.insert_events(&group_id, &events).await?;
+                let events_changed = !accepted_event_ids.is_empty();
+                let events = self
+                    .repository
+                    .list_events(
+                        &group_id,
+                        after_cursor,
+                        limit.clamp(1, MAX_EVENTS_PER_BATCH),
+                    )
+                    .await?;
+                let latest_cursor = events
+                    .last()
+                    .map(|item| item.cursor)
+                    .unwrap_or(after_cursor);
+                let peers = self
+                    .repository
+                    .list_peers(&group_id, &device.device_id)
+                    .await?;
+                drop(group_guard);
+                if removals_changed || events_changed {
+                    self.notify_group_change(&group_id).await;
+                }
+                info!(
+                    protocol = "v2",
+                    submitted_events = submitted_event_count,
+                    accepted_events = accepted_event_ids.len(),
+                    returned_events = events.len(),
+                    submitted_removals = submitted_removal_count,
+                    returned_removals = merged_removals.len(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "cloud sync request completed"
+                );
+                write_frame(
+                    send,
+                    &Response::SyncedV2 {
+                        accepted_event_ids,
+                        events,
+                        peers,
+                        latest_cursor,
+                        removed_devices: merged_removals,
                     },
                 )
                 .await?;
@@ -469,22 +611,26 @@ impl HubService {
                 if devices.len() > 256 {
                     bail!("too many removed devices");
                 }
-                let removed = if self
+                let group_lock = self.group_sync_lock(&group_id).await;
+                let group_guard = group_lock.lock().await;
+                let (removed, changed) = if self
                     .repository
                     .is_removed_endpoint(&group_id, remote_endpoint_id)
                     .await?
                 {
-                    self.repository.list_removed_devices(&group_id).await?
+                    (
+                        self.repository.list_removed_devices(&group_id).await?,
+                        false,
+                    )
                 } else {
-                    let (removed, changed) = self
-                        .repository
+                    self.repository
                         .merge_removed_devices(&group_id, &devices)
-                        .await?;
-                    if changed {
-                        self.notify_group_change(&group_id).await;
-                    }
-                    removed
+                        .await?
                 };
+                drop(group_guard);
+                if changed {
+                    self.notify_group_change(&group_id).await;
+                }
                 write_frame(send, &Response::RemovedDevices { devices: removed }).await?;
             }
         }

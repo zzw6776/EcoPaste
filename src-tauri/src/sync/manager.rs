@@ -14,7 +14,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     read_frame, write_frame, CloudEvent, DeviceAnnouncement, EncryptedEvent, ErrorCode,
-    PeerAnnouncement, Request, Response, ALPN, MAX_EVENTS_PER_BATCH, PROTOCOL_VERSION,
+    PeerAnnouncement, RemovedDevice, Request, Response, ALPN, MAX_EVENTS_PER_BATCH,
+    PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -74,6 +75,7 @@ const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -94,6 +96,7 @@ pub struct SyncManager {
     lan_cycle_lock: AsyncRwLock<()>,
     cloud_cycle_lock: Mutex<()>,
     cloud_connect_lock: Mutex<()>,
+    cloud_session_lock: Mutex<()>,
     cloud_force_reconnect: AtomicBool,
     maintenance_lock: Mutex<()>,
     apply_lock: Mutex<()>,
@@ -105,6 +108,7 @@ pub struct SyncManager {
     cloud_path: RwLock<ConnectionRoute>,
     cloud_server_version: RwLock<Option<String>>,
     cloud_connection: RwLock<Option<Connection>>,
+    cloud_session: RwLock<Option<CloudSessionState>>,
     lan_connections: RwLock<HashMap<String, Connection>>,
     lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
     lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -145,6 +149,13 @@ struct EndpointRuntime {
     router: Router,
     config: EndpointRuntimeConfig,
     _mdns: Option<MdnsAddressLookup>,
+}
+
+#[derive(Clone, Debug)]
+struct CloudSessionState {
+    connection_id: usize,
+    group_id: String,
+    sync_v2_supported: bool,
 }
 
 struct LanPeerActor {
@@ -193,6 +204,24 @@ enum LanPeerSyncOutcome {
     ConnectionFailed(String),
     TransferFailed(String),
 }
+
+struct SyncBatchResponse {
+    events: Vec<CloudEvent>,
+    peers: Vec<PeerAnnouncement>,
+    latest_cursor: u64,
+    removed_devices: Vec<RemovedDevice>,
+}
+
+#[derive(Debug)]
+struct CloudAttemptTimeout;
+
+impl std::fmt::Display for CloudAttemptTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cloud attempt timed out")
+    }
+}
+
+impl std::error::Error for CloudAttemptTimeout {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EndpointRuntimeConfig {
@@ -279,6 +308,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_cycle_lock: AsyncRwLock::new(()),
         cloud_cycle_lock: Mutex::new(()),
         cloud_connect_lock: Mutex::new(()),
+        cloud_session_lock: Mutex::new(()),
         cloud_force_reconnect: AtomicBool::new(false),
         maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
@@ -290,6 +320,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         cloud_path: RwLock::new(ConnectionRoute::default()),
         cloud_server_version: RwLock::new(None),
         cloud_connection: RwLock::new(None),
+        cloud_session: RwLock::new(None),
         lan_connections: RwLock::new(HashMap::new()),
         lan_peer_actors: RwLock::new(HashMap::new()),
         lan_peer_locks: RwLock::new(HashMap::new()),
@@ -518,7 +549,7 @@ impl SyncManager {
                     let address = peer_endpoint_addr(&peer.announcement)?;
                     let connection =
                         connect_peer(&endpoint, address, Duration::from_secs(8)).await?;
-                    self.sync_removed_devices(&connection, &group).await
+                    self.sync_removed_devices(&connection, &group, false).await
                 }
                 .await;
                 if let Err(error) = result {
@@ -1655,69 +1686,115 @@ impl SyncManager {
         let mut cloud_succeeded = false;
         let mut cloud_error = None;
         if target != Some(SyncTarget::Lan) {
-            match server_endpoint_addr(&settings).await {
-                Ok(Some(server)) => {
-                    if self.cached_cloud_connection().is_none() {
-                        self.set_channel_status(
-                            SyncTarget::Cloud,
-                            SyncChannelState::Connecting,
-                            None,
-                            false,
-                        );
-                    }
-                    match self.connect_cloud(&endpoint, server).await {
-                        Ok(connection) => {
-                            let result = async {
+            for attempt in 0..2 {
+                let cloud_cycle_started_at = Instant::now();
+                let reused_connection = self.cached_cloud_connection().is_some();
+                if !reused_connection && server_is_configured(&settings) {
+                    self.set_channel_status(
+                        SyncTarget::Cloud,
+                        SyncChannelState::Connecting,
+                        None,
+                        false,
+                    );
+                }
+                match self.configured_cloud_connection(&endpoint, &settings).await {
+                    Ok(Some(connection)) => {
+                        let connection_elapsed = cloud_cycle_started_at.elapsed();
+                        let group_started_at = Instant::now();
+                        let result = async {
+                            let initialized_group =
                                 self.ensure_cloud_group(&connection, &group).await?;
-                                let cursor = repository::cloud_cursor(&pool).await?;
-                                let latest = self
-                                    .sync_connection(
-                                        &connection,
-                                        CLOUD_TARGET,
-                                        cursor,
-                                        &group,
-                                        &endpoint,
-                                    )
-                                    .await?;
-                                repository::set_cloud_cursor(&pool, latest).await
-                            }
-                            .await;
-                            match result {
-                                Ok(()) => {
-                                    self.set_cloud_path(&connection);
-                                    cloud_succeeded = true;
-                                }
-                                Err(error) => {
-                                    self.invalidate_cloud_connection(connection.stable_id());
-                                    cloud_error = Some(error.to_string());
-                                }
-                            }
-                        }
-                        Err(error) => cloud_error = Some(format!("云端同步连接失败: {error}")),
-                    }
-                    if cloud_succeeded {
-                        self.set_channel_status(
-                            SyncTarget::Cloud,
-                            SyncChannelState::Online,
-                            None,
-                            true,
-                        );
-                    } else {
-                        let pending = repository::pending_origin_events_for_target(
-                            &pool,
-                            CLOUD_TARGET,
-                            &identity.device_id,
-                            MAX_EVENTS_PER_BATCH,
-                        )
-                        .await?;
-                        let event_ids = pending
-                            .into_iter()
-                            .map(|stored| stored.event.event_id)
-                            .collect::<Vec<_>>();
-                        if let Some(error) = cloud_error.as_deref() {
-                            repository::mark_delivery_error(&pool, CLOUD_TARGET, &event_ids, error)
+                            let group_elapsed = group_started_at.elapsed();
+                            let transfer_started_at = Instant::now();
+                            let cursor = repository::cloud_cursor(&pool).await?;
+                            let latest = self
+                                .sync_connection(
+                                    &connection,
+                                    CLOUD_TARGET,
+                                    cursor,
+                                    &group,
+                                    &endpoint,
+                                )
                                 .await?;
+                            repository::set_cloud_cursor(&pool, latest).await?;
+                            Ok::<_, anyhow::Error>((
+                                initialized_group,
+                                group_elapsed,
+                                transfer_started_at.elapsed(),
+                            ))
                         }
+                        .await;
+                        match result {
+                            Ok((initialized_group, group_elapsed, transfer_elapsed)) => {
+                                self.set_cloud_path(&connection);
+                                cloud_succeeded = true;
+                                log::info!(
+                                    "cloud sync cycle completed: reusedConnection={reused_connection} initializedGroup={initialized_group} retryAttempt={attempt} connectionMs={} groupMs={} transferMs={} totalMs={}",
+                                    connection_elapsed.as_millis(),
+                                    group_elapsed.as_millis(),
+                                    transfer_elapsed.as_millis(),
+                                    cloud_cycle_started_at.elapsed().as_millis()
+                                );
+                            }
+                            Err(error) => {
+                                let connection_closed = connection.close_reason().is_some();
+                                let retry_immediately = attempt == 0
+                                    && (is_cloud_attempt_timeout(&error) || connection_closed);
+                                self.invalidate_cloud_connection(connection.stable_id());
+                                if retry_immediately {
+                                    log::warn!(
+                                        "cloud connection became unavailable; resolving the server again and retrying immediately"
+                                    );
+                                    continue;
+                                }
+                                cloud_error = Some(error.to_string());
+                            }
+                        }
+                        if cloud_succeeded {
+                            self.set_channel_status(
+                                SyncTarget::Cloud,
+                                SyncChannelState::Online,
+                                None,
+                                true,
+                            );
+                        } else {
+                            let pending = repository::pending_origin_events_for_target(
+                                &pool,
+                                CLOUD_TARGET,
+                                &identity.device_id,
+                                MAX_EVENTS_PER_BATCH,
+                            )
+                            .await?;
+                            let event_ids = pending
+                                .into_iter()
+                                .map(|stored| stored.event.event_id)
+                                .collect::<Vec<_>>();
+                            if let Some(error) = cloud_error.as_deref() {
+                                repository::mark_delivery_error(
+                                    &pool,
+                                    CLOUD_TARGET,
+                                    &event_ids,
+                                    error,
+                                )
+                                .await?;
+                            }
+                            self.set_channel_status(
+                                SyncTarget::Cloud,
+                                SyncChannelState::Error,
+                                cloud_error.as_deref(),
+                                false,
+                            );
+                        }
+                        break;
+                    }
+                    Ok(None) => self.set_channel_status(
+                        SyncTarget::Cloud,
+                        SyncChannelState::Disabled,
+                        None,
+                        false,
+                    ),
+                    Err(error) => {
+                        cloud_error = Some(error.to_string());
                         self.set_channel_status(
                             SyncTarget::Cloud,
                             SyncChannelState::Error,
@@ -1726,21 +1803,7 @@ impl SyncManager {
                         );
                     }
                 }
-                Ok(None) => self.set_channel_status(
-                    SyncTarget::Cloud,
-                    SyncChannelState::Disabled,
-                    None,
-                    false,
-                ),
-                Err(error) => {
-                    cloud_error = Some(error.to_string());
-                    self.set_channel_status(
-                        SyncTarget::Cloud,
-                        SyncChannelState::Error,
-                        cloud_error.as_deref(),
-                        false,
-                    );
-                }
+                break;
             }
         }
 
@@ -2071,20 +2134,80 @@ impl SyncManager {
         &self,
         connection: &Connection,
         group: &GroupSecrets,
-    ) -> Result<()> {
-        match call(
+    ) -> Result<bool> {
+        if self.cloud_group_is_ready(connection, &group.group_id) {
+            return Ok(false);
+        }
+        let _guard = self.cloud_session_lock.lock().await;
+        if self.cloud_group_is_ready(connection, &group.group_id) {
+            return Ok(false);
+        }
+
+        let create_group = call_cloud(
             connection,
             Request::CreateGroup {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
             },
-        )
-        .await?
-        {
-            Response::GroupCreated => Ok(()),
+        );
+        let read_metadata = call_cloud(connection, Request::HealthV2);
+        let (group_response, metadata_response) = tokio::join!(create_group, read_metadata);
+        match group_response? {
+            Response::GroupCreated => {}
             Response::Error { message, .. } => bail!(message),
             _ => bail!("云端返回了无效的建组响应"),
         }
+        let sync_v2_supported = match metadata_response {
+            Ok(Response::HealthV2 {
+                protocol_version,
+                server_version,
+                ..
+            }) => {
+                log::info!(
+                    "cloud Hub metadata received: protocolVersion={protocol_version} serverVersion={server_version}"
+                );
+                self.update_cloud_server_version(Some(server_version));
+                protocol_version >= SYNC_V2_PROTOCOL_VERSION
+            }
+            Ok(_) => {
+                log::debug!("cloud Hub returned an invalid health response; using legacy sync");
+                false
+            }
+            Err(error) => {
+                log::debug!("query cloud Hub metadata failed; using legacy sync: {error}");
+                false
+            }
+        };
+        *self
+            .cloud_session
+            .write()
+            .expect("cloud session state poisoned") = Some(CloudSessionState {
+            connection_id: connection.stable_id(),
+            group_id: group.group_id.clone(),
+            sync_v2_supported,
+        });
+        Ok(true)
+    }
+
+    fn cloud_group_is_ready(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .is_some_and(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+    }
+
+    fn cloud_sync_v2_supported(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .filter(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+            .is_some_and(|session| session.sync_v2_supported)
     }
 
     async fn sync_connection(
@@ -2096,10 +2219,19 @@ impl SyncManager {
         endpoint: &Endpoint,
     ) -> Result<u64> {
         let pool = self.pool().await;
-        self.sync_removed_devices(connection, group).await?;
         let identity = self.identity.snapshot();
+        let use_sync_v2 =
+            target_id == CLOUD_TARGET && self.cloud_sync_v2_supported(connection, &group.group_id);
+        let removed_devices = if use_sync_v2 {
+            repository::removed_devices(&pool).await?
+        } else {
+            self.sync_removed_devices(connection, group, target_id == CLOUD_TARGET)
+                .await?;
+            Vec::new()
+        };
         let mut cursor = after_cursor;
         for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            let batch_started_at = Instant::now();
             let pending = if target_id == CLOUD_TARGET {
                 repository::pending_origin_events_for_target(
                     &pool,
@@ -2120,30 +2252,9 @@ impl SyncManager {
             let source_icon_blob_ids = source_icon_blob_ids(&pending, &group.content_key_bytes()?);
             repository::mark_delivery_syncing(&pool, target_id, &event_ids).await?;
             self.emit_updated();
-            let result = async {
-                let blobs = repository::blobs_for_events(&pool, &event_ids).await?;
-                let (required_blobs, source_icon_blobs) =
-                    split_source_icon_blobs(blobs, &source_icon_blob_ids);
-                upload_blobs(connection, group, required_blobs).await?;
-                if let Err(error) = upload_blobs(connection, group, source_icon_blobs).await {
-                    log::warn!("publish optional source app icons failed: {error}");
-                }
-                call(
-                    connection,
-                    Request::Sync {
-                        group_id: group.group_id.clone(),
-                        access_token: group.access_token_bytes()?,
-                        device: self.device_announcement(endpoint),
-                        after_cursor: cursor,
-                        events: pending.into_iter().map(|item| item.event).collect(),
-                        limit: MAX_EVENTS_PER_BATCH,
-                    },
-                )
-                .await
-            }
-            .await;
-            let response = match result {
-                Ok(response) => response,
+            let blob_started_at = Instant::now();
+            let blobs = match repository::blobs_for_events(&pool, &event_ids).await {
+                Ok(blobs) => blobs,
                 Err(error) => {
                     repository::mark_delivery_error(
                         &pool,
@@ -2156,30 +2267,131 @@ impl SyncManager {
                     return Err(error);
                 }
             };
-            let Response::Synced {
-                events,
-                peers,
-                latest_cursor,
-                ..
-            } = response
-            else {
-                if let Response::Error { message, .. } = response {
-                    repository::mark_delivery_error(&pool, target_id, &event_ids, &message).await?;
-                    self.emit_updated();
-                    bail!(message);
+            let (required_blobs, source_icon_blobs) =
+                split_source_icon_blobs(blobs, &source_icon_blob_ids);
+            let required_blob_count = required_blobs.len();
+            let source_icon_blob_count = source_icon_blobs.len();
+            if let Err(error) = upload_blobs(connection, group, required_blobs).await {
+                repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
+                    .await?;
+                self.emit_updated();
+                return Err(error);
+            }
+            if let Err(error) = upload_blobs(connection, group, source_icon_blobs).await {
+                log::warn!("publish optional source app icons failed: {error}");
+            }
+            let blob_elapsed = blob_started_at.elapsed();
+            let outgoing_events = pending
+                .iter()
+                .map(|item| item.event.clone())
+                .collect::<Vec<_>>();
+            let request_started_at = Instant::now();
+            let result = async {
+                let mut protocol = "legacy";
+                let response = if use_sync_v2 {
+                    let response = call_cloud(
+                        connection,
+                        Request::SyncV2 {
+                            group_id: group.group_id.clone(),
+                            access_token: group.access_token_bytes()?,
+                            device: self.device_announcement(endpoint),
+                            after_cursor: cursor,
+                            events: outgoing_events.clone(),
+                            removed_devices: removed_devices.clone(),
+                            limit: MAX_EVENTS_PER_BATCH,
+                        },
+                    )
+                    .await?;
+                    protocol = "v2";
+                    response
+                } else {
+                    let request = Request::Sync {
+                        group_id: group.group_id.clone(),
+                        access_token: group.access_token_bytes()?,
+                        device: self.device_announcement(endpoint),
+                        after_cursor: cursor,
+                        events: outgoing_events,
+                        limit: MAX_EVENTS_PER_BATCH,
+                    };
+                    if target_id == CLOUD_TARGET {
+                        call_cloud(connection, request).await?
+                    } else {
+                        call(connection, request).await?
+                    }
+                };
+                let response = match response {
+                    Response::Synced {
+                        events,
+                        peers,
+                        latest_cursor,
+                        ..
+                    } => SyncBatchResponse {
+                        events,
+                        peers,
+                        latest_cursor,
+                        removed_devices: Vec::new(),
+                    },
+                    Response::SyncedV2 {
+                        events,
+                        peers,
+                        latest_cursor,
+                        removed_devices,
+                        ..
+                    } => SyncBatchResponse {
+                        events,
+                        peers,
+                        latest_cursor,
+                        removed_devices,
+                    },
+                    Response::Error { message, .. } => bail!(message),
+                    _ => bail!("同步端返回了无效响应"),
+                };
+                Ok::<_, anyhow::Error>((response, protocol))
+            }
+            .await;
+            let (response, protocol) = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    if !is_cloud_attempt_timeout(&error) {
+                        repository::mark_delivery_error(
+                            &pool,
+                            target_id,
+                            &event_ids,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        self.emit_updated();
+                    }
+                    return Err(error);
                 }
-                bail!("同步端返回了无效响应");
             };
-            let received_count = events.len();
+            let request_elapsed = request_started_at.elapsed();
+            let received_count = response.events.len();
+            let removed_count = response.removed_devices.len();
+            if !response.removed_devices.is_empty() {
+                self.apply_removed_devices(&pool, response.removed_devices)
+                    .await?;
+            }
             repository::mark_delivered(&pool, target_id, &event_ids).await?;
-            for peer in peers {
+            for peer in response.peers {
                 if peer.device_id != identity.device_id {
                     repository::upsert_peer(&pool, &peer).await?;
                 }
             }
-            self.accept_remote_events(connection, events, group, target_id)
+            let apply_started_at = Instant::now();
+            self.accept_remote_events(connection, response.events, group, target_id)
                 .await?;
-            cursor = latest_cursor;
+            let apply_elapsed = apply_started_at.elapsed();
+            cursor = response.latest_cursor;
+            if target_id == CLOUD_TARGET {
+                log::info!(
+                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} blobMs={} requestMs={} applyMs={} totalMs={}",
+                    blob_elapsed.as_millis(),
+                    request_elapsed.as_millis(),
+                    apply_elapsed.as_millis(),
+                    batch_started_at.elapsed().as_millis()
+                );
+            }
             if pending_count < usize::from(MAX_EVENTS_PER_BATCH)
                 && received_count < usize::from(MAX_EVENTS_PER_BATCH)
             {
@@ -2197,20 +2409,23 @@ impl SyncManager {
         &self,
         connection: &Connection,
         group: &GroupSecrets,
+        cloud: bool,
     ) -> Result<()> {
         let pool = self.pool().await;
         let local = repository::removed_devices(&pool).await?;
-        let response = match call(
-            connection,
-            Request::SyncRemovedDevices {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                devices: local,
-            },
-        )
-        .await
-        {
+        let request = Request::SyncRemovedDevices {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            devices: local,
+        };
+        let result = if cloud {
+            call_cloud(connection, request).await
+        } else {
+            call(connection, request).await
+        };
+        let response = match result {
             Ok(response) => response,
+            Err(error) if cloud && is_cloud_attempt_timeout(&error) => return Err(error),
             Err(error) => {
                 // 旧版对端不识别新请求时仍保留原有剪贴板同步能力。
                 log::debug!("peer does not support removed-device exchange: {error}");
@@ -2223,19 +2438,27 @@ impl SyncManager {
             }
             return Ok(());
         };
+        self.apply_removed_devices(&pool, devices).await
+    }
+
+    async fn apply_removed_devices(
+        &self,
+        pool: &SqlitePool,
+        devices: Vec<RemovedDevice>,
+    ) -> Result<()> {
         let identity = self.identity.snapshot();
         let endpoint_id = self.identity.secret_key()?.public().to_string();
         let removed_self = devices.iter().any(|device| {
             device.is_removed()
                 && (device.device_id == identity.device_id || device.endpoint_id == endpoint_id)
         });
-        repository::merge_removed_devices(&pool, &devices).await?;
+        repository::merge_removed_devices(pool, &devices).await?;
         for device in &devices {
             self.clear_peer_suspension(&device.device_id);
         }
         self.emit_updated();
         if removed_self {
-            self.leave_after_removal(&pool).await?;
+            self.leave_after_removal(pool).await?;
             bail!("本设备已被移出同步空间");
         }
         Ok(())
@@ -3138,54 +3361,31 @@ impl SyncManager {
             .cloud_connection
             .write()
             .expect("cloud connection cache poisoned") = Some(connection.clone());
+        self.cloud_session
+            .write()
+            .expect("cloud session state poisoned")
+            .take();
         self.cloud_server_version
             .write()
             .expect("cloud server version poisoned")
             .take();
-        let manager = self.clone();
-        let version_connection = connection.clone();
-        tauri::async_runtime::spawn(async move {
-            manager
-                .refresh_cloud_server_version(version_connection)
-                .await;
-        });
         Ok(connection)
     }
 
-    /// Reads Hub metadata once for each newly established cloud connection.
-    async fn refresh_cloud_server_version(&self, connection: Connection) {
-        let response =
-            tokio::time::timeout(Duration::from_secs(3), call(&connection, Request::HealthV2))
-                .await;
-        let version = match response {
-            Ok(Ok(Response::HealthV2 { server_version, .. })) => Some(server_version),
-            Ok(Ok(_)) => {
-                log::debug!("cloud Hub returned an invalid health response");
-                None
-            }
-            Ok(Err(error)) => {
-                log::debug!("query cloud Hub version failed: {error}");
-                None
-            }
-            Err(_) => {
-                log::debug!("query cloud Hub version timed out");
-                None
-            }
-        };
-        let Some(version) = version else {
-            return;
-        };
-        let is_current_connection = self
-            .cloud_connection
-            .read()
-            .expect("cloud connection cache poisoned")
-            .as_ref()
-            .is_some_and(|current| current.stable_id() == connection.stable_id());
-        if !is_current_connection {
-            return;
+    /// Reuses a healthy cloud connection without repeating endpoint DNS resolution.
+    async fn configured_cloud_connection(
+        self: &Arc<Self>,
+        endpoint: &Endpoint,
+        settings: &SyncSettings,
+    ) -> Result<Option<Connection>> {
+        if let Some(connection) = self.cached_cloud_connection() {
+            return Ok(Some(connection));
         }
+        let Some(server) = server_endpoint_addr(settings).await? else {
+            return Ok(None);
+        };
 
-        self.update_cloud_server_version(Some(version));
+        self.connect_cloud(endpoint, server).await.map(Some)
     }
 
     fn cached_cloud_connection(&self) -> Option<Connection> {
@@ -3198,15 +3398,34 @@ impl SyncManager {
     }
 
     fn invalidate_cloud_connection(&self, stable_id: usize) {
-        let mut connection = self
-            .cloud_connection
-            .write()
-            .expect("cloud connection cache poisoned");
-        if connection
-            .as_ref()
-            .is_some_and(|connection| connection.stable_id() == stable_id)
-        {
-            connection.take();
+        let removed = {
+            let mut connection = self
+                .cloud_connection
+                .write()
+                .expect("cloud connection cache poisoned");
+            if connection
+                .as_ref()
+                .is_some_and(|connection| connection.stable_id() == stable_id)
+            {
+                if let Some(connection) = connection.take() {
+                    connection.close(0_u32.into(), b"cloud connection invalidated");
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            let mut session = self
+                .cloud_session
+                .write()
+                .expect("cloud session state poisoned");
+            if session
+                .as_ref()
+                .is_some_and(|session| session.connection_id == stable_id)
+            {
+                session.take();
+            }
         }
     }
 
@@ -3214,6 +3433,10 @@ impl SyncManager {
         self.cloud_connection
             .write()
             .expect("cloud connection cache poisoned")
+            .take();
+        self.cloud_session
+            .write()
+            .expect("cloud session state poisoned")
             .take();
         self.cloud_server_version
             .write()
@@ -3780,17 +4003,20 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
             manager.set_cloud_watch_status(SyncChannelState::Connecting, None, false);
             manager.emit_updated();
             let connection = manager.connect_cloud(&endpoint, server).await?;
-            manager.ensure_cloud_group(&connection, &group).await?;
-            manager.set_cloud_path(&connection);
-            manager.notify_cloud_connected();
-            manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
-            manager.emit_updated();
-            let pool = manager.pool().await;
-            let watch_result = watch_cloud_group(&manager, &connection, &group, &pool).await;
-            if watch_result.is_err() {
+            let connection_result = async {
+                manager.ensure_cloud_group(&connection, &group).await?;
+                manager.set_cloud_path(&connection);
+                manager.notify_cloud_connected();
+                manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
+                manager.emit_updated();
+                let pool = manager.pool().await;
+                watch_cloud_group(&manager, &connection, &group, &pool).await
+            }
+            .await;
+            if connection_result.is_err() {
                 manager.invalidate_cloud_connection(connection.stable_id());
             }
-            watch_result
+            connection_result
         }
         .await;
         match result {
@@ -3937,7 +4163,12 @@ fn apply_cloud_watch_response(
             latest_cursor,
             latest_removed_at_ms,
         } => {
-            if latest_cursor > *cursor || latest_removed_at_ms > *removed_at_ms {
+            let events_changed = latest_cursor > *cursor;
+            let removals_changed = latest_removed_at_ms > *removed_at_ms;
+            if events_changed || removals_changed {
+                log::info!(
+                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed}"
+                );
                 manager.wake_cloud_transfer();
             }
             *cursor = (*cursor).max(latest_cursor);
@@ -3950,7 +4181,12 @@ fn apply_cloud_watch_response(
             server_version,
         } => {
             manager.update_cloud_server_version(Some(server_version));
-            if latest_cursor > *cursor || latest_removed_at_ms > *removed_at_ms {
+            let events_changed = latest_cursor > *cursor;
+            let removals_changed = latest_removed_at_ms > *removed_at_ms;
+            if events_changed || removals_changed {
+                log::info!(
+                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed}"
+                );
                 manager.wake_cloud_transfer();
             }
             *cursor = (*cursor).max(latest_cursor);
@@ -3959,6 +4195,7 @@ fn apply_cloud_watch_response(
         }
         Response::Changed { latest_cursor } => {
             if latest_cursor > *cursor {
+                log::info!("cloud watch change received: eventsChanged=true removalsChanged=false");
                 manager.wake_cloud_transfer();
             }
             *cursor = (*cursor).max(latest_cursor);
@@ -4498,6 +4735,9 @@ async fn dispatch_peer(
                 manager.wake_lan_transfer();
             }
         }
+        Request::SyncV2 { .. } => {
+            bail!("combined sync is only supported by the cloud Hub");
+        }
         Request::SyncRemovedDevices {
             group_id,
             access_token,
@@ -4608,6 +4848,31 @@ async fn call(connection: &Connection, request: Request) -> Result<Response> {
     write_frame(&mut send, &request).await?;
     send.finish()?;
     read_frame(&mut recv).await.context("read sync response")
+}
+
+/// Bounds short cloud control requests without constraining LAN or long-lived watch streams.
+async fn call_cloud(connection: &Connection, request: Request) -> Result<Response> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(&mut send, &request).await?;
+    send.finish()?;
+    let length = match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, recv.read_u32()).await {
+        Ok(length) => length.context("read cloud response frame length")? as usize,
+        Err(_) => {
+            return Err(anyhow::Error::new(CloudAttemptTimeout).context("等待云端同步响应超时"));
+        }
+    };
+    if length > ecopaste_sync_protocol::MAX_FRAME_BYTES {
+        bail!("cloud response frame is too large: {length} bytes");
+    }
+    let mut encoded = vec![0; length];
+    tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read_exact(&mut encoded))
+        .await
+        .context("读取云端同步响应超时")??;
+    minicbor::decode(&encoded).context("decode cloud sync response")
+}
+
+fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CloudAttemptTimeout>().is_some()
 }
 
 /// Confirms both the approval response and its durable commit before returning it to the UI.
