@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::{
-    ALPN, DeviceAnnouncement, EncryptedEvent, ErrorCode, Request, Response, read_frame, write_frame,
+    ALPN, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice, Request, Response,
+    read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -32,6 +33,13 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         call(&connection, Request::Health).await?,
         Response::Health {
             protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
+            ..
+        }
+    ));
+    assert!(matches!(
+        call(&connection, Request::HealthV2).await?,
+        Response::HealthV2 {
+            protocol_version: ecopaste_sync_protocol::SYNC_V2_PROTOCOL_VERSION,
             ..
         }
     ));
@@ -113,17 +121,31 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         nonce: vec![3; 24],
         ciphertext: vec![4; 128],
     };
-    let notify_watch = sync_request(
-        &group_id,
-        &access_token,
-        device("device_123456", "Mac", &client_endpoint_id),
-        1,
-        vec![next_event.clone()],
-    );
-    assert!(matches!(
-        call(&connection, notify_watch).await?,
-        Response::Synced { .. }
-    ));
+    let removed_device = RemovedDevice {
+        device_id: "device_removed".into(),
+        endpoint_id: "endpoint_removed".into(),
+        removed_at_ms: 300,
+        restored_at_ms: None,
+    };
+    let notify_watch = Request::SyncV2 {
+        group_id: group_id.clone(),
+        access_token: access_token.clone(),
+        device: device("device_123456", "Mac", &client_endpoint_id),
+        after_cursor: 1,
+        events: vec![next_event.clone()],
+        removed_devices: vec![removed_device.clone()],
+        limit: 100,
+    };
+    let Response::SyncedV2 {
+        accepted_event_ids,
+        removed_devices,
+        ..
+    } = call(&connection, notify_watch).await?
+    else {
+        anyhow::bail!("expected combined sync response");
+    };
+    assert_eq!(accepted_event_ids, vec![next_event.event_id.clone()]);
+    assert_eq!(removed_devices, vec![removed_device]);
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), watch)
             .await
@@ -166,6 +188,43 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     upload_blob(&connection, &group_id, &access_token, &blob_id, blob).await?;
     let downloaded = download_blob(&connection, &group_id, &access_token, &blob_id).await?;
     assert_eq!(downloaded, blob);
+
+    let rejected_event = EncryptedEvent {
+        event_id: "event_after_removal".into(),
+        origin_device_id: "device_123456".into(),
+        origin_sequence: 3,
+        created_at_ms: 400,
+        nonce: vec![5; 24],
+        ciphertext: vec![6; 128],
+    };
+    let remove_self = Request::SyncV2 {
+        group_id: group_id.clone(),
+        access_token: access_token.clone(),
+        device: device("device_123456", "Mac", &client_endpoint_id),
+        after_cursor: 2,
+        events: vec![rejected_event],
+        removed_devices: vec![RemovedDevice {
+            device_id: "device_123456".into(),
+            endpoint_id: client_endpoint_id.clone(),
+            removed_at_ms: 500,
+            restored_at_ms: None,
+        }],
+        limit: 100,
+    };
+    let Response::SyncedV2 {
+        accepted_event_ids,
+        events,
+        removed_devices,
+        ..
+    } = call(&connection, remove_self).await?
+    else {
+        anyhow::bail!("expected removed-device sync response");
+    };
+    assert!(accepted_event_ids.is_empty());
+    assert!(events.is_empty());
+    assert!(removed_devices.iter().any(|device| {
+        device.device_id == "device_123456" && device.endpoint_id == client_endpoint_id
+    }));
 
     connection.close(0_u32.into(), b"test complete");
     client.close().await;

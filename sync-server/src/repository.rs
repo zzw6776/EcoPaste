@@ -177,6 +177,10 @@ impl Repository {
         group_id: &str,
         devices: &[RemovedDevice],
     ) -> Result<(Vec<RemovedDevice>, bool)> {
+        if devices.is_empty() {
+            return Ok((self.list_removed_devices(group_id).await?, false));
+        }
+
         let mut transaction = self
             .pool
             .begin()
