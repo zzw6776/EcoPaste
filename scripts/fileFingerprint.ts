@@ -8,6 +8,24 @@ export interface FileFingerprint {
   mtimeSeconds: number;
 }
 
+/** 为文件快照生成与遍历顺序无关的摘要。 */
+export function hashFileSnapshot(
+  snapshot: Map<string, FileFingerprint>,
+): string {
+  const hash = createHash("sha256");
+  const entries = [...snapshot.entries()].sort(([left], [right]) => {
+    return left.localeCompare(right);
+  });
+
+  for (const [path, fingerprint] of entries) {
+    hash.update(`${Buffer.byteLength(path)}:`);
+    hash.update(path);
+    hash.update(fingerprint.hash);
+  }
+
+  return hash.digest("hex");
+}
+
 /** 计算文件内容摘要，不依赖文件时间戳。 */
 export async function hashFile(path: string): Promise<string> {
   return createHash("sha256")
