@@ -17,6 +17,7 @@ import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
+import android.util.LruCache
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -35,6 +36,8 @@ import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.widget.ViewPager2
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.DateFormat
@@ -72,6 +75,7 @@ class EcoPasteOverlayPanel(
         val tag: String,
         val preview: String,
         val detail: String,
+        val imagePath: String,
         val sourceAppName: String,
         val sourceAppIconPath: String,
         val sourceAppAccentStart: String,
@@ -145,8 +149,13 @@ class EcoPasteOverlayPanel(
     private var loadGeneration = 0
     private var activeFilter = ItemFilter.ALL
     private var loadedItems = emptyList<OverlayItem>()
-    private var itemContainer: LinearLayout? = null
+    private var itemsLoading = false
+    private var itemPager: ViewPager2? = null
+    private var itemPagerAdapter: OverlayItemPagerAdapter? = null
+    private var cloudRecordsScroller: ScrollView? = null
+    private var cloudRecordsContainer: LinearLayout? = null
     private var filterContainer: LinearLayout? = null
+    private var filterScrollView: HorizontalScrollView? = null
     private var searchInput: EditText? = null
     private var searchMode = false
     private var searchRunnable: Runnable? = null
@@ -169,7 +178,11 @@ class EcoPasteOverlayPanel(
     private var cloudLoadFuture: Future<*>? = null
     private val queryExecutor = Executors.newSingleThreadExecutor()
     private val actionExecutor = Executors.newFixedThreadPool(2)
+    private val imageDecodeExecutor = Executors.newFixedThreadPool(2)
     private val heightPersistenceExecutor = Executors.newSingleThreadExecutor()
+    private val imageBitmapCache = object : LruCache<String, Bitmap>(16 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+    }
 
     fun show(heightPercent: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
@@ -268,46 +281,85 @@ class EcoPasteOverlayPanel(
             setPadding(dp(12), dp(2), dp(12), dp(6))
         }
         filterContainer = filters
+        val filterScroller = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+            addView(
+                filters,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        filterScrollView = filterScroller
         renderFilters()
         content.addView(
-            HorizontalScrollView(context).apply {
-                isHorizontalScrollBarEnabled = false
-                clipToPadding = false
-                addView(
-                    filters,
-                    FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                    ),
-                )
-            },
+            filterScroller,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ),
         )
 
-        val body = LinearLayout(context).apply {
+        val pagerAdapter = OverlayItemPagerAdapter()
+        val pager = ViewPager2(context).apply {
+            adapter = pagerAdapter
+            offscreenPageLimit = 1
+            orientation = ViewPager2.ORIENTATION_HORIZONTAL
+            setPageTransformer { page, position ->
+                val progress = 1f - abs(position).coerceIn(0f, 1f)
+                page.alpha = 0.72f + progress * 0.28f
+                page.scaleY = 0.97f + progress * 0.03f
+            }
+            registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+                override fun onPageSelected(position: Int) {
+                    val selected = ItemFilter.entries.getOrNull(position) ?: return
+                    if (activeFilter == selected) return
+
+                    activeFilter = selected
+                    renderFilters()
+                }
+            })
+        }
+        pager.setCurrentItem(activeFilter.ordinal, false)
+        itemPager = pager
+        itemPagerAdapter = pagerAdapter
+
+        val cloudBody = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(2), dp(12), dp(12))
-            addView(statusText(R.string.overlay_panel_loading))
         }
-        itemContainer = body
-        content.addView(
-            ScrollView(context).apply {
-                isFillViewport = true
-                isVerticalScrollBarEnabled = false
-                clipToPadding = false
-                addView(
-                    body,
-                    FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                    ),
-                )
-            },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f),
-        )
+        val cloudScroller = ScrollView(context).apply {
+            visibility = View.GONE
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            clipToPadding = false
+            addView(
+                cloudBody,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        cloudRecordsContainer = cloudBody
+        cloudRecordsScroller = cloudScroller
+
+        content.addView(FrameLayout(context).apply {
+            addView(pager, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+            addView(cloudScroller, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f,
+        ))
 
         var outsideAdded = false
         var panelAdded = false
@@ -346,7 +398,9 @@ class EcoPasteOverlayPanel(
         removeCurrentPanel()
         queryExecutor.shutdownNow()
         actionExecutor.shutdownNow()
+        imageDecodeExecutor.shutdownNow()
         heightPersistenceExecutor.shutdownNow()
+        imageBitmapCache.evictAll()
     }
 
     /** 返回面板内上一层；返回 false 表示当前已在根层，可由服务收起面板。 */
@@ -406,8 +460,13 @@ class EcoPasteOverlayPanel(
         panelView = null
         outsideView = null
         activeSessionId = null
-        itemContainer = null
+        itemPager?.adapter = null
+        itemPager = null
+        itemPagerAdapter = null
+        cloudRecordsScroller = null
+        cloudRecordsContainer = null
         filterContainer = null
+        filterScrollView = null
         syncDetailsContainer = null
         syncDetailsCard = null
         syncDetailsScrim = null
@@ -419,15 +478,14 @@ class EcoPasteOverlayPanel(
         cloudConnectionDetailsOpen = false
         syncStatus = null
         cloudImagePreview = null
+        itemsLoading = false
         loadedItems = emptyList()
     }
 
     private fun requestItems(keyword: String) {
         val generation = ++loadGeneration
-        itemContainer?.apply {
-            removeAllViews()
-            addView(statusText(R.string.overlay_panel_loading))
-        }
+        itemsLoading = true
+        renderItems()
         itemLoadFuture?.cancel(false)
         itemLoadFuture = queryExecutor.submit {
             val json = try {
@@ -439,6 +497,7 @@ class EcoPasteOverlayPanel(
             mainHandler.post {
                 if (generation == loadGeneration && panelView != null) {
                     loadedItems = parseItems(json)
+                    itemsLoading = false
                     renderItems()
                 }
             }
@@ -1019,11 +1078,13 @@ class EcoPasteOverlayPanel(
         if (panelView == null) return
         if (append && cloudNextBeforeCursor == null) return
         showingCloudRecords = true
-        filterContainer?.visibility = View.GONE
+        filterScrollView?.visibility = View.GONE
+        itemPager?.visibility = View.GONE
+        cloudRecordsScroller?.visibility = View.VISIBLE
         if (!append) {
             cloudRecords = emptyList()
             cloudNextBeforeCursor = null
-            itemContainer?.apply {
+            cloudRecordsContainer?.apply {
                 removeAllViews()
                 addView(statusText(R.string.overlay_panel_loading))
             }
@@ -1052,7 +1113,7 @@ class EcoPasteOverlayPanel(
     }
 
     private fun renderCloudRecords(json: String, append: Boolean) {
-        val container = itemContainer ?: return
+        val container = cloudRecordsContainer ?: return
         container.removeAllViews()
         container.addView(TextView(context).apply {
             text = "‹  云端剪贴板记录"
@@ -1183,7 +1244,9 @@ class EcoPasteOverlayPanel(
         showingCloudRecords = false
         cloudLoadGeneration += 1
         cloudLoadFuture?.cancel(false)
-        filterContainer?.visibility = View.VISIBLE
+        filterScrollView?.visibility = View.VISIBLE
+        cloudRecordsScroller?.visibility = View.GONE
+        itemPager?.visibility = View.VISIBLE
         renderItems()
     }
 
@@ -1221,14 +1284,26 @@ class EcoPasteOverlayPanel(
 
     /** 按显示尺寸采样图片，避免云端原图直接解码导致悬浮服务占用过多内存。 */
     private fun decodeScaledBitmap(path: String, maxDimension: Int): Bitmap? {
+        return decodeScaledBitmap(path, maxDimension, maxDimension)
+    }
+
+    /** 按 FIT_CENTER 的实际显示边界采样，兼顾超宽图清晰度和普通图片内存占用。 */
+    private fun decodeScaledBitmap(path: String, maxWidth: Int, maxHeight: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
+        val displayScale = minOf(
+            maxWidth.toFloat() / bounds.outWidth,
+            maxHeight.toFloat() / bounds.outHeight,
+            1f,
+        )
+        val targetWidth = (bounds.outWidth * displayScale).roundToInt().coerceAtLeast(1)
+        val targetHeight = (bounds.outHeight * displayScale).roundToInt().coerceAtLeast(1)
         var sampleSize = 1
         while (
-            bounds.outWidth / sampleSize > maxDimension ||
-            bounds.outHeight / sampleSize > maxDimension
+            bounds.outWidth / (sampleSize * 2) >= targetWidth &&
+            bounds.outHeight / (sampleSize * 2) >= targetHeight
         ) {
             sampleSize *= 2
         }
@@ -1530,6 +1605,14 @@ class EcoPasteOverlayPanel(
         filters.forEach { (filter, label) ->
             container.addView(createFilterChip(filter, label))
         }
+        val scroller = filterScrollView ?: return
+        scroller.post {
+            if (filterScrollView !== scroller) return@post
+
+            val selected = container.getChildAt(activeFilter.ordinal) ?: return@post
+            val target = (selected.left - dp(12)).coerceAtLeast(0)
+            scroller.smoothScrollTo(target, 0)
+        }
     }
 
     private fun createFilterChip(filter: ItemFilter, label: String): TextView {
@@ -1547,9 +1630,7 @@ class EcoPasteOverlayPanel(
             )
             setOnClickListener {
                 if (activeFilter == filter) return@setOnClickListener
-                activeFilter = filter
-                renderFilters()
-                renderItems()
+                itemPager?.setCurrentItem(filter.ordinal, true)
             }
         }.also {
             it.layoutParams = LinearLayout.LayoutParams(
@@ -1579,6 +1660,7 @@ class EcoPasteOverlayPanel(
                         tag = item.optString("tag", "文本"),
                         preview = item.optString("preview"),
                         detail = item.optString("detail"),
+                        imagePath = item.optString("imagePath"),
                         sourceAppName = item.optString("sourceAppName", "EcoPaste"),
                         sourceAppIconPath = item.optString("sourceAppIconPath"),
                         sourceAppAccentStart = item.optString("sourceAppAccentStart"),
@@ -1607,10 +1689,63 @@ class EcoPasteOverlayPanel(
 
     private fun renderItems() {
         if (showingCloudRecords) return
-        val container = itemContainer ?: return
+        itemPagerAdapter?.notifyDataSetChanged()
+    }
+
+    /** ViewPager2 页面：每个内置分类拥有独立纵向滚动容器，由系统处理横滑与过渡动画。 */
+    private inner class OverlayItemPagerAdapter :
+        RecyclerView.Adapter<OverlayItemPageViewHolder>() {
+        override fun getItemCount(): Int = ItemFilter.entries.size
+
+        override fun onCreateViewHolder(
+            parent: android.view.ViewGroup,
+            viewType: Int,
+        ): OverlayItemPageViewHolder {
+            val container = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(2), dp(12), dp(12))
+            }
+            val scroller = ScrollView(context).apply {
+                isFillViewport = true
+                isVerticalScrollBarEnabled = false
+                clipToPadding = false
+                addView(container, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ))
+            }
+            scroller.layoutParams = android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            return OverlayItemPageViewHolder(scroller, container)
+        }
+
+        override fun onBindViewHolder(holder: OverlayItemPageViewHolder, position: Int) {
+            renderItemPage(holder.container, ItemFilter.entries[position])
+            if (holder.boundLoadGeneration != loadGeneration) {
+                holder.scroller.scrollTo(0, 0)
+                holder.boundLoadGeneration = loadGeneration
+            }
+        }
+    }
+
+    private class OverlayItemPageViewHolder(
+        val scroller: ScrollView,
+        val container: LinearLayout,
+    ) : RecyclerView.ViewHolder(scroller) {
+        var boundLoadGeneration = -1
+    }
+
+    private fun renderItemPage(container: LinearLayout, filter: ItemFilter) {
         container.removeAllViews()
+        if (itemsLoading) {
+            container.addView(statusText(R.string.overlay_panel_loading))
+            return
+        }
+
         val visibleItems = loadedItems.filter { item ->
-            when (activeFilter) {
+            when (filter) {
                 ItemFilter.ALL -> true
                 ItemFilter.FAVORITE -> item.isFavorite
                 ItemFilter.TEXT -> item.kind == "text"
@@ -1635,13 +1770,7 @@ class EcoPasteOverlayPanel(
             elevation = dp(2).toFloat()
 
             addView(createCardHeader(item))
-            addView(TextView(context).apply {
-                text = item.preview
-                textSize = 15f
-                maxLines = 4
-                setTextColor(primaryTextColor())
-                setPadding(dp(12), dp(10), dp(12), dp(6))
-            }, LinearLayout.LayoutParams(
+            addView(createCardBody(item), LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f,
@@ -1662,6 +1791,62 @@ class EcoPasteOverlayPanel(
                 dp(118),
             ).apply {
                 bottomMargin = dp(8)
+            }
+        }
+    }
+
+    /** 图片条目完整展示采样原图；路径缺失或解码失败时保留文字摘要。 */
+    private fun createCardBody(item: OverlayItem): View {
+        val fallback = TextView(context).apply {
+            text = item.preview
+            textSize = 15f
+            maxLines = 4
+            setTextColor(primaryTextColor())
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        }
+        if (item.kind != "image" || item.imagePath.isBlank()) return fallback
+
+        return FrameLayout(context).apply {
+            addView(fallback, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+            val imageView = ImageView(context).apply {
+                visibility = View.INVISIBLE
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                contentDescription = item.preview
+                tag = item.imagePath
+            }
+            addView(imageView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+            loadCardImage(imageView, fallback, item.imagePath)
+        }
+    }
+
+    /** 在专用线程按卡片显示尺寸采样图片，并通过有界缓存复用解码结果。 */
+    private fun loadCardImage(imageView: ImageView, fallback: TextView, path: String) {
+        imageBitmapCache.get(path)?.let { bitmap ->
+            imageView.setImageBitmap(bitmap)
+            imageView.visibility = View.VISIBLE
+            fallback.visibility = View.GONE
+            return
+        }
+
+        val maxWidth = (displayBounds().width() - dp(40)).coerceAtLeast(dp(120))
+        val maxHeight = dp(46)
+        imageDecodeExecutor.submit {
+            val bitmap = imageBitmapCache.get(path)
+                ?: decodeScaledBitmap(path, maxWidth, maxHeight)?.also { decoded ->
+                    imageBitmapCache.put(path, decoded)
+                }
+            mainHandler.post {
+                if (panelView == null || imageView.tag != path || bitmap == null) return@post
+                imageView.setImageBitmap(bitmap)
+                imageView.visibility = View.VISIBLE
+                fallback.visibility = View.GONE
             }
         }
     }

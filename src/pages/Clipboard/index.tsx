@@ -1,12 +1,34 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type {
+  PointerEvent as ReactPointerEvent,
+  UIEvent as ReactUIEvent,
+} from "react";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useSnapshot } from "valtio";
 import { resizeClipboardWindow } from "@/commands";
 import { minimizeAndroidApp } from "@/commands/android";
 import { useClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
+import { clipboardViewState } from "@/stores/clipboardView";
+import type { ClipboardCategory, ClipboardRange } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMobile, isTauri, isWin } from "@/utils/is";
 import Header from "./components/Header";
 import List from "./components/List";
+
+interface BuiltInFilter {
+  category: ClipboardCategory | null;
+  labelKey: string;
+  range: ClipboardRange;
+}
+
+const BUILT_IN_FILTERS: BuiltInFilter[] = [
+  { category: null, labelKey: "groups.all", range: "all" },
+  { category: null, labelKey: "groups.favorite", range: "favorite" },
+  { category: "text", labelKey: "groups.text", range: "all" },
+  { category: "image", labelKey: "groups.image", range: "all" },
+  { category: "files", labelKey: "groups.files", range: "all" },
+];
+const CATEGORY_SCROLL_SETTLE_MS = 100;
 
 /**
  * 剪贴板主窗口：
@@ -15,11 +37,18 @@ import List from "./components/List";
  */
 const Clipboard = () => {
   useClipboardWindowEditableFocus();
+  const { t } = useTranslation("clipboard");
+  const clipboardSnapshot = useSnapshot(clipboardViewState);
 
   const isDraggingRef = useRef(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(340);
   const popupDragStartYRef = useRef(0);
+  const categoryPagerRef = useRef<HTMLDivElement>(null);
+  const categoryScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const categoryPagerReadyRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // 移动端/桌面端视口自适应与预览状态
@@ -28,6 +57,14 @@ const Clipboard = () => {
     return isAndroid && window.innerHeight < window.screen.height * 0.95;
   });
   const [sheetOpen, setSheetOpen] = useState(true);
+  const builtInFilterIndex = Math.max(
+    0,
+    getCurrentBuiltInFilterIndex(
+      clipboardSnapshot.range,
+      clipboardSnapshot.category,
+      clipboardSnapshot.groupId,
+    ),
+  );
 
   useEffect(() => {
     const handleResize = () => {
@@ -41,6 +78,31 @@ const Clipboard = () => {
     handleResize();
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!mobileMode) return;
+
+    const pager = categoryPagerRef.current;
+    if (!pager) return;
+
+    const frame = requestAnimationFrame(() => {
+      pager.scrollTo({
+        behavior: categoryPagerReadyRef.current ? "smooth" : "auto",
+        left: pager.clientWidth * builtInFilterIndex,
+      });
+      categoryPagerReadyRef.current = true;
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [builtInFilterIndex, mobileMode]);
+
+  useEffect(() => {
+    return () => {
+      if (categoryScrollTimerRef.current !== null) {
+        clearTimeout(categoryScrollTimerRef.current);
+      }
+    };
   }, []);
 
   const handleResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -104,6 +166,25 @@ const Clipboard = () => {
     }
   };
 
+  const handleCategoryPagerScroll = (event: ReactUIEvent<HTMLDivElement>) => {
+    if (!mobileMode) return;
+    if (categoryScrollTimerRef.current !== null) {
+      clearTimeout(categoryScrollTimerRef.current);
+    }
+
+    const pager = event.currentTarget;
+    categoryScrollTimerRef.current = setTimeout(() => {
+      categoryScrollTimerRef.current = null;
+      if (pager.clientWidth <= 0) return;
+
+      const nextIndex = Math.round(pager.scrollLeft / pager.clientWidth);
+      const filter = BUILT_IN_FILTERS[nextIndex];
+      if (!filter) return;
+
+      applyBuiltInFilter(filter);
+    }, CATEGORY_SCROLL_SETTLE_MS);
+  };
+
   const content = (
     <div
       className={cn(
@@ -147,9 +228,35 @@ const Clipboard = () => {
 
       <Header />
 
-      <div className="min-h-0 w-full flex-1 overflow-hidden">
-        <List />
-      </div>
+      {mobileMode ? (
+        <div
+          className="no-scrollbar flex min-h-0 w-full flex-1 snap-x snap-mandatory overflow-x-auto overflow-y-hidden overscroll-x-contain scroll-smooth"
+          onScroll={handleCategoryPagerScroll}
+          ref={categoryPagerRef}
+        >
+          {BUILT_IN_FILTERS.map((filter, index) => {
+            return (
+              <section
+                className="h-full w-full shrink-0 snap-center overflow-hidden"
+                key={`${filter.range}:${filter.category ?? "all"}`}
+                style={{ scrollSnapStop: "always" }}
+              >
+                {index === builtInFilterIndex ? (
+                  <List />
+                ) : (
+                  <div className="flex size-full items-center justify-center text-ant-secondary text-sm">
+                    {t(filter.labelKey)}
+                  </div>
+                )}
+              </section>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="min-h-0 w-full flex-1 overflow-hidden">
+          <List />
+        </div>
+      )}
 
       {isWin && !mobileMode ? (
         <div
@@ -277,5 +384,25 @@ const Clipboard = () => {
     </div>
   );
 };
+
+function getCurrentBuiltInFilterIndex(
+  range: ClipboardRange,
+  category: ClipboardCategory | null,
+  groupId: string | null,
+) {
+  if (groupId !== null) return -1;
+  if (range === "favorite") return 1;
+  if (category === null) return 0;
+
+  return BUILT_IN_FILTERS.findIndex((filter) => {
+    return filter.category === category;
+  });
+}
+
+function applyBuiltInFilter(filter: BuiltInFilter) {
+  clipboardViewState.groupId = null;
+  clipboardViewState.range = filter.range;
+  clipboardViewState.category = filter.category;
+}
 
 export default Clipboard;

@@ -27,6 +27,9 @@ static WATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKUP_WATCH_NOTIFICATION_DELAY: Duration = Duration::from_millis(100);
+const PRIMARY_WATCH_SLOT: u8 = 0;
+const BACKUP_WATCH_SLOT: u8 = 1;
 const GLOBAL_STREAM_ADMISSION: usize = 256;
 const GLOBAL_REQUEST_CONCURRENCY: usize = 128;
 const GLOBAL_BLOB_CONCURRENCY: usize = 8;
@@ -36,6 +39,15 @@ const GLOBAL_WATCH_CONCURRENCY: usize = 512;
 struct ActiveWatch {
     generation: u64,
     cancel: oneshot::Sender<()>,
+}
+
+type ActiveWatchRegistry = Arc<Mutex<HashMap<(String, String, u8), ActiveWatch>>>;
+
+#[derive(Clone)]
+struct ConnectionLimits {
+    requests: Arc<Semaphore>,
+    blobs: Arc<Semaphore>,
+    watches: Arc<Semaphore>,
 }
 
 struct TemporaryFileCleanup {
@@ -62,7 +74,7 @@ pub struct HubService {
     request_concurrency: Arc<Semaphore>,
     blob_concurrency: Arc<Semaphore>,
     watch_concurrency: Arc<Semaphore>,
-    active_watches: Arc<Mutex<HashMap<(String, String), ActiveWatch>>>,
+    active_watches: ActiveWatchRegistry,
 }
 
 impl HubService {
@@ -120,8 +132,9 @@ impl HubService {
         &self,
         group_id: &str,
         endpoint_id: &str,
+        watch_slot: u8,
     ) -> (u64, oneshot::Receiver<()>) {
-        let key = (group_id.to_owned(), endpoint_id.to_owned());
+        let key = (group_id.to_owned(), endpoint_id.to_owned(), watch_slot);
         let generation = WATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let (cancel, receiver) = oneshot::channel();
         let mut watches = self.active_watches.lock().await;
@@ -131,8 +144,14 @@ impl HubService {
         (generation, receiver)
     }
 
-    async fn unregister_watch(&self, group_id: &str, endpoint_id: &str, generation: u64) {
-        let key = (group_id.to_owned(), endpoint_id.to_owned());
+    async fn unregister_watch(
+        &self,
+        group_id: &str,
+        endpoint_id: &str,
+        watch_slot: u8,
+        generation: u64,
+    ) {
+        let key = (group_id.to_owned(), endpoint_id.to_owned(), watch_slot);
         let mut watches = self.active_watches.lock().await;
         if watches
             .get(&key)
@@ -148,9 +167,7 @@ impl HubService {
         mut send: SendStream,
         mut recv: RecvStream,
         admission_permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
-        connection_requests: Arc<Semaphore>,
-        connection_blobs: Arc<Semaphore>,
-        connection_watches: Arc<Semaphore>,
+        connection_limits: ConnectionLimits,
     ) -> Result<()> {
         let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
             .await
@@ -158,21 +175,26 @@ impl HubService {
             .context("read request frame")?;
         let _request_permits = if matches!(
             &request,
-            Request::WatchGroupStream { .. } | Request::WatchGroupStreamV2 { .. }
+            Request::WatchGroupStream { .. }
+                | Request::WatchGroupStreamV2 { .. }
+                | Request::WatchGroupStreamV3 { .. }
         ) {
             Some((
                 self.watch_concurrency.clone().acquire_owned().await?,
-                connection_watches.acquire_owned().await?,
+                connection_limits.watches.acquire_owned().await?,
             ))
-        } else if matches!(&request, Request::PutBlob { .. } | Request::GetBlob { .. }) {
+        } else if matches!(
+            &request,
+            Request::PutBlob { .. } | Request::PutSourceIcon { .. } | Request::GetBlob { .. }
+        ) {
             Some((
                 self.blob_concurrency.clone().acquire_owned().await?,
-                connection_blobs.acquire_owned().await?,
+                connection_limits.blobs.acquire_owned().await?,
             ))
         } else {
             Some((
                 self.request_concurrency.clone().acquire_owned().await?,
-                connection_requests.acquire_owned().await?,
+                connection_limits.requests.acquire_owned().await?,
             ))
         };
         drop(admission_permits);
@@ -204,7 +226,14 @@ impl HubService {
         recv: &mut RecvStream,
         request: Request,
     ) -> Result<()> {
-        let versioned_watch = matches!(&request, Request::WatchGroupStreamV2 { .. });
+        let versioned_watch = matches!(
+            &request,
+            Request::WatchGroupStreamV2 { .. } | Request::WatchGroupStreamV3 { .. }
+        );
+        let watch_slot = match &request {
+            Request::WatchGroupStreamV3 { watch_slot, .. } => *watch_slot,
+            _ => PRIMARY_WATCH_SLOT,
+        };
         match request {
             Request::Health => {
                 write_frame(
@@ -442,12 +471,23 @@ impl HubService {
                 )
                 .await?;
             }
-            Request::PutBlob {
-                group_id,
-                access_token,
-                blob_id,
-                size,
-            } => {
+            request @ (Request::PutBlob { .. } | Request::PutSourceIcon { .. }) => {
+                let notify_source_icon = matches!(request, Request::PutSourceIcon { .. });
+                let (group_id, access_token, blob_id, size) = match request {
+                    Request::PutBlob {
+                        group_id,
+                        access_token,
+                        blob_id,
+                        size,
+                    }
+                    | Request::PutSourceIcon {
+                        group_id,
+                        access_token,
+                        blob_id,
+                        size,
+                    } => (group_id, access_token, blob_id, size),
+                    _ => unreachable!(),
+                };
                 let started_at = Instant::now();
                 self.repository
                     .authenticate(&group_id, &access_token)
@@ -468,6 +508,7 @@ impl HubService {
                         group_ref = %group_log_ref(&group_id),
                         source_endpoint_id = remote_endpoint_id,
                         blob_ref = %blob_log_ref(&blob_id),
+                        kind = if notify_source_icon { "source-icon" } else { "content" },
                         outcome = "already-stored",
                         blob_bytes = size,
                         uploaded_bytes = 0_u64,
@@ -486,12 +527,16 @@ impl HubService {
                     self.repository
                         .record_blob(&group_id, &blob_id, size)
                         .await?;
+                    if notify_source_icon {
+                        self.notify_group_change(&group_id).await;
+                    }
                     let confirmation_started_at = Instant::now();
                     write_frame(send, &Response::BlobStored).await?;
                     info!(
                         group_ref = %group_log_ref(&group_id),
                         source_endpoint_id = remote_endpoint_id,
                         blob_ref = %blob_log_ref(&blob_id),
+                        kind = if notify_source_icon { "source-icon" } else { "content" },
                         outcome = "uploaded",
                         blob_bytes = size,
                         uploaded_bytes = size,
@@ -499,6 +544,7 @@ impl HubService {
                         response_write_ms = readiness_elapsed.as_millis(),
                         receive_ms = receive_elapsed.as_millis(),
                         confirmation_write_ms = confirmation_started_at.elapsed().as_millis(),
+                        watchers_notified = notify_source_icon,
                         total_ms = started_at.elapsed().as_millis(),
                         "cloud blob request completed"
                     );
@@ -585,7 +631,17 @@ impl HubService {
                 access_token,
                 after_cursor,
                 after_removed_at_ms,
+            }
+            | Request::WatchGroupStreamV3 {
+                group_id,
+                access_token,
+                after_cursor,
+                after_removed_at_ms,
+                watch_slot: _,
             } => {
+                if watch_slot > BACKUP_WATCH_SLOT {
+                    bail!("invalid cloud watch slot");
+                }
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
@@ -595,8 +651,9 @@ impl HubService {
                 let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
                 let mut latest_removed_at_ms =
                     self.repository.latest_removed_at_ms(&group_id).await?;
-                let (watch_generation, mut cancelled) =
-                    self.register_watch(&group_id, remote_endpoint_id).await;
+                let (watch_generation, mut cancelled) = self
+                    .register_watch(&group_id, remote_endpoint_id, watch_slot)
+                    .await;
                 let group_ref = group_log_ref(&group_id);
                 let watch_result: Result<()> = async {
                     tokio::time::timeout(
@@ -616,6 +673,7 @@ impl HubService {
                         group_ref = %group_ref,
                         target_endpoint_id = remote_endpoint_id,
                         watch_generation,
+                        watch_slot,
                         latest_cursor,
                         latest_removed_at_ms,
                         ready_at_ms = now_ms(),
@@ -631,6 +689,12 @@ impl HubService {
                             ) => matches!(result, Ok(Ok(()))),
                         };
                         if changed {
+                            if watch_slot == BACKUP_WATCH_SLOT {
+                                tokio::select! {
+                                    _ = &mut cancelled => return Ok(()),
+                                    _ = tokio::time::sleep(BACKUP_WATCH_NOTIFICATION_DELAY) => {},
+                                }
+                            }
                             latest_cursor = self.repository.latest_cursor(&group_id).await?;
                             latest_removed_at_ms =
                                 self.repository.latest_removed_at_ms(&group_id).await?;
@@ -654,6 +718,7 @@ impl HubService {
                                 group_ref = %group_ref,
                                 target_endpoint_id = remote_endpoint_id,
                                 watch_generation,
+                                watch_slot,
                                 notification_version = *changes.borrow(),
                                 latest_cursor,
                                 latest_removed_at_ms,
@@ -665,7 +730,7 @@ impl HubService {
                     }
                 }
                 .await;
-                self.unregister_watch(&group_id, remote_endpoint_id, watch_generation)
+                self.unregister_watch(&group_id, remote_endpoint_id, watch_slot, watch_generation)
                     .await;
                 watch_result?;
             }
@@ -750,9 +815,11 @@ impl ProtocolHandler for HubService {
         let remote_endpoint_id = connection.remote_id().to_string();
         debug!(remote = %remote_endpoint_id, "accepted sync connection");
         let connection_admission = Arc::new(Semaphore::new(8));
-        let connection_requests = Arc::new(Semaphore::new(16));
-        let connection_blobs = Arc::new(Semaphore::new(2));
-        let connection_watches = Arc::new(Semaphore::new(4));
+        let connection_limits = ConnectionLimits {
+            requests: Arc::new(Semaphore::new(16)),
+            blobs: Arc::new(Semaphore::new(2)),
+            watches: Arc::new(Semaphore::new(4)),
+        };
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
@@ -768,9 +835,7 @@ impl ProtocolHandler for HubService {
             };
             let service = self.clone();
             let remote_endpoint_id = remote_endpoint_id.clone();
-            let connection_requests = connection_requests.clone();
-            let connection_blobs = connection_blobs.clone();
-            let connection_watches = connection_watches.clone();
+            let connection_limits = connection_limits.clone();
             tokio::spawn(async move {
                 if let Err(error) = service
                     .handle_stream(
@@ -778,9 +843,7 @@ impl ProtocolHandler for HubService {
                         send,
                         recv,
                         (global_admission, connection_admission),
-                        connection_requests,
-                        connection_blobs,
-                        connection_watches,
+                        connection_limits,
                     )
                     .await
                 {
@@ -824,7 +887,7 @@ async fn receive_blob(
         path: temporary.clone(),
         armed: true,
     };
-    let result = async {
+    async {
         let mut file = tokio::fs::File::create(&temporary)
             .await
             .context("create blob temporary file")?;
@@ -854,8 +917,7 @@ async fn receive_blob(
         cleanup.armed = false;
         Ok(())
     }
-    .await;
-    result
+    .await
 }
 
 async fn copy_with_idle_timeout<R, W>(

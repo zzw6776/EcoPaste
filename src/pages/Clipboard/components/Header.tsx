@@ -1,7 +1,7 @@
 import { useDebounceFn, useMount } from "ahooks";
 import type { MenuProps } from "antd";
 import type { ChangeEvent, FC } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import {
@@ -70,6 +70,7 @@ const Header: FC = () => {
     "auto",
   );
   const [searchFocusToken, setSearchFocusToken] = useState(0);
+  const mobileGroupsRef = useRef<HTMLDivElement>(null);
 
   const { groupId, range } = snapshot;
 
@@ -298,6 +299,19 @@ const Header: FC = () => {
   const isAllActive = range === "all" && groupId === null;
   const isFavoriteActive = range === "favorite" && groupId === null;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 分类状态变化后需要滚动到本次渲染产生的选中按钮。
+  useEffect(() => {
+    const container = mobileGroupsRef.current;
+    const active = container?.querySelector<HTMLElement>(
+      '[aria-current="page"]',
+    );
+    active?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "center",
+    });
+  }, [groupId, range, snapshot.category]);
+
   if (isMobile()) {
     return (
       <div className="flex shrink-0 select-none flex-col gap-2 px-3 pt-1 pb-2">
@@ -345,9 +359,13 @@ const Header: FC = () => {
         />
 
         {/* 分类与画板横向滑块 */}
-        <div className="no-scrollbar -mx-3 flex items-center gap-1.5 overflow-x-auto px-3 py-0.5">
+        <div
+          className="no-scrollbar -mx-3 flex items-center gap-1.5 overflow-x-auto px-3 py-0.5"
+          ref={mobileGroupsRef}
+        >
           {/* 全部 */}
           <button
+            aria-current={isAllActive && !snapshot.category ? "page" : void 0}
             className={cn(
               "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
               isAllActive && !snapshot.category
@@ -363,6 +381,7 @@ const Header: FC = () => {
 
           {/* 收藏 */}
           <button
+            aria-current={isFavoriteActive ? "page" : void 0}
             className={cn(
               "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
               isFavoriteActive
@@ -378,6 +397,9 @@ const Header: FC = () => {
 
           {/* 文本 */}
           <button
+            aria-current={
+              snapshot.category === "text" && !groupId ? "page" : void 0
+            }
             className={cn(
               "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
               snapshot.category === "text" && !groupId
@@ -397,6 +419,9 @@ const Header: FC = () => {
 
           {/* 图片 */}
           <button
+            aria-current={
+              snapshot.category === "image" && !groupId ? "page" : void 0
+            }
             className={cn(
               "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
               snapshot.category === "image" && !groupId
@@ -416,6 +441,9 @@ const Header: FC = () => {
 
           {/* 文件 */}
           <button
+            aria-current={
+              snapshot.category === "files" && !groupId ? "page" : void 0
+            }
             className={cn(
               "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
               snapshot.category === "files" && !groupId
@@ -439,6 +467,7 @@ const Header: FC = () => {
             const { color, icon } = parseGroupIcon(group.icon);
             return (
               <button
+                aria-current={isCurrent ? "page" : void 0}
                 className={cn(
                   "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1.5 font-medium text-xs transition-all",
                   isCurrent

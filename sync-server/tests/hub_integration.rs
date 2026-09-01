@@ -39,7 +39,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     assert!(matches!(
         call(&connection, Request::HealthV2).await?,
         Response::HealthV2 {
-            protocol_version: ecopaste_sync_protocol::SYNC_V2_PROTOCOL_VERSION,
+            protocol_version: ecopaste_sync_protocol::PROTOCOL_VERSION,
             ..
         }
     ));
@@ -140,12 +140,19 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         accepted_event_ids,
         removed_devices,
         ..
-    } = call(&connection, notify_watch).await?
+    } = call(&connection, notify_watch.clone()).await?
     else {
         anyhow::bail!("expected combined sync response");
     };
     assert_eq!(accepted_event_ids, vec![next_event.event_id.clone()]);
     assert_eq!(removed_devices, vec![removed_device]);
+    let Response::SyncedV2 {
+        accepted_event_ids, ..
+    } = call(&connection, notify_watch).await?
+    else {
+        anyhow::bail!("expected duplicate combined sync response");
+    };
+    assert!(accepted_event_ids.is_empty());
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), watch)
             .await
@@ -188,6 +195,85 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     upload_blob(&connection, &group_id, &access_token, &blob_id, blob).await?;
     let downloaded = download_blob(&connection, &group_id, &access_token, &blob_id).await?;
     assert_eq!(downloaded, blob);
+
+    let (mut asset_watch_send, mut asset_watch_recv) = connection.open_bi().await?;
+    write_frame(
+        &mut asset_watch_send,
+        &Request::WatchGroupStreamV3 {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            after_cursor: 2,
+            after_removed_at_ms: 300,
+            watch_slot: 0,
+        },
+    )
+    .await?;
+    asset_watch_send.finish()?;
+    assert!(matches!(
+        read_frame::<_, Response>(&mut asset_watch_recv).await?,
+        Response::GroupChangedV2 {
+            latest_cursor: 2,
+            latest_removed_at_ms: 300,
+            ..
+        }
+    ));
+    let (mut asset_backup_send, mut asset_backup_recv) = connection.open_bi().await?;
+    write_frame(
+        &mut asset_backup_send,
+        &Request::WatchGroupStreamV3 {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            after_cursor: 2,
+            after_removed_at_ms: 300,
+            watch_slot: 1,
+        },
+    )
+    .await?;
+    asset_backup_send.finish()?;
+    assert!(matches!(
+        read_frame::<_, Response>(&mut asset_backup_recv).await?,
+        Response::GroupChangedV2 {
+            latest_cursor: 2,
+            latest_removed_at_ms: 300,
+            ..
+        }
+    ));
+    let source_icon = b"encrypted-source-icon";
+    let source_icon_id = blake3::hash(source_icon).to_hex().to_string();
+    upload_source_icon(
+        &connection,
+        &group_id,
+        &access_token,
+        &source_icon_id,
+        source_icon,
+    )
+    .await?;
+    assert!(matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_frame::<_, Response>(&mut asset_watch_recv),
+        )
+        .await
+        .context("watch did not react to a new source icon")??,
+        Response::GroupChangedV2 {
+            latest_cursor: 2,
+            latest_removed_at_ms: 300,
+            ..
+        }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_frame::<_, Response>(&mut asset_backup_recv),
+        )
+        .await
+        .context("backup watch did not react to a new source icon")??,
+        Response::GroupChangedV2 {
+            latest_cursor: 2,
+            latest_removed_at_ms: 300,
+            ..
+        }
+    ));
 
     let rejected_event = EncryptedEvent {
         event_id: "event_after_removal".into(),
@@ -278,6 +364,37 @@ async fn upload_blob(
     write_frame(
         &mut send,
         &Request::PutBlob {
+            group_id: group_id.into(),
+            access_token: access_token.to_vec(),
+            blob_id: blob_id.into(),
+            size: blob.len() as u64,
+        },
+    )
+    .await?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobReady { size: 0 }
+    );
+    send.write_all(blob).await?;
+    send.finish()?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobStored
+    );
+    Ok(())
+}
+
+async fn upload_source_icon(
+    connection: &Connection,
+    group_id: &str,
+    access_token: &[u8],
+    blob_id: &str,
+    blob: &[u8],
+) -> Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(
+        &mut send,
+        &Request::PutSourceIcon {
             group_id: group_id.into(),
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),

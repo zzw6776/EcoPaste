@@ -9,7 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
 pub const SYNC_V2_PROTOCOL_VERSION: u16 = 5;
-pub const PROTOCOL_VERSION: u16 = SYNC_V2_PROTOCOL_VERSION;
+pub const ASYNC_SOURCE_ICON_PROTOCOL_VERSION: u16 = 6;
+pub const REDUNDANT_WATCH_PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = REDUNDANT_WATCH_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -243,6 +245,32 @@ pub enum Request {
         #[n(6)]
         limit: u16,
     },
+    /// Stores an optional source application icon and wakes group watchers after a new upload.
+    #[n(13)]
+    PutSourceIcon {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blob_id: String,
+        #[n(3)]
+        size: u64,
+    },
+    /// Keeps one slot of a redundant version-aware response stream open.
+    #[n(14)]
+    WatchGroupStreamV3 {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        after_cursor: u64,
+        #[n(3)]
+        after_removed_at_ms: i64,
+        #[n(4)]
+        watch_slot: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -474,6 +502,23 @@ mod tests {
                 removed_at_ms: 42,
                 restored_at_ms: None,
             }],
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        let decoded: Request = read_frame(&mut server).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn redundant_watch_request_round_trip() {
+        let request = Request::WatchGroupStreamV3 {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            after_cursor: 42,
+            after_removed_at_ms: 84,
+            watch_slot: 1,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
