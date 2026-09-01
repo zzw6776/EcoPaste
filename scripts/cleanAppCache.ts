@@ -9,24 +9,38 @@ const cargo = resolve(
   "bin",
   process.platform === "win32" ? "cargo.exe" : "cargo",
 );
-const result = spawnSync(
-  cargo,
-  [
+const androidTargetDirectory = resolve(
+  projectRoot,
+  "src-tauri/target/aarch64-linux-android",
+);
+const extraArgs = process.argv.slice(2);
+
+/** 清理指定 target 目录中的 EcoPaste 主包产物，保留第三方依赖缓存。 */
+function cleanAppArtifacts(targetDirectory?: string) {
+  const args = [
     "clean",
     "--package",
     "EcoPaste",
     "--manifest-path",
     "src-tauri/Cargo.toml",
-    ...process.argv.slice(2),
-  ],
-  {
+  ];
+  if (targetDirectory) {
+    args.push("--target-dir", targetDirectory);
+  }
+  args.push(...extraArgs);
+
+  const result = spawnSync(cargo, args, {
     cwd: projectRoot,
     stdio: "inherit",
-  },
-);
+  });
 
-if (result.error) {
-  throw result.error;
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`cargo ${args.join(" ")} exited with ${result.status}`);
+  }
 }
 
-process.exitCode = result.status ?? 1;
+cleanAppArtifacts();
+cleanAppArtifacts(androidTargetDirectory);

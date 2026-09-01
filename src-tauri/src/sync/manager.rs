@@ -397,7 +397,9 @@ impl SyncManager {
                         if let Err(error) =
                             repository::mark_peer_offline(&pool, &device_id, None).await
                         {
-                            log::debug!("mark peer offline after Android Wi-Fi loss failed: {error}");
+                            log::debug!(
+                                "mark peer offline after Android Wi-Fi loss failed: {error}"
+                            );
                         }
                     }
                 }
@@ -415,6 +417,7 @@ impl SyncManager {
         self.emit_updated();
     }
 
+    #[cfg(target_os = "android")]
     fn advance_presence_nonce(&self) {
         self.lan_presence_nonce.fetch_add(1, Ordering::AcqRel);
     }
@@ -818,7 +821,7 @@ impl SyncManager {
                 let (connected_address, transport) = connection_path(&connection);
                 peer.state = SyncChannelState::Online;
                 peer.connected_address = connected_address;
-                peer.transport = transport;
+                peer.transport = transport.map(str::to_owned);
             } else if peer.state == SyncChannelState::Online {
                 peer.state = SyncChannelState::Idle;
                 peer.connected_address = None;

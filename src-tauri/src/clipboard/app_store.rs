@@ -1,10 +1,10 @@
 //! 来源应用图标的规范化与落盘。
 //!
-//! 图标统一转换为 64 × 64 RGBA PNG，并按规范化字节的 BLAKE3 平铺存放在
+//! 图标统一转换为 128 × 128 RGBA PNG，并按规范化字节的 BLAKE3 平铺存放在
 //! `<app_local_data>/resources/app-icons/<hash>.png`。稳定字节既用于本机去重，
 //! 也作为跨设备来源图标资源的明文身份。
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -17,8 +17,9 @@ use tauri::AppHandle;
 use crate::core::Result;
 
 const APP_ICONS_DIR: &str = "app-icons";
-pub const APP_ICON_SIZE: u32 = 64;
+pub const APP_ICON_SIZE: u32 = 128;
 pub const MAX_APP_ICON_BYTES: usize = 256 * 1024;
+const LEGACY_APP_ICON_SIZE: u32 = 64;
 const MAX_SOURCE_ICON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_ICON_DIMENSION: u32 = 4096;
 
@@ -80,7 +81,10 @@ impl AppIconStore {
             return Err(anyhow!("source app icon must be an 8-bit RGBA PNG").into());
         }
         let rgba = decode_png(png_bytes, APP_ICON_SIZE)?;
-        if rgba.dimensions() != (APP_ICON_SIZE, APP_ICON_SIZE) {
+        if !matches!(
+            rgba.dimensions(),
+            (APP_ICON_SIZE, APP_ICON_SIZE) | (LEGACY_APP_ICON_SIZE, LEGACY_APP_ICON_SIZE)
+        ) {
             return Err(anyhow!("source app icon dimensions are invalid").into());
         }
         self.store_normalized(png_bytes, &rgba)
@@ -118,6 +122,18 @@ impl AppIconStore {
         let path = self.icon_path(&file_name);
         let bytes = std::fs::read(path).ok()?;
         (blake3_hex(&bytes) == icon_hash).then_some(file_name)
+    }
+
+    /// 判断缓存是否已经使用当前规范尺寸；只读取 PNG 头，供来源再次出现时升级旧图标。
+    pub fn is_current_format(&self, file_name: &str) -> bool {
+        let Ok(mut file) = std::fs::File::open(self.icon_path(file_name)) else {
+            return false;
+        };
+        let mut header = [0_u8; 24];
+        if file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        png_dimensions(&header) == Some((APP_ICON_SIZE, APP_ICON_SIZE))
     }
 
     fn store_normalized(&self, png_bytes: &[u8], rgba: &RgbaImage) -> Result<StoredAppIcon> {
@@ -186,6 +202,15 @@ fn decode_png(bytes: &[u8], maximum_dimension: u32) -> Result<RgbaImage> {
         .decode()
         .context("failed to decode source app icon")?
         .into_rgba8())
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
 }
 
 fn accent_colors(image: &RgbaImage, fallback_seed: &str) -> (String, String) {
@@ -355,8 +380,9 @@ mod tests {
         let stored = std::fs::read(store.icon_path(&first.file_name)).unwrap();
         assert_eq!(
             decode_png(&stored, APP_ICON_SIZE).unwrap().dimensions(),
-            (64, 64)
+            (128, 128)
         );
+        assert!(store.is_current_format(&first.file_name));
         assert!(store.store_synced_png(&stored, &first.icon_hash).is_ok());
         assert!(store.store_synced_png(&stored, &"0".repeat(64)).is_err());
 
@@ -370,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_canonical_png_from_a_different_encoder_configuration() {
+    fn accepts_legacy_canonical_png_for_mixed_version_sync() {
         let directory = tempfile::tempdir().unwrap();
         let store = AppIconStore::for_test(directory.path().join("app-icons"));
         let image = RgbaImage::from_pixel(64, 64, image::Rgba([20, 80, 180, 255]));
@@ -391,5 +417,6 @@ mod tests {
             store.synced_metadata_for_hash(&stored.icon_hash).unwrap(),
             stored
         );
+        assert!(!store.is_current_format(&stored.file_name));
     }
 }

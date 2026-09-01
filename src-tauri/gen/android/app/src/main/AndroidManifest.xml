@@ -52,7 +52,7 @@
                 <data android:mimeType="application/vnd.ecopaste.backup" />
                 <data android:pathPattern=".*\\.ecopastebak" />
             </intent-filter>
-            
+
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 

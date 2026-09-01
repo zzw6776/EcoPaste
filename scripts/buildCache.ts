@@ -73,7 +73,7 @@ async function isCacheLimitExceeded(
 function cleanCargoProfiles(
   projectRoot: string,
   profiles: string[],
-  target?: string,
+  targetDirectory?: string,
 ) {
   const cargoHome = process.env.CARGO_HOME ?? resolve(homedir(), ".cargo");
   const cargo = resolve(
@@ -90,8 +90,8 @@ function cleanCargoProfiles(
       "--manifest-path",
       "src-tauri/Cargo.toml",
     ];
-    if (target) {
-      args.push("--target", target);
+    if (targetDirectory) {
+      args.push("--target-dir", targetDirectory);
     }
 
     const result = spawnSync(cargo, args, {
@@ -151,13 +151,20 @@ export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
     }
   }
 
+  const remainingSize = await getPathsSize(cachePaths);
   if (cargoError) {
-    const remainingSize = await getPathsSize(cachePaths);
     if (remainingSize > DESKTOP_CACHE_LIMIT) {
       throw cargoError;
     }
     process.stderr.write(
       `Cargo cache cleanup was interrupted, but the remaining desktop cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
+    );
+    return;
+  }
+
+  if (remainingSize > DESKTOP_CACHE_LIMIT) {
+    throw new Error(
+      `Desktop cache cleanup completed without errors, but ${(remainingSize / GIBIBYTE).toFixed(2)} GiB remains above the ${(DESKTOP_CACHE_LIMIT / GIBIBYTE).toFixed(0)} GiB limit.`,
     );
   }
 }
@@ -195,7 +202,7 @@ export async function cleanAndroidCacheIfNeeded(
 
   let debugError: unknown;
   try {
-    cleanCargoProfiles(projectRoot, ["dev"], "aarch64-linux-android");
+    cleanCargoProfiles(projectRoot, ["dev"], androidTargetRoot);
   } catch (error) {
     debugError = error;
   }
@@ -226,7 +233,7 @@ export async function cleanAndroidCacheIfNeeded(
     cleanCargoProfiles(
       projectRoot,
       debugError ? ["dev", "release"] : ["release"],
-      "aarch64-linux-android",
+      androidTargetRoot,
     );
   } catch (error) {
     cargoError = error;
@@ -235,8 +242,8 @@ export async function cleanAndroidCacheIfNeeded(
   const cleanupErrors = [debugError, gradleError, cargoError].filter(
     (error) => error !== void 0,
   );
+  const remainingSize = await getPathsSize(cachePaths);
   if (cleanupErrors.length > 0) {
-    const remainingSize = await getPathsSize(cachePaths);
     if (remainingSize <= ANDROID_CACHE_LIMIT) {
       process.stderr.write(
         `Android cache cleanup was interrupted, but the remaining cache is ${(remainingSize / GIBIBYTE).toFixed(2)} GiB; continuing build.\n`,
@@ -247,5 +254,11 @@ export async function cleanAndroidCacheIfNeeded(
 
   if (cleanupErrors.length > 0) {
     throw new AggregateError(cleanupErrors, "Android cache cleanup failed");
+  }
+
+  if (remainingSize > ANDROID_CACHE_LIMIT) {
+    throw new Error(
+      `Android cache cleanup completed without errors, but ${(remainingSize / GIBIBYTE).toFixed(2)} GiB remains above the ${(ANDROID_CACHE_LIMIT / GIBIBYTE).toFixed(0)} GiB limit.`,
+    );
   }
 }

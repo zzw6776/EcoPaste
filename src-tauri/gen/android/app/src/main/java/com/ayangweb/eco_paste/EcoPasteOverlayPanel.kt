@@ -1699,7 +1699,7 @@ class EcoPasteOverlayPanel(
             val iconView: View = if (iconBitmap != null) {
                 ImageView(context).apply {
                     setImageBitmap(iconBitmap)
-                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    scaleType = ImageView.ScaleType.FIT_CENTER
                 }
             } else {
                 TextView(context).apply {
@@ -1711,7 +1711,7 @@ class EcoPasteOverlayPanel(
                     background = roundedBackground(Color.argb(52, 255, 255, 255), dp(8).toFloat())
                 }
             }
-            addView(iconView, LinearLayout.LayoutParams(dp(32), dp(32)))
+            addView(iconView, LinearLayout.LayoutParams(dp(28), dp(28)))
         }.also {
             it.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,

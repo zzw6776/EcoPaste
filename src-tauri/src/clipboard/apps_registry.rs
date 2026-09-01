@@ -170,10 +170,14 @@ fn materialize_metas(registry: &AppsRegistry, metas: Vec<ScannedAppMeta>) -> Vec
 
     for meta in metas {
         let existing = registry.get(&meta.id);
-        let icon = match existing.as_ref().and_then(|app| app.icon_file.as_ref()) {
-            Some(_) => None,
-            None => meta
-                .path
+        let icon_is_current = existing
+            .as_ref()
+            .and_then(|app| app.icon_file.as_deref())
+            .is_some_and(|file_name| registry.icon_store.is_current_format(file_name));
+        let icon = if icon_is_current {
+            None
+        } else {
+            meta.path
                 .as_deref()
                 .and_then(|path| super::icon::icon_png(path, None))
                 .as_deref()
@@ -185,7 +189,7 @@ fn materialize_metas(registry: &AppsRegistry, metas: Vec<ScannedAppMeta>) -> Vec
                             None
                         }
                     },
-                ),
+                )
         };
         let app = ClipboardApp {
             id: meta.id,
