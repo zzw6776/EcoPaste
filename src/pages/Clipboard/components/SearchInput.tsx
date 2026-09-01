@@ -1,6 +1,15 @@
 import { Input, type InputProps, type InputRef } from "antd";
 import type { ChangeEvent, FC } from "react";
 import { useCallback, useEffect, useRef } from "react";
+import {
+  cancelClipboardSearchHandoff,
+  confirmClipboardSearchHandoff,
+  prepareClipboardSearchHandoff,
+} from "@/commands";
+import {
+  SEARCH_HANDOFF_EDITABLE_ATTRIBUTE,
+  SEARCH_HANDOFF_EDITING_EVENT,
+} from "@/constants/searchHandoff";
 import { prepareClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
 
 interface SearchInputProps extends Omit<InputProps, "prefix"> {
@@ -8,6 +17,7 @@ interface SearchInputProps extends Omit<InputProps, "prefix"> {
   clearToken?: number;
   focusCursor?: "auto" | "end";
   focusToken?: number;
+  handoffSessionId?: number | null;
 }
 
 /**
@@ -19,23 +29,57 @@ const SearchInput: FC<SearchInputProps> = (props) => {
     clearToken = 0,
     focusCursor = "auto",
     focusToken = 0,
+    handoffSessionId = null,
     onChange,
     ...rest
   } = props;
 
   const inputRef = useRef<InputRef>(null);
+  const handledHandoffSessionRef = useRef<number | null>(null);
 
   /**
    * 聚焦搜索框并选中已有内容，便于直接覆盖输入。
    */
   const focusSearch = useCallback(async () => {
-    if (!inputRef.current) return;
+    const input = inputRef.current?.input;
+    const pendingHandoff =
+      handoffSessionId !== null &&
+      handledHandoffSessionRef.current !== handoffSessionId;
+    if (!input) {
+      if (pendingHandoff) {
+        handledHandoffSessionRef.current = handoffSessionId;
+        await cancelClipboardSearchHandoff(handoffSessionId);
+      }
+      return;
+    }
+
+    if (pendingHandoff) {
+      handledHandoffSessionRef.current = handoffSessionId;
+      const prepared = await prepareClipboardSearchHandoff(handoffSessionId);
+      if (!prepared) return;
+
+      input.setAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE, "true");
+      input.focus();
+      if (document.activeElement !== input) {
+        input.removeAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE);
+        await cancelClipboardSearchHandoff(handoffSessionId);
+        return;
+      }
+
+      const confirmed = await confirmClipboardSearchHandoff(handoffSessionId);
+      if (confirmed) {
+        window.dispatchEvent(new Event(SEARCH_HANDOFF_EDITING_EVENT));
+      }
+      input.removeAttribute(SEARCH_HANDOFF_EDITABLE_ATTRIBUTE);
+      if (!confirmed) input.blur();
+      return;
+    }
 
     await prepareClipboardWindowEditableFocus();
-    const isAlreadyFocused = document.activeElement === inputRef.current.input;
+    const isAlreadyFocused = document.activeElement === input;
     const cursor = focusCursor === "end" || isAlreadyFocused ? "end" : "all";
     inputRef.current?.focus({ cursor });
-  }, [focusCursor]);
+  }, [focusCursor, handoffSessionId]);
 
   useEffect(() => {
     if (blurToken <= 0) return;

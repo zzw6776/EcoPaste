@@ -120,6 +120,24 @@ pub async fn set_clipboard_window_editing(app: AppHandle, editing: bool) -> Resu
 }
 
 #[tauri::command]
+pub async fn prepare_clipboard_search_handoff(app: AppHandle, session_id: u64) -> Result<bool> {
+    window::prepare_clipboard_search_handoff(&app, session_id)
+}
+
+#[tauri::command]
+pub async fn confirm_clipboard_search_handoff(app: AppHandle, session_id: u64) -> Result<bool> {
+    window::confirm_clipboard_search_handoff(&app, session_id)
+}
+
+#[tauri::command]
+pub async fn cancel_clipboard_search_handoff(
+    app: AppHandle,
+    session_id: Option<u64>,
+) -> Result<bool> {
+    window::cancel_clipboard_search_handoff(&app, session_id)
+}
+
+#[tauri::command]
 pub async fn show_clipboard_preview(
     app: AppHandle,
     item_id: String,

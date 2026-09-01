@@ -43,6 +43,10 @@ interface WindowVisibilityPayload {
   visible: boolean;
 }
 
+interface SearchHandoffPayload {
+  sessionId: number;
+}
+
 type HeaderMoreMenuKey = "clear" | "preference" | "android_permissions";
 
 const MORE_ACTION_TRIGGER: AppDropdownProps["trigger"] = ["click"];
@@ -70,6 +74,9 @@ const Header: FC = () => {
     "auto",
   );
   const [searchFocusToken, setSearchFocusToken] = useState(0);
+  const [searchHandoffSessionId, setSearchHandoffSessionId] = useState<
+    number | null
+  >(null);
   const mobileGroupsRef = useRef<HTMLDivElement>(null);
 
   const { groupId, range } = snapshot;
@@ -206,6 +213,18 @@ const Header: FC = () => {
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
     handleWindowVisibility,
+  );
+
+  const handleSearchHandoff = (event: { payload: SearchHandoffPayload }) => {
+    setSearchOpen(true);
+    setSearchFocusCursor("end");
+    setSearchHandoffSessionId(event.payload.sessionId);
+    setSearchFocusToken((current) => current + 1);
+  };
+
+  useTauriListen<SearchHandoffPayload>(
+    TAURI_EVENT.KEYBOARD_SEARCH_HANDOFF,
+    handleSearchHandoff,
   );
 
   const selectAllHistory = () => {
@@ -352,6 +371,7 @@ const Header: FC = () => {
           clearToken={searchClearToken}
           focusCursor={searchFocusCursor}
           focusToken={searchFocusToken}
+          handoffSessionId={searchHandoffSessionId}
           onChange={handleKeywordChange}
           placeholder="搜索剪贴板历史..."
           size="middle"
@@ -518,6 +538,7 @@ const Header: FC = () => {
               clearToken={searchClearToken}
               focusCursor={searchFocusCursor}
               focusToken={searchFocusToken}
+              handoffSessionId={searchHandoffSessionId}
               onChange={handleKeywordChange}
               placeholder={t("header.searchPlaceholder")}
               size="small"

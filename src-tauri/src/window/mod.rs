@@ -84,6 +84,42 @@ pub fn set_clipboard_window_editing(app_handle: &AppHandle, editing: bool) -> Re
     }
 }
 
+pub fn prepare_clipboard_search_handoff(app_handle: &AppHandle, session_id: u64) -> Result<bool> {
+    #[cfg(target_os = "windows")]
+    return windows::prepare_clipboard_search_handoff(app_handle, session_id);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app_handle, session_id);
+        Ok(false)
+    }
+}
+
+pub fn confirm_clipboard_search_handoff(app_handle: &AppHandle, session_id: u64) -> Result<bool> {
+    #[cfg(target_os = "windows")]
+    return windows::confirm_clipboard_search_handoff(app_handle, session_id);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app_handle, session_id);
+        Ok(false)
+    }
+}
+
+pub fn cancel_clipboard_search_handoff(
+    app_handle: &AppHandle,
+    session_id: Option<u64>,
+) -> Result<bool> {
+    #[cfg(target_os = "windows")]
+    return windows::cancel_clipboard_search_handoff(app_handle, session_id);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app_handle, session_id);
+        Ok(false)
+    }
+}
+
 /// 剪贴板窗口显隐变化事件。前端用以做默认聚焦 / 自动清空搜索等 UI 副作用。
 /// 由 [`show_window`] / [`hide_window`] 在统一入口处发出，平台一致，
 /// 不依赖 `tauri://focus` / `tauri://blur`（Windows 剪贴板窗口 `focusable: false` 不可靠）。

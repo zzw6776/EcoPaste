@@ -10,6 +10,9 @@ mod drag_out;
 mod i18n;
 #[cfg(target_os = "windows")]
 mod keyboard;
+#[cfg(any(target_os = "windows", test))]
+#[path = "keyboard/search_handoff.rs"]
+mod keyboard_search_handoff;
 mod keystroke;
 mod menu;
 #[cfg(target_os = "windows")]
@@ -173,6 +176,9 @@ pub fn run() {
             commands::set_clipboard_window_pinned,
             commands::set_clipboard_window_auto_hide_suspended,
             commands::set_clipboard_window_editing,
+            commands::prepare_clipboard_search_handoff,
+            commands::confirm_clipboard_search_handoff,
+            commands::cancel_clipboard_search_handoff,
             commands::show_clipboard_preview,
             commands::close_clipboard_preview,
             commands::get_clipboard_preview_state,

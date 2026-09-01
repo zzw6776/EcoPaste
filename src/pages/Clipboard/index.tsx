@@ -1,5 +1,5 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSnapshot } from "valtio";
 import { resizeClipboardWindow } from "@/commands";
 import { minimizeAndroidApp } from "@/commands/android";
@@ -10,6 +10,7 @@ import { cn } from "@/utils/cn";
 import { isAndroid, isMobile, isTauri, isWin } from "@/utils/is";
 import Header from "./components/Header";
 import List, { type ClipboardListView } from "./components/List";
+import MobileCategoryPager from "./components/MobileCategoryPager";
 
 interface BuiltInFilter {
   category: ClipboardCategory | null;
@@ -23,23 +24,9 @@ const BUILT_IN_FILTERS: BuiltInFilter[] = [
   { category: "image", range: "all" },
   { category: "files", range: "all" },
 ];
-const CATEGORY_DRAG_DIRECTION_THRESHOLD = 6;
-const CATEGORY_DRAG_DISTANCE_RATIO = 0.2;
-const CATEGORY_DRAG_MIN_FLING_DISTANCE = 12;
-const CATEGORY_DRAG_VELOCITY_THRESHOLD = 0.45;
-const CATEGORY_SNAP_TRANSITION =
-  "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)";
-
-interface CategoryDragState {
-  anchorX: number;
-  lastAt: number;
-  lastX: number;
-  mode: "pending" | "horizontal" | "vertical";
-  pointerId: number;
-  startOffset: number;
-  startX: number;
-  startY: number;
-}
+const BUILT_IN_FILTER_KEYS = BUILT_IN_FILTERS.map((filter) => {
+  return `${filter.range}:${filter.category ?? "all"}`;
+});
 
 /**
  * 剪贴板主窗口：
@@ -54,11 +41,6 @@ const Clipboard = () => {
   const startYRef = useRef(0);
   const startHeightRef = useRef(340);
   const popupDragStartYRef = useRef(0);
-  const categoryPagerRef = useRef<HTMLDivElement>(null);
-  const categoryPagerTrackRef = useRef<HTMLDivElement>(null);
-  const categoryPagerIndexRef = useRef(0);
-  const categoryPagerReadyRef = useRef(false);
-  const categoryDragRef = useRef<CategoryDragState | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // 移动端/桌面端视口自适应与预览状态
@@ -76,19 +58,6 @@ const Clipboard = () => {
     ),
   );
 
-  const positionCategoryPager = useCallback(
-    (index: number, animated: boolean) => {
-      const pager = categoryPagerRef.current;
-      const track = categoryPagerTrackRef.current;
-      if (!pager || !track) return;
-
-      categoryPagerIndexRef.current = index;
-      track.style.transition = animated ? CATEGORY_SNAP_TRANSITION : "none";
-      track.style.transform = `translate3d(${-pager.clientWidth * index}px, 0, 0)`;
-    },
-    [],
-  );
-
   useEffect(() => {
     const handleResize = () => {
       if (!isTauri) {
@@ -102,29 +71,6 @@ const Clipboard = () => {
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
-
-  useEffect(() => {
-    if (!mobileMode) return;
-
-    const pager = categoryPagerRef.current;
-    if (!pager || !categoryPagerTrackRef.current) return;
-
-    const frame = requestAnimationFrame(() => {
-      positionCategoryPager(builtInFilterIndex, categoryPagerReadyRef.current);
-      categoryPagerReadyRef.current = true;
-    });
-    const observer = new ResizeObserver(() => {
-      if (categoryDragRef.current?.mode === "horizontal") return;
-
-      positionCategoryPager(categoryPagerIndexRef.current, false);
-    });
-    observer.observe(pager);
-
-    return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, [builtInFilterIndex, mobileMode, positionCategoryPager]);
 
   const handleResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
     isDraggingRef.current = true;
@@ -187,118 +133,6 @@ const Clipboard = () => {
     }
   };
 
-  const handleCategoryPagerPointerDown = (
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => {
-    if (event.button !== 0) return;
-
-    categoryDragRef.current = {
-      anchorX: event.clientX,
-      lastAt: event.timeStamp,
-      lastX: event.clientX,
-      mode: "pending",
-      pointerId: event.pointerId,
-      startOffset: 0,
-      startX: event.clientX,
-      startY: event.clientY,
-    };
-  };
-
-  const handleCategoryPagerPointerMove = (
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => {
-    const drag = categoryDragRef.current;
-    const pager = categoryPagerRef.current;
-    const track = categoryPagerTrackRef.current;
-    if (!drag || drag.pointerId !== event.pointerId || !pager || !track) return;
-
-    const deltaX = event.clientX - drag.startX;
-    const deltaY = event.clientY - drag.startY;
-    if (drag.mode === "pending") {
-      if (
-        Math.max(Math.abs(deltaX), Math.abs(deltaY)) <
-        CATEGORY_DRAG_DIRECTION_THRESHOLD
-      ) {
-        return;
-      }
-
-      if (Math.abs(deltaY) >= Math.abs(deltaX)) {
-        drag.mode = "vertical";
-        return;
-      }
-
-      drag.mode = "horizontal";
-      drag.anchorX = event.clientX;
-      drag.startOffset = getRenderedTranslateX(track);
-      track.style.transition = "none";
-      track.style.transform = `translate3d(${drag.startOffset}px, 0, 0)`;
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-
-    if (drag.mode !== "horizontal") return;
-
-    event.preventDefault();
-    const pointerDelta = event.clientX - drag.anchorX;
-    const rawOffset = drag.startOffset + pointerDelta;
-    const minOffset = -pager.clientWidth * (BUILT_IN_FILTERS.length - 1);
-    const resistedOffset = resistCategoryPagerEdge(rawOffset, minOffset);
-    track.style.transform = `translate3d(${resistedOffset}px, 0, 0)`;
-    drag.lastAt = event.timeStamp;
-    drag.lastX = event.clientX;
-  };
-
-  const handleCategoryPagerPointerEnd = (
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => {
-    const drag = categoryDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-
-    categoryDragRef.current = null;
-    if (drag.mode !== "horizontal") return;
-
-    try {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    } catch {
-      // WebView 取消手势时可能已经释放指针。
-    }
-
-    const pager = categoryPagerRef.current;
-    if (!pager || pager.clientWidth <= 0) return;
-
-    const deltaX = event.clientX - drag.startX;
-    const elapsed = Math.max(event.timeStamp - drag.lastAt, 1);
-    const velocity = (event.clientX - drag.lastX) / elapsed;
-    const crossedDistance =
-      Math.abs(deltaX) >= pager.clientWidth * CATEGORY_DRAG_DISTANCE_RATIO;
-    const flung =
-      Math.abs(deltaX) >= CATEGORY_DRAG_MIN_FLING_DISTANCE &&
-      Math.abs(velocity) >= CATEGORY_DRAG_VELOCITY_THRESHOLD;
-    const direction = crossedDistance || flung ? (deltaX < 0 ? 1 : -1) : 0;
-    const nextIndex = Math.max(
-      0,
-      Math.min(
-        BUILT_IN_FILTERS.length - 1,
-        categoryPagerIndexRef.current + direction,
-      ),
-    );
-
-    positionCategoryPager(nextIndex, true);
-    const filter = BUILT_IN_FILTERS[nextIndex];
-    if (filter) applyBuiltInFilter(filter);
-  };
-
-  const handleCategoryPagerPointerCancel = (
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => {
-    const drag = categoryDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-
-    categoryDragRef.current = null;
-    if (drag.mode === "horizontal") {
-      positionCategoryPager(categoryPagerIndexRef.current, true);
-    }
-  };
-
   const content = (
     <div
       className={cn(
@@ -343,41 +177,28 @@ const Clipboard = () => {
       <Header />
 
       {mobileMode ? (
-        <div
-          className="relative min-h-0 w-full flex-1 touch-pan-y overflow-hidden"
-          onPointerCancel={handleCategoryPagerPointerCancel}
-          onPointerDown={handleCategoryPagerPointerDown}
-          onPointerMove={handleCategoryPagerPointerMove}
-          onPointerUp={handleCategoryPagerPointerEnd}
-          ref={categoryPagerRef}
-        >
-          <div
-            className="flex size-full will-change-transform"
-            ref={categoryPagerTrackRef}
-          >
-            {BUILT_IN_FILTERS.map((filter, index) => {
-              const view = getBuiltInListView(
-                filter,
-                index,
-                clipboardSnapshot.range,
-                clipboardSnapshot.category,
-                clipboardSnapshot.groupId,
-              );
-              const preloaded = Math.abs(index - builtInFilterIndex) <= 1;
+        <MobileCategoryPager
+          index={builtInFilterIndex}
+          onIndexChange={(index) => {
+            const filter = BUILT_IN_FILTERS[index];
+            if (filter) applyBuiltInFilter(filter);
+          }}
+          pageKeys={BUILT_IN_FILTER_KEYS}
+          renderPage={(index, active) => {
+            const filter = BUILT_IN_FILTERS[index];
+            if (!filter) return null;
 
-              return (
-                <section
-                  className="h-full w-full shrink-0 overflow-hidden"
-                  key={`${filter.range}:${filter.category ?? "all"}`}
-                >
-                  {preloaded ? (
-                    <List active={index === builtInFilterIndex} view={view} />
-                  ) : null}
-                </section>
-              );
-            })}
-          </div>
-        </div>
+            const view = getBuiltInListView(
+              filter,
+              index,
+              clipboardSnapshot.range,
+              clipboardSnapshot.category,
+              clipboardSnapshot.groupId,
+            );
+
+            return <List active={active} view={view} />;
+          }}
+        />
       ) : (
         <div className="min-h-0 w-full flex-1 overflow-hidden">
           <List />
@@ -529,22 +350,6 @@ function applyBuiltInFilter(filter: BuiltInFilter) {
   clipboardViewState.groupId = null;
   clipboardViewState.range = filter.range;
   clipboardViewState.category = filter.category;
-}
-
-/** 读取当前合成后的横向位移，允许用户在分页回弹动画中途继续拖动。 */
-function getRenderedTranslateX(element: HTMLElement) {
-  const transform = window.getComputedStyle(element).transform;
-  if (transform === "none") return 0;
-
-  return new DOMMatrixReadOnly(transform).m41;
-}
-
-/** 首尾页保留轻微阻尼，避免轨道被直接拖出可视区域。 */
-function resistCategoryPagerEdge(offset: number, minOffset: number) {
-  if (offset > 0) return offset * 0.2;
-  if (offset < minOffset) return minOffset + (offset - minOffset) * 0.2;
-
-  return offset;
 }
 
 /** 自定义分组占用首个分页；滑离后再恢复为“全部历史”。 */
