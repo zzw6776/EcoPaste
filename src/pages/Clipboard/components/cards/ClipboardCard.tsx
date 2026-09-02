@@ -44,10 +44,8 @@ interface ClipboardCardProps {
   quickActions?: ItemAction[];
   quickActionLabels?: ItemActionLabels;
   onQuickAction?: (action: ItemAction) => Promise<void> | void;
-  onMobileFileOpen?: () => void;
-  onMobileFileSave?: () => void;
-  mobileFileOpenLabel?: string;
-  mobileFileSaveLabel?: string;
+  onMobileSave?: () => void;
+  mobileSaveLabel?: string;
   showOriginalOnHover?: boolean;
   rootRef?: Ref<HTMLDivElement>;
   syncStatus?: SyncItemStatus;
@@ -82,10 +80,8 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     quickActions = [],
     quickActionLabels,
     onQuickAction,
-    onMobileFileOpen,
-    onMobileFileSave,
-    mobileFileOpenLabel,
-    mobileFileSaveLabel,
+    onMobileSave,
+    mobileSaveLabel,
     showOriginalOnHover = true,
     rootRef,
     syncStatus,
@@ -187,14 +183,9 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     void onQuickAction?.("copy");
   };
 
-  const handleMobileFileOpen = (event: MouseEvent<HTMLButtonElement>) => {
+  const handleMobileSave = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    onMobileFileOpen?.();
-  };
-
-  const handleMobileFileSave = (event: MouseEvent<HTMLButtonElement>) => {
-    event.stopPropagation();
-    onMobileFileSave?.();
+    onMobileSave?.();
   };
 
   const handleMobileDelete = (event: MouseEvent<HTMLButtonElement>) => {
@@ -203,6 +194,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   };
 
   const isImageCard = kind === "image";
+  const isFileBackedCard = kind === "image" || kind === "files";
   const isUrlCard = subKind === "url";
   const urlText = isUrlCard ? item.content || summary : summary;
   const urlInfo = isUrlCard ? parseUrlInfo(urlText) : null;
@@ -400,30 +392,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                     )}
                   />
                 </button>
-                {kind === "files" ? (
-                  <>
-                    <button
-                      aria-label={mobileFileOpenLabel}
-                      className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
-                      onClick={handleMobileFileOpen}
-                      onMouseDown={handleMobileActionMouseDown}
-                      title={mobileFileOpenLabel}
-                      type="button"
-                    >
-                      <i className="i-lucide:external-link size-3.5" />
-                    </button>
-                    <button
-                      aria-label={mobileFileSaveLabel}
-                      className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
-                      onClick={handleMobileFileSave}
-                      onMouseDown={handleMobileActionMouseDown}
-                      title={mobileFileSaveLabel}
-                      type="button"
-                    >
-                      <i className="i-lucide:download size-3.5" />
-                    </button>
-                  </>
-                ) : (
+                {kind !== "files" && (
                   <button
                     className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
                     onClick={handleMobileCopy}
@@ -432,6 +401,18 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                     type="button"
                   >
                     <i className="i-lucide:copy size-3.5" />
+                  </button>
+                )}
+                {isFileBackedCard && (
+                  <button
+                    aria-label={mobileSaveLabel}
+                    className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
+                    onClick={handleMobileSave}
+                    onMouseDown={handleMobileActionMouseDown}
+                    title={mobileSaveLabel}
+                    type="button"
+                  >
+                    <i className="i-lucide:download size-3.5" />
                   </button>
                 )}
                 <button

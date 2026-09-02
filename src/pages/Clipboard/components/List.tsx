@@ -946,7 +946,12 @@ const List: FC<ListProps> = (props) => {
     }
   }
 
-  function handleMobileFileOpen(item: ClipboardItem) {
+  function handleMobileItemOpen(item: ClipboardItem) {
+    if (item.kind === "image") {
+      void handleOpenAndroidFile(item, 0);
+      return;
+    }
+
     if (!hasOneOpenableFile(item)) {
       void showAndroidFileDetails(item);
       return;
@@ -955,7 +960,12 @@ const List: FC<ListProps> = (props) => {
     void handleOpenAndroidFile(item, 0);
   }
 
-  function handleMobileFileSave(item: ClipboardItem) {
+  function handleMobileItemSave(item: ClipboardItem) {
+    if (item.kind === "image") {
+      void handleSaveAndroidFile(item, 0);
+      return;
+    }
+
     if (!hasOneOpenableFile(item)) {
       void showAndroidFileDetails(item);
       return;
@@ -1226,8 +1236,8 @@ const List: FC<ListProps> = (props) => {
 
     const handleMobileClick = () => {
       setSelectedId(item.id);
-      if (item.kind === "files") {
-        handleMobileFileOpen(item);
+      if (item.kind !== "text") {
+        handleMobileItemOpen(item);
         return;
       }
 
@@ -1283,16 +1293,12 @@ const List: FC<ListProps> = (props) => {
               : item.id === selectedId
           }
           item={item}
-          mobileFileOpenLabel={t("fileAccess.open")}
-          mobileFileSaveLabel={t("fileAccess.saveAs")}
+          mobileSaveLabel={t("fileAccess.saveAs")}
           onAuxClick={handleAuxClick}
           onClick={isMobile() ? handleMobileClick : void 0}
           onDoubleClick={handleDoubleClick}
-          onMobileFileOpen={() => {
-            handleMobileFileOpen(item);
-          }}
-          onMobileFileSave={() => {
-            handleMobileFileSave(item);
+          onMobileSave={() => {
+            handleMobileItemSave(item);
           }}
           onMouseDown={isMobile() ? void 0 : handleMouseDown}
           onOpenLink={handleOpenLink}

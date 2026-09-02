@@ -1294,7 +1294,7 @@ export const saveClipboardImageToFile = async (id: string) => {
   return path;
 };
 
-/** Android：通过系统应用选择器打开文件记录中的一个文件。 */
+/** Android：通过系统应用选择器打开图片原图或文件记录中的一个文件。 */
 export const openAndroidClipboardFile = async (id: string, index: number) => {
   await call<void>(
     TAURI_COMMAND.OPEN_ANDROID_CLIPBOARD_FILE,
@@ -1303,7 +1303,7 @@ export const openAndroidClipboardFile = async (id: string, index: number) => {
   );
 };
 
-/** Android：通过系统文档选择器另存文件；取消选择时返回 false。 */
+/** Android：通过系统文档选择器另存图片原图或文件；取消选择时返回 false。 */
 export const saveAndroidClipboardFile = async (id: string, index: number) => {
   const saved = await call<boolean>(
     TAURI_COMMAND.SAVE_ANDROID_CLIPBOARD_FILE,
