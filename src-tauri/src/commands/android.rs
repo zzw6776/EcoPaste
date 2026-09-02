@@ -81,6 +81,9 @@ static PENDING_AUTOMATIC_DEVICE_NAME: std::sync::LazyLock<PendingAutomaticDevice
 pub fn set_app_handle(app_handle: tauri::AppHandle) {
     let _ = APP_HANDLE.set(app_handle);
     refresh_pending_automatic_device_name();
+    if let Err(error) = jni_bridge::notify_sync_runtime_ready() {
+        log::debug!("defer Android sync network notification replay: {error}");
+    }
 }
 
 /// 暂存 Android 系统名称，并在 Rust 同步运行时就绪后可靠交付。
@@ -1126,6 +1129,16 @@ mod jni_bridge {
         with_jni_env(|env, _context, bridge_class| {
             env.call_static_method(bridge_class, "onClipboardDataChanged", "()V", &[])
                 .map_err(|e| anyhow!("call onClipboardDataChanged failed: {e}"))?;
+            Ok(())
+        })
+    }
+
+    /// Completes the two-sided startup handshake so Kotlin can replay network callbacks
+    /// that arrived before the Rust synchronization manager became available.
+    pub fn notify_sync_runtime_ready() -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            env.call_static_method(bridge_class, "onSyncRuntimeReady", "()V", &[])
+                .map_err(|e| anyhow!("call onSyncRuntimeReady failed: {e}"))?;
             Ok(())
         })
     }

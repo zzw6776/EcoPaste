@@ -9,17 +9,21 @@
 //! - text / html / rtf：watcher 拿到的 plain/html/rtf 经 `draft_from_text` 后 `content` 即我们写入的串，
 //!   `content_hash(Text, written)` 自然匹配；
 //! - files：watcher 把路径列表用 `\n` 连接后哈希，与我们 `item.content` 一致；
-//! - image：watcher 把 PNG 字节再 sha256 → 文件名 → 哈希。前提是 OS pasteboard 不改像素，
-//!   且 clipboard-rs 的 PNG 重新编码确定。绝大多数复制路径满足，极端情况可能漏抑制一次（最多多入一条新行）。
+//! - image：使用解码后的像素指纹，避免 Windows 或 clipboard-rs 重编码 PNG 后字节哈希变化。
 //!
 //! 纯文本模式（`plain = true`）：忽略 `sub_kind`，写 `search_text`（OS 提供的纯文本表示），
 //! 缺失时退回 `content`。供「纯文本粘贴」快捷路径使用。
+
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
+use std::time::Duration;
 
 #[cfg(not(any(target_os = "android", target_os = "macos")))]
 use clipboard_rs::common::RustImage;
 #[cfg(not(target_os = "android"))]
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
+#[cfg(not(target_os = "android"))]
+use super::guard::image_pixel_fingerprint;
 use super::guard::WritebackGuard;
 #[cfg(not(target_os = "android"))]
 use super::storage::ImageStore;
@@ -130,8 +134,8 @@ fn write_image(
         log::error!("read image {path:?} failed: {err}");
         AppError::Clipboard(err.to_string())
     })?;
-
-    guard.suppress(item.content_hash.clone());
+    let suppression = image_pixel_fingerprint(&bytes).unwrap_or_else(|| item.content_hash.clone());
+    guard.suppress(suppression.clone());
 
     #[cfg(target_os = "macos")]
     {
@@ -150,6 +154,7 @@ fn write_image(
             let write_objects =
                 NSArray::from_retained_slice(&[ProtocolObject::from_retained(item_obj)]);
             if !pasteboard.writeObjects(&write_objects) {
+                guard.cancel(&suppression);
                 return Err(AppError::Clipboard("writeObjects failed".to_owned()));
             }
         }
@@ -157,11 +162,45 @@ fn write_image(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let image = clipboard_rs::RustImageData::from_bytes(&bytes).map_err(clip_err)?;
-        ctx.set_image(image).map_err(clip_err)?;
+        if let Err(error) = set_image_with_retry(ctx, &bytes) {
+            guard.cancel(&suppression);
+            return Err(error);
+        }
     }
 
     Ok(())
+}
+
+/// Windows 的系统剪贴板可能被其它进程短暂占用；图片写入做有限重试。
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
+fn set_image_with_retry(ctx: &ClipboardContext, bytes: &[u8]) -> Result<()> {
+    const RETRY_DELAYS: [Duration; 4] = [
+        Duration::ZERO,
+        Duration::from_millis(15),
+        Duration::from_millis(35),
+        Duration::from_millis(75),
+    ];
+
+    let attempts = if cfg!(target_os = "windows") {
+        RETRY_DELAYS.len()
+    } else {
+        1
+    };
+    let mut last_error = None;
+    for delay in RETRY_DELAYS.iter().take(attempts) {
+        if !delay.is_zero() {
+            std::thread::sleep(*delay);
+        }
+        let image = clipboard_rs::RustImageData::from_bytes(bytes).map_err(clip_err)?;
+        match ctx.set_image(image) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(clip_err(
+        last_error.expect("image write attempted at least once"),
+    ))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -305,7 +344,7 @@ mod tests {
         assert_eq!(read_item.content, "Hello World");
     }
 
-    // 图片往返：写盘上的 PNG → 写剪贴板 → 读回 → 落盘的文件名应一致（去重哈希命中）。
+    // 图片往返：即使系统重编码 PNG，解码后的像素指纹仍应命中回环抑制。
     #[test]
     #[ignore = "touches the real system clipboard; run with --ignored on a desktop session"]
     fn round_trip_image_matches_hash() {
@@ -365,11 +404,15 @@ mod tests {
             .read_with_capture(&crate::settings::Capture::default())
             .unwrap()
             .expect("should read image");
+        let fingerprint = match &payload {
+            crate::clipboard::ClipboardPayload::Image(image) => {
+                image_pixel_fingerprint(&image.bytes).unwrap()
+            }
+            _ => panic!("expected image payload"),
+        };
         let read_item = build_item(&store, &payload).unwrap().unwrap();
         assert_eq!(read_item.kind, ClipboardKind::Image);
-        // 往返期望 PNG 字节哈希一致 → 同 content_hash → guard 抑制。
-        assert_eq!(read_item.content_hash, item.content_hash);
-        assert!(guard.should_skip(&read_item.content_hash));
+        assert!(guard.should_skip(&fingerprint));
     }
 
     fn sample_png(w: u32, h: u32) -> Vec<u8> {

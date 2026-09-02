@@ -145,6 +145,7 @@
   "syncStatus": {
     "candidateAddresses": "{{count}} 个候选地址",
     "cloud": {
+      "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
       "connecting": "云端正在连接",
       "degraded": "云端部分链路异常",
       "disabled": "云端未启用",

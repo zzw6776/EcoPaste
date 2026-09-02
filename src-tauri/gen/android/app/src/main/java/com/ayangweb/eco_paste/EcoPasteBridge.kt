@@ -321,6 +321,12 @@ object EcoPasteBridge {
         replayPendingSyncNetworkNotifications()
     }
 
+    /** Replays callbacks that raced with creation of the native synchronization manager. */
+    @JvmStatic
+    fun onSyncRuntimeReady() {
+        replayPendingSyncNetworkNotifications()
+    }
+
     /** Separates the app's cloud default route from Wi-Fi-only LAN discovery lifecycle. */
     @Synchronized
     private fun registerSyncNetworkCallbacks(context: Context) {

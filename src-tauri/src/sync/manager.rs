@@ -18,7 +18,7 @@ use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     read_frame, write_frame, CloudEvent, DeviceAnnouncement, EncryptedEvent, ErrorCode,
     PeerAnnouncement, RemovedDevice, Request, Response, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
-    MAX_EVENTS_PER_BATCH, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
+    MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
     SYNC_V2_PROTOCOL_VERSION,
 };
 use iroh::{
@@ -82,6 +82,7 @@ const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const LAN_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const CLOUD_SYNC_HEDGE_DELAY: Duration = Duration::from_millis(300);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -298,6 +299,17 @@ impl std::fmt::Display for CloudAttemptTimeout {
 }
 
 impl std::error::Error for CloudAttemptTimeout {}
+
+#[derive(Debug)]
+struct LanAttemptTimeout;
+
+impl std::fmt::Display for LanAttemptTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LAN attempt timed out")
+    }
+}
+
+impl std::error::Error for LanAttemptTimeout {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EndpointRuntimeConfig {
@@ -2166,10 +2178,21 @@ impl SyncManager {
             }
             Err(error) => {
                 let message = error.to_string();
+                let connection_failed =
+                    is_lan_attempt_timeout(&error) || connection.close_reason().is_some();
                 if self.invalidate_lan_connection(&device_id, connection.stable_id()) {
-                    repository::mark_peer_error(&pool, &device_id, &message).await?;
+                    connection.close(0_u32.into(), b"LAN connection invalidated");
+                    if connection_failed {
+                        repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
+                    } else {
+                        repository::mark_peer_error(&pool, &device_id, &message).await?;
+                    }
                 }
-                Ok(LanPeerSyncOutcome::TransferFailed(message))
+                if connection_failed {
+                    Ok(LanPeerSyncOutcome::ConnectionFailed(message))
+                } else {
+                    Ok(LanPeerSyncOutcome::TransferFailed(message))
+                }
             }
         }
     }
@@ -2644,7 +2667,7 @@ impl SyncManager {
                     if target_id == CLOUD_TARGET {
                         call_cloud(connection, request).await?
                     } else {
-                        call(connection, request).await?
+                        call_lan(connection, request).await?
                     }
                 };
                 let response = match response {
@@ -2763,11 +2786,17 @@ impl SyncManager {
         let result = if cloud {
             call_cloud(connection, request).await
         } else {
-            call(connection, request).await
+            call_lan(connection, request).await
         };
         let response = match result {
             Ok(response) => response,
             Err(error) if cloud && is_cloud_attempt_timeout(&error) => return Err(error),
+            Err(error)
+                if !cloud
+                    && (is_lan_attempt_timeout(&error) || connection.close_reason().is_some()) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 // 旧版对端不识别新请求时仍保留原有剪贴板同步能力。
                 log::debug!("peer does not support removed-device exchange: {error}");
@@ -2869,6 +2898,7 @@ impl SyncManager {
         let _apply_guard = self.apply_lock.lock().await;
         let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
         let mut source_assets_pending = false;
+        let mut latest_clipboard_item = None;
         #[cfg(target_os = "android")]
         let mut applied_any = false;
         for stored in pending_apply {
@@ -2912,11 +2942,12 @@ impl SyncManager {
             }
             repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let item_id = self.apply_envelope(&event, envelope, group).await?;
+            let (item_id, item) = self.apply_envelope(&event, envelope, group).await?;
             repository::link_event_to_item(&pool, &item_id, &event.event_id, "remote").await?;
             self.reconcile_item_timestamps(&pool, group, &item_id)
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
+            latest_clipboard_item = Some(item);
             if let Some(icon) = source_icon {
                 match self.source_icon_blob_record(&icon) {
                     Ok(blob) => {
@@ -2935,6 +2966,9 @@ impl SyncManager {
             {
                 applied_any = true;
             }
+        }
+        if let Some(item) = latest_clipboard_item.as_ref() {
+            self.write_latest_synced_item_to_clipboard(item);
         }
         drop(_apply_guard);
         #[cfg(target_os = "android")]
@@ -3002,7 +3036,7 @@ impl SyncManager {
         event: &EncryptedEvent,
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
-    ) -> Result<String> {
+    ) -> Result<(String, ClipboardItem)> {
         if envelope.version != 1 {
             bail!("不支持的同步事件版本");
         }
@@ -3090,7 +3124,7 @@ impl SyncManager {
         } else {
             None
         };
-        let item = ClipboardItem {
+        let mut item = ClipboardItem {
             id: uuid::Uuid::new_v4().to_string(),
             kind,
             sub_kind: envelope
@@ -3135,28 +3169,45 @@ impl SyncManager {
             display_created_at: String::new(),
         };
         let result = db::items::upsert_synced_item(&pool, &item).await?;
+        item.id.clone_from(&result.id);
         self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
-        if self
+        Ok((result.id, item))
+    }
+
+    /// A remote batch updates the system clipboard at most once. Clipboard ownership is
+    /// independent from transport health, so a busy OS clipboard must never fail synchronization.
+    fn write_latest_synced_item_to_clipboard(&self, item: &ClipboardItem) {
+        if !self
             .app
             .state::<SettingsStore>()
             .snapshot()
             .sync
             .auto_write_clipboard
         {
-            let guard = self.app.state::<Arc<WritebackGuard>>();
-            #[cfg(target_os = "android")]
-            if item.kind == ClipboardKind::Text {
-                crate::clipboard::write_to_clipboard_app(&self.app, &guard, &item)?;
-            }
-            #[cfg(not(target_os = "android"))]
-            crate::clipboard::write_to_clipboard(
-                &self.app.state::<ImageStore>(),
-                &guard,
-                &item,
-                false,
-            )?;
+            return;
         }
-        Ok(result.id)
+
+        let guard = self.app.state::<Arc<WritebackGuard>>();
+        #[cfg(target_os = "android")]
+        let result = if item.kind == ClipboardKind::Text {
+            crate::clipboard::write_to_clipboard_app(&self.app, &guard, item)
+        } else {
+            Ok(())
+        };
+        #[cfg(not(target_os = "android"))]
+        let result = crate::clipboard::write_to_clipboard(
+            &self.app.state::<ImageStore>(),
+            &guard,
+            item,
+            false,
+        );
+
+        if let Err(error) = result {
+            log::warn!(
+                "synchronized item {} was persisted but clipboard writeback failed: {error}",
+                item.id
+            );
+        }
     }
 
     /// Creates or refreshes the local alias before the clipboard row references it.
@@ -5370,6 +5421,7 @@ async fn dispatch_peer(
             let apply_guard = manager.apply_lock.lock().await;
             let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
             let mut source_assets_pending = false;
+            let mut latest_clipboard_item = None;
             #[cfg(target_os = "android")]
             let mut applied_any = false;
             for stored in pending_apply {
@@ -5407,7 +5459,7 @@ async fn dispatch_peer(
                 if all_blobs_available {
                     let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
                     repository::attach_event_blobs(&pool, &stored.event.event_id, &blobs).await?;
-                    if let Ok(item_id) = manager
+                    if let Ok((item_id, item)) = manager
                         .apply_envelope(&stored.event, envelope, &group)
                         .await
                     {
@@ -5426,6 +5478,7 @@ async fn dispatch_peer(
                         repository::mark_applied(&pool, &stored.event.event_id)
                             .await
                             .ok();
+                        latest_clipboard_item = Some(item);
                         if let Some(icon) = source_icon {
                             if let Ok(blob) = manager.source_icon_blob_record(&icon) {
                                 repository::attach_event_blobs(
@@ -5444,6 +5497,9 @@ async fn dispatch_peer(
                         }
                     }
                 }
+            }
+            if let Some(item) = latest_clipboard_item.as_ref() {
+                manager.write_latest_synced_item_to_clipboard(item);
             }
             drop(apply_guard);
             #[cfg(target_os = "android")]
@@ -5577,6 +5633,33 @@ async fn call(connection: &Connection, request: Request) -> Result<Response> {
     read_frame(&mut recv).await.context("read sync response")
 }
 
+/// Bounds LAN control-response latency without constraining request or blob transfer duration.
+async fn call_lan(connection: &Connection, request: Request) -> Result<Response> {
+    let (mut send, mut recv) =
+        tokio::time::timeout(LAN_CONTROL_REQUEST_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| anyhow::Error::new(LanAttemptTimeout).context("打开局域网同步流超时"))??;
+    write_frame(&mut send, &request).await?;
+    send.finish()?;
+    let length = match tokio::time::timeout(LAN_CONTROL_REQUEST_TIMEOUT, recv.read_u32()).await {
+        Ok(length) => length.context("读取局域网同步响应长度")? as usize,
+        Err(_) => {
+            return Err(anyhow::Error::new(LanAttemptTimeout).context("等待局域网同步响应超时"));
+        }
+    };
+    if length > MAX_FRAME_BYTES {
+        bail!("LAN response frame is too large: {length} bytes");
+    }
+    let mut encoded = vec![0; length];
+    match tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read_exact(&mut encoded)).await {
+        Ok(result) => result.context("读取局域网同步响应")?,
+        Err(_) => {
+            return Err(anyhow::Error::new(LanAttemptTimeout).context("读取局域网同步响应超时"));
+        }
+    }
+    minicbor::decode(&encoded).context("decode LAN sync response")
+}
+
 /// Bounds short cloud control requests without constraining LAN or long-lived watch streams.
 async fn call_cloud(connection: &Connection, request: Request) -> Result<Response> {
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -5680,6 +5763,10 @@ async fn call_cloud_hedged(connection: &Connection, request: Request) -> Result<
 
 fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
+}
+
+fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LanAttemptTimeout>().is_some()
 }
 
 /// Confirms both the approval response and its durable commit before returning it to the UI.
@@ -6044,16 +6131,41 @@ async fn ensure_lan_connection(connection: &Connection, selection_timeout: Durat
     let mut paths = connection.paths_stream();
     tokio::time::timeout(selection_timeout, async {
         while let Some(paths) = paths.next().await {
-            let Some(path) = paths.iter().find(|path| path.is_selected()) else {
-                continue;
-            };
-
-            return ensure_lan_transport_addr(path.remote_addr());
+            let selected = paths
+                .iter()
+                .find(|path| path.is_selected())
+                .map(|path| path.remote_addr().clone());
+            if lan_path_snapshot_is_usable(
+                selected,
+                paths.iter().map(|path| path.remote_addr().clone()),
+            )? {
+                return Ok(());
+            }
         }
         bail!("连接已关闭")
     })
     .await
     .context("连接没有可用路径")?
+}
+
+/// Accepts Iroh's selected-path-less snapshot only when every open path is LAN-private.
+fn lan_path_snapshot_is_usable(
+    selected: Option<TransportAddr>,
+    paths: impl IntoIterator<Item = TransportAddr>,
+) -> Result<bool> {
+    if let Some(selected) = selected {
+        ensure_lan_transport_addr(&selected)?;
+        return Ok(true);
+    }
+
+    let mut has_path = false;
+    for path in paths {
+        has_path = true;
+        if ensure_lan_transport_addr(&path).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(has_path)
 }
 
 /// 校验 Iroh 的结构化传输地址，避免把 `ip:地址` 展示文本误当作 SocketAddr 解析。
@@ -6502,6 +6614,41 @@ mod tests {
         assert_eq!(
             ensure_lan_transport_addr(&public).unwrap_err().to_string(),
             "局域网同步禁止使用公网地址"
+        );
+    }
+
+    #[test]
+    fn lan_path_snapshot_accepts_private_paths_without_a_selected_path() {
+        let private = [
+            TransportAddr::Ip("192.168.50.84:56786".parse().unwrap()),
+            TransportAddr::Ip("10.0.0.8:56786".parse().unwrap()),
+        ];
+
+        assert!(lan_path_snapshot_is_usable(None, private).unwrap());
+    }
+
+    #[test]
+    fn lan_path_snapshot_waits_when_unselected_paths_are_not_all_private() {
+        let mixed = [
+            TransportAddr::Ip("192.168.50.84:56786".parse().unwrap()),
+            TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+        ];
+        let public = [TransportAddr::Ip("8.8.8.8:443".parse().unwrap())];
+
+        assert!(!lan_path_snapshot_is_usable(None, mixed).unwrap());
+        assert!(!lan_path_snapshot_is_usable(None, public).unwrap());
+        assert!(!lan_path_snapshot_is_usable(None, []).unwrap());
+    }
+
+    #[test]
+    fn lan_path_snapshot_rejects_a_selected_non_lan_path() {
+        let relay = TransportAddr::Relay("https://relay.example.com".parse().unwrap());
+
+        assert_eq!(
+            lan_path_snapshot_is_usable(Some(relay.clone()), [relay])
+                .unwrap_err()
+                .to_string(),
+            "局域网同步禁止使用 Relay"
         );
     }
 

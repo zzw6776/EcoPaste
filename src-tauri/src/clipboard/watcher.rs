@@ -537,6 +537,12 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 return;
             }
         };
+        let image_fingerprint = match &payload {
+            super::payload::ClipboardPayload::Image(image) => {
+                super::guard::image_pixel_fingerprint(&image.bytes)
+            }
+            _ => None,
+        };
 
         let mut item = match build_item_with_settings(
             &self.store,
@@ -554,7 +560,8 @@ impl ClipboardHandler for ClipboardChangeHandler {
         };
 
         // 自身写回触发的变更：跳过入库，避免回环。
-        if self.guard.should_skip(&item.content_hash) {
+        let suppression = image_fingerprint.as_deref().unwrap_or(&item.content_hash);
+        if self.guard.should_skip(suppression) {
             return;
         }
 

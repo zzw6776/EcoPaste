@@ -145,6 +145,7 @@
   "syncStatus": {
     "candidateAddresses": "Candidate addresses: {{count}}",
     "cloud": {
+      "activeRoute": "Last successful route ({{transport}}): {{address}}",
       "connecting": "Cloud is connecting",
       "degraded": "Cloud is partially degraded",
       "disabled": "Cloud is disabled",
