@@ -112,6 +112,7 @@ pub struct MdnsAddressLookup {
 #[derive(Debug)]
 enum Message {
     Discovered(String, Peer),
+    SetMulticastEnabled(bool),
     SetMulticastInterfacesV4(BTreeSet<Ipv4Addr>),
     Resolve(
         EndpointId,
@@ -166,6 +167,7 @@ fn peer_metadata_eq(left: &Peer, right: &Peer) -> bool {
 #[derive(Debug)]
 pub struct MdnsAddressLookupBuilder {
     advertise: bool,
+    multicast_enabled: bool,
     service_name: String,
     filter: AddrFilter,
     multicast_interfaces_v4: BTreeSet<Ipv4Addr>,
@@ -176,6 +178,7 @@ impl MdnsAddressLookupBuilder {
     fn new() -> Self {
         Self {
             advertise: true,
+            multicast_enabled: true,
             service_name: N0_SERVICE_NAME.to_string(),
             filter: AddrFilter::default(),
             multicast_interfaces_v4: BTreeSet::new(),
@@ -187,6 +190,12 @@ impl MdnsAddressLookupBuilder {
     /// Default is true.
     pub fn advertise(mut self, advertise: bool) -> Self {
         self.advertise = advertise;
+        self
+    }
+
+    /// Controls whether multicast sockets start immediately after the service is built.
+    pub fn multicast_enabled(mut self, enabled: bool) -> Self {
+        self.multicast_enabled = enabled;
         self
     }
 
@@ -223,7 +232,7 @@ impl MdnsAddressLookupBuilder {
     /// Builds an [`MdnsAddressLookup`] instance with the configured settings.
     ///
     /// # Errors
-    /// Returns an error if the network does not allow ipv4 OR ipv6.
+    /// Returns an error if the network does not allow IPv4.
     ///
     /// # Panics
     /// This relies on [`tokio::runtime::Handle::current`] and will panic if called outside of the context of a tokio runtime.
@@ -234,6 +243,7 @@ impl MdnsAddressLookupBuilder {
         MdnsAddressLookup::new(
             endpoint_id,
             self.advertise,
+            self.multicast_enabled,
             self.service_name,
             self.filter,
             self.multicast_interfaces_v4,
@@ -287,13 +297,14 @@ impl MdnsAddressLookup {
     /// and receives addresses from other endpoints in your local network.
     ///
     /// # Errors
-    /// Returns an error if the network does not allow ipv4 OR ipv6.
+    /// Returns an error if the network does not allow IPv4.
     ///
     /// # Panics
     /// This relies on [`tokio::runtime::Handle::current`] and will panic if called outside of the context of a tokio runtime.
     fn new(
         endpoint_id: EndpointId,
         advertise: bool,
+        mut multicast_enabled: bool,
         service_name: String,
         filter: AddrFilter,
         mut multicast_interfaces_v4: BTreeSet<Ipv4Addr>,
@@ -302,15 +313,19 @@ impl MdnsAddressLookup {
         let (send, mut recv) = mpsc::channel(64);
         let task_sender = send.clone();
         let rt = tokio::runtime::Handle::current();
-        let address_lookup = MdnsAddressLookup::spawn_discoverer(
-            endpoint_id,
-            advertise,
-            task_sender.clone(),
-            BTreeSet::new(),
-            service_name,
-            multicast_interfaces_v4.clone(),
-            &rt,
-        )?;
+        let mut address_lookup = if multicast_enabled {
+            Some(MdnsAddressLookup::spawn_discoverer(
+                endpoint_id,
+                advertise,
+                task_sender.clone(),
+                BTreeSet::new(),
+                service_name.clone(),
+                multicast_interfaces_v4.clone(),
+                &rt,
+            )?)
+        } else {
+            None
+        };
 
         let local_addrs: Watchable<Option<EndpointData>> = Watchable::default();
         let mut addrs_change = local_addrs.watch();
@@ -323,6 +338,7 @@ impl MdnsAddressLookup {
                 HashMap<usize, mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>>,
             > = HashMap::default();
             let mut timeouts = JoinSet::new();
+            let mut current_data: Option<EndpointData> = None;
             loop {
                 trace!(?endpoint_addrs, "Mdns Service loop tick");
                 let msg = tokio::select! {
@@ -331,25 +347,12 @@ impl MdnsAddressLookup {
                     }
                     Ok(Some(data)) = addrs_change.updated() => {
                         tracing::trace!(?data, "Mdns address changed");
-                        address_lookup.remove_all();
-
                         // apply user-supplied filter
                         let data = data.apply_filter(&filter).into_owned();
-
-
-                        let addrs =
-                            MdnsAddressLookup::socketaddrs_to_addrs(data.ip_addrs());
-                        for addr in addrs {
-                            address_lookup.add(addr.0, addr.1)
+                        if let Some(address_lookup) = address_lookup.as_ref() {
+                            MdnsAddressLookup::publish_data(address_lookup, &data);
                         }
-                        if let Some(relay) = data.relay_urls().next()
-                            && let Err(err) = address_lookup.set_txt_attribute(RELAY_URL_ATTRIBUTE.to_string(), Some(relay.to_string()))  {
-                                warn!("Failed to set the relay url in mDNS: {err:?}");
-                        }
-                        if let Some(user_data) = data.user_data()
-                            && let Err(err) = address_lookup.set_txt_attribute(USER_DATA_ATTRIBUTE.to_string(), Some(user_data.to_string())) {
-                                warn!("Failed to set the user-defined data in mDNS: {err:?}");
-                        }
+                        current_data = Some(data);
                         continue;
                     }
                 };
@@ -358,13 +361,18 @@ impl MdnsAddressLookup {
                         error!("Mdns channel closed");
                         error!("closing Mdns");
                         timeouts.abort_all();
-                        address_lookup.remove_all();
+                        if let Some(address_lookup) = address_lookup.as_ref() {
+                            address_lookup.remove_all();
+                        }
                         return;
                     }
                     Some(msg) => msg,
                 };
                 match msg {
                     Message::Discovered(discovered_endpoint_id, peer_info) => {
+                        if address_lookup.is_none() {
+                            continue;
+                        }
                         trace!(
                             ?discovered_endpoint_id,
                             ?peer_info,
@@ -431,12 +439,53 @@ impl MdnsAddressLookup {
                             });
                         }
                     }
-                    Message::SetMulticastInterfacesV4(interfaces) => {
-                        for interface in multicast_interfaces_v4.difference(&interfaces) {
-                            address_lookup.remove_interface_v4(*interface);
+                    Message::SetMulticastEnabled(enabled) => {
+                        if enabled == multicast_enabled {
+                            continue;
                         }
-                        for interface in interfaces.difference(&multicast_interfaces_v4) {
-                            address_lookup.add_interface_v4(*interface);
+                        if enabled {
+                            let next = match MdnsAddressLookup::spawn_discoverer(
+                                endpoint_id,
+                                advertise,
+                                task_sender.clone(),
+                                BTreeSet::new(),
+                                service_name.clone(),
+                                multicast_interfaces_v4.clone(),
+                                &rt,
+                            ) {
+                                Ok(next) => next,
+                                Err(error) => {
+                                    warn!("Failed to resume IPv4 mDNS discovery: {error:?}");
+                                    continue;
+                                }
+                            };
+                            if let Some(data) = current_data.as_ref() {
+                                MdnsAddressLookup::publish_data(&next, data);
+                            }
+                            address_lookup = Some(next);
+                            multicast_enabled = true;
+                            debug!("Resumed IPv4 mDNS discovery on LAN interfaces");
+                        } else {
+                            if let Some(previous) = address_lookup.take() {
+                                previous.remove_all();
+                                drop(previous);
+                                debug!("Paused IPv4 mDNS discovery without a LAN interface");
+                            }
+                            for endpoint_id in endpoint_addrs.keys().copied().collect::<Vec<_>>() {
+                                subscribers.send(DiscoveryEvent::Expired { endpoint_id });
+                            }
+                            endpoint_addrs.clear();
+                            multicast_enabled = false;
+                        }
+                    }
+                    Message::SetMulticastInterfacesV4(interfaces) => {
+                        if let Some(address_lookup) = address_lookup.as_ref() {
+                            for interface in multicast_interfaces_v4.difference(&interfaces) {
+                                address_lookup.remove_interface_v4(*interface);
+                            }
+                            for interface in interfaces.difference(&multicast_interfaces_v4) {
+                                address_lookup.add_interface_v4(*interface);
+                            }
                         }
                         multicast_interfaces_v4 = interfaces;
                     }
@@ -516,6 +565,34 @@ impl MdnsAddressLookup {
             .ok();
     }
 
+    /// Pauses or resumes IPv4 multicast discovery without dropping resolver subscriptions.
+    pub async fn set_multicast_enabled(&self, enabled: bool) {
+        self.sender
+            .send(Message::SetMulticastEnabled(enabled))
+            .await
+            .ok();
+    }
+
+    fn publish_data(address_lookup: &DropGuard, data: &EndpointData) {
+        address_lookup.remove_all();
+        let addrs = MdnsAddressLookup::socketaddrs_to_addrs(data.ip_addrs());
+        for addr in addrs {
+            address_lookup.add(addr.0, addr.1)
+        }
+        if let Some(relay) = data.relay_urls().next()
+            && let Err(err) = address_lookup
+                .set_txt_attribute(RELAY_URL_ATTRIBUTE.to_string(), Some(relay.to_string()))
+        {
+            warn!("Failed to set the relay url in mDNS: {err:?}");
+        }
+        if let Some(user_data) = data.user_data()
+            && let Err(err) = address_lookup
+                .set_txt_attribute(USER_DATA_ATTRIBUTE.to_string(), Some(user_data.to_string()))
+        {
+            warn!("Failed to set the user-defined data in mDNS: {err:?}");
+        }
+    }
+
     fn spawn_discoverer(
         endpoint_id: PublicKey,
         advertise: bool,
@@ -544,7 +621,7 @@ impl MdnsAddressLookup {
             .to_ascii_lowercase();
         let mut discoverer = Discoverer::new_interactive(service_name, endpoint_id_str)
             .with_callback(callback)
-            .with_ip_class(IpClass::Auto)
+            .with_ip_class(IpClass::V4Only)
             .with_multicast_interfaces_v4(multicast_interfaces_v4.into_iter().collect());
         if advertise {
             let addrs = MdnsAddressLookup::socketaddrs_to_addrs(socketaddrs.iter());
@@ -652,6 +729,16 @@ mod tests {
         let builder = MdnsAddressLookup::builder().multicast_interfaces_v4([interface, interface]);
 
         assert_eq!(builder.multicast_interfaces_v4, [interface].into());
+    }
+
+    #[test]
+    fn multicast_starts_enabled_unless_explicitly_paused() {
+        assert!(MdnsAddressLookup::builder().multicast_enabled);
+        assert!(
+            !MdnsAddressLookup::builder()
+                .multicast_enabled(false)
+                .multicast_enabled
+        );
     }
 
     /// This module's name signals nextest to run test in a single thread (no other concurrent

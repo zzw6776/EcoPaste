@@ -8,10 +8,15 @@ import {
 } from "node:fs";
 import { parse, resolve } from "node:path";
 import { acquireAndroidBuildLock } from "./androidBuildLock";
+import { normalizeAndroidManifestFile } from "./androidManifest";
 import { cleanAndroidCacheIfNeeded } from "./buildCache";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const SKIP_GRADLE_RUST_BUILD_ENV = "ECOPASTE_SKIP_GRADLE_RUST_BUILD";
+const androidManifestPath = resolve(
+  projectRoot,
+  "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+);
 const mode = process.argv[2];
 if (mode !== "debug" && mode !== "release") {
   throw new Error("Android build mode must be debug or release.");
@@ -173,5 +178,18 @@ try {
 
   process.stdout.write(`Android APK: ${artifactApk}\n`);
 } finally {
-  await buildLock.release();
+  try {
+    if (normalizeAndroidManifestFile(androidManifestPath)) {
+      process.stdout.write(
+        "Normalized generated Android Manifest whitespace.\n",
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `Failed to normalize generated Android Manifest whitespace: ${message}\n`,
+    );
+  } finally {
+    await buildLock.release();
+  }
 }

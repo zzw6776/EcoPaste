@@ -264,15 +264,17 @@ pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<Endp
         if direct.is_empty() {
             continue;
         }
-        if let Ok(address) = direct.parse() {
-            if resolved.insert(address) {
+        if let Ok(address) = direct.parse::<SocketAddr>() {
+            if address.is_ipv6() {
+                direct_error = Some(anyhow::anyhow!("Hub IPv6 地址已禁用: {direct}"));
+            } else if resolved.insert(address) {
                 addresses.push(TransportAddr::Ip(address));
             }
             continue;
         }
         match tokio::net::lookup_host(direct).await {
             Ok(found) => {
-                for address in found {
+                for address in found.filter(SocketAddr::is_ipv4) {
                     if resolved.insert(address) {
                         addresses.push(TransportAddr::Ip(address));
                     }
@@ -348,7 +350,7 @@ pub fn peer_endpoint_addr_with_preferred(
 pub(super) fn is_lan_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
-        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback(),
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -726,6 +728,21 @@ mod tests {
         assert!(peer_endpoint_addr(&peer).is_err());
     }
 
+    #[test]
+    fn peer_address_rejects_ipv6_lan_routes() {
+        let peer = ecopaste_sync_protocol::PeerAnnouncement {
+            device_id: "00112233445566778899aabbccddeeff".to_owned(),
+            device_name: "Peer".to_owned(),
+            platform: "macos".to_owned(),
+            endpoint_id: SecretKey::generate().public().to_string(),
+            direct_addresses: vec!["[fd00::11]:53192".to_owned()],
+            relay_urls: Vec::new(),
+            last_seen_ms: 1,
+        };
+
+        assert!(peer_endpoint_addr(&peer).is_err());
+    }
+
     #[tokio::test]
     async fn disabled_cloud_ignores_stale_invalid_configuration() {
         let settings = SyncSettings {
@@ -750,6 +767,19 @@ mod tests {
         let address = server_endpoint_addr(&settings).await.unwrap().unwrap();
 
         assert!(address.ip_addrs().next().is_some());
+        assert!(address.ip_addrs().all(SocketAddr::is_ipv4));
+    }
+
+    #[tokio::test]
+    async fn cloud_direct_address_rejects_ipv6() {
+        let settings = SyncSettings {
+            cloud_enabled: true,
+            server_endpoint_id: SecretKey::generate().public().to_string(),
+            server_direct_addresses: vec!["[fd00::10]:44820".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(server_endpoint_addr(&settings).await.is_err());
     }
 
     #[tokio::test]

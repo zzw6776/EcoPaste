@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    net::{IpAddr, Ipv4Addr},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -9,6 +9,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[cfg(any(not(target_os = "android"), test))]
+use std::net::IpAddr;
 
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
@@ -122,6 +125,8 @@ pub struct SyncManager {
     lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
     lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     lan_suspended_peers: RwLock<HashSet<String>>,
+    #[cfg(target_os = "android")]
+    android_lan_multicast_interfaces: RwLock<BTreeSet<Ipv4Addr>>,
     lan_presence_nonce: AtomicU64,
     nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
     incoming_join_requests: Mutex<HashMap<String, PendingIncomingJoinRequest>>,
@@ -157,7 +162,8 @@ struct EndpointRuntime {
     endpoint: Endpoint,
     router: Router,
     config: EndpointRuntimeConfig,
-    _mdns: Option<MdnsAddressLookup>,
+    #[cfg(target_os = "android")]
+    mdns: Option<MdnsAddressLookup>,
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +394,8 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_peer_actors: RwLock::new(HashMap::new()),
         lan_peer_locks: RwLock::new(HashMap::new()),
         lan_suspended_peers: RwLock::new(HashSet::new()),
+        #[cfg(target_os = "android")]
+        android_lan_multicast_interfaces: RwLock::new(BTreeSet::new()),
         lan_presence_nonce: AtomicU64::new(u64::from_le_bytes(presence_nonce)),
         nearby_devices: RwLock::new(HashMap::new()),
         incoming_join_requests: Mutex::new(HashMap::new()),
@@ -412,13 +420,22 @@ impl SyncManager {
         self.source_asset_wake.notify_one();
     }
 
-    /// Reconnects LAN peers and disconnected cloud work after a real network lifecycle event.
-    pub fn notify_connectivity_changed(&self) {
+    /// Reconnects LAN peers after an endpoint address or mDNS presence change.
+    fn notify_lan_connectivity_changed(&self) {
         self.resume_all_peers();
         self.wake_lan_transfer();
-        self.notify_cloud_connectivity_changed();
     }
 
+    /// Bypasses cloud backoff and restarts both transfer and persistent watch workers.
+    #[cfg(target_os = "android")]
+    fn notify_cloud_network_changed(&self) {
+        self.cloud_force_reconnect.store(true, Ordering::Release);
+        self.wake_cloud_transfer();
+        self.watch_wake.notify_one();
+    }
+
+    /// Preserves the existing desktop connection unless Iroh has already marked it unavailable.
+    #[cfg(not(target_os = "android"))]
     fn notify_cloud_connectivity_changed(&self) {
         self.cloud_force_reconnect.store(true, Ordering::Release);
         self.wake_cloud_transfer();
@@ -433,9 +450,20 @@ impl SyncManager {
         }
     }
 
-    /// Refreshes Iroh before reconnecting after an externally observed network change.
+    /// Migrates cloud synchronization immediately when Android changes its default network.
     #[cfg(target_os = "android")]
-    pub fn notify_network_changed(self: &Arc<Self>) {
+    pub fn notify_default_network_changed(self: &Arc<Self>) {
+        self.handle_default_network_event("changed");
+    }
+
+    /// Stops reusing the old cloud path when Android loses its current default network.
+    #[cfg(target_os = "android")]
+    pub fn notify_default_network_lost(self: &Arc<Self>) {
+        self.handle_default_network_event("lost");
+    }
+
+    #[cfg(target_os = "android")]
+    fn handle_default_network_event(self: &Arc<Self>, event: &'static str) {
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             let endpoint = manager
@@ -444,8 +472,50 @@ impl SyncManager {
                 .await
                 .as_ref()
                 .map(|runtime| runtime.endpoint.clone());
+            let endpoint_refreshed = endpoint.is_some();
             if let Some(endpoint) = endpoint {
                 endpoint.network_change().await;
+            }
+            let invalidated_connection = manager.invalidate_current_cloud_connection();
+            manager.notify_cloud_network_changed();
+            log::info!(
+                "Android default network {event}: endpointRefreshed={} invalidatedCloudConnection={}",
+                endpoint_refreshed,
+                invalidated_connection
+                    .map(|connection_id| connection_id.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            );
+        });
+    }
+
+    /// Refreshes only LAN discovery and peer routes when Android Wi-Fi appears or changes.
+    #[cfg(target_os = "android")]
+    pub fn notify_lan_network_changed(self: &Arc<Self>, interface_addresses: &str) {
+        let interfaces = parse_android_lan_multicast_interfaces(interface_addresses);
+        if interfaces.is_empty() {
+            log::warn!("ignore Android LAN network change without IPv4 interfaces");
+            return;
+        }
+        *self
+            .android_lan_multicast_interfaces
+            .write()
+            .expect("Android LAN multicast interfaces poisoned") = interfaces;
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let runtime = manager
+                .runtime
+                .lock()
+                .await
+                .as_ref()
+                .map(|runtime| (runtime.endpoint.clone(), runtime.mdns.clone()));
+            let mut interface_count = 0;
+            if let Some((endpoint, mdns)) = runtime {
+                endpoint.network_change().await;
+                if let Some(mdns) = mdns {
+                    interface_count = manager
+                        .configure_mdns_multicast(&mdns, &endpoint.addr())
+                        .await;
+                }
                 let settings = manager.app.state::<SettingsStore>().snapshot().sync;
                 if settings.enabled && settings.lan_enabled {
                     manager.advance_presence_nonce();
@@ -454,16 +524,38 @@ impl SyncManager {
                     }
                 }
             }
-            manager.notify_connectivity_changed();
+            manager.notify_lan_connectivity_changed();
+            log::info!(
+                "Android LAN network changed: multicastInterfaces={interface_count} cloudConnectionPreserved=true"
+            );
         });
     }
 
-    /// Invalidates LAN connectivity immediately when Android reports that its active Wi-Fi route
-    /// disappeared, instead of waiting for QUIC keepalive or a transfer timeout.
+    /// Invalidates LAN connectivity and removes stale mDNS interfaces after Android Wi-Fi loss.
     #[cfg(target_os = "android")]
-    pub fn notify_network_lost(self: &Arc<Self>) {
+    pub fn notify_lan_network_lost(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
+            manager
+                .android_lan_multicast_interfaces
+                .write()
+                .expect("Android LAN multicast interfaces poisoned")
+                .clear();
+            let runtime = manager
+                .runtime
+                .lock()
+                .await
+                .as_ref()
+                .map(|runtime| (runtime.endpoint.clone(), runtime.mdns.clone()));
+            if let Some((endpoint, mdns)) = runtime {
+                endpoint.network_change().await;
+                if let Some(mdns) = mdns {
+                    manager
+                        .configure_mdns_multicast(&mdns, &endpoint.addr())
+                        .await;
+                }
+            }
+
             let connections = manager
                 .lan_connections
                 .write()
@@ -471,7 +563,7 @@ impl SyncManager {
                 .drain()
                 .map(|(_, connection)| connection)
                 .collect::<Vec<_>>();
-            for connection in connections {
+            for connection in &connections {
                 connection.close(0_u32.into(), b"Android Wi-Fi route lost");
             }
 
@@ -503,8 +595,44 @@ impl SyncManager {
             }
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Idle, None, false);
             manager.emit_updated();
-            manager.notify_cloud_connectivity_changed();
+            log::info!(
+                "Android LAN network lost: multicastInterfaces=0 closedLanConnections={} cloudConnectionPreserved=true",
+                connections.len(),
+            );
         });
+    }
+
+    fn active_lan_multicast_interfaces_v4(&self, address: &EndpointAddr) -> BTreeSet<Ipv4Addr> {
+        #[cfg(target_os = "android")]
+        {
+            let _ = address;
+            return self
+                .android_lan_multicast_interfaces
+                .read()
+                .expect("Android LAN multicast interfaces poisoned")
+                .clone();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            lan_multicast_interfaces_v4(address)
+        }
+    }
+
+    async fn configure_mdns_multicast(
+        &self,
+        mdns: &MdnsAddressLookup,
+        address: &EndpointAddr,
+    ) -> usize {
+        let interfaces = self.active_lan_multicast_interfaces_v4(address);
+        let interface_count = interfaces.len();
+        if interfaces.is_empty() {
+            mdns.set_multicast_enabled(false).await;
+            mdns.set_multicast_interfaces_v4(interfaces).await;
+        } else {
+            mdns.set_multicast_interfaces_v4(interfaces).await;
+            mdns.set_multicast_enabled(true).await;
+        }
+        interface_count
     }
 
     /// Makes visible Android surfaces reread committed status without changing network state.
@@ -3386,11 +3514,21 @@ impl SyncManager {
             }
         }
         let mdns = if settings.lan_enabled {
-            match MdnsAddressLookup::builder()
+            let builder = MdnsAddressLookup::builder()
                 .service_name("ecopaste-v1")
-                .addr_filter(AddrFilter::ip_only())
-                .build(secret_key.public())
-            {
+                .addr_filter(ipv4_direct_addr_filter());
+            #[cfg(target_os = "android")]
+            let builder = {
+                let interfaces = self
+                    .android_lan_multicast_interfaces
+                    .read()
+                    .expect("Android LAN multicast interfaces poisoned")
+                    .clone();
+                builder
+                    .multicast_enabled(!interfaces.is_empty())
+                    .multicast_interfaces_v4(interfaces)
+            };
+            match builder.build(secret_key.public()) {
                 Ok(mdns) => Some(mdns),
                 Err(error) => {
                     log::warn!("LAN discovery is unavailable: {error}");
@@ -3413,6 +3551,9 @@ impl SyncManager {
             .write()
             .expect("cloud connection route poisoned") = ConnectionRoute::default();
         let mut builder = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::UNSPECIFIED, 0))
+            .context("configure IPv4-only Iroh sync endpoint")?
             .secret_key(secret_key)
             .relay_mode(relay_mode);
         if settings.cloud_enabled && settings.cloud_relay_mode == CloudRelayMode::Public {
@@ -3427,9 +3568,12 @@ impl SyncManager {
             .bind()
             .await
             .context("failed to bind Iroh sync endpoint")?;
+        log::info!(
+            "Iroh sync endpoint bound IPv4-only: sockets={:?}",
+            endpoint.bound_sockets()
+        );
         if let Some(mdns) = mdns.as_ref() {
-            mdns.set_multicast_interfaces_v4(lan_multicast_interfaces_v4(&endpoint.addr()))
-                .await;
+            self.configure_mdns_multicast(mdns, &endpoint.addr()).await;
         }
         self.update_discovery_metadata(&endpoint, settings.lan_enabled)?;
         let router = Router::builder(endpoint.clone())
@@ -3451,7 +3595,8 @@ impl SyncManager {
             endpoint: endpoint.clone(),
             router,
             config,
-            _mdns: mdns,
+            #[cfg(target_os = "android")]
+            mdns,
         });
         Ok(endpoint)
     }
@@ -3652,6 +3797,42 @@ impl SyncManager {
                 session.take();
             }
         }
+    }
+
+    /// Atomically evicts the shared cloud connection after an external network-path change.
+    #[cfg(target_os = "android")]
+    fn invalidate_current_cloud_connection(&self) -> Option<usize> {
+        let connection = self
+            .cloud_connection
+            .write()
+            .expect("cloud connection cache poisoned")
+            .take()?;
+        let stable_id = connection.stable_id();
+        connection.close(0_u32.into(), b"cloud network path changed");
+        self.confirmed_cloud_source_icons
+            .write()
+            .expect("confirmed cloud source icons poisoned")
+            .clear_connection(stable_id);
+        let mut session = self
+            .cloud_session
+            .write()
+            .expect("cloud session state poisoned");
+        if session
+            .as_ref()
+            .is_some_and(|session| session.connection_id == stable_id)
+        {
+            session.take();
+        }
+        drop(session);
+        self.cloud_server_version
+            .write()
+            .expect("cloud server version poisoned")
+            .take();
+        *self
+            .cloud_path
+            .write()
+            .expect("cloud connection route poisoned") = ConnectionRoute::default();
+        Some(stable_id)
     }
 
     fn clear_connection_caches(&self) {
@@ -4025,18 +4206,19 @@ fn spawn_endpoint_watchers(
     tauri::async_runtime::spawn(address_closed.run_until(async move {
         let mut initial = true;
         while let Some(address) = address_stream.next().await {
+            let Some(manager) = address_manager.upgrade() else {
+                break;
+            };
             if let Some(mdns) = address_mdns.as_ref() {
-                mdns.set_multicast_interfaces_v4(lan_multicast_interfaces_v4(&address))
-                    .await;
+                manager.configure_mdns_multicast(mdns, &address).await;
             }
             if initial {
                 initial = false;
                 continue;
             }
-            let Some(manager) = address_manager.upgrade() else {
-                break;
-            };
-            manager.notify_connectivity_changed();
+            manager.notify_lan_connectivity_changed();
+            #[cfg(not(target_os = "android"))]
+            manager.notify_cloud_connectivity_changed();
         }
     }));
 
@@ -4175,10 +4357,24 @@ fn presence_nonce_changed(previous: Option<u64>, current: Option<u64>) -> bool {
 }
 
 /// Returns every private or link-local IPv4 address on which mDNS should operate.
+#[cfg(any(not(target_os = "android"), test))]
 fn lan_multicast_interfaces_v4(address: &EndpointAddr) -> BTreeSet<Ipv4Addr> {
     collect_lan_multicast_interfaces_v4(address.ip_addrs().map(|address| address.ip()))
 }
 
+fn ipv4_direct_addr_filter() -> AddrFilter {
+    AddrFilter::new(|addresses| {
+        std::borrow::Cow::Owned(
+            addresses
+                .iter()
+                .filter(|address| matches!(address, TransportAddr::Ip(socket) if socket.is_ipv4()))
+                .cloned()
+                .collect(),
+        )
+    })
+}
+
+#[cfg(any(not(target_os = "android"), test))]
 fn collect_lan_multicast_interfaces_v4(
     addresses: impl IntoIterator<Item = IpAddr>,
 ) -> BTreeSet<Ipv4Addr> {
@@ -4188,6 +4384,14 @@ fn collect_lan_multicast_interfaces_v4(
             IpAddr::V4(ip) if !ip.is_loopback() && is_lan_ip(ip.into()) => Some(ip),
             _ => None,
         })
+        .collect()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn parse_android_lan_multicast_interfaces(value: &str) -> BTreeSet<Ipv4Addr> {
+    value
+        .split(',')
+        .filter_map(|address| address.parse::<Ipv4Addr>().ok())
         .collect()
 }
 
@@ -6101,6 +6305,36 @@ mod tests {
             ]
             .into_iter()
             .collect()
+        );
+    }
+
+    #[test]
+    fn android_lan_multicast_uses_only_reported_ipv4_interfaces() {
+        let interfaces =
+            parse_android_lan_multicast_interfaces("10.120.90.161,invalid,fe80::1,192.168.50.84");
+
+        assert_eq!(
+            interfaces,
+            [
+                Ipv4Addr::new(10, 120, 90, 161),
+                Ipv4Addr::new(192, 168, 50, 84),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn mdns_publishes_only_ipv4_direct_addresses() {
+        let addresses = vec![
+            TransportAddr::Ip("192.168.50.84:44820".parse().unwrap()),
+            TransportAddr::Ip("[fd00::84]:44820".parse().unwrap()),
+            TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+        ];
+
+        assert_eq!(
+            ipv4_direct_addr_filter().apply(&addresses).as_ref(),
+            &[TransportAddr::Ip("192.168.50.84:44820".parse().unwrap())]
         );
     }
 

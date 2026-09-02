@@ -38,6 +38,16 @@ html {
   padding-bottom: var(--mobile-safe-area-bottom) !important;
 }
 
+/*
+ * Android 分类分页内嵌 Virtuoso 与多层 overflow 容器。touch-action 不继承，
+ * 必须在命中节点到最近滚动容器的整条链路预先保留纵向原生滚动，
+ * WebView 才不会接管横向手势并向 Motion 发送 pointercancel。
+ */
+.mobile-category-pager,
+.mobile-category-pager * {
+  touch-action: pan-y;
+}
+
 /* Portal 不继承页面布局安全区，需要在保留 antd 默认间距的基础上额外避让。 */
 .android-safe-drawer-header {
   padding-top: calc(1rem + var(--mobile-safe-area-top)) !important;

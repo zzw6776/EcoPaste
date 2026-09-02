@@ -35,6 +35,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.lang.ref.WeakReference
+import java.net.Inet4Address
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -60,8 +61,14 @@ object EcoPasteBridge {
     private var applicationContext: Context? = null
     private var clipboardManager: ClipboardManager? = null
     private var clipboardListenerRegistered = false
-    private var syncNetworkCallback: ConnectivityManager.NetworkCallback? = null
-    private var syncNetworkFingerprint: String? = null
+    private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var defaultNetwork: Network? = null
+    private var defaultNetworkFingerprint: String? = null
+    private var pendingDefaultNetworkNotification: PendingNetworkNotification? = null
+    private var lanNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lanNetwork: Network? = null
+    private var lanNetworkFingerprint: String? = null
+    private var pendingLanNetworkNotification: PendingNetworkNotification? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
     private var lastAccessibilitySourcePackage: String? = null
@@ -78,6 +85,17 @@ object EcoPasteBridge {
         val leftHeightDp: Int,
         val rightWidthDp: Int,
         val rightHeightDp: Int,
+    )
+
+    private enum class NetworkNotificationKind {
+        CHANGED,
+        LOST,
+    }
+
+    private data class PendingNetworkNotification(
+        val kind: NetworkNotificationKind,
+        val fingerprint: String? = null,
+        val interfaceAddresses: String = "",
     )
 
     // 剪贴板变更监听回调队列
@@ -124,10 +142,16 @@ object EcoPasteBridge {
     external fun persistOverlayPanelHeightPercent(heightPercent: Int): Boolean
 
     @JvmStatic
-    external fun notifySyncNetworkChanged()
+    external fun notifySyncDefaultNetworkChanged(): Boolean
 
     @JvmStatic
-    external fun notifySyncNetworkLost()
+    external fun notifySyncDefaultNetworkLost(): Boolean
+
+    @JvmStatic
+    external fun notifySyncLanNetworkChanged(interfaceAddresses: String): Boolean
+
+    @JvmStatic
+    external fun notifySyncLanNetworkLost(): Boolean
 
     @JvmStatic
     external fun notifySyncStatusRefresh()
@@ -293,38 +317,115 @@ object EcoPasteBridge {
             ?.takeIf { it == "accessibility" || it == "root" || it == "foreground" }
             ?: "accessibility"
         refreshClipboardListener()
-        registerSyncNetworkCallback(context.applicationContext)
+        registerSyncNetworkCallbacks(context.applicationContext)
+        replayPendingSyncNetworkNotifications()
     }
 
-    /** Wakes native synchronization only when the active Wi-Fi route appears or changes. */
+    /** Separates the app's cloud default route from Wi-Fi-only LAN discovery lifecycle. */
     @Synchronized
-    private fun registerSyncNetworkCallback(context: Context) {
-        if (syncNetworkCallback != null) return
-
+    private fun registerSyncNetworkCallbacks(context: Context) {
         val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
             as? ConnectivityManager ?: return
+
+        if (defaultNetworkCallback == null) {
+            registerDefaultNetworkCallback(connectivityManager)
+        }
+        if (lanNetworkCallback == null) {
+            registerLanNetworkCallback(connectivityManager)
+        }
+    }
+
+    /** Tracks the network Android selected for this app's cloud traffic. */
+    private fun registerDefaultNetworkCallback(connectivityManager: ConnectivityManager) {
+        connectivityManager.activeNetwork?.let { network ->
+            val properties = connectivityManager.getLinkProperties(network)
+            val capabilities = connectivityManager.getNetworkCapabilities(network)
+            synchronized(this) {
+                defaultNetwork = network
+                if (properties != null && capabilities != null) {
+                    defaultNetworkFingerprint = networkFingerprint(
+                        network,
+                        properties,
+                        capabilities,
+                    )
+                }
+            }
+        }
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                connectivityManager.getLinkProperties(network)?.let { properties ->
-                    notifySyncRouteChanged(network, properties)
+                synchronized(this@EcoPasteBridge) {
+                    defaultNetwork = network
                 }
+                notifyDefaultNetworkChanged(connectivityManager, network, "available")
             }
 
             override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
-                notifySyncRouteChanged(network, properties)
+                if (!isCurrentDefaultNetwork(network)) return
+                notifyDefaultNetworkChanged(
+                    connectivityManager,
+                    network,
+                    "link-properties",
+                    properties,
+                )
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities,
+            ) {
+                if (!isCurrentDefaultNetwork(network)) return
+                notifyDefaultNetworkChanged(
+                    connectivityManager,
+                    network,
+                    "capabilities",
+                    capabilities = capabilities,
+                )
             }
 
             override fun onLost(network: Network) {
-                val lostActiveRoute = synchronized(this@EcoPasteBridge) {
-                    if (syncNetworkFingerprint?.startsWith("$network:") == true) {
-                        syncNetworkFingerprint = null
-                        true
-                    } else {
-                        false
-                    }
+                synchronized(this@EcoPasteBridge) {
+                    if (defaultNetwork != network) return
+                    defaultNetwork = null
+                    defaultNetworkFingerprint = null
+                    queueDefaultNetworkNotification(
+                        PendingNetworkNotification(NetworkNotificationKind.LOST),
+                        "lost:$network",
+                    )
                 }
-                if (lostActiveRoute) {
-                    notifySyncNetworkLostSafely("route:$network")
+            }
+        }
+        try {
+            connectivityManager.registerDefaultNetworkCallback(callback)
+            defaultNetworkCallback = callback
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "register default sync network callback failed: ${error.message}")
+        }
+    }
+
+    /** Tracks Wi-Fi independently because only Wi-Fi interfaces may carry LAN discovery. */
+    private fun registerLanNetworkCallback(connectivityManager: ConnectivityManager) {
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                synchronized(this@EcoPasteBridge) {
+                    lanNetwork = network
+                }
+                notifyLanNetworkChanged(connectivityManager, network, "available")
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
+                if (!isCurrentLanNetwork(network)) return
+                notifyLanNetworkChanged(connectivityManager, network, "link-properties", properties)
+            }
+
+            override fun onLost(network: Network) {
+                synchronized(this@EcoPasteBridge) {
+                    if (lanNetwork != network) return
+                    lanNetwork = null
+                    lanNetworkFingerprint = null
+                    queueLanNetworkNotification(
+                        PendingNetworkNotification(NetworkNotificationKind.LOST),
+                        "lost:$network",
+                    )
                 }
             }
         }
@@ -333,47 +434,195 @@ object EcoPasteBridge {
             .build()
         try {
             connectivityManager.registerNetworkCallback(request, callback)
-            syncNetworkCallback = callback
+            lanNetworkCallback = callback
         } catch (error: RuntimeException) {
-            Log.w(TAG, "register sync network callback failed: ${error.message}")
+            Log.w(TAG, "register LAN sync network callback failed: ${error.message}")
         }
     }
 
-    /** Coalesces the paired callbacks Android emits for the same Wi-Fi route. */
-    private fun notifySyncRouteChanged(network: Network, properties: LinkProperties) {
-        val addresses = properties.linkAddresses
-            .map { it.address.hostAddress.orEmpty() }
+    /** Coalesces duplicate default-network callbacks without hiding effective path changes. */
+    @Synchronized
+    private fun notifyDefaultNetworkChanged(
+        connectivityManager: ConnectivityManager,
+        network: Network,
+        reason: String,
+        properties: LinkProperties? = null,
+        capabilities: NetworkCapabilities? = null,
+    ) {
+        val currentProperties = properties ?: connectivityManager.getLinkProperties(network)
+            ?: return
+        val currentCapabilities = capabilities
+            ?: connectivityManager.getNetworkCapabilities(network)
+            ?: return
+        val fingerprint = networkFingerprint(network, currentProperties, currentCapabilities)
+        if (defaultNetwork != network || defaultNetworkFingerprint == fingerprint) return
+        defaultNetworkFingerprint = fingerprint
+        Log.i(TAG, "default sync network changed ($reason): $fingerprint")
+        queueDefaultNetworkNotification(
+            PendingNetworkNotification(
+                kind = NetworkNotificationKind.CHANGED,
+                fingerprint = fingerprint,
+            ),
+            "$reason:$fingerprint",
+        )
+    }
+
+    /** Coalesces duplicate Wi-Fi callbacks and requires at least one usable interface address. */
+    @Synchronized
+    private fun notifyLanNetworkChanged(
+        connectivityManager: ConnectivityManager,
+        network: Network,
+        reason: String,
+        properties: LinkProperties? = null,
+    ) {
+        val currentProperties = properties ?: connectivityManager.getLinkProperties(network)
+            ?: return
+        val multicastInterfaces = currentProperties.linkAddresses
+            .map { it.address }
+            .filterIsInstance<Inet4Address>()
+            .map { it.hostAddress.orEmpty() }
             .filter { it.isNotEmpty() }
             .sorted()
-        if (addresses.isEmpty()) return
+        if (multicastInterfaces.isEmpty()) return
 
-        val fingerprint = buildString {
-            append(network)
-            append(':')
-            append(addresses.joinToString(","))
-        }
-        synchronized(this) {
-            if (syncNetworkFingerprint == fingerprint) return
-            syncNetworkFingerprint = fingerprint
-        }
-        notifySyncNetworkChangedSafely("route:$fingerprint")
+        val fingerprint = listOf(
+            network.toString(),
+            currentProperties.interfaceName.orEmpty(),
+            multicastInterfaces.joinToString(","),
+        ).joinToString(":")
+        if (lanNetwork != network || lanNetworkFingerprint == fingerprint) return
+        lanNetworkFingerprint = fingerprint
+        Log.i(TAG, "LAN sync network changed ($reason): $fingerprint")
+        queueLanNetworkNotification(
+            PendingNetworkNotification(
+                kind = NetworkNotificationKind.CHANGED,
+                fingerprint = fingerprint,
+                interfaceAddresses = multicastInterfaces.joinToString(","),
+            ),
+            "$reason:$fingerprint",
+        )
     }
 
-    /** Keeps callbacks safe when an Android service starts before the Tauri runtime is ready. */
-    private fun notifySyncNetworkChangedSafely(reason: String) {
-        try {
-            notifySyncNetworkChanged()
-        } catch (error: Throwable) {
-            Log.w(TAG, "notify sync network change failed ($reason): ${error.message}")
+    /** Includes only properties that change the effective outbound QUIC path. */
+    private fun networkFingerprint(
+        network: Network,
+        properties: LinkProperties,
+        capabilities: NetworkCapabilities,
+    ): String {
+        val addresses = properties.linkAddresses
+            .map { it.address }
+            .filterIsInstance<Inet4Address>()
+            .map { it.hostAddress.orEmpty() }
+            .filter { it.isNotEmpty() }
+            .sorted()
+        val routes = properties.routes
+            .filter { it.destination.address is Inet4Address }
+            .map { route ->
+                "${route.destination}:${route.gateway?.hostAddress.orEmpty()}"
+            }
+            .sorted()
+        val transports = listOf(
+            NetworkCapabilities.TRANSPORT_CELLULAR to "cellular",
+            NetworkCapabilities.TRANSPORT_WIFI to "wifi",
+            NetworkCapabilities.TRANSPORT_BLUETOOTH to "bluetooth",
+            NetworkCapabilities.TRANSPORT_ETHERNET to "ethernet",
+            NetworkCapabilities.TRANSPORT_VPN to "vpn",
+        ).filter { (transport, _) -> capabilities.hasTransport(transport) }
+            .joinToString(",") { (_, label) -> label }
+
+        return listOf(
+            network.toString(),
+            properties.interfaceName.orEmpty(),
+            transports,
+            addresses.joinToString(","),
+            routes.joinToString(","),
+        ).joinToString(":")
+    }
+
+    @Synchronized
+    private fun isCurrentDefaultNetwork(network: Network): Boolean {
+        return defaultNetwork == network
+    }
+
+    @Synchronized
+    private fun isCurrentLanNetwork(network: Network): Boolean {
+        return lanNetwork == network
+    }
+
+    /** Retains the latest callback until the native synchronization manager confirms receipt. */
+    @Synchronized
+    private fun queueDefaultNetworkNotification(
+        notification: PendingNetworkNotification,
+        reason: String,
+    ) {
+        pendingDefaultNetworkNotification = notification
+        deliverDefaultNetworkNotification(notification, reason)
+    }
+
+    @Synchronized
+    private fun queueLanNetworkNotification(
+        notification: PendingNetworkNotification,
+        reason: String,
+    ) {
+        pendingLanNetworkNotification = notification
+        deliverLanNetworkNotification(notification, reason)
+    }
+
+    /** Replays only callbacks that arrived before the Tauri synchronization runtime was ready. */
+    @Synchronized
+    private fun replayPendingSyncNetworkNotifications() {
+        pendingDefaultNetworkNotification?.let { notification ->
+            deliverDefaultNetworkNotification(notification, "runtime-ready-replay")
+        }
+        pendingLanNetworkNotification?.let { notification ->
+            deliverLanNetworkNotification(notification, "runtime-ready-replay")
         }
     }
 
-    /** Marks the current LAN route unavailable without waiting for transport timeout. */
-    private fun notifySyncNetworkLostSafely(reason: String) {
-        try {
-            notifySyncNetworkLost()
+    @Synchronized
+    private fun deliverDefaultNetworkNotification(
+        notification: PendingNetworkNotification,
+        reason: String,
+    ) {
+        val delivered = try {
+            when (notification.kind) {
+                NetworkNotificationKind.CHANGED -> notifySyncDefaultNetworkChanged()
+                NetworkNotificationKind.LOST -> notifySyncDefaultNetworkLost()
+            }
         } catch (error: Throwable) {
-            Log.w(TAG, "notify sync network loss failed ($reason): ${error.message}")
+            Log.w(TAG, "notify default sync network failed ($reason): ${error.message}")
+            false
+        }
+        if (!delivered) {
+            Log.d(TAG, "default sync network notification pending ($reason)")
+            return
+        }
+        if (pendingDefaultNetworkNotification == notification) {
+            pendingDefaultNetworkNotification = null
+        }
+    }
+
+    @Synchronized
+    private fun deliverLanNetworkNotification(
+        notification: PendingNetworkNotification,
+        reason: String,
+    ) {
+        val delivered = try {
+            when (notification.kind) {
+                NetworkNotificationKind.CHANGED ->
+                    notifySyncLanNetworkChanged(notification.interfaceAddresses)
+                NetworkNotificationKind.LOST -> notifySyncLanNetworkLost()
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "notify LAN sync network failed ($reason): ${error.message}")
+            false
+        }
+        if (!delivered) {
+            Log.d(TAG, "LAN sync network notification pending ($reason)")
+            return
+        }
+        if (pendingLanNetworkNotification == notification) {
+            pendingLanNetworkNotification = null
         }
     }
 
