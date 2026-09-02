@@ -728,30 +728,74 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_persistOver
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncNetworkChanged(
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncDefaultNetworkChanged(
     _raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
-) {
+) -> jni::sys::jboolean {
     let Some(app) = APP_HANDLE.get() else {
-        return;
+        return 0;
     };
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
-        manager.notify_network_changed();
+        manager.notify_default_network_changed();
+        return 1;
     }
+    0
 }
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncNetworkLost(
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncDefaultNetworkLost(
     _raw_env: *mut jni::sys::JNIEnv,
     _class: jni::sys::jclass,
-) {
+) -> jni::sys::jboolean {
     let Some(app) = APP_HANDLE.get() else {
-        return;
+        return 0;
     };
     if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
-        manager.notify_network_lost();
+        manager.notify_default_network_lost();
+        return 1;
     }
+    0
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncLanNetworkChanged(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    interface_addresses: jni::sys::jstring,
+) -> jni::sys::jboolean {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return 0;
+    };
+    let interface_addresses = jni::objects::JString::from_raw(interface_addresses);
+    let Ok(interface_addresses) = env.get_string(&interface_addresses).map(String::from) else {
+        return 0;
+    };
+    let Some(app) = APP_HANDLE.get() else {
+        return 0;
+    };
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.notify_lan_network_changed(&interface_addresses);
+        return 1;
+    }
+    0
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_notifySyncLanNetworkLost(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jboolean {
+    let Some(app) = APP_HANDLE.get() else {
+        return 0;
+    };
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.notify_lan_network_lost();
+        return 1;
+    }
+    0
 }
 
 #[cfg(target_os = "android")]

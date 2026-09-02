@@ -1,16 +1,9 @@
-import {
-  animate,
-  motion,
-  type PanInfo,
-  useDragControls,
-  useMotionValue,
-} from "motion/react";
-import type { FC, MouseEvent, PointerEvent, ReactNode } from "react";
+import { animate, motion, type PanInfo, useMotionValue } from "motion/react";
+import type { FC, MouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { resolveCategoryPagerIndex } from "./MobileCategoryPager.logic";
 
 const CATEGORY_EDGE_ELASTIC = 0.12;
-const CATEGORY_DRAG_START_DISTANCE = 6;
 
 interface MobileCategoryPagerProps {
   index: number;
@@ -34,7 +27,6 @@ const MobileCategoryPager: FC<MobileCategoryPagerProps> = (props) => {
   const suppressClickRef = useRef(false);
   const clearClickSuppressionRef = useRef(0);
   const animationRef = useRef<ReturnType<typeof animate> | null>(null);
-  const dragControls = useDragControls();
   const x = useMotionValue(0);
 
   const snapToIndex = useCallback(
@@ -151,20 +143,10 @@ const MobileCategoryPager: FC<MobileCategoryPagerProps> = (props) => {
     event.stopPropagation();
   };
 
-  const handlePointerDownCapture = (event: PointerEvent<HTMLDivElement>) => {
-    if (!event.isPrimary || event.button !== 0) return;
-
-    dragControls.start(event, {
-      distanceThreshold: CATEGORY_DRAG_START_DISTANCE,
-      snapToCursor: false,
-    });
-  };
-
   return (
     <div
-      className="relative min-h-0 w-full flex-1 touch-pan-y overflow-hidden"
+      className="mobile-category-pager relative min-h-0 w-full flex-1 overflow-hidden"
       onClickCapture={handleClickCapture}
-      onPointerDownCapture={handlePointerDownCapture}
       ref={viewportRef}
     >
       <motion.div
@@ -174,10 +156,8 @@ const MobileCategoryPager: FC<MobileCategoryPagerProps> = (props) => {
           left: -viewportWidth * (pageCount - 1),
           right: 0,
         }}
-        dragControls={dragControls}
         dragDirectionLock
         dragElastic={CATEGORY_EDGE_ELASTIC}
-        dragListener={false}
         dragMomentum={false}
         onDragEnd={handleDragEnd}
         onDragStart={handleDragStart}

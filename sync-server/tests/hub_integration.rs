@@ -17,15 +17,30 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let service = HubService::new(repository, directory.path().join("blobs"), 1024 * 1024);
     let server = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
         .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))?
         .bind()
         .await?;
+    assert!(
+        server
+            .bound_sockets()
+            .iter()
+            .all(|address| address.is_ipv4())
+    );
     let server_address = server.addr();
     let router = Router::builder(server).accept(ALPN, service).spawn();
     let client = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))?
         .bind()
         .await?;
+    assert!(
+        client
+            .bound_sockets()
+            .iter()
+            .all(|address| address.is_ipv4())
+    );
     let client_endpoint_id = client.id().to_string();
     let connection = client.connect(server_address, ALPN).await?;
 

@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
 
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
+        .clear_ip_transports()
         .bind_addr(config.bind)
         .context("configure Iroh UDP bind address")?;
     if config.no_relay {
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
         let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
     }
     let address = endpoint.addr();
-    info!(endpoint_id = %endpoint.id(), bind = %config.bind, "EcoPaste sync hub ready");
+    info!(endpoint_id = %endpoint.id(), bind = %config.bind, ipv4_only = true, "EcoPaste sync hub ready");
     println!("ECOPASTE_SERVER_ENDPOINT_ID={}", endpoint.id());
     for direct in address.ip_addrs() {
         println!("ECOPASTE_SERVER_DIRECT_ADDRESS={direct}");
