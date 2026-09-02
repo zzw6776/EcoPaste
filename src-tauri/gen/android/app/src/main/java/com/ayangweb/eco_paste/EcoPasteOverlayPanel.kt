@@ -1,5 +1,6 @@
 package com.ayangweb.eco_paste
 
+import android.app.Dialog
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
@@ -143,6 +144,7 @@ class EcoPasteOverlayPanel(
     private var reconnectInProgress = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var panelDialog: Dialog? = null
     private var panelView: View? = null
     private var outsideView: View? = null
     private var activeSessionId: Long? = null
@@ -204,12 +206,12 @@ class EcoPasteOverlayPanel(
         val panelHeight = (bounds.height() * initialHeightPercent / 100f).toInt()
         val outsideHeight = (bounds.height() - panelHeight).coerceAtLeast(1)
         val sessionId = ++nextSessionId
+        val crossWindowBlurEnabled = isCrossWindowBlurEnabled()
         val root = GestureDismissFrameLayout(context, sessionId, outsideOnly = false)
         val outside = GestureDismissFrameLayout(context, sessionId, outsideOnly = true)
         val content = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, 0, 0, dp(8))
-            background = panelBackground()
             elevation = dp(18).toFloat()
         }
         root.addView(
@@ -363,12 +365,12 @@ class EcoPasteOverlayPanel(
         ))
 
         var outsideAdded = false
-        var panelAdded = false
+        var createdDialog: Dialog? = null
         try {
             windowManager.addView(outside, createLayoutParams(outsideHeight, Gravity.TOP))
             outsideAdded = true
-            windowManager.addView(root, createLayoutParams(panelHeight, Gravity.BOTTOM))
-            panelAdded = true
+            createdDialog = createPanelDialog(root, panelHeight, crossWindowBlurEnabled)
+            panelDialog = createdDialog
             panelView = root
             outsideView = outside
             activeSessionId = sessionId
@@ -380,7 +382,7 @@ class EcoPasteOverlayPanel(
             installSystemGestureExclusion(root, preserveBottomSystemArea = true)
         } catch (error: Exception) {
             Log.e(TAG, "show overlay panel failed: ${error.message}", error)
-            if (panelAdded) removeViewImmediately(root)
+            createdDialog?.dismiss()
             if (outsideAdded) removeViewImmediately(outside)
             clearPanelState()
             return
@@ -427,13 +429,14 @@ class EcoPasteOverlayPanel(
     private fun removeCurrentPanel(expectedSessionId: Long? = null) {
         if (expectedSessionId != null && activeSessionId != expectedSessionId) return
         loadGeneration += 1
+        val currentDialog = panelDialog
         val currentPanel = panelView
         val currentOutside = outsideView
-        if (currentPanel == null && currentOutside == null) return
+        if (currentDialog == null && currentPanel == null && currentOutside == null) return
         hideKeyboard()
         clearPanelState()
         onSessionChanged(null)
-        currentPanel?.let { removeViewImmediately(it) }
+        currentDialog?.dismiss()
         currentOutside?.let { removeViewImmediately(it) }
     }
 
@@ -458,6 +461,7 @@ class EcoPasteOverlayPanel(
         searchMode = false
         EcoPasteBridge.setSyncStatusChangedListener(null)
         EcoPasteBridge.setClipboardDataChangedListener(null)
+        panelDialog = null
         panelView = null
         outsideView = null
         activeSessionId = null
@@ -1333,7 +1337,7 @@ class EcoPasteOverlayPanel(
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         startRawY = event.rawY
-                        startHeight = panelView?.layoutParams?.height
+                        startHeight = panelDialog?.window?.attributes?.height
                             ?: (displayHeight * initialHeightPercent / 100f).toInt()
                         view.parent?.requestDisallowInterceptTouchEvent(true)
                     }
@@ -1344,7 +1348,7 @@ class EcoPasteOverlayPanel(
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         view.parent?.requestDisallowInterceptTouchEvent(false)
                         if (event.actionMasked == MotionEvent.ACTION_UP) {
-                            val currentHeight = panelView?.layoutParams?.height ?: startHeight
+                            val currentHeight = panelDialog?.window?.attributes?.height ?: startHeight
                             val nextPercent = (currentHeight * 100f / displayHeight)
                                 .roundToInt()
                                 .coerceIn(30, 90)
@@ -1372,6 +1376,7 @@ class EcoPasteOverlayPanel(
     /** 同步更新上下两个覆盖窗口，避免调整过程中出现不可点击的空隙。 */
     private fun resizePanel(requestedHeight: Int, displayHeight: Int) {
         val panel = panelView ?: return
+        val panelWindow = panelDialog?.window ?: return
         val outside = outsideView ?: return
         val minHeight = (displayHeight * 0.3f).roundToInt()
         val maxHeight = (displayHeight * 0.9f).roundToInt()
@@ -1383,9 +1388,9 @@ class EcoPasteOverlayPanel(
             outsideParams.height = outsideHeight
             windowManager.updateViewLayout(outside, outsideParams)
 
-            val panelParams = panel.layoutParams as WindowManager.LayoutParams
+            val panelParams = panelWindow.attributes
             panelParams.height = panelHeight
-            windowManager.updateViewLayout(panel, panelParams)
+            panelWindow.attributes = panelParams
             installSystemGestureExclusion(outside, preserveBottomSystemArea = false)
             installSystemGestureExclusion(panel, preserveBottomSystemArea = true)
         } catch (error: Exception) {
@@ -1538,17 +1543,22 @@ class EcoPasteOverlayPanel(
         if (searchMode) return
         closeSyncDetails()
         val current = panelView ?: return
-        val params = current.layoutParams as? WindowManager.LayoutParams ?: return
+        val currentWindow = panelDialog?.window ?: return
         searchMode = true
         input.isFocusable = true
         input.isFocusableInTouchMode = true
         input.isCursorVisible = true
         mainHandler.post {
-            if (!searchMode || panelView !== current) return@post
+            if (
+                !searchMode ||
+                panelView !== current ||
+                panelDialog?.window !== currentWindow
+            ) return@post
+            val params = currentWindow.attributes
             params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
             params.softInputMode = searchSoftInputMode()
             try {
-                windowManager.updateViewLayout(current, params)
+                currentWindow.attributes = params
             } catch (error: Exception) {
                 searchMode = false
                 input.isFocusable = false
@@ -2080,6 +2090,58 @@ class EcoPasteOverlayPanel(
         }
     }
 
+    /** 使用独立 Window 把系统背景模糊严格限制在底部抽屉及其圆角范围内。 */
+    private fun createPanelDialog(
+        root: View,
+        height: Int,
+        crossWindowBlurEnabled: Boolean,
+    ): Dialog {
+        val dialog = Dialog(context, R.style.Theme_eco_paste_Overlay).apply {
+            setCancelable(false)
+            setContentView(root)
+        }
+        val window = requireNotNull(dialog.window) { "overlay dialog window is unavailable" }
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        window.setType(type)
+        window.setGravity(Gravity.BOTTOM)
+        window.setBackgroundDrawable(panelBackground(crossWindowBlurEnabled))
+        window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        )
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        window.attributes = window.attributes.apply {
+            width = WindowManager.LayoutParams.MATCH_PARENT
+            this.height = height
+            gravity = Gravity.BOTTOM
+            format = PixelFormat.TRANSLUCENT
+            windowAnimations = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                fitInsetsTypes = 0
+                fitInsetsSides = 0
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && crossWindowBlurEnabled) {
+            window.setBackgroundBlurRadius(dp(24))
+        }
+
+        try {
+            dialog.show()
+            window.setLayout(WindowManager.LayoutParams.MATCH_PARENT, height)
+        } catch (error: Exception) {
+            dialog.dismiss()
+            throw error
+        }
+        return dialog
+    }
+
     private fun installSystemGestureExclusion(root: View, preserveBottomSystemArea: Boolean) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         root.post {
@@ -2212,11 +2274,11 @@ class EcoPasteOverlayPanel(
         )
     }
 
-    private fun panelBackground(): GradientDrawable {
+    private fun panelBackground(crossWindowBlurEnabled: Boolean): GradientDrawable {
         val radius = dp(16).toFloat()
         return GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
-            setColor(panelColor())
+            setColor(panelColor(crossWindowBlurEnabled))
             cornerRadii = floatArrayOf(radius, radius, radius, radius, 0f, 0f, 0f, 0f)
         }
     }
@@ -2275,7 +2337,26 @@ class EcoPasteOverlayPanel(
         return mode == Configuration.UI_MODE_NIGHT_YES
     }
 
-    private fun panelColor(): Int = if (isDarkMode()) Color.rgb(18, 18, 18) else Color.rgb(242, 242, 247)
+    /** 系统模糊不可用时提高材质不透明度，避免底层内容干扰阅读。 */
+    private fun panelColor(crossWindowBlurEnabled: Boolean): Int {
+        val darkMode = isDarkMode()
+        val alpha = if (crossWindowBlurEnabled) {
+            if (darkMode) 216 else 208
+        } else {
+            248
+        }
+        return if (darkMode) {
+            Color.argb(alpha, 18, 18, 18)
+        } else {
+            Color.argb(alpha, 242, 242, 247)
+        }
+    }
+
+    private fun isCrossWindowBlurEnabled(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+
+        return runCatching { windowManager.isCrossWindowBlurEnabled }.getOrDefault(false)
+    }
 
     private fun cardColor(): Int = if (isDarkMode()) Color.rgb(38, 38, 40) else Color.WHITE
 
