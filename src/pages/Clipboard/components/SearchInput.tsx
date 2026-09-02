@@ -6,6 +6,7 @@ import {
   confirmClipboardSearchHandoff,
   prepareClipboardSearchHandoff,
 } from "@/commands";
+import { EDITABLE_GLOBAL_KEYBOARD_PROPS } from "@/constants/keyboard";
 import {
   SEARCH_HANDOFF_EDITABLE_ATTRIBUTE,
   SEARCH_HANDOFF_EDITING_EVENT,
@@ -116,7 +117,7 @@ const SearchInput: FC<SearchInputProps> = (props) => {
     <Input
       autoCapitalize="off"
       autoCorrect="off"
-      data-allow-global-keyboard="true"
+      {...EDITABLE_GLOBAL_KEYBOARD_PROPS}
       key={clearToken}
       onChange={handleChange}
       prefix={<i className="i-lucide:search size-3.5 text-neutral-400" />}

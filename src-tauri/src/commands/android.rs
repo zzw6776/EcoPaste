@@ -216,9 +216,11 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                         "路径"
                     }
                     (ClipboardKind::Text, Some(crate::db::models::ClipboardSubKind::Html)) => {
-                        "HTML"
+                        "富文本"
                     }
-                    (ClipboardKind::Text, Some(crate::db::models::ClipboardSubKind::Rtf)) => "RTF",
+                    (ClipboardKind::Text, Some(crate::db::models::ClipboardSubKind::Rtf)) => {
+                        "富文本"
+                    }
                     (ClipboardKind::Text, None) => "文本",
                 };
                 let preview = if redact_sensitive && item.is_sensitive {

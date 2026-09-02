@@ -13,7 +13,7 @@ import AssetImage from "@/components/AssetImage";
 import VirtuosoScroller, {
   type VirtuosoScrollerChildrenProps,
 } from "@/components/VirtuosoScroller";
-import { getAppTheme, parseUrlInfo } from "@/utils/appIcons";
+import { parseUrlInfo } from "@/utils/appIcons";
 import { cn } from "@/utils/cn";
 import { PREVIEW_TEXT_SOFT_WRAP_CHARS } from "../constants";
 
@@ -59,14 +59,6 @@ export const PreviewHeader: FC<PreviewHeaderProps> = (props) => {
     );
   }
 
-  const theme = getAppTheme(
-    payload.sourceAppName ?? void 0,
-    void 0,
-    payload.kind,
-    payload.subKind,
-    payload.text,
-  );
-
   const handleClose = () => {
     void closeClipboardPreview();
   };
@@ -90,7 +82,7 @@ export const PreviewHeader: FC<PreviewHeaderProps> = (props) => {
           <i className="i-lucide:x size-2.5 stroke-[2.5]" />
         </button>
         <span className="font-bold text-[13.5px] text-neutral-800 dark:text-neutral-100">
-          {theme.tag}
+          {t(`clipboard:types.${payload.subKind ?? payload.kind}`)}
         </span>
       </div>
 

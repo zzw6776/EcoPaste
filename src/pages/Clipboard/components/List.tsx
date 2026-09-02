@@ -37,7 +37,10 @@ import {
 } from "@/constants/windowOpenSelection";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useClipboardItems } from "@/hooks/useClipboardItems";
-import { useKeyboardEvent } from "@/hooks/useKeyboardEvent";
+import {
+  allowsEditableGlobalKeyboard,
+  useKeyboardEvent,
+} from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { clipboardStatsState } from "@/stores/clipboardStats";
 import { clipboardViewState } from "@/stores/clipboardView";
@@ -690,13 +693,20 @@ const List: FC<ListProps> = (props) => {
       (target.tagName === "INPUT" ||
         target.tagName === "TEXTAREA" ||
         target.isContentEditable);
+    // macOS WebView 的输入法确认事件可能只通过遗留 keyCode=229 标记组合态。
+    const shouldPasteFromSearch =
+      isInputActive &&
+      event.key === "Enter" &&
+      !event.isComposing &&
+      event.keyCode !== 229 &&
+      allowsEditableGlobalKeyboard(target);
 
     if (isInputActive) {
       if (event.key === "Escape") {
         event.preventDefault();
         closeTopEscapeLayer();
       }
-      return;
+      if (!shouldPasteFromSearch) return;
     }
 
     const eventModifierPressed = isMac ? event.metaKey : event.ctrlKey;

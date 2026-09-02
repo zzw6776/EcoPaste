@@ -206,6 +206,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   const isUrlCard = subKind === "url";
   const urlText = isUrlCard ? item.content || summary : summary;
   const urlInfo = isUrlCard ? parseUrlInfo(urlText) : null;
+  const typeLabel = t(`types.${subKind ?? kind}`);
   const fileCollectionMeta =
     kind === "files"
       ? getFileCollectionMeta(item.content, item.fileTypes)
@@ -275,7 +276,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         <div className="flex min-w-0 flex-col justify-center pr-2">
           <div className="flex items-center gap-1">
             <span className="font-bold text-[12px] text-white leading-none tracking-tight drop-shadow-2xs">
-              {theme.tag}
+              {typeLabel}
             </span>
             {item.isPinned && (
               <i
