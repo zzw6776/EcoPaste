@@ -26,6 +26,7 @@ pub use icon::{get_icon_cache_key, icon_png, DIR_CACHE_KEY};
 #[cfg(test)]
 pub use ingest::build_item;
 pub use ingest::build_item_with_settings;
+pub(crate) use ingest::calculate_files_total_size;
 pub use payload::{ClipboardPayload, ImagePayload, TextPayload};
 pub use read::ClipboardReader;
 pub use sound::play_copy_sound;

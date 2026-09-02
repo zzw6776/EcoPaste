@@ -190,7 +190,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
               onOpenChange={handleLanDetailsOpenChange}
               open={detailsTarget === "lan"}
               placement="bottomRight"
-              tooltip={lanLabel}
+              tooltip={{ mouseEnterDelay: 0.3, title: lanLabel }}
               trigger="click"
             >
               {renderStatusButton(
@@ -206,7 +206,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
               onOpenChange={handleCloudDetailsOpenChange}
               open={detailsTarget === "cloud"}
               placement="bottomRight"
-              tooltip={cloudLabel}
+              tooltip={{ mouseEnterDelay: 0.3, title: cloudLabel }}
               trigger="click"
             >
               {renderStatusButton(

@@ -1,5 +1,6 @@
 import type { DragEvent, FC, MouseEvent, PointerEvent, Ref } from "react";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { SyncItemStatus } from "@/commands";
 import { popupClipboardItemMenu, startDragClipboardItem } from "@/commands";
 import AssetImage from "@/components/AssetImage";
@@ -16,6 +17,10 @@ import { useDynamicHeaderBg } from "@/utils/dominantColor";
 import { isMobile } from "@/utils/is";
 import ClipboardQuickActions from "./ClipboardQuickActions";
 import FilesCard from "./FilesCard";
+import {
+  type FileCollectionMeta,
+  getFileCollectionMeta,
+} from "./fileCollectionMeta";
 import ImageCard from "./ImageCard";
 import NoteContentSwitcher from "./NoteContentSwitcher";
 import SyncItemIndicators from "./SyncItemIndicators";
@@ -101,6 +106,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     size,
     summary,
   } = item;
+  const { t } = useTranslation("clipboard");
   const [hovered, setHovered] = useState(false);
   const [footerHovered, setFooterHovered] = useState(false);
 
@@ -200,15 +206,27 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   const isUrlCard = subKind === "url";
   const urlText = isUrlCard ? item.content || summary : summary;
   const urlInfo = isUrlCard ? parseUrlInfo(urlText) : null;
+  const fileCollectionMeta =
+    kind === "files"
+      ? getFileCollectionMeta(item.content, item.fileTypes)
+      : null;
 
   // 底部元信息
-  const metaText = isImageCard
+  const primaryMetaText = isImageCard
     ? width && height
       ? `${width} × ${height}`
       : "图片"
     : isUrlCard
       ? urlInfo?.host || "网页"
-      : `${summary?.length ?? size ?? 0} 个字符`;
+      : kind === "files"
+        ? t(fileCollectionMetaKey(fileCollectionMeta), {
+            count: fileCollectionMeta?.count ?? 0,
+          })
+        : `${summary?.length ?? size ?? 0} 个字符`;
+  const sizeText = formatBytes(size);
+  const metaText = sizeText
+    ? `${primaryMetaText} · ${sizeText}`
+    : primaryMetaText;
 
   const isMob = isMobile();
 
@@ -448,3 +466,31 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 };
 
 export default ClipboardCard;
+
+/** 把已有内容字节数格式化为适合卡片底栏的紧凑标签。 */
+function formatBytes(value?: number | null) {
+  if (value === null || value === void 0 || value < 0) return null;
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || size >= 10 ? 0 : 1;
+
+  return `${size.toFixed(digits)} ${units[unit]}`;
+}
+
+/** 为文件集合选择兼顾中英文单复数的卡片文案。 */
+function fileCollectionMetaKey(meta: FileCollectionMeta | null) {
+  if (!meta || meta.kind === "items") {
+    return meta?.count === 1 ? "cardMeta.item" : "cardMeta.items";
+  }
+  if (meta.kind === "folders") {
+    return meta.count === 1 ? "cardMeta.folder" : "cardMeta.folders";
+  }
+
+  return meta.count === 1 ? "cardMeta.file" : "cardMeta.files";
+}

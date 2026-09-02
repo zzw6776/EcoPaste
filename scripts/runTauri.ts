@@ -1,9 +1,15 @@
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, resolve } from "node:path";
+import { normalizeAndroidManifestFile } from "./androidManifest";
 import { cleanDesktopCacheIfNeeded } from "./buildCache";
 
 const projectRoot = resolve(import.meta.dirname, "..");
+const androidManifestPath = resolve(
+  projectRoot,
+  "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+);
 const pathKey =
   Object.keys(process.env).find((key) => {
     return key.toLowerCase() === "path";
@@ -47,6 +53,21 @@ const result = spawnSync("tauri", tauriArgs, {
   shell: process.platform === "win32",
   stdio: "inherit",
 });
+
+if (tauriArgs[0] === "android" && existsSync(androidManifestPath)) {
+  try {
+    if (normalizeAndroidManifestFile(androidManifestPath)) {
+      process.stdout.write(
+        "Normalized generated Android Manifest whitespace.\n",
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `Failed to normalize generated Android Manifest whitespace: ${message}\n`,
+    );
+  }
+}
 
 if (result.error) {
   throw result.error;

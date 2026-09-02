@@ -42,7 +42,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    clipboard::{fallback_accent_colors, AppIconStore, ImageStore, WritebackGuard},
+    clipboard::{
+        calculate_files_total_size, fallback_accent_colors, AppIconStore, ImageStore,
+        WritebackGuard,
+    },
     db::{
         self,
         models::{ClipboardApp, ClipboardItem, ClipboardKind, ClipboardSubKind, Platform},
@@ -91,6 +94,12 @@ const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
+
+/// 自动文件同步只看整张卡片的原始总大小；0 明确表示全部手动。
+fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
+    limit_mb > 0 && total_size <= u64::from(limit_mb) * 1024 * 1024
+}
+
 const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
@@ -1403,11 +1412,38 @@ impl SyncManager {
         {
             Some(value) => value,
             None => {
-                repository::mark_pending_item(&pool, &item.id, "文件超过自动同步阈值").await?;
+                repository::mark_pending_item(&pool, &item.id, "文件卡片总大小超过自动同步阈值")
+                    .await?;
                 self.emit_updated();
                 return Ok(None);
             }
         };
+        if item.kind == ClipboardKind::Files {
+            if let Some(size) = envelope.item.size {
+                if item.size != Some(size)
+                    && db::items::update_file_item_size(
+                        &pool,
+                        &item.id,
+                        &item.source_revision,
+                        size,
+                    )
+                    .await?
+                {
+                    if let Err(error) = self.app.emit(
+                        crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                        serde_json::json!({
+                            "id": item.id,
+                            "kind": item.kind,
+                            "deduplicated": true,
+                        }),
+                    ) {
+                        log::warn!("emit clipboard file size update failed: {error}");
+                    }
+                    #[cfg(target_os = "android")]
+                    crate::commands::android::notify_overlay_clipboard_changed();
+                }
+            }
+        }
         let sequence = repository::next_origin_sequence(&pool).await?;
         let created_at_ms = Utc::now().timestamp_millis();
         let key = group.content_key_bytes()?;
@@ -1444,6 +1480,7 @@ impl SyncManager {
         let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
         let mut manifests = Vec::new();
         let mut stored_blobs = Vec::new();
+        let mut envelope_size = item.size;
         match item.kind {
             ClipboardKind::Text => {}
             ClipboardKind::Image => {
@@ -1476,45 +1513,65 @@ impl SyncManager {
                 if paths.is_empty() {
                     bail!("没有可同步的文件");
                 }
-                let threshold = u64::from(settings.auto_upload_max_mb) * 1024 * 1024;
-                if !force_files
-                    && paths.iter().any(|path| {
-                        path.metadata()
-                            .map(|metadata| {
-                                metadata.is_dir() || threshold == 0 || metadata.len() > threshold
-                            })
-                            .unwrap_or(true)
+                if !force_files {
+                    if settings.auto_upload_max_mb == 0 {
+                        return Ok(None);
+                    }
+                    let content = item.content.clone();
+                    let total_size = tauri::async_runtime::spawn_blocking(move || {
+                        calculate_files_total_size(&content)
                     })
-                {
-                    return Ok(None);
+                    .await
+                    .context("file size verification task failed")?;
+                    let total_size = match total_size {
+                        Ok(size) => u64::try_from(size).context("invalid clipboard file size")?,
+                        Err(error) => {
+                            log::debug!(
+                                "defer automatic file sync because size is unavailable: {error:#}"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    if !permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
+                        return Ok(None);
+                    }
                 }
+                let mut packed_total_size = 0_u64;
                 for (index, source) in paths.into_iter().enumerate() {
                     let name = safe_file_name(&source);
                     let source_for_task = source.clone();
                     let root_for_task = blob_root.clone();
                     let key_for_task = key;
                     let is_directory = source.is_dir();
-                    let (blob, original_size) = tauri::async_runtime::spawn_blocking(move || {
-                        if is_directory {
-                            let temporary = tempfile::tempdir()?;
-                            let archive_path = temporary.path().join("directory.zip");
-                            crypto::archive_directory(&source_for_task, &archive_path)?;
-                            let size = archive_path.metadata()?.len();
-                            let blob =
-                                crypto::encrypt_blob(&archive_path, &root_for_task, &key_for_task)?;
-                            Ok::<_, anyhow::Error>((blob, size))
-                        } else {
-                            let size = source_for_task.metadata()?.len();
-                            let blob = crypto::encrypt_blob(
-                                &source_for_task,
-                                &root_for_task,
-                                &key_for_task,
-                            )?;
-                            Ok((blob, size))
-                        }
-                    })
-                    .await
-                    .context("file encryption task failed")??;
+                    let (blob, original_size, content_size) =
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if is_directory {
+                                let temporary = tempfile::tempdir()?;
+                                let archive_path = temporary.path().join("directory.zip");
+                                let content_size =
+                                    crypto::archive_directory(&source_for_task, &archive_path)?;
+                                let archive_size = archive_path.metadata()?.len();
+                                let blob = crypto::encrypt_blob(
+                                    &archive_path,
+                                    &root_for_task,
+                                    &key_for_task,
+                                )?;
+                                Ok::<_, anyhow::Error>((blob, archive_size, content_size))
+                            } else {
+                                let size = source_for_task.metadata()?.len();
+                                let blob = crypto::encrypt_blob(
+                                    &source_for_task,
+                                    &root_for_task,
+                                    &key_for_task,
+                                )?;
+                                Ok((blob, size, size))
+                            }
+                        })
+                        .await
+                        .context("file encryption task failed")??;
+                    packed_total_size = packed_total_size
+                        .checked_add(content_size)
+                        .context("clipboard file size overflow")?;
                     manifests.push(BlobManifest {
                         blob_id: blob.blob_id.clone(),
                         name,
@@ -1526,6 +1583,18 @@ impl SyncManager {
                     });
                     stored_blobs.push(blob);
                 }
+                if !force_files
+                    && !permits_automatic_file_upload(
+                        packed_total_size,
+                        settings.auto_upload_max_mb,
+                    )
+                {
+                    return Ok(None);
+                }
+                envelope_size = Some(
+                    i64::try_from(packed_total_size)
+                        .context("clipboard file size exceeds supported range")?,
+                );
             }
         }
         let source_app = self
@@ -1541,7 +1610,7 @@ impl SyncManager {
                     search_text: item.search_text.clone(),
                     summary: item.summary.clone(),
                     file_types: item.file_types.clone(),
-                    size: item.size,
+                    size: envelope_size,
                     width: item.width,
                     height: item.height,
                     is_sensitive: item.is_sensitive,
@@ -6286,6 +6355,13 @@ fn parse_platform(value: &str) -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_file_upload_uses_the_whole_card_size() {
+        assert!(permits_automatic_file_upload(10 * 1024 * 1024, 10));
+        assert!(!permits_automatic_file_upload(10 * 1024 * 1024 + 1, 10));
+        assert!(!permits_automatic_file_upload(1, 0));
+    }
 
     #[test]
     fn lan_multicast_uses_all_private_ipv4_interfaces() {

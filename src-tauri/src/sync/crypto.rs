@@ -342,10 +342,12 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn archive_directory(source: &Path, destination: &Path) -> Result<()> {
+/// 把目录压缩为 ZIP，并返回其中实际写入的普通文件原始字节总数。
+pub fn archive_directory(source: &Path, destination: &Path) -> Result<u64> {
     let output = File::create(destination)?;
     let mut archive = ZipWriter::new(BufWriter::new(output));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut original_size = 0_u64;
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry?;
         let path = entry.path();
@@ -362,11 +364,13 @@ pub fn archive_directory(source: &Path, destination: &Path) -> Result<()> {
         } else if entry.file_type().is_file() {
             archive.start_file(name, options)?;
             let mut input = File::open(path)?;
-            std::io::copy(&mut input, &mut archive)?;
+            original_size = original_size
+                .checked_add(std::io::copy(&mut input, &mut archive)?)
+                .context("directory content size overflow")?;
         }
     }
     archive.finish()?;
-    Ok(())
+    Ok(original_size)
 }
 
 pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Result<()> {
@@ -395,6 +399,21 @@ pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_archive_reports_original_file_total() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let nested = source.join("nested");
+        let archive = temporary.path().join("directory.zip");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("first.txt"), b"abc").unwrap();
+        std::fs::write(nested.join("second.txt"), b"12345").unwrap();
+
+        let original_size = archive_directory(&source, &archive).unwrap();
+
+        assert_eq!(original_size, 8);
+    }
 
     #[test]
     fn blob_stream_round_trip_covers_chunk_boundary() {

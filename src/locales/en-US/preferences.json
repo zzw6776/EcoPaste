@@ -597,8 +597,8 @@
       },
       "sync": {
         "autoUploadMaxMb": {
-          "description": "Files up to this size are encrypted and uploaded automatically. Set 0 to require manual upload for every file. Folders are always manual.",
-          "title": "Automatic File Upload Limit"
+          "description": "Automatically encrypt and upload a file card when its total original size is within this limit. Folders include all nested files. Set 0 for manual upload only.",
+          "title": "Automatic Sync Size Limit"
         },
         "autoWriteClipboard": {
           "description": "When disabled, remote items enter history without replacing the current system clipboard.",

@@ -1,4 +1,12 @@
 {
+  "cardMeta": {
+    "file": "{{count}} file",
+    "files": "{{count}} files",
+    "folder": "{{count}} folder",
+    "folders": "{{count}} folders",
+    "item": "{{count}} item",
+    "items": "{{count}} items"
+  },
   "empty": {
     "categories": {
       "files": "file",

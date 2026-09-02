@@ -75,6 +75,7 @@ class EcoPasteOverlayPanel(
         val tag: String,
         val preview: String,
         val detail: String,
+        val size: Long?,
         val imagePath: String,
         val sourceAppName: String,
         val sourceAppIconPath: String,
@@ -1660,6 +1661,7 @@ class EcoPasteOverlayPanel(
                         tag = item.optString("tag", "文本"),
                         preview = item.optString("preview"),
                         detail = item.optString("detail"),
+                        size = item.optLong("size", -1L).takeIf { size -> size >= 0L },
                         imagePath = item.optString("imagePath"),
                         sourceAppName = item.optString("sourceAppName", "EcoPaste"),
                         sourceAppIconPath = item.optString("sourceAppIconPath"),
@@ -1911,7 +1913,10 @@ class EcoPasteOverlayPanel(
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(12), 0, dp(12), dp(2))
             addView(TextView(context).apply {
-                text = item.detail
+                text = buildString {
+                    append(item.detail)
+                    item.size?.let { size -> append(" · ${formatBytes(size)}") }
+                }
                 textSize = 11f
                 maxLines = 1
                 setTextColor(tertiaryTextColor())

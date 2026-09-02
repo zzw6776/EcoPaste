@@ -1,7 +1,7 @@
 import { STORAGE_ERROR_BYTES, STORAGE_WARNING_BYTES } from "../constants";
 
-interface StorageToneClass {
-  bg: string;
+interface StorageTone {
+  stroke: string;
   text: string;
 }
 
@@ -24,14 +24,14 @@ export function formatBytes(bytes: number) {
 }
 
 /**
- * 用离散宽度表达本地数据总量所在档位，避免 inline style。
+ * 返回当前总量相对展示目标的实际百分比。
  */
-export function storageMeterClass(totalBytes: number) {
-  if (totalBytes <= 0) return "w-1/5";
-  if (totalBytes >= STORAGE_ERROR_BYTES) return "w-full";
-  if (totalBytes >= STORAGE_WARNING_BYTES) return "w-3/5";
+export function storageMeterPercent(totalBytes: number) {
+  if (totalBytes <= 0) return 0;
 
-  return "w-1/5";
+  const targetBytes = storageTargetBytes(totalBytes);
+
+  return Math.min((totalBytes / targetBytes) * 100, 100);
 }
 
 /**
@@ -46,14 +46,23 @@ export function storageTargetBytes(totalBytes: number) {
 /**
  * 按本地数据总量返回状态色：低占用绿色、中等黄色、高占用红色。
  */
-export function storageToneClass(totalBytes: number): StorageToneClass {
+export function storageTone(totalBytes: number): StorageTone {
   if (totalBytes >= STORAGE_ERROR_BYTES) {
-    return { bg: "bg-ant-error", text: "text-ant-error" };
+    return {
+      stroke: "var(--ant-color-error)",
+      text: "text-ant-error",
+    };
   }
 
   if (totalBytes >= STORAGE_WARNING_BYTES) {
-    return { bg: "bg-ant-warning", text: "text-ant-warning" };
+    return {
+      stroke: "var(--ant-color-warning)",
+      text: "text-ant-warning",
+    };
   }
 
-  return { bg: "bg-ant-success", text: "text-ant-success" };
+  return {
+    stroke: "var(--ant-color-success)",
+    text: "text-ant-success",
+  };
 }

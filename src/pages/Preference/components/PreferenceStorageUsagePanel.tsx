@@ -1,3 +1,4 @@
+import { Progress } from "antd";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
 import type { StorageUsage } from "@/commands";
@@ -5,9 +6,9 @@ import { cn } from "@/utils/cn";
 import type { PreferenceStorageState } from "../types/preferences";
 import {
   formatBytes,
-  storageMeterClass,
+  storageMeterPercent,
   storageTargetBytes,
-  storageToneClass,
+  storageTone,
 } from "../utils/storageUsage";
 
 interface PreferenceStorageUsagePanelProps {
@@ -32,12 +33,17 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
     state === "loading"
       ? t("storage.loading")
       : t("storage.usage", { target: targetLabel, total: totalLabel });
-  const meterClassName = isReady
-    ? storageMeterClass(storageUsage.totalBytes)
-    : "w-1/5";
-  const storageToneClassName = isReady
-    ? storageToneClass(storageUsage.totalBytes)
-    : { bg: "bg-ant-success", text: "text-ant-success" };
+  const meterPercent = isReady
+    ? storageMeterPercent(storageUsage.totalBytes)
+    : 20;
+  const storageToneValue = isReady
+    ? storageTone(storageUsage.totalBytes)
+    : {
+        stroke: "var(--ant-color-success)",
+        text: "text-ant-success",
+      };
+  const meterStrokeColor =
+    state === "error" ? "var(--ant-color-error)" : storageToneValue.stroke;
 
   return (
     <div className="px-3 pb-3">
@@ -46,7 +52,7 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
           <span
             className={cn(
               "flex size-7 shrink-0 items-center justify-center text-lg",
-              state === "error" ? "text-ant-error" : storageToneClassName.text,
+              state === "error" ? "text-ant-error" : storageToneValue.text,
             )}
           >
             <i aria-hidden="true" className="i-lucide:hard-drive" />
@@ -66,15 +72,16 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
           </div>
         </div>
 
-        <div className="mt-3 h-1 overflow-hidden rounded-full bg-ant-fill-secondary">
-          <span
-            className={cn(
-              "block h-full rounded-full transition-all motion-reduce:transition-none",
-              state === "error" ? "bg-ant-error" : storageToneClassName.bg,
-              meterClassName,
-            )}
-          />
-        </div>
+        <Progress
+          aria-label={usageLabel}
+          className="mt-3 leading-none"
+          percent={meterPercent}
+          railColor="var(--ant-color-fill-secondary)"
+          showInfo={false}
+          size={["100%", 4]}
+          status={state === "error" ? "exception" : "normal"}
+          strokeColor={meterStrokeColor}
+        />
       </div>
     </div>
   );

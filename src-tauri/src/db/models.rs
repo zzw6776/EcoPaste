@@ -56,6 +56,7 @@ pub struct ClipboardItem {
     /// Files 类型专用：紧凑格式记录每个路径的类型，如 "d,f,f" 表示 [dir, file, file]。
     /// d=directory, f=file。用于删除文件后仍能准确显示 icon。
     pub file_types: Option<String>,
+    /// 内容的原始字节数；Files 为全部顶层文件及目录内部普通文件的合计，不含压缩开销。
     pub size: Option<i64>,
     pub width: Option<i64>,
     pub height: Option<i64>,

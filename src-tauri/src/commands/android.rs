@@ -118,6 +118,7 @@ struct AndroidOverlayClipboardItem {
     tag: &'static str,
     preview: String,
     detail: String,
+    size: Option<i64>,
     image_path: Option<String>,
     source_app_name: String,
     source_app_icon_path: Option<String>,
@@ -127,6 +128,29 @@ struct AndroidOverlayClipboardItem {
     is_favorite: bool,
     is_pinned: bool,
     sync: crate::sync::SyncItemStatus,
+}
+
+/// Android 上滑卡片使用完整的顶层类型序列区分文件、文件夹和混合项目。
+#[cfg(any(target_os = "android", test))]
+fn android_files_detail(content: &str, file_types: Option<&str>) -> String {
+    let count = content.lines().filter(|line| !line.is_empty()).count();
+    let types = file_types
+        .map(|value| value.split(',').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let has_complete_types = count > 0
+        && types.len() == count
+        && types
+            .iter()
+            .all(|file_type| matches!(*file_type, "d" | "f"));
+    let unit = if has_complete_types && types.iter().all(|file_type| *file_type == "d") {
+        "个文件夹"
+    } else if has_complete_types && types.iter().all(|file_type| *file_type == "f") {
+        "个文件"
+    } else {
+        "个项目"
+    };
+
+    format!("{count} {unit}")
 }
 
 #[cfg(target_os = "android")]
@@ -215,7 +239,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                             let count =
                                 item.content.lines().filter(|line| !line.is_empty()).count();
                             if count > 1 {
-                                format!("{count} 个文件")
+                                android_files_detail(&item.content, item.file_types.as_deref())
                             } else {
                                 item.content
                                     .lines()
@@ -247,8 +271,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                         _ => "图片".to_owned(),
                     },
                     ClipboardKind::Files => {
-                        let count = item.content.lines().filter(|line| !line.is_empty()).count();
-                        format!("{count} 个文件")
+                        android_files_detail(&item.content, item.file_types.as_deref())
                     }
                     ClipboardKind::Text => format!("{} 个字符", preview.chars().count()),
                 };
@@ -266,6 +289,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     tag,
                     preview,
                     detail,
+                    size: item.size,
                     image_path,
                     source_app_name,
                     source_app_icon_path,
@@ -1344,7 +1368,24 @@ pub fn perform_android_auto_paste() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::PendingAutomaticDeviceName;
+    use super::{android_files_detail, PendingAutomaticDeviceName};
+
+    #[test]
+    fn android_file_detail_distinguishes_top_level_entry_types() {
+        assert_eq!(
+            android_files_detail("/a.txt\n/b.txt\n/c.txt", Some("f,f,f")),
+            "3 个文件"
+        );
+        assert_eq!(android_files_detail("/a\n/b", Some("d,d")), "2 个文件夹");
+        assert_eq!(android_files_detail("/a\n/b.txt", Some("d,f")), "2 个项目");
+        assert_eq!(android_files_detail("/a", Some("d")), "1 个文件夹");
+    }
+
+    #[test]
+    fn android_file_detail_treats_incomplete_metadata_as_items() {
+        assert_eq!(android_files_detail("/a\n/b", None), "2 个项目");
+        assert_eq!(android_files_detail("/a\n/b", Some("f")), "2 个项目");
+    }
 
     #[test]
     fn pending_device_name_waits_until_consumed() {

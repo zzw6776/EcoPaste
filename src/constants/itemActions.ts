@@ -87,7 +87,7 @@ export const ITEM_ACTION_META: Record<ItemAction, ItemActionMeta> = {
   },
   pinItem: {
     activeLabelKey: "quickActions.pinItemActive",
-    icon: "i-ph:push-pin-bold -rotate-45",
+    icon: "i-lucide:pin",
     labelKey: "quickActions.pinItem",
   },
   reveal: {

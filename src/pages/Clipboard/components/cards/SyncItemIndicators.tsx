@@ -7,6 +7,7 @@ import {
   type SyncTarget,
   syncItemNow,
 } from "@/commands";
+import Tooltip from "@/components/Tooltip";
 import { cn } from "@/utils/cn";
 import { getMessageApi } from "@/utils/feedback";
 
@@ -104,23 +105,30 @@ const ChannelButton: FC<ChannelButtonProps> = (props) => {
       });
 
   return (
-    <button
-      aria-label={title}
-      className={cn(
-        "flex size-5 items-center justify-center rounded-1.5 border-0 bg-transparent transition-colors",
-        channelClassName(state),
-        actionable && "cursor-pointer hover:bg-ant-fill-tertiary",
-      )}
-      disabled={!actionable}
-      onClick={onClick}
-      onMouseDown={onMouseDown}
-      title={title}
-      type="button"
-    >
-      <i
-        className={cn("size-3.5", icon, state === "syncing" && "animate-pulse")}
-      />
-    </button>
+    <Tooltip mouseEnterDelay={0.3} title={title}>
+      <span className="inline-flex size-5">
+        <button
+          aria-label={title}
+          className={cn(
+            "flex size-full items-center justify-center rounded-1.5 border-0 bg-transparent transition-colors",
+            channelClassName(state),
+            actionable && "cursor-pointer hover:bg-ant-fill-tertiary",
+          )}
+          disabled={!actionable}
+          onClick={onClick}
+          onMouseDown={onMouseDown}
+          type="button"
+        >
+          <i
+            className={cn(
+              "size-3.5",
+              icon,
+              state === "syncing" && "animate-pulse",
+            )}
+          />
+        </button>
+      </span>
+    </Tooltip>
   );
 };
 
