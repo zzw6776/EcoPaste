@@ -200,10 +200,10 @@
     "color": "Color",
     "email": "Email",
     "files": "Files",
-    "html": "HTML",
+    "html": "Rich Text",
     "image": "Image",
     "path": "Path",
-    "rtf": "RTF",
+    "rtf": "Rich Text",
     "text": "Text",
     "url": "Link"
   }

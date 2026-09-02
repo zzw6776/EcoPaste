@@ -1,12 +1,11 @@
 import { useEventListener, useLatest } from "ahooks";
 import { TAURI_EVENT } from "@/constants/events";
+import { EDITABLE_GLOBAL_KEYBOARD_SELECTOR } from "@/constants/keyboard";
 import { isWinClipboardWindow } from "@/utils/is";
 import { useTauriListen } from "./useTauriListen";
 
 type KeyboardEventType = "keydown" | "keyup";
 
-const EDITABLE_GLOBAL_KEYBOARD_ATTRIBUTE = "data-allow-global-keyboard";
-const EDITABLE_GLOBAL_KEYBOARD_SELECTOR = `[${EDITABLE_GLOBAL_KEYBOARD_ATTRIBUTE}="true"]`;
 const EDITABLE_GLOBAL_HANDOFF_KEYS = new Set([
   "ArrowDown",
   "ArrowLeft",
@@ -67,6 +66,13 @@ export const useKeyboardEvent = (
     );
   });
 };
+
+/** 判断当前输入控件是否显式允许列表处理指定的全局按键。 */
+export function allowsEditableGlobalKeyboard(target: EventTarget | null) {
+  return Boolean(
+    findEditableElement(target)?.closest(EDITABLE_GLOBAL_KEYBOARD_SELECTOR),
+  );
+}
 
 function findEditableElement(target: EventTarget | null): HTMLElement | null {
   if (!(target instanceof Element)) return null;

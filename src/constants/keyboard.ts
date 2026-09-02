@@ -1,0 +1,5 @@
+export const EDITABLE_GLOBAL_KEYBOARD_ATTRIBUTE = "data-allow-global-keyboard";
+export const EDITABLE_GLOBAL_KEYBOARD_SELECTOR = `[${EDITABLE_GLOBAL_KEYBOARD_ATTRIBUTE}="true"]`;
+export const EDITABLE_GLOBAL_KEYBOARD_PROPS = {
+  [EDITABLE_GLOBAL_KEYBOARD_ATTRIBUTE]: "true",
+} as const;

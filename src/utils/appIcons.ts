@@ -100,21 +100,6 @@ export function getAppTheme(
   subKind?: string | null,
   contentSummary?: string | null,
 ) {
-  const tag =
-    kind === "image"
-      ? "图片"
-      : kind === "files"
-        ? "文件"
-        : subKind === "url"
-          ? "链接"
-          : subKind === "color"
-            ? "颜色"
-            : subKind === "html"
-              ? "HTML"
-              : subKind === "rtf"
-                ? "RTF"
-                : "文本";
-
   const name = (appName || "").toLowerCase();
   const id = (appId || "").toLowerCase();
 
@@ -124,7 +109,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #8B5CF6 0%, #7C3AED 100%)",
       iconUrl: LOCAL_SVG_ICONS.figma,
       isPreset: true,
-      tag,
     };
   }
 
@@ -137,7 +121,6 @@ export function getAppTheme(
         "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
       iconUrl: urlInfo?.iconUrl ?? LOCAL_SVG_ICONS.link,
       isPreset: true,
-      tag,
     };
   }
 
@@ -152,7 +135,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #1C3E2F 0%, #132A20 100%)",
       iconUrl: LOCAL_SVG_ICONS.activity,
       isPreset: true,
-      tag,
     };
   }
 
@@ -162,7 +144,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
       iconUrl: LOCAL_SVG_ICONS.arc,
       isPreset: true,
-      tag,
     };
   }
 
@@ -172,7 +153,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #3B82F6 0%, #2563EB 100%)",
       iconUrl: LOCAL_SVG_ICONS.chrome,
       isPreset: true,
-      tag,
     };
   }
 
@@ -182,7 +162,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
       iconUrl: LOCAL_SVG_ICONS.chatgpt,
       isPreset: true,
-      tag,
     };
   }
 
@@ -196,7 +175,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #07C160 0%, #059A4C 100%)",
       iconUrl: LOCAL_SVG_ICONS.wechat,
       isPreset: true,
-      tag,
     };
   }
 
@@ -210,7 +188,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #1F73F1 0%, #1557BF 100%)",
       iconUrl: LOCAL_SVG_ICONS.feishu,
       isPreset: true,
-      tag,
     };
   }
 
@@ -224,7 +201,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #F59E0B 0%, #D97706 100%)",
       iconUrl: LOCAL_SVG_ICONS.notes,
       isPreset: true,
-      tag,
     };
   }
 
@@ -234,7 +210,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #A855F7 0%, #7E22CE 100%)",
       iconUrl: LOCAL_SVG_ICONS.figma,
       isPreset: true,
-      tag,
     };
   }
 
@@ -248,7 +223,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #007ACC 0%, #005A9E 100%)",
       iconUrl: LOCAL_SVG_ICONS.code,
       isPreset: true,
-      tag,
     };
   }
 
@@ -258,7 +232,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #059669 0%, #047857 100%)",
       iconUrl: LOCAL_SVG_ICONS.finder,
       isPreset: true,
-      tag,
     };
   }
 
@@ -272,7 +245,6 @@ export function getAppTheme(
       headerBg: "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
       iconUrl: LOCAL_SVG_ICONS.arc,
       isPreset: true,
-      tag,
     };
   }
 
@@ -281,6 +253,5 @@ export function getAppTheme(
     headerBg: "linear-gradient(135deg, #2B8FF7 0%, #1A80F5 100%)",
     iconUrl: LOCAL_SVG_ICONS.safari,
     isPreset: false,
-    tag,
   };
 }
