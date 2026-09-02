@@ -229,6 +229,7 @@ async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) ->
         UPDATE clipboard_items
         SET use_count = use_count + 1,
             updated_at = ?,
+            size = ?,
             source_app_id = CASE
                 WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
                 THEN ? ELSE source_app_id END,
@@ -242,6 +243,7 @@ async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) ->
         "#,
     )
     .bind(now)
+    .bind(item.size)
     .bind(item.updated_at)
     .bind(item.updated_at)
     .bind(&item.source_revision)
@@ -259,6 +261,48 @@ async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) ->
     .await
     .context("merge local clipboard reuse")?;
     Ok(())
+}
+
+/// 后台目录统计只填充仍为空且 revision 未变化的大小，避免覆盖更新后的同路径记录。
+pub async fn fill_file_item_size(
+    pool: &SqlitePool,
+    item_id: &str,
+    source_revision: &str,
+    size: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE clipboard_items SET size = ? \
+         WHERE id = ? AND kind = ? AND source_revision = ? AND size IS NULL",
+    )
+    .bind(size)
+    .bind(item_id)
+    .bind(ClipboardKind::Files)
+    .bind(source_revision)
+    .execute(pool)
+    .await
+    .context("fill clipboard file size")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// 文件真正打包时用复核后的总大小更新记录，但不改变记录排序时间。
+pub async fn update_file_item_size(
+    pool: &SqlitePool,
+    item_id: &str,
+    source_revision: &str,
+    size: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE clipboard_items SET size = ? \
+         WHERE id = ? AND kind = ? AND source_revision = ?",
+    )
+    .bind(size)
+    .bind(item_id)
+    .bind(ClipboardKind::Files)
+    .bind(source_revision)
+    .execute(pool)
+    .await
+    .context("update clipboard file size")?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// 仅返回项的轻量查询：生产路径走 [`query_items_page`]（顺带返回 total），
@@ -323,6 +367,20 @@ pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<
         .fetch_all(pool)
         .await
         .context("failed to query recent clipboard items for sync")?)
+}
+
+/// 返回尚未记录总大小的文件卡片，供升级后的后台回填使用。
+pub async fn file_items_missing_size(pool: &SqlitePool) -> Result<Vec<ClipboardItem>> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
+    qb.push(" WHERE clipboard_items.kind = ")
+        .push_bind(ClipboardKind::Files)
+        .push(" AND clipboard_items.size IS NULL ORDER BY clipboard_items.updated_at DESC");
+
+    Ok(qb
+        .build_query_as::<ClipboardItem>()
+        .fetch_all(pool)
+        .await
+        .context("query clipboard file items missing size")?)
 }
 
 /// 按 `id` 查找单条记录的「列表视图」副本——与 [`fetch_items`] 走同款 [`LIST_SELECT_ITEM`] 裁剪：
@@ -1012,6 +1070,71 @@ mod tests {
         assert_eq!(merged.source_app_id.as_deref(), Some("new-app"));
         assert_eq!(merged.source_revision, "captured");
         assert_eq!(merged.use_count, 2);
+    }
+
+    #[tokio::test]
+    async fn local_file_reuse_invalidates_then_refills_recursive_size() {
+        let pool = memory_pool().await;
+        let mut existing = sample_item("existing");
+        existing.kind = ClipboardKind::Files;
+        existing.content = "/tmp/folder".into();
+        existing.content_hash = content_hash(existing.kind, &existing.content);
+        existing.size = Some(10);
+        insert_item(&pool, &existing).await.unwrap();
+
+        let mut captured = existing.clone();
+        captured.id = "captured".into();
+        captured.source_revision = "captured".into();
+        captured.updated_at = existing.updated_at + chrono::Duration::seconds(1);
+        captured.size = None;
+        let result = upsert_item(&pool, &captured).await.unwrap();
+
+        assert!(result.deduplicated);
+        assert_eq!(
+            find_item_by_id(&pool, &existing.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            None
+        );
+        assert!(
+            !fill_file_item_size(&pool, &existing.id, "stale-revision", 20)
+                .await
+                .unwrap()
+        );
+        assert!(
+            fill_file_item_size(&pool, &existing.id, &captured.source_revision, 20)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            find_item_by_id(&pool, &existing.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            Some(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn file_size_backfill_query_only_returns_missing_file_sizes() {
+        let pool = memory_pool().await;
+        insert_item(&pool, &sample_item("text")).await.unwrap();
+        let mut missing = sample_item("missing");
+        missing.kind = ClipboardKind::Files;
+        missing.content_hash = content_hash(missing.kind, &missing.content);
+        insert_item(&pool, &missing).await.unwrap();
+        let mut complete = sample_item("complete");
+        complete.kind = ClipboardKind::Files;
+        complete.content_hash = content_hash(complete.kind, &complete.content);
+        complete.size = Some(10);
+        insert_item(&pool, &complete).await.unwrap();
+
+        let items = file_items_missing_size(&pool).await.unwrap();
+
+        assert_eq!(ids(&items), ["missing"]);
     }
 
     #[tokio::test]

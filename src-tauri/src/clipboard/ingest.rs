@@ -9,7 +9,11 @@
 //! 图片：落盘原图 + 缩略图，`content` 存文件名 `<sha256>.png`，`content_hash` 仍走
 //! [`content_hash(Image, file_name)`]，而 `file_name` 源自 PNG 字节哈希 → 去重对字节敏感。
 
+use std::path::Path;
+
+use anyhow::{Context, Result as AnyhowResult};
 use chrono::Utc;
+use walkdir::WalkDir;
 
 use super::detect::detect_text_sub_kind;
 use super::payload::{ClipboardPayload, TextPayload};
@@ -70,6 +74,70 @@ struct Draft {
 /// files 列表入库时的 `content`：换行连接的路径串（与去重哈希、FTS 检索单一来源）。
 fn files_to_content(files: &[String]) -> String {
     files.join("\n")
+}
+
+/// 读取顶层文件元数据；纯文件载荷可直接得到总大小，包含目录时交给后台递归统计。
+fn inspect_file_payload(files: &[String]) -> (String, Option<i64>) {
+    let mut total_size = Some(0_u64);
+    let file_types = files
+        .iter()
+        .map(|path| match Path::new(path).metadata() {
+            Ok(metadata) if metadata.is_dir() => {
+                total_size = None;
+                "d"
+            }
+            Ok(metadata) => {
+                total_size = total_size.and_then(|total| total.checked_add(metadata.len()));
+                "f"
+            }
+            Err(_) => {
+                total_size = None;
+                "f"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let total_size = total_size.and_then(|size| i64::try_from(size).ok());
+
+    (file_types, total_size)
+}
+
+/// 统计一张文件卡片的原始内容总大小；目录只累计其内部普通文件，不计目录节点与压缩开销。
+pub(crate) fn calculate_files_total_size(content: &str) -> AnyhowResult<i64> {
+    let mut total_size = 0_u64;
+    let mut has_path = false;
+    for value in content.lines().filter(|value| !value.is_empty()) {
+        has_path = true;
+        let path = Path::new(value);
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("failed to stat clipboard path {path:?}"))?;
+        if !metadata.is_dir() {
+            total_size = total_size
+                .checked_add(metadata.len())
+                .context("clipboard file size overflow")?;
+            continue;
+        }
+
+        for entry in WalkDir::new(path).follow_links(false) {
+            let entry = entry.with_context(|| format!("failed to walk clipboard path {path:?}"))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let size = entry
+                .metadata()
+                .with_context(|| format!("failed to stat clipboard file {:?}", entry.path()))?
+                .len();
+            total_size = total_size
+                .checked_add(size)
+                .context("clipboard file size overflow")?;
+        }
+    }
+    if !has_path {
+        anyhow::bail!("clipboard file list is empty");
+    }
+
+    i64::try_from(total_size).context("clipboard file size exceeds supported range")
 }
 
 /// 文本载荷 → 草稿。优先级来自用户配置：
@@ -223,18 +291,8 @@ pub fn build_item_with_settings(
             if content.trim().is_empty() {
                 None
             } else {
-                // 记录每个路径的类型：d=directory, f=file
-                let file_types: Vec<&str> = files
-                    .iter()
-                    .map(|p| {
-                        if std::path::Path::new(p).is_dir() {
-                            "d"
-                        } else {
-                            "f"
-                        }
-                    })
-                    .collect();
-                let file_types_str = file_types.join(",");
+                // 记录每个路径的类型：d=directory, f=file；目录大小随后在后台递归补齐。
+                let (file_types, size) = inspect_file_payload(files);
 
                 // 文件名写入 search_text 供 FTS 命中；列表名由命令层从 content 路径现算，summary 保持为空。
                 let basenames = files
@@ -254,10 +312,10 @@ pub fn build_item_with_settings(
                     content,
                     search_text: Some(basenames),
                     summary: None,
-                    file_types: Some(file_types_str),
+                    file_types: Some(file_types),
                     width: None,
                     height: None,
-                    size: None,
+                    size,
                 })
             }
         }
@@ -750,6 +808,38 @@ mod tests {
             item.content_hash,
             content_hash(ClipboardKind::Files, "/a/b.txt\n/c/d")
         );
+    }
+
+    #[test]
+    fn regular_files_store_their_combined_size_immediately() {
+        let (directory, store) = store();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        std::fs::write(&first, b"abc").unwrap();
+        std::fs::write(&second, b"12345").unwrap();
+        let payload = ClipboardPayload::Files(vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ]);
+
+        let item = build_item(&store, &payload).unwrap().unwrap();
+
+        assert_eq!(item.size, Some(8));
+        assert_eq!(item.file_types.as_deref(), Some("f,f"));
+    }
+
+    #[test]
+    fn directory_size_includes_all_nested_files() {
+        let (directory, _) = store();
+        let root = directory.path().join("folder");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("first.txt"), b"abc").unwrap();
+        std::fs::write(nested.join("second.txt"), b"12345").unwrap();
+
+        let size = calculate_files_total_size(&root.to_string_lossy()).unwrap();
+
+        assert_eq!(size, 8);
     }
 
     #[test]

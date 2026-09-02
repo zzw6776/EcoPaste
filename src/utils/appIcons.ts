@@ -109,7 +109,11 @@ export function getAppTheme(
           ? "链接"
           : subKind === "color"
             ? "颜色"
-            : "文本";
+            : subKind === "html"
+              ? "HTML"
+              : subKind === "rtf"
+                ? "RTF"
+                : "文本";
 
   const name = (appName || "").toLowerCase();
   const id = (appId || "").toLowerCase();

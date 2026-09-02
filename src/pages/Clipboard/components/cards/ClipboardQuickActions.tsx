@@ -50,7 +50,10 @@ const ClipboardQuickActions: FC<ClipboardQuickActionsProps> = (props) => {
   return (
     <div className="flex items-center justify-end overflow-hidden">
       {enabled && onQuickAction && labels ? (
-        <div aria-hidden={!actionsVisible} className="flex items-center gap-1">
+        <div
+          aria-hidden={!actionsVisible}
+          className="flex items-center gap-0.5"
+        >
           <AnimatePresence initial={false} mode="popLayout">
             {availableActions.map((action) => {
               return (
@@ -153,11 +156,11 @@ const QuickActionButton: FC<QuickActionButtonProps> = (props) => {
   };
 
   return (
-    <Tooltip title={presentation.label}>
+    <Tooltip mouseEnterDelay={0.3} title={presentation.label}>
       <button
         aria-label={presentation.label}
         className={cn(
-          "flex size-5 items-center justify-center rounded-1.5 border-0 bg-transparent text-ant-secondary transition-colors hover:bg-ant-fill-tertiary hover:text-ant-text motion-reduce:transition-none",
+          "flex size-5 items-center justify-center rounded-1.5 border-0 bg-transparent text-ant-tertiary transition-colors hover:bg-ant-fill-tertiary hover:text-ant-text motion-reduce:transition-none",
           {
             "text-ant-error hover:text-ant-error": presentation.danger,
             "text-ant-primary hover:text-ant-primary": activePrimary,
@@ -174,7 +177,7 @@ const QuickActionButton: FC<QuickActionButtonProps> = (props) => {
         tabIndex={tabIndex}
         type="button"
       >
-        <i aria-hidden="true" className={cn(presentation.icon, "text-sm")} />
+        <i aria-hidden="true" className={cn(presentation.icon, "size-3")} />
       </button>
     </Tooltip>
   );

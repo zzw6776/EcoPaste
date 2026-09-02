@@ -1,4 +1,12 @@
 {
+  "cardMeta": {
+    "file": "{{count}} 个文件",
+    "files": "{{count}} 个文件",
+    "folder": "{{count}} 个文件夹",
+    "folders": "{{count}} 个文件夹",
+    "item": "{{count}} 个项目",
+    "items": "{{count}} 个项目"
+  },
   "empty": {
     "categories": {
       "files": "文件",

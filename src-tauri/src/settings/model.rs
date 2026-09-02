@@ -35,7 +35,7 @@ pub struct SyncSettings {
     pub cloud_enabled: bool,
     /// 收到远端内容后是否立即覆盖系统剪贴板；关闭时仍会进入本地历史记录。
     pub auto_write_clipboard: bool,
-    /// 单个文件小于等于该值时自动上传，0 表示文件只允许手动上传。
+    /// 文件卡片原始总大小小于等于该值时自动上传，0 表示文件只允许手动上传。
     pub auto_upload_max_mb: u32,
     /// 敏感内容默认不参与同步，用户必须显式开启。
     pub sync_sensitive: bool,

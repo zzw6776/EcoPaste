@@ -23,7 +23,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
 use super::guard::WritebackGuard;
-use super::ingest::build_item_with_settings;
+use super::ingest::{build_item_with_settings, calculate_files_total_size};
 #[cfg(not(target_os = "android"))]
 use super::read::ClipboardReader;
 use super::sound;
@@ -32,8 +32,8 @@ use super::source;
 use super::source::FrontmostApp;
 use super::storage::ImageStore;
 use crate::db::apps::upsert_app;
-use crate::db::items::{upsert_item, UpsertResult};
-use crate::db::models::{ClipboardApp, ClipboardItem};
+use crate::db::items::{file_items_missing_size, fill_file_item_size, upsert_item, UpsertResult};
+use crate::db::models::{ClipboardApp, ClipboardItem, ClipboardKind};
 use crate::settings::SettingsStore;
 
 /// 剪贴板更新事件名。前端监听此事件后增量刷新 / 重新拉取列表。
@@ -188,21 +188,132 @@ pub async fn persist_and_notify(
     }
     let result = upsert_item(pool, &item_to_write).await?;
     sound::maybe_play_copy(app);
+    notify_clipboard_updated(app, &result.id, item_to_write.kind, result.deduplicated);
+    item_to_write.id = result.id.clone();
+    if item_to_write.kind == ClipboardKind::Files && item_to_write.size.is_none() {
+        resolve_file_size_and_enqueue(app, pool, item_to_write);
+    } else {
+        crate::sync::enqueue_local_item(app, item_to_write);
+    }
+    Ok(result)
+}
+
+/// 发出统一的记录刷新通知，并同步唤醒 Android 原生上滑面板。
+fn notify_clipboard_updated(
+    app: &AppHandle,
+    item_id: &str,
+    kind: ClipboardKind,
+    deduplicated: bool,
+) {
     if let Err(err) = app.emit(
         CLIPBOARD_UPDATED_EVENT,
         json!({
-            "id": result.id,
-            "kind": item_to_write.kind,
-            "deduplicated": result.deduplicated,
+            "id": item_id,
+            "kind": kind,
+            "deduplicated": deduplicated,
         }),
     ) {
         log::warn!("emit {CLIPBOARD_UPDATED_EVENT} failed: {err}");
     }
     #[cfg(target_os = "android")]
     crate::commands::android::notify_overlay_clipboard_changed();
-    item_to_write.id = result.id.clone();
-    crate::sync::enqueue_local_item(app, item_to_write);
-    Ok(result)
+}
+
+/// 目录递归统计在阻塞线程池执行；完成前记录已可见，但不会用未知大小启动自动同步。
+fn resolve_file_size_and_enqueue(app: &AppHandle, pool: &SqlitePool, mut item: ClipboardItem) {
+    let app = app.clone();
+    let pool = pool.clone();
+    let content = item.content.clone();
+    tauri::async_runtime::spawn(async move {
+        let size = match tauri::async_runtime::spawn_blocking(move || {
+            calculate_files_total_size(&content)
+        })
+        .await
+        {
+            Ok(Ok(size)) => size,
+            Ok(Err(error)) => {
+                log::warn!("calculate clipboard file size failed: {error:#}");
+                crate::sync::enqueue_local_item(&app, item);
+                return;
+            }
+            Err(error) => {
+                log::warn!("clipboard file size task failed: {error}");
+                crate::sync::enqueue_local_item(&app, item);
+                return;
+            }
+        };
+        item.size = Some(size);
+        match fill_file_item_size(&pool, &item.id, &item.source_revision, size).await {
+            Ok(true) => {
+                notify_clipboard_updated(&app, &item.id, item.kind, true);
+                crate::sync::enqueue_local_item(&app, item);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("persist clipboard file size failed: {error:#}");
+                crate::sync::enqueue_local_item(&app, item);
+            }
+        }
+    });
+}
+
+/// 顺序回填升级前的文件记录；只更新展示元数据，不产生新的同步事件。
+fn spawn_file_size_backfill(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let pool = app.state::<crate::db::DatabaseState>().pool().await;
+        let items = match file_items_missing_size(&pool).await {
+            Ok(items) => items,
+            Err(error) => {
+                log::warn!("load clipboard file size backfill failed: {error:#}");
+                return;
+            }
+        };
+        let candidate_count = items.len();
+        let mut updated_count = 0_usize;
+        for item in items {
+            let content = item.content.clone();
+            let size = match tauri::async_runtime::spawn_blocking(move || {
+                calculate_files_total_size(&content)
+            })
+            .await
+            {
+                Ok(Ok(size)) => size,
+                Ok(Err(error)) => {
+                    log::debug!(
+                        "skip clipboard file size backfill for {}: {error:#}",
+                        item.id
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!("clipboard file size backfill task failed: {error}");
+                    continue;
+                }
+            };
+            match fill_file_item_size(&pool, &item.id, &item.source_revision, size).await {
+                Ok(true) => updated_count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("persist clipboard file size backfill failed: {error:#}");
+                }
+            }
+        }
+        if updated_count > 0 {
+            if let Err(error) = app.emit(
+                CLIPBOARD_UPDATED_EVENT,
+                json!({
+                    "reconciled": true,
+                }),
+            ) {
+                log::warn!("emit clipboard file size backfill update failed: {error}");
+            }
+            #[cfg(target_os = "android")]
+            crate::commands::android::notify_overlay_clipboard_changed();
+        }
+        log::debug!(
+            "clipboard file size backfill completed: candidates={candidate_count} updated={updated_count}"
+        );
+    });
 }
 
 /// 启动监听：注册 [`WritebackGuard`] / [`ImageStore`] / [`AppIconStore`] 到 Tauri `State`
@@ -246,6 +357,7 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
         });
     }
 
+    spawn_file_size_backfill(app.clone());
     super::cleanup::spawn(app.clone());
     #[cfg(not(target_os = "android"))]
     spawn_watch_thread(app.clone(), guard, store, app_icon_store, registry, pause);
