@@ -243,16 +243,17 @@ pub async fn save_clipboard_image_to_file(
         .ok_or_else(|| AppError::Clipboard("save path is not valid utf-8".to_owned()))
 }
 
-/// Opens one file from an Android clipboard record through the system app chooser.
+/// Opens an Android image or file record through the system app chooser.
 #[tauri::command]
 pub async fn open_android_clipboard_file(
     app: AppHandle,
     db: State<'_, DatabaseState>,
+    store: State<'_, ImageStore>,
     id: String,
     index: usize,
 ) -> Result<()> {
     log_android_file_action("rust.open.request", format!("id={id} index={index}"));
-    let path = android_clipboard_file_path(&app, &db, "open", &id, index).await?;
+    let path = android_clipboard_file_path(&app, &db, &store, "open", &id, index).await?;
     let result = crate::commands::android::open_android_clipboard_file_path(&path)?;
     log_android_file_action(
         "rust.open.result",
@@ -278,16 +279,17 @@ pub async fn open_android_clipboard_file(
     }
 }
 
-/// Exports one file from an Android clipboard record through the system document picker.
+/// Exports an Android image or file record through the system document picker.
 #[tauri::command]
 pub async fn save_android_clipboard_file(
     app: AppHandle,
     db: State<'_, DatabaseState>,
+    store: State<'_, ImageStore>,
     id: String,
     index: usize,
 ) -> Result<bool> {
     log_android_file_action("rust.save.request", format!("id={id} index={index}"));
-    let path = android_clipboard_file_path(&app, &db, "save", &id, index).await?;
+    let path = android_clipboard_file_path(&app, &db, &store, "save", &id, index).await?;
     let result = crate::commands::android::save_android_clipboard_file_path(&path)?;
     log_android_file_action(
         "rust.save.result",
@@ -313,6 +315,7 @@ pub async fn save_android_clipboard_file(
 async fn android_clipboard_file_path(
     app: &AppHandle,
     db: &State<'_, DatabaseState>,
+    image_store: &ImageStore,
     action: &str,
     id: &str,
     index: usize,
@@ -335,18 +338,39 @@ async fn android_clipboard_file_path(
             return Err(error);
         }
     };
-    let path_count = item
-        .content
-        .lines()
-        .filter(|value| !value.is_empty())
-        .count();
-    let Some(path) = item
-        .content
-        .lines()
-        .filter(|value| !value.is_empty())
-        .nth(index)
-        .map(PathBuf::from)
-    else {
+    let (path, path_count) = match item.kind {
+        ClipboardKind::Image if index == 0 => {
+            validate_image_file_name(&item.content)?;
+            (image_store.origin_path(&item.content), 1)
+        }
+        ClipboardKind::Image => (PathBuf::new(), 1),
+        ClipboardKind::Files => {
+            let paths = item
+                .content
+                .lines()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            let path = paths
+                .get(index)
+                .map(|path| PathBuf::from(*path))
+                .unwrap_or_default();
+
+            (path, paths.len())
+        }
+        ClipboardKind::Text => {
+            log_android_file_action(
+                &format!("rust.{action}.kind_unsupported"),
+                format!("id={id} kind=text"),
+            );
+            let key = if action == "open" {
+                crate::i18n::commands::Key::AndroidFileOpenFailed
+            } else {
+                crate::i18n::commands::Key::AndroidFileSaveFailed
+            };
+            return Err(android_file_error(app, key));
+        }
+    };
+    if path.as_os_str().is_empty() {
         log_android_file_action(
             &format!("rust.{action}.index_missing"),
             format!("id={id} index={index} count={path_count}"),
@@ -355,7 +379,7 @@ async fn android_clipboard_file_path(
             app,
             crate::i18n::commands::Key::AndroidFileMissing,
         ));
-    };
+    }
     log_android_file_action(
         &format!("rust.{action}.path"),
         format!(
@@ -705,9 +729,9 @@ fn hide_clipboard_window_after_copy(app: &AppHandle) {
     #[cfg(target_os = "android")]
     {
         let _ = app;
-        let _ = tauri::async_runtime::spawn(async {
+        std::mem::drop(tauri::async_runtime::spawn(async {
             let _ = crate::commands::android::minimize_android_app().await;
-        });
+        }));
     }
     #[cfg(not(target_os = "android"))]
     {

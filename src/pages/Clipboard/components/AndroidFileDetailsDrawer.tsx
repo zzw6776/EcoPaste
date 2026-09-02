@@ -49,17 +49,29 @@ const AndroidFileDetailsDrawer: FC<AndroidFileDetailsDrawerProps> = (props) => {
               className="flex items-center gap-2 rounded-2 border border-ant-border-secondary bg-ant-fill-quaternary p-2"
               key={entry.path}
             >
-              <AssetImage className="size-8 shrink-0" src={entry.iconPath} />
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium text-sm">{entry.name}</div>
-                <div className="truncate text-ant-secondary text-xs">
-                  {entry.isDir
-                    ? t("fileAccess.directoryHint")
-                    : entry.exists
-                      ? entry.path
-                      : t("fileAccess.missing")}
+              <button
+                className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-not-allowed"
+                disabled={disabled || busyKey !== null}
+                onClick={() => {
+                  handleOpen(index);
+                }}
+                title={disabled ? void 0 : t("fileAccess.open")}
+                type="button"
+              >
+                <AssetImage className="size-8 shrink-0" src={entry.iconPath} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium text-sm">
+                    {entry.name}
+                  </div>
+                  <div className="truncate text-ant-secondary text-xs">
+                    {entry.isDir
+                      ? t("fileAccess.directoryHint")
+                      : entry.exists
+                        ? entry.path
+                        : t("fileAccess.missing")}
+                  </div>
                 </div>
-              </div>
+              </button>
               <Button
                 aria-label={t("fileAccess.open")}
                 disabled={disabled || busyKey !== null}
