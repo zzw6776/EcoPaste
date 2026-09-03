@@ -3,6 +3,7 @@ mod apps_registry;
 mod cleanup;
 mod detect;
 mod file_icon_store;
+mod fingerprint;
 mod guard;
 mod icon;
 mod ingest;
@@ -21,6 +22,9 @@ pub use apps_registry::{
 };
 pub use detect::sanitize_css_color;
 pub use file_icon_store::FileIconStore;
+pub use fingerprint::{
+    ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation, FileEntryFingerprint,
+};
 pub use guard::WritebackGuard;
 pub use icon::{get_icon_cache_key, icon_png, DIR_CACHE_KEY};
 #[cfg(test)]
@@ -40,9 +44,9 @@ pub(crate) use watcher::CLIPBOARD_UPDATED_EVENT;
 pub(crate) const SOURCE_APP_UPDATED_EVENT: &str = "source-app://updated";
 pub use watcher::{init, materialize_source, persist_and_notify, WatcherPause};
 #[cfg(not(target_os = "android"))]
-pub use write::write_to_clipboard;
+pub use write::{write_synced_item_to_clipboard, write_to_clipboard};
 #[cfg(target_os = "android")]
-pub use write::write_to_clipboard_app;
+pub use write::{write_synced_item_to_clipboard_app, write_to_clipboard_app};
 
 #[cfg(test)]
 pub(crate) mod test_lock {

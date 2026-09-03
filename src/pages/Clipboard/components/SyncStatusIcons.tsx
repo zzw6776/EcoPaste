@@ -6,6 +6,7 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   getSyncStatus,
+  reconnectCloud,
   reconnectSyncPeer,
   type SyncChannelState,
   type SyncStatus,
@@ -103,6 +104,17 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     }
   }
 
+  async function handleReconnectCloud() {
+    setReconnectingKey("cloud");
+    try {
+      setStatus(await reconnectCloud());
+    } catch {
+      // 命令层已统一记录并显示错误。
+    } finally {
+      setReconnectingKey(null);
+    }
+  }
+
   function handleOpenRecords() {
     if (!isAndroid) {
       setDetailsTarget(null);
@@ -156,6 +168,8 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
       addresses={[...(status?.cloudDirectAddresses ?? [])]}
       endpointId={status?.cloudEndpointId ?? ""}
       onOpenRecords={handleOpenRecords}
+      onReconnect={handleReconnectCloud}
+      reconnecting={reconnectingKey === "cloud"}
       showTitle={!isAndroid}
       status={status}
     />
@@ -487,6 +501,8 @@ interface CloudDetailsProps {
   addresses: readonly string[];
   endpointId: string;
   onOpenRecords: () => void;
+  onReconnect: () => void;
+  reconnecting: boolean;
   showTitle?: boolean;
   status: SyncStatus | null;
 }
@@ -496,6 +512,8 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
     addresses,
     endpointId,
     onOpenRecords,
+    onReconnect,
+    reconnecting,
     showTitle = true,
     status,
   } = props;
@@ -561,11 +579,33 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
       {cloud?.lastError ? (
         <span className="text-ant-error text-xs">{cloud.lastError}</span>
       ) : null}
+      {cloud?.nextRetryAt ? (
+        <span className="text-ant-secondary text-xs">
+          {t("syncStatus.nextRetry", {
+            time: new Date(cloud.nextRetryAt).toLocaleString(),
+          })}
+        </span>
+      ) : null}
       {status?.pendingEvents ? (
         <span className="text-ant-warning text-xs">
           {t("syncStatus.cloud.pending", { count: status.pendingEvents })}
         </span>
       ) : null}
+      <Button
+        block
+        disabled={
+          !status?.enabled ||
+          !status.cloudEnabled ||
+          !status.paired ||
+          cloud?.state === "connecting"
+        }
+        icon={<i className="i-lucide:refresh-cw size-4" />}
+        loading={reconnecting}
+        onClick={onReconnect}
+        size="small"
+      >
+        {t("syncStatus.cloud.reconnect")}
+      </Button>
       <Button
         block
         disabled={!status?.enabled || !status.cloudEnabled || !status.paired}

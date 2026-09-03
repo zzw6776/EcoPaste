@@ -45,6 +45,8 @@ export interface ClipboardItem {
   contentHash: string;
   searchText: string | null;
   summary: string | null;
+  /** Rust 列表查询返回的完整纯文本字符数；无需传输完整内容。 */
+  textCharCount?: number;
   fileTypes: string | null;
   size: number | null;
   width: number | null;

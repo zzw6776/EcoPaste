@@ -1,7 +1,6 @@
 <resources>
     <string name="app_name">"EcoPaste"</string>
     <string name="main_activity_title">"EcoPaste"</string>
-    <string name="accessibility_service_description">EcoPaste 需要此无障碍服务来监听剪贴板内容变化，并在您选择历史记录后自动粘贴到当前应用的输入框。</string>
     <string name="overlay_service_channel_name">EcoPaste 后台服务</string>
     <string name="overlay_service_channel_desc">保持 Root 剪贴板监听和上滑呼出手势在后台运行</string>
     <string name="overlay_service_notification_title">EcoPaste 正在后台运行</string>

@@ -26,7 +26,7 @@ interface PreferenceSidebarProps {
  * 偏好窗口左侧导航栏：展示应用身份、一级分类和本地存储概览。
  */
 const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
-  const { t } = useTranslation("preferences");
+  const { t } = useTranslation(["preferences", "common"]);
   const {
     activeTabId,
     appName,
@@ -135,11 +135,11 @@ const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
           <button
             className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-ant-border-secondary bg-ant-fill-quaternary p-2 text-ant-primary text-xs transition-colors hover:bg-ant-fill"
             onClick={openAndroidPermissionsModal}
-            title={isCompact ? "Android 权限与引擎设置" : void 0}
+            title={isCompact ? t("common:androidPermissions.title") : void 0}
             type="button"
           >
             <i className="i-lucide:smartphone text-sm" />
-            {!isCompact && <span>Android 权限设置</span>}
+            {!isCompact && <span>{t("common:androidPermissions.title")}</span>}
           </button>
         </div>
       )}

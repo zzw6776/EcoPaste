@@ -1,16 +1,23 @@
-import { useMount } from "ahooks";
-import type { RadioChangeEvent } from "antd";
-import { Button, Radio, Tag } from "antd";
-import type { FC } from "react";
+import { useInterval, useMount } from "ahooks";
+import { Button, Tag } from "antd";
+import type { TFunction } from "i18next";
+import type { FC, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useSnapshot } from "valtio";
 import {
+  type AndroidMode,
   type AndroidPermissionsStatus,
-  getAndroidPermissionsStatus,
+  authorizeAndroidRoot,
   requestAndroidPermission,
-  setAndroidEngineMode,
-  toggleAndroidOverlayService,
+  setAndroidMode,
 } from "@/commands/android";
 import Modal from "@/components/Modal";
+import {
+  androidState,
+  refreshAndroidPermissionsStatus,
+} from "@/stores/android";
+import { settingsState, updateSettings } from "@/stores/settings";
 import { cn } from "@/utils/cn";
 import { getMessageApi } from "@/utils/feedback";
 import { isAndroid, isMobile } from "@/utils/is";
@@ -21,43 +28,38 @@ interface AndroidPermissionsModalProps {
   onFinish?: () => void;
 }
 
+const INITIAL_STATUS: AndroidPermissionsStatus = {
+  batteryIgnored: false,
+  clipboardMonitorRunning: false,
+  foregroundCaptureRunning: false,
+  gestureMonitorRunning: false,
+  mode: "basic",
+  modeSelected: false,
+  notificationGranted: false,
+  overlayGranted: false,
+  overlayServiceRunning: false,
+  rootStatus: "unknown",
+};
+
 export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   props,
 ) => {
   const { open, onClose, onFinish } = props;
-  const [status, setStatus] = useState<AndroidPermissionsStatus>({
-    accessibilityGranted: false,
-    batteryIgnored: false,
-    engineMode: "accessibility",
-    notificationGranted: false,
-    overlayGranted: false,
-    overlayServiceRunning: false,
-    rootAvailable: false,
-    rootClipboardGranted: false,
-  });
-  const [engineMode, setEngineMode] = useState<
-    "accessibility" | "root" | "foreground"
-  >("accessibility");
-  const [loading, setLoading] = useState(false);
-  const [engineLoading, setEngineLoading] = useState(false);
+  const { t } = useTranslation("common");
+  const androidSnapshot = useSnapshot(androidState);
+  const status = androidSnapshot.status ?? INITIAL_STATUS;
+  const [activeAction, setActiveAction] = useState<AndroidMode | "root" | null>(
+    null,
+  );
   const fetchingRef = useRef(false);
   const mobile = isAndroid || isMobile();
 
   const fetchStatus = useCallback(async () => {
     if (!isAndroid || fetchingRef.current) return;
+
     fetchingRef.current = true;
     try {
-      const res = await getAndroidPermissionsStatus();
-      setStatus(res);
-      if (
-        res.engineMode === "accessibility" ||
-        res.engineMode === "root" ||
-        res.engineMode === "foreground"
-      ) {
-        setEngineMode(res.engineMode);
-      }
-    } catch {
-      // ignore
+      await refreshAndroidPermissionsStatus();
     } finally {
       fetchingRef.current = false;
     }
@@ -66,6 +68,15 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   useMount(() => {
     void fetchStatus();
   });
+
+  useInterval(
+    () => {
+      if (open) {
+        void fetchStatus();
+      }
+    },
+    open ? 1_500 : void 0,
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -86,59 +97,108 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   }, [fetchStatus, open]);
 
   const handleRequest = async (
-    kind: "overlay" | "accessibility" | "battery" | "notification",
+    kind: "overlay" | "battery" | "notification",
   ) => {
     await requestAndroidPermission(kind);
     void fetchStatus();
   };
 
-  const handleEngineChange = async (
-    mode: "accessibility" | "root" | "foreground",
-  ) => {
-    setEngineLoading(true);
+  const handleAuthorizeRoot = async () => {
+    setActiveAction("root");
     try {
-      const result = await setAndroidEngineMode(mode);
+      const result = await authorizeAndroidRoot();
       if (!result.success) {
-        getMessageApi().error(result.message || "切换剪贴板引擎失败");
+        getMessageApi().error(
+          result.message || t("androidPermissions.messages.rootFailed"),
+        );
         return;
       }
 
-      setEngineMode(mode);
-      if (mode === "root") {
-        getMessageApi().success("Root 剪贴板权限已自动授权");
-      }
+      getMessageApi().success(t("androidPermissions.messages.rootReady"));
       await fetchStatus();
     } catch {
-      getMessageApi().error("切换剪贴板引擎失败");
+      getMessageApi().error(t("androidPermissions.messages.rootFailed"));
     } finally {
-      setEngineLoading(false);
+      setActiveAction(null);
     }
   };
 
-  const handleEngineRadioChange = (event: RadioChangeEvent) => {
-    void handleEngineChange(event.target.value);
-  };
+  /** 同步设置真相源后切换原生运行模式；失败时恢复手势开关。 */
+  const handleSelectMode = async (mode: AndroidMode) => {
+    const previousGestureEnabled = settingsState.android.gesture.enabled;
+    const gestureEnabled = mode === "full";
+    let gestureSettingUpdated = false;
+    setActiveAction(mode);
 
-  const handleFinish = async () => {
-    setLoading(true);
     try {
-      if (status.overlayGranted) {
-        await toggleAndroidOverlayService(true);
+      await updateSettings({
+        android: {
+          gesture: {
+            enabled: gestureEnabled,
+          },
+        },
+      });
+      gestureSettingUpdated = true;
+      const result = await setAndroidMode(mode);
+      if (!result.success) {
+        await updateSettings({
+          android: {
+            gesture: {
+              enabled: previousGestureEnabled,
+            },
+          },
+        });
+        gestureSettingUpdated = false;
+        getMessageApi().error(
+          result.message || t("androidPermissions.messages.modeFailed"),
+        );
+        return;
       }
+      gestureSettingUpdated = false;
+
+      await fetchStatus();
+      getMessageApi().success(
+        t(
+          mode === "full"
+            ? "androidPermissions.messages.fullEnabled"
+            : "androidPermissions.messages.basicEnabled",
+        ),
+      );
       onFinish?.();
       onClose?.();
+    } catch {
+      if (gestureSettingUpdated) {
+        try {
+          await updateSettings({
+            android: {
+              gesture: {
+                enabled: previousGestureEnabled,
+              },
+            },
+          });
+        } catch {
+          // 设置命令会显示具体错误；这里仍需结束本次模式切换。
+        }
+      }
+      getMessageApi().error(t("androidPermissions.messages.modeFailed"));
     } finally {
-      setLoading(false);
+      setActiveAction(null);
     }
   };
 
-  const isAllEssentialReady =
+  const handleCancel = () => {
+    onClose?.();
+  };
+
+  const rootAuthorized = status.rootStatus === "authorized";
+  const fullModeReady =
+    status.modeSelected &&
+    status.mode === "full" &&
     status.overlayGranted &&
-    (engineMode === "accessibility"
-      ? status.accessibilityGranted
-      : engineMode === "root"
-        ? status.rootAvailable && status.rootClipboardGranted
-        : true);
+    status.clipboardMonitorRunning &&
+    status.gestureMonitorRunning;
+  const basicModeActive = status.modeSelected && status.mode === "basic";
+  const busy = activeAction !== null;
   const permissionCardClass = cn(
     "flex rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs",
     mobile
@@ -147,42 +207,46 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   );
   const permissionActionClass = cn(mobile && "self-end");
   const modalTitle = (
-    <div className="flex items-center gap-2 font-semibold text-base text-neutral-800 dark:text-white">
+    <div className="flex items-center gap-2 font-semibold text-ant-text text-base">
       <i
         aria-hidden="true"
         className="i-lucide:smartphone text-ant-primary text-lg"
       />
-      <span>Android 核心权限与引擎配置</span>
+      <span>{t("androidPermissions.title")}</span>
     </div>
   );
   const modalFooter = (
     <div
       className={cn(
-        "flex gap-3",
-        mobile ? "items-stretch" : "items-center justify-between",
+        "flex gap-2",
+        mobile ? "flex-col items-stretch" : "items-center justify-end",
       )}
     >
-      <Button block={mobile} onClick={() => void fetchStatus()} size="small">
-        🔄 刷新状态
-      </Button>
-
       <Button
         block={mobile}
-        className={cn(
-          "font-medium",
-          isAllEssentialReady && "bg-emerald-600 hover:bg-emerald-500",
-        )}
-        loading={loading}
-        onClick={() => void handleFinish()}
+        disabled={busy || basicModeActive}
+        loading={activeAction === "basic"}
+        onClick={() => void handleSelectMode("basic")}
+      >
+        {basicModeActive
+          ? t("androidPermissions.actions.basicActive")
+          : t("androidPermissions.actions.useBasic")}
+      </Button>
+      <Button
+        block={mobile}
+        disabled={
+          busy || !rootAuthorized || !status.overlayGranted || fullModeReady
+        }
+        loading={activeAction === "full"}
+        onClick={() => void handleSelectMode("full")}
         type="primary"
       >
-        {isAllEssentialReady ? "✓ 启动服务并进入应用" : "暂不开启，进入应用"}
+        {fullModeReady
+          ? t("androidPermissions.actions.fullActive")
+          : t("androidPermissions.actions.enableFull")}
       </Button>
     </div>
   );
-  const handleCancel = () => {
-    onClose?.();
-  };
 
   return (
     <Modal
@@ -220,7 +284,7 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
           : void 0,
       }}
       title={modalTitle}
-      width={mobile ? "calc(100vw - 1.5rem)" : 480}
+      width={mobile ? "calc(100vw - 1.5rem)" : 520}
     >
       <div
         className={cn(
@@ -228,191 +292,250 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
           mobile ? "gap-3" : "gap-4",
         )}
       >
-        <p className="text-neutral-500 leading-relaxed dark:text-neutral-400">
-          为实现<b>后台剪贴板实时捕获</b>与<b>屏幕底部上滑呼出</b>
-          ，请根据指引开启以下系统能力：
+        <p className="m-0 text-ant-secondary leading-relaxed">
+          {t("androidPermissions.description")}
         </p>
 
-        {/* 剪贴板监听方案选择 */}
-        <div className="rounded-xl border border-ant-border-secondary bg-ant-fill-quaternary p-3">
-          <div className="mb-2 font-medium text-neutral-700 dark:text-neutral-200">
-            剪贴板监听引擎
-          </div>
-          <Radio.Group
-            className="flex flex-col gap-2"
-            disabled={engineLoading}
-            onChange={handleEngineRadioChange}
-            value={engineMode}
-          >
-            <Radio
-              className="m-0 rounded-lg border border-ant-border-secondary bg-ant-container p-2.5"
-              value="accessibility"
-            >
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="font-medium text-neutral-800 dark:text-neutral-200">
-                  无障碍服务模式
-                </span>
-                <Tag className="m-0" color="blue">
-                  推荐 / 免Root
-                </Tag>
-              </div>
-              <div className="mt-0.5 text-[11px] text-neutral-400">
-                后台实时采集剪贴板，支持选择记录后自动模拟粘贴
-              </div>
-            </Radio>
-
-            <Radio
-              className="m-0 rounded-lg border border-ant-border-secondary bg-ant-container p-2.5"
-              disabled={!status.rootAvailable}
-              value="root"
-            >
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="font-medium text-neutral-800 dark:text-neutral-200">
-                  Root 授权模式
-                </span>
-                <Tag
-                  className="m-0"
-                  color={
-                    status.rootClipboardGranted
-                      ? "green"
-                      : status.rootAvailable
-                        ? "blue"
-                        : "default"
-                  }
-                >
-                  {status.rootClipboardGranted
-                    ? "剪贴板已授权"
-                    : status.rootAvailable
-                      ? "选择后自动授权"
-                      : "未检测到 Root"}
-                </Tag>
-              </div>
-              <div className="mt-0.5 text-[11px] text-neutral-400">
-                通过系统 AppOps 权限直接解锁后台剪贴板访问
-              </div>
-            </Radio>
-
-            <Radio
-              className="m-0 rounded-lg border border-ant-border-secondary bg-ant-container p-2.5"
-              value="foreground"
-            >
-              <span className="font-medium text-neutral-800 dark:text-neutral-200">
-                前台常驻轮询模式
-              </span>
-              <div className="mt-0.5 text-[11px] text-neutral-400">
-                仅在前台或常驻前台服务时轮询剪贴板
-              </div>
-            </Radio>
-          </Radio.Group>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <ModeCard
+            description={t("androidPermissions.modes.full.description")}
+            icon="i-lucide:zap"
+            selected={status.modeSelected && status.mode === "full"}
+            title={t("androidPermissions.modes.full.title")}
+          />
+          <ModeCard
+            description={t("androidPermissions.modes.basic.description")}
+            icon="i-lucide:panel-top"
+            selected={status.modeSelected && status.mode === "basic"}
+            title={t("androidPermissions.modes.basic.title")}
+          />
         </div>
 
-        {/* 权限列表 */}
-        <div className="flex flex-col gap-2.5">
-          {/* 1. 悬浮窗权限 */}
+        <section className="flex flex-col gap-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-ant-text">
+              {t("androidPermissions.sections.required")}
+            </span>
+            <Button onClick={() => void fetchStatus()} size="small" type="text">
+              {t("androidPermissions.actions.refresh")}
+            </Button>
+          </div>
+
           <div className={permissionCardClass}>
-            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <div className="flex flex-wrap items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
-                <span>悬浮窗权限 (Overlay)</span>
-                {status.overlayGranted ? (
-                  <Tag color="success">已开启</Tag>
-                ) : (
-                  <Tag color="warning">待开启</Tag>
-                )}
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <div className="flex flex-wrap items-center gap-1.5 font-medium text-ant-text">
+                <span>{t("androidPermissions.permissions.root.title")}</span>
+                <Tag color={rootAuthorized ? "success" : "warning"}>
+                  {t(`androidPermissions.rootStatus.${status.rootStatus}`)}
+                </Tag>
               </div>
-              <span className="text-[11px] text-neutral-400">
-                用于在屏幕底角监听向上滑动手势，随时呼出抽屉
+              <span className="text-ant-secondary text-xs">
+                {t("androidPermissions.permissions.root.description")}
               </span>
             </div>
             <Button
               className={permissionActionClass}
-              disabled={status.overlayGranted}
+              disabled={rootAuthorized || busy}
+              loading={activeAction === "root"}
+              onClick={() => void handleAuthorizeRoot()}
+              size="small"
+              type={rootAuthorized ? "default" : "primary"}
+            >
+              {rootAuthorized
+                ? t("androidPermissions.actions.ready")
+                : t("androidPermissions.actions.authorizeRoot")}
+            </Button>
+          </div>
+
+          <div className={permissionCardClass}>
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <div className="flex flex-wrap items-center gap-1.5 font-medium text-ant-text">
+                <span>{t("androidPermissions.permissions.overlay.title")}</span>
+                <Tag color={status.overlayGranted ? "success" : "warning"}>
+                  {status.overlayGranted
+                    ? t("androidPermissions.status.enabled")
+                    : t("androidPermissions.status.pending")}
+                </Tag>
+              </div>
+              <span className="text-ant-secondary text-xs">
+                {t("androidPermissions.permissions.overlay.description")}
+              </span>
+            </div>
+            <Button
+              className={permissionActionClass}
+              disabled={status.overlayGranted || busy}
               onClick={() => void handleRequest("overlay")}
               size="small"
               type={status.overlayGranted ? "default" : "primary"}
             >
-              {status.overlayGranted ? "已就绪" : "去授权"}
+              {status.overlayGranted
+                ? t("androidPermissions.actions.ready")
+                : t("androidPermissions.actions.openSettings")}
             </Button>
           </div>
+        </section>
 
-          {/* 2. 无障碍服务 */}
-          {engineMode === "accessibility" && (
-            <div className={permissionCardClass}>
-              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <div className="flex flex-wrap items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
-                  <span>无障碍服务 (Accessibility)</span>
-                  {status.accessibilityGranted ? (
-                    <Tag color="success">已开启</Tag>
-                  ) : (
-                    <Tag color="warning">待开启</Tag>
-                  )}
-                </div>
-                <span className="text-[11px] text-neutral-400">
-                  在设置中找到「EcoPaste」并打开，用于后台采集与自动粘贴
-                </span>
-              </div>
+        {status.modeSelected && (
+          <section className="rounded-xl border border-ant-border-secondary bg-ant-fill-quaternary p-3">
+            <div className="mb-2 font-medium text-ant-text">
+              {t("androidPermissions.sections.runtime")}
+            </div>
+            {status.mode === "full" ? (
+              <>
+                <RuntimeRow
+                  label={t("androidPermissions.runtime.capture")}
+                  running={status.clipboardMonitorRunning}
+                  t={t}
+                />
+                <RuntimeRow
+                  label={t("androidPermissions.runtime.gesture")}
+                  running={status.gestureMonitorRunning}
+                  t={t}
+                />
+              </>
+            ) : (
+              <RuntimeRow
+                label={t("androidPermissions.runtime.foregroundCapture")}
+                running={status.foregroundCaptureRunning}
+                t={t}
+              />
+            )}
+          </section>
+        )}
+
+        <section className="flex flex-col gap-2.5">
+          <span className="font-medium text-ant-text">
+            {t("androidPermissions.sections.recommended")}
+          </span>
+
+          <PermissionCard
+            action={
               <Button
-                className={permissionActionClass}
-                disabled={status.accessibilityGranted}
-                onClick={() => void handleRequest("accessibility")}
+                disabled={status.batteryIgnored || busy}
+                onClick={() => void handleRequest("battery")}
                 size="small"
-                type={status.accessibilityGranted ? "default" : "primary"}
               >
-                {status.accessibilityGranted ? "已就绪" : "去开启"}
+                {status.batteryIgnored
+                  ? t("androidPermissions.actions.ready")
+                  : t("androidPermissions.actions.openSettings")}
               </Button>
-            </div>
-          )}
+            }
+            description={t(
+              "androidPermissions.permissions.battery.description",
+            )}
+            ready={status.batteryIgnored}
+            title={t("androidPermissions.permissions.battery.title")}
+          />
 
-          {/* 3. 忽略电池优化 */}
-          <div className={permissionCardClass}>
-            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <div className="flex flex-wrap items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
-                <span>忽略电池优化 (后台保活)</span>
-                {status.batteryIgnored ? (
-                  <Tag color="success">已加白</Tag>
-                ) : (
-                  <Tag color="default">建议开启</Tag>
-                )}
-              </div>
-              <span className="text-[11px] text-neutral-400">
-                防止手机系统切后台后将剪贴板后台服务自动休眠或杀死
-              </span>
-            </div>
-            <Button
-              className={permissionActionClass}
-              disabled={status.batteryIgnored}
-              onClick={() => void handleRequest("battery")}
-              size="small"
-            >
-              {status.batteryIgnored ? "已就绪" : "去加白"}
-            </Button>
-          </div>
-
-          {/* 5. 通知权限 */}
-          <div className={permissionCardClass}>
-            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <div className="flex flex-wrap items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
-                <span>通知权限</span>
-                {status.notificationGranted ? (
-                  <Tag color="success">已允许</Tag>
-                ) : (
-                  <Tag color="default">建议允许</Tag>
-                )}
-              </div>
-              <span className="text-[11px] text-neutral-400">
-                用于常驻前台服务，保障屏幕底角手势稳定响应
-              </span>
-            </div>
-            <Button
-              className={permissionActionClass}
-              disabled={status.notificationGranted}
-              onClick={() => void handleRequest("notification")}
-              size="small"
-            >
-              {status.notificationGranted ? "已允许" : "去允许"}
-            </Button>
-          </div>
-        </div>
+          <PermissionCard
+            action={
+              <Button
+                disabled={status.notificationGranted || busy}
+                onClick={() => void handleRequest("notification")}
+                size="small"
+              >
+                {status.notificationGranted
+                  ? t("androidPermissions.actions.ready")
+                  : t("androidPermissions.actions.openSettings")}
+              </Button>
+            }
+            description={t(
+              "androidPermissions.permissions.notification.description",
+            )}
+            ready={status.notificationGranted}
+            title={t("androidPermissions.permissions.notification.title")}
+          />
+        </section>
       </div>
     </Modal>
+  );
+};
+
+interface ModeCardProps {
+  description: string;
+  icon: string;
+  selected: boolean;
+  title: string;
+}
+
+const ModeCard: FC<ModeCardProps> = (props) => {
+  const { description, icon, selected, title } = props;
+  const { t } = useTranslation("common");
+
+  return (
+    <div
+      className={cn(
+        "rounded-xl border p-3",
+        selected
+          ? "border-ant-primary bg-ant-primary-bg"
+          : "border-ant-border-secondary bg-ant-container",
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <i
+          aria-hidden="true"
+          className={cn(icon, "text-ant-primary text-lg")}
+        />
+        <span className="font-medium text-ant-text">{title}</span>
+        {selected && (
+          <Tag className="m-0" color="blue">
+            {t("androidPermissions.status.current")}
+          </Tag>
+        )}
+      </div>
+      <p className="mt-2 mb-0 text-ant-secondary text-xs leading-relaxed">
+        {description}
+      </p>
+    </div>
+  );
+};
+
+interface PermissionCardProps {
+  action: ReactNode;
+  description: string;
+  ready: boolean;
+  title: string;
+}
+
+const PermissionCard: FC<PermissionCardProps> = (props) => {
+  const { action, description, ready, title } = props;
+  const { t } = useTranslation("common");
+
+  return (
+    <div className="flex flex-col items-stretch gap-2 rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-1.5 font-medium text-ant-text">
+          <span>{title}</span>
+          <Tag color={ready ? "success" : "default"}>
+            {ready
+              ? t("androidPermissions.status.enabled")
+              : t("androidPermissions.status.recommended")}
+          </Tag>
+        </div>
+        <span className="text-ant-secondary text-xs">{description}</span>
+      </div>
+      <div className="self-end">{action}</div>
+    </div>
+  );
+};
+
+interface RuntimeRowProps {
+  label: string;
+  running: boolean;
+  t: TFunction<"common">;
+}
+
+const RuntimeRow: FC<RuntimeRowProps> = (props) => {
+  const { label, running, t } = props;
+
+  return (
+    <div className="flex items-center justify-between gap-3 py-1">
+      <span className="text-ant-secondary">{label}</span>
+      <Tag color={running ? "success" : "default"}>
+        {running
+          ? t("androidPermissions.status.running")
+          : t("androidPermissions.status.stopped")}
+      </Tag>
+    </div>
   );
 };

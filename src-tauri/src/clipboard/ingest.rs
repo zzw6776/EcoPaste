@@ -373,6 +373,7 @@ pub fn build_item_with_settings(
         content: draft.content,
         search_text: draft.search_text,
         summary: draft.summary,
+        text_char_count: None,
         file_types: draft.file_types,
         size: draft.size,
         width: draft.width,

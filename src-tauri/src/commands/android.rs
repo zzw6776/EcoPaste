@@ -11,21 +11,30 @@ use tauri::{Emitter, Manager};
 #[serde(rename_all = "camelCase")]
 pub struct AndroidPermissionsStatus {
     pub overlay_granted: bool,
-    pub accessibility_granted: bool,
     pub notification_granted: bool,
     pub battery_ignored: bool,
-    pub root_available: bool,
-    pub root_clipboard_granted: bool,
+    pub root_status: String,
     pub overlay_service_running: bool,
-    pub engine_mode: String,
+    pub clipboard_monitor_running: bool,
+    pub gesture_monitor_running: bool,
+    pub foreground_capture_running: bool,
+    pub mode: String,
+    pub mode_selected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AndroidEngineResult {
+pub struct AndroidRootResult {
+    pub success: bool,
+    pub root_status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidModeResult {
     pub success: bool,
     pub mode: String,
-    pub root_clipboard_granted: bool,
     pub message: String,
 }
 
@@ -156,6 +165,15 @@ fn android_files_detail(content: &str, file_types: Option<&str>) -> String {
     format!("{count} {unit}")
 }
 
+/// Android 上滑卡片优先展示列表查询计算的完整纯文本字符数；旧返回缺少该字段时
+/// 才按摘要计数，避免超过摘要上限的文本固定显示为 256 个字符。
+#[cfg(any(target_os = "android", test))]
+fn android_text_detail(text_char_count: Option<i64>, preview: &str) -> String {
+    let count = text_char_count.unwrap_or_else(|| preview.chars().count() as i64);
+
+    format!("{count} 个字符")
+}
+
 #[cfg(target_os = "android")]
 fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String> {
     use crate::db::models::{ClipboardItemQuery, ClipboardKind};
@@ -278,7 +296,7 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
                     ClipboardKind::Files => {
                         android_files_detail(&item.content, item.file_types.as_deref())
                     }
-                    ClipboardKind::Text => format!("{} 个字符", preview.chars().count()),
+                    ClipboardKind::Text => android_text_detail(item.text_char_count, &preview),
                 };
                 let image_path = if item.kind == ClipboardKind::Image
                     && !(redact_sensitive && item.is_sensitive)
@@ -390,6 +408,17 @@ fn reconnect_overlay_peer(device_id: Option<String>) -> Result<()> {
         manager.inner().clone().reconnect_peer(device_id).await?;
         Ok(())
     })
+}
+
+#[cfg(target_os = "android")]
+fn reconnect_overlay_cloud() -> Result<()> {
+    let app = APP_HANDLE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Android app runtime is not ready"))?;
+    let manager = app.state::<std::sync::Arc<crate::sync::SyncManager>>();
+    manager.reconnect_cloud()?;
+    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -650,6 +679,21 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_reconnectOv
         Ok(()) => 1,
         Err(error) => {
             log::warn!("Android overlay reconnect failed: {error}");
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_reconnectOverlayCloud(
+    _raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jboolean {
+    match reconnect_overlay_cloud() {
+        Ok(()) => 1,
+        Err(error) => {
+            log::warn!("Android overlay cloud reconnect failed: {error}");
             0
         }
     }
@@ -969,20 +1013,6 @@ mod jni_bridge {
         })
     }
 
-    pub fn toggle_overlay_service(enabled: bool) -> Result<()> {
-        with_jni_env(|env, context, bridge_class| {
-            env.call_static_method(
-                bridge_class,
-                "setOverlayServiceEnabled",
-                "(Landroid/content/Context;Z)V",
-                &[JValue::Object(context), JValue::Bool(enabled as u8)],
-            )
-            .map_err(|e| anyhow!("call setOverlayServiceEnabled failed: {e}"))?;
-
-            Ok(())
-        })
-    }
-
     pub fn minimize_app() -> Result<()> {
         with_jni_env(|env, context, bridge_class| {
             env.call_static_method(
@@ -997,7 +1027,27 @@ mod jni_bridge {
         })
     }
 
-    pub fn set_engine_mode(mode: &str) -> Result<AndroidEngineResult> {
+    pub fn authorize_root() -> Result<AndroidRootResult> {
+        with_jni_env(|env, _context, bridge_class| {
+            let result = env
+                .call_static_method(bridge_class, "authorizeRoot", "()Ljava/lang/String;", &[])
+                .map_err(|e| anyhow!("call authorizeRoot failed: {e}"))?;
+
+            let jstr: JString = result
+                .l()
+                .map_err(|e| anyhow!("extract Root authorization result failed: {e}"))?
+                .into();
+            let json: String = env
+                .get_string(&jstr)
+                .map_err(|e| anyhow!("read Root authorization result failed: {e}"))?
+                .into();
+
+            serde_json::from_str(&json)
+                .map_err(|e| anyhow!("parse Root authorization result failed: {e}").into())
+        })
+    }
+
+    pub fn set_mode(mode: &str) -> Result<AndroidModeResult> {
         with_jni_env(|env, context, bridge_class| {
             let mode_jstr = env
                 .new_string(mode)
@@ -1006,23 +1056,23 @@ mod jni_bridge {
             let result = env
                 .call_static_method(
                     bridge_class,
-                    "setEngine",
+                    "setMode",
                     "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
                     &[JValue::Object(context), JValue::Object(&mode_jstr)],
                 )
-                .map_err(|e| anyhow!("call setEngine failed: {e}"))?;
+                .map_err(|e| anyhow!("call setMode failed: {e}"))?;
 
             let jstr: JString = result
                 .l()
-                .map_err(|e| anyhow!("extract engine result failed: {e}"))?
+                .map_err(|e| anyhow!("extract Android mode result failed: {e}"))?
                 .into();
             let json: String = env
                 .get_string(&jstr)
-                .map_err(|e| anyhow!("read engine result failed: {e}"))?
+                .map_err(|e| anyhow!("read Android mode result failed: {e}"))?
                 .into();
 
             serde_json::from_str(&json)
-                .map_err(|e| anyhow!("parse engine result failed: {e}").into())
+                .map_err(|e| anyhow!("parse Android mode result failed: {e}").into())
         })
     }
 
@@ -1286,13 +1336,15 @@ pub async fn get_android_permissions_status() -> Result<AndroidPermissionsStatus
     {
         Ok(AndroidPermissionsStatus {
             overlay_granted: true,
-            accessibility_granted: true,
             notification_granted: true,
             battery_ignored: true,
-            root_available: false,
-            root_clipboard_granted: false,
+            root_status: "unavailable".to_string(),
             overlay_service_running: false,
-            engine_mode: "accessibility".to_string(),
+            clipboard_monitor_running: false,
+            gesture_monitor_running: false,
+            foreground_capture_running: false,
+            mode: "basic".to_string(),
+            mode_selected: true,
         })
     }
 }
@@ -1311,20 +1363,6 @@ pub async fn request_android_permission(kind: String) -> Result<()> {
     }
 }
 
-/// 启停屏幕底角上滑手势悬浮服务
-#[tauri::command]
-pub async fn toggle_android_overlay_service(enabled: bool) -> Result<()> {
-    #[cfg(target_os = "android")]
-    {
-        jni_bridge::toggle_overlay_service(enabled)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = enabled;
-        Ok(())
-    }
-}
-
 /// 最小化退回后台
 #[tauri::command]
 pub async fn minimize_android_app() -> Result<()> {
@@ -1338,19 +1376,37 @@ pub async fn minimize_android_app() -> Result<()> {
     }
 }
 
-/// 切换剪贴板监听引擎模式
+/// 仅在用户明确操作时发起 Root 授权。
 #[tauri::command]
-pub async fn set_android_engine_mode(mode: String) -> Result<AndroidEngineResult> {
+pub async fn authorize_android_root() -> Result<AndroidRootResult> {
     #[cfg(target_os = "android")]
     {
-        jni_bridge::set_engine_mode(&mode)
+        tauri::async_runtime::spawn_blocking(jni_bridge::authorize_root)
+            .await
+            .map_err(|error| anyhow::anyhow!("Android Root authorization task failed: {error}"))?
     }
     #[cfg(not(target_os = "android"))]
     {
-        Ok(AndroidEngineResult {
+        Ok(AndroidRootResult {
+            success: false,
+            root_status: "unavailable".to_string(),
+            message: "Root is only available on Android".to_string(),
+        })
+    }
+}
+
+/// 切换 Android 完整/基础运行模式。
+#[tauri::command]
+pub async fn set_android_mode(mode: String) -> Result<AndroidModeResult> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::set_mode(&mode)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(AndroidModeResult {
             success: true,
             mode,
-            root_clipboard_granted: false,
             message: String::new(),
         })
     }
@@ -1383,7 +1439,7 @@ pub fn perform_android_auto_paste() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{android_files_detail, PendingAutomaticDeviceName};
+    use super::{android_files_detail, android_text_detail, PendingAutomaticDeviceName};
 
     #[test]
     fn android_file_detail_distinguishes_top_level_entry_types() {
@@ -1400,6 +1456,15 @@ mod tests {
     fn android_file_detail_treats_incomplete_metadata_as_items() {
         assert_eq!(android_files_detail("/a\n/b", None), "2 个项目");
         assert_eq!(android_files_detail("/a\n/b", Some("f")), "2 个项目");
+    }
+
+    #[test]
+    fn android_text_detail_prefers_full_character_count_over_summary_length() {
+        let summary = "你😀".repeat(128);
+
+        assert_eq!(summary.chars().count(), 256);
+        assert_eq!(android_text_detail(Some(1_024), &summary), "1024 个字符");
+        assert_eq!(android_text_detail(None, &summary), "256 个字符");
     }
 
     #[test]

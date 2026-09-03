@@ -67,6 +67,7 @@
     "paste": "Paste",
     "pinItem": "Pin item",
     "playCopySound": "Play sound",
+    "reconnectCloud": "Reconnect cloud",
     "reconnectSyncPeer": "Reconnect device",
     "removeSyncPeer": "Remove paired device",
     "requestNearbySyncJoin": "Request to join nearby sync space",

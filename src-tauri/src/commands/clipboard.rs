@@ -118,7 +118,7 @@ pub async fn read_clipboard(
     }
 
     let pool = db.pool().await;
-    let result = persist_and_notify(&app, &pool, &item, source_app.as_ref()).await?;
+    let result = persist_and_notify(&app, &pool, &item, source_app.as_ref(), None).await?;
     Ok(Some(ReadClipboardResult {
         item,
         deduplicated: result.deduplicated,
@@ -1805,6 +1805,7 @@ mod tests {
             content,
             search_text: None,
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: None,
             width: None,

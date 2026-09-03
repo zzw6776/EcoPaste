@@ -130,6 +130,12 @@ pub async fn reconnect_sync_peer(
 }
 
 #[tauri::command]
+pub async fn reconnect_cloud(manager: State<'_, Arc<SyncManager>>) -> Result<SyncStatus> {
+    manager.reconnect_cloud()?;
+    Ok(manager.status().await?)
+}
+
+#[tauri::command]
 pub async fn remove_sync_peer(
     manager: State<'_, Arc<SyncManager>>,
     device_id: String,

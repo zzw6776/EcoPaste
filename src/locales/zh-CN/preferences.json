@@ -81,7 +81,7 @@
         "title": "快捷动作"
       },
       "androidGesture": {
-        "description": "仅在 Root 环境中监听屏幕底角上滑。",
+        "description": "完整模式下通过 Root 监听屏幕底角上滑。",
         "title": "Android 上滑唤起"
       },
       "appearance": {
@@ -203,7 +203,7 @@
       },
       "androidGesture": {
         "enabled": {
-          "description": "仅在 Root 可用、屏幕已解锁时监听底角上滑；锁屏期间自动暂停。",
+          "description": "仅在完整模式、Root 可用且屏幕已解锁时监听底角上滑；锁屏期间自动暂停。",
           "title": "启用上滑唤起"
         },
         "hideOverlay": {
@@ -769,6 +769,7 @@
       "leave": "断开本机连接",
       "pairDevice": "添加新设备",
       "reconnectAll": "重新连接全部设备",
+      "reconnectCloud": "立即重连云端",
       "reconnectDevice": "重新连接 {{device}}",
       "removeDevice": "删除设备",
       "removeDeviceNamed": "删除 {{device}}",
@@ -853,6 +854,7 @@
       },
       "title": "附近同步空间"
     },
+    "nextRetry": "下次重试：{{time}}",
     "noPeers": "暂无已配对设备",
     "notPaired": "未连接",
     "paired": "已连接",

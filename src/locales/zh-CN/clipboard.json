@@ -153,6 +153,7 @@
       "idle": "云端未连接",
       "online": "云端连接正常",
       "pending": "{{count}} 条事件等待上传",
+      "reconnect": "立即重连",
       "serverVersion": "服务端版本：v{{version}}",
       "serverVersionUnknown": "服务端版本：未知",
       "title": "云端"
@@ -171,6 +172,7 @@
     },
     "lastSeen": "最近发现：{{time}}",
     "lastSuccess": "最近成功：{{time}}",
+    "nextRetry": "下次重试：{{time}}",
     "peer": {
       "connecting": "连接中",
       "degraded": "部分异常",

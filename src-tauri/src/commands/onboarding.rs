@@ -195,7 +195,7 @@ pub async fn import_legacy_data(
 
         item.is_favorite = is_favorite;
 
-        let result = persist_and_notify(&app, &pool, &item, None).await?;
+        let result = persist_and_notify(&app, &pool, &item, None, None).await?;
         if result.deduplicated {
             skipped += 1;
             continue;

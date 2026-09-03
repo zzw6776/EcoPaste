@@ -68,6 +68,7 @@ export const TAURI_COMMAND = {
   PLAY_COPY_SOUND: "play_copy_sound",
   POPUP_CLIPBOARD_ITEM_MENU: "popup_clipboard_item_menu",
   PREPARE_CLIPBOARD_SEARCH_HANDOFF: "prepare_clipboard_search_handoff",
+  RECONNECT_CLOUD: "reconnect_cloud",
   RECONNECT_SYNC_PEER: "reconnect_sync_peer",
   RELEASE_WINDOW_KEEPALIVE: "release_window_keepalive",
   REMOVE_SYNC_PEER: "remove_sync_peer",

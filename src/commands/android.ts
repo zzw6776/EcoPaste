@@ -1,20 +1,30 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type AndroidMode = "basic" | "full";
+export type AndroidRootStatus = "authorized" | "unavailable" | "unknown";
+
 export interface AndroidPermissionsStatus {
   overlayGranted: boolean;
-  accessibilityGranted: boolean;
   notificationGranted: boolean;
   batteryIgnored: boolean;
-  rootAvailable: boolean;
-  rootClipboardGranted: boolean;
+  rootStatus: AndroidRootStatus;
   overlayServiceRunning: boolean;
-  engineMode: string;
+  clipboardMonitorRunning: boolean;
+  gestureMonitorRunning: boolean;
+  foregroundCaptureRunning: boolean;
+  mode: AndroidMode;
+  modeSelected: boolean;
 }
 
-export interface AndroidEngineResult {
+export interface AndroidRootResult {
   success: boolean;
-  mode: string;
-  rootClipboardGranted: boolean;
+  rootStatus: AndroidRootStatus;
+  message: string;
+}
+
+export interface AndroidModeResult {
+  success: boolean;
+  mode: AndroidMode;
   message: string;
 }
 
@@ -32,18 +42,9 @@ export const getAndroidPermissionsStatus =
  * 请求跳转系统权限设置页或触发授权
  */
 export const requestAndroidPermission = async (
-  kind: "overlay" | "accessibility" | "battery" | "notification",
+  kind: "overlay" | "battery" | "notification",
 ): Promise<void> => {
   await invoke("request_android_permission", { kind });
-};
-
-/**
- * 启停屏幕底角上滑手势悬浮服务
- */
-export const toggleAndroidOverlayService = async (
-  enabled: boolean,
-): Promise<void> => {
-  await invoke("toggle_android_overlay_service", { enabled });
 };
 
 /**
@@ -53,11 +54,14 @@ export const minimizeAndroidApp = async (): Promise<void> => {
   await invoke("minimize_android_app");
 };
 
-/**
- * 切换剪贴板监听引擎模式
- */
-export const setAndroidEngineMode = async (
-  mode: "accessibility" | "root" | "foreground",
-): Promise<AndroidEngineResult> => {
-  return await invoke<AndroidEngineResult>("set_android_engine_mode", { mode });
+/** 仅在用户明确点击时请求 Root 管理器授权。 */
+export const authorizeAndroidRoot = async (): Promise<AndroidRootResult> => {
+  return await invoke<AndroidRootResult>("authorize_android_root");
+};
+
+/** 切换 Android 完整/基础运行模式。 */
+export const setAndroidMode = async (
+  mode: AndroidMode,
+): Promise<AndroidModeResult> => {
+  return await invoke<AndroidModeResult>("set_android_mode", { mode });
 };

@@ -169,6 +169,7 @@ const App: FC = () => {
     if (isAndroid) {
       if (!settings.onboarding.completed) {
         void router.navigate("/onboarding", { replace: true });
+        return;
       }
       void checkAndAutoPromptAndroidPermissions();
     }

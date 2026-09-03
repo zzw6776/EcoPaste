@@ -56,19 +56,6 @@
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
-        <!-- EcoPaste 无障碍剪贴板监听与自动粘贴服务 -->
-        <service
-            android:name=".EcoPasteAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
-
         <!-- EcoPaste 屏幕底角上滑手势前台悬浮服务 -->
         <service
             android:name=".EcoPasteOverlayService"

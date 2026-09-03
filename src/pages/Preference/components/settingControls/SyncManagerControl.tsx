@@ -24,6 +24,7 @@ import {
   type NearbyJoinAttempt,
   type NearbySyncDevice,
   type NearbySyncSpace,
+  reconnectCloud,
   reconnectSyncPeer,
   removeSyncPeer,
   requestNearbySyncJoin,
@@ -280,6 +281,17 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
 
   function handleReconnectAll() {
     void handleReconnect();
+  }
+
+  async function handleReconnectCloud() {
+    setReconnectingKey("cloud");
+    try {
+      setStatus(await reconnectCloud());
+    } catch {
+      // 命令层已统一记录并显示错误。
+    } finally {
+      setReconnectingKey(null);
+    }
   }
 
   async function handleRemovePeer(deviceId: string) {
@@ -649,18 +661,41 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
               {status.cloud.lastError}
             </div>
           ) : null}
+          {status?.cloudEnabled && status.cloud.nextRetryAt ? (
+            <div className="mt-2 text-ant-secondary text-xs">
+              {t("sync.nextRetry", {
+                time: new Date(status.cloud.nextRetryAt).toLocaleString(),
+              })}
+            </div>
+          ) : null}
           {status?.cloudEnabled ? (
-            <Button
-              className="mt-2"
-              disabled={
-                disabled || busy || !status.paired || !status.cloudEndpointId
-              }
-              icon={<i className="i-lucide:cloud-download size-4" />}
-              onClick={handleOpenRecords}
-              size="small"
-            >
-              {t("sync.cloud.records")}
-            </Button>
+            <Space className="mt-2" wrap>
+              <Button
+                disabled={
+                  disabled ||
+                  busy ||
+                  !status.paired ||
+                  !status.cloudEndpointId ||
+                  status.cloud.state === "connecting"
+                }
+                icon={<i className="i-lucide:refresh-cw size-4" />}
+                loading={reconnectingKey === "cloud"}
+                onClick={handleReconnectCloud}
+                size="small"
+              >
+                {t("sync.actions.reconnectCloud")}
+              </Button>
+              <Button
+                disabled={
+                  disabled || busy || !status.paired || !status.cloudEndpointId
+                }
+                icon={<i className="i-lucide:cloud-download size-4" />}
+                onClick={handleOpenRecords}
+                size="small"
+              >
+                {t("sync.cloud.records")}
+              </Button>
+            </Space>
           ) : (
             <div className="mt-2 text-ant-secondary text-xs">
               {t("sync.cloud.disabledHint")}

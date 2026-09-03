@@ -207,6 +207,7 @@ mod tests {
             content_hash: content_hash(ClipboardKind::Text, "content"),
             search_text: None,
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: None,
             width: None,
