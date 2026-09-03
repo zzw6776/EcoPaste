@@ -1,10 +1,9 @@
-import { Button, Drawer } from "antd";
+import { Button } from "antd";
 import type { FC } from "react";
-import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import AssetImage from "@/components/AssetImage";
+import Drawer from "@/components/Drawer";
 import type { ClipboardItem, FileEntry } from "@/types/clipboard";
-import { isAndroid } from "@/utils/is";
 
 interface AndroidFileDetailsDrawerProps {
   busyKey: string | null;
@@ -19,33 +18,6 @@ interface AndroidFileDetailsDrawerProps {
 const AndroidFileDetailsDrawer: FC<AndroidFileDetailsDrawerProps> = (props) => {
   const { busyKey, entries, item, onClose, onOpen, onSave } = props;
   const { t } = useTranslation("clipboard");
-  const navigationEntryRef = useRef(false);
-  const onCloseRef = useRef(onClose);
-
-  useEffect(() => {
-    onCloseRef.current = onClose;
-  }, [onClose]);
-
-  useEffect(() => {
-    if (!isAndroid || item === null || navigationEntryRef.current) return;
-
-    window.history.pushState(
-      { ...window.history.state, ecopasteLayer: "android-file-details" },
-      "",
-    );
-    navigationEntryRef.current = true;
-    const handlePopState = () => {
-      if (!navigationEntryRef.current) return;
-
-      navigationEntryRef.current = false;
-      onCloseRef.current();
-    };
-    window.addEventListener("popstate", handlePopState);
-
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, [item]);
 
   function handleOpen(index: number) {
     if (!item) return;
@@ -60,10 +32,6 @@ const AndroidFileDetailsDrawer: FC<AndroidFileDetailsDrawerProps> = (props) => {
   }
 
   function handleClose() {
-    if (isAndroid && navigationEntryRef.current) {
-      navigationEntryRef.current = false;
-      window.history.back();
-    }
     onClose();
   }
 

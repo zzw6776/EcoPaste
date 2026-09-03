@@ -1,7 +1,8 @@
 import type { TreeDataNode, TreeProps } from "antd";
-import { Modal, Tree } from "antd";
+import { Tree } from "antd";
 import type { FC, Key, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import Modal from "@/components/Modal";
 
 interface SortableTreeModalProps {
   cancelText: string;

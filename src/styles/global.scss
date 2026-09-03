@@ -24,6 +24,13 @@ html {
       -webkit-user-drag: none;
     }
 
+    input,
+    textarea,
+    [contenteditable="true"] {
+      -webkit-user-select: text;
+      user-select: text;
+    }
+
     * {
       outline: none;
     }

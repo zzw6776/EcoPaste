@@ -20,6 +20,7 @@ import {
 } from "@/commands";
 import ScrollArea from "@/components/ScrollArea";
 import { TAURI_EVENT } from "@/constants/events";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { settingsState } from "@/stores/settings";
 import { preloadSourceApps, reloadSourceApps } from "@/stores/sourceApps";
@@ -110,6 +111,10 @@ const Preference: FC = () => {
 
   const handleSearchChange = (event: ChangeEvent<HTMLInputElement>) => {
     setSearchQuery(event.target.value);
+  };
+
+  const closeSearchResults = () => {
+    setSearchQuery("");
   };
 
   const handleTabSelect = (nextTabId: PreferenceTabId) => {
@@ -263,6 +268,8 @@ const Preference: FC = () => {
       log.warn("load app metadata failed", error);
     }
   };
+
+  useAndroidBack(searchQuery.trim().length > 0, closeSearchResults);
 
   useMount(async () => {
     void initializeStorageUsage();

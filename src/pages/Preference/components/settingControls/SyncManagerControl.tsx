@@ -3,7 +3,6 @@ import { useMount, useUnmount } from "ahooks";
 import {
   Button,
   Input,
-  Modal,
   Radio,
   type RadioChangeEvent,
   Space,
@@ -34,7 +33,9 @@ import {
   setSyncDeviceName,
   syncNow,
 } from "@/commands";
+import Modal from "@/components/Modal";
 import { TAURI_EVENT } from "@/constants/events";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import CloudRecordsDrawer from "@/pages/Clipboard/components/CloudRecordsDrawer";
 import { updateSettings } from "@/stores/settings";
 import type { CloudRelayMode } from "@/types/settings";
@@ -395,6 +396,10 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
     });
   }
 
+  function closeCloudConfig() {
+    setCloudConfigOpen(false);
+  }
+
   const busy = loading || reconnectingKey !== null || removingKey !== null;
 
   async function scanNearby() {
@@ -468,6 +473,9 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   function handleJoinCodeChange(event: ChangeEvent<HTMLTextAreaElement>) {
     setJoinCode(event.target.value);
   }
+
+  useAndroidBack(scannerOpen, closeScanner);
+  useAndroidBack(cloudConfigOpen, closeCloudConfig);
 
   return (
     <div className="flex w-full flex-col gap-2">
@@ -1119,6 +1127,12 @@ const SyncPeerSetting: FC<SyncPeerSettingProps> = (props) => {
   function handleCandidateAddressesToggle() {
     setCandidateAddressesOpen((open) => !open);
   }
+
+  function closeCandidateAddresses() {
+    setCandidateAddressesOpen(false);
+  }
+
+  useAndroidBack(candidateAddressesOpen, closeCandidateAddresses);
 
   return (
     <div className="text-xs">

@@ -1,6 +1,6 @@
 import { useMount } from "ahooks";
 import type { RadioChangeEvent } from "antd";
-import { Button, Modal, Radio, Tag } from "antd";
+import { Button, Radio, Tag } from "antd";
 import type { FC } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -10,6 +10,7 @@ import {
   setAndroidEngineMode,
   toggleAndroidOverlayService,
 } from "@/commands/android";
+import Modal from "@/components/Modal";
 import { cn } from "@/utils/cn";
 import { getMessageApi } from "@/utils/feedback";
 import { isAndroid, isMobile } from "@/utils/is";
@@ -179,13 +180,16 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
       </Button>
     </div>
   );
+  const handleCancel = () => {
+    onClose?.();
+  };
 
   return (
     <Modal
       centered
       closable={mobile}
       footer={modalFooter}
-      onCancel={onClose}
+      onCancel={handleCancel}
       open={open}
       style={mobile ? { paddingBottom: 0 } : void 0}
       styles={{

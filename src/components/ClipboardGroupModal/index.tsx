@@ -1,5 +1,5 @@
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { Form, type GetRef, Input, Modal } from "antd";
+import { Form, type GetRef, Input } from "antd";
 import type { FC, MouseEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,7 @@ import {
   setClipboardWindowAutoHideSuspended,
 } from "@/commands";
 import CustomIconButton from "@/components/CustomIconButton";
+import Modal from "@/components/Modal";
 import type {
   ClipboardGroupIcon as ClipboardGroupIconValue,
   ClipboardGroupInput,

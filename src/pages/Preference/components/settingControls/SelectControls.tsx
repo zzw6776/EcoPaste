@@ -1,6 +1,6 @@
-import { Select } from "antd";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
+import Select from "@/components/Select";
 import type { PreferenceSetting, SettingValue } from "../../types/preferences";
 import { translatePreferenceOption } from "../../utils/preferenceI18n";
 import type { ControlProps } from "./types";

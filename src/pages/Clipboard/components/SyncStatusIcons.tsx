@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { useMount, useUnmount } from "ahooks";
-import { Button, Drawer } from "antd";
+import { Button } from "antd";
 import type { FC, MouseEventHandler, ReactElement } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -10,10 +10,12 @@ import {
   type SyncChannelState,
   type SyncStatus,
 } from "@/commands";
+import Drawer from "@/components/Drawer";
 import Popover from "@/components/Popover";
 import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
@@ -102,7 +104,9 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   }
 
   function handleOpenRecords() {
-    setDetailsTarget(null);
+    if (!isAndroid) {
+      setDetailsTarget(null);
+    }
     setRecordsOpen(true);
   }
 
@@ -392,6 +396,12 @@ const LanPeerDetails: FC<LanPeerDetailsProps> = (props) => {
   function handleCandidateAddressesToggle() {
     setCandidateAddressesOpen((open) => !open);
   }
+
+  function closeCandidateAddresses() {
+    setCandidateAddressesOpen(false);
+  }
+
+  useAndroidBack(candidateAddressesOpen, closeCandidateAddresses);
 
   return (
     <div className="rounded-2 bg-ant-fill-quaternary p-2">

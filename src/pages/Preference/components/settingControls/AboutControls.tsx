@@ -1,6 +1,6 @@
-import { Image } from "antd";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
+import Image from "@/components/Image";
 import type { PreferenceSetting } from "../../types/preferences";
 
 interface SponsorQrControlProps {

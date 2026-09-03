@@ -10,6 +10,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { resumeGlobalShortcuts, suspendGlobalShortcuts } from "@/commands";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { cn } from "@/utils/cn";
 import { getMessageApi } from "@/utils/feedback";
 import { log } from "@/utils/log";
@@ -309,6 +310,10 @@ const ShortcutRecorder: FC<ShortcutRecorderProps> = (props) => {
   const handleClearClick = async () => {
     await clearShortcut();
   };
+
+  useAndroidBack(recording, () => {
+    inputRef.current?.blur();
+  });
 
   return (
     <fieldset
