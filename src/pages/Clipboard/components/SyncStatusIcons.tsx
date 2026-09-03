@@ -13,6 +13,7 @@ import {
 } from "@/commands";
 import Drawer from "@/components/Drawer";
 import Popover from "@/components/Popover";
+import ScrollArea from "@/components/ScrollArea";
 import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
@@ -331,33 +332,8 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
     void onReconnect();
   }
 
-  return (
-    <div
-      className={cn(
-        "flex flex-col gap-2 text-sm",
-        showHeader ? "w-72" : "w-full",
-      )}
-    >
-      {showHeader ? (
-        <div className="flex items-center justify-between gap-2">
-          <strong>{t("syncStatus.lan.title")}</strong>
-          <Tooltip title={t("syncStatus.lan.reconnectAll")}>
-            <Button
-              aria-label={t("syncStatus.lan.reconnectAll")}
-              disabled={
-                !status?.lanEnabled ||
-                !status?.peers.length ||
-                reconnectingKey !== null
-              }
-              icon={<i className="i-lucide:refresh-cw size-3.5" />}
-              loading={reconnectingKey === "all"}
-              onClick={handleReconnectAll}
-              size="small"
-              type="text"
-            />
-          </Tooltip>
-        </div>
-      ) : null}
+  const peerContent = (
+    <>
       {status?.peers.length ? (
         status.peers.map((peer) => {
           return (
@@ -375,6 +351,41 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
           {t("syncStatus.lan.noPeers")}
         </span>
       )}
+    </>
+  );
+
+  if (!showHeader) {
+    return (
+      <div className="flex w-full flex-col gap-2 text-sm">{peerContent}</div>
+    );
+  }
+
+  return (
+    <div className="flex w-72 flex-col gap-2 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <strong>{t("syncStatus.lan.title")}</strong>
+        <Tooltip title={t("syncStatus.lan.reconnectAll")}>
+          <Button
+            aria-label={t("syncStatus.lan.reconnectAll")}
+            disabled={
+              !status?.lanEnabled ||
+              !status?.peers.length ||
+              reconnectingKey !== null
+            }
+            icon={<i className="i-lucide:refresh-cw size-3.5" />}
+            loading={reconnectingKey === "all"}
+            onClick={handleReconnectAll}
+            size="small"
+            type="text"
+          />
+        </Tooltip>
+      </div>
+      <ScrollArea
+        className="max-h-[calc(100vh-8rem)] overscroll-contain"
+        contentClassName="flex flex-col gap-2 pr-2"
+      >
+        {peerContent}
+      </ScrollArea>
     </div>
   );
 };
