@@ -1,5 +1,5 @@
 import { save } from "@tauri-apps/plugin-dialog";
-import { Alert, Checkbox, Form, Input, Modal, Segmented } from "antd";
+import { Alert, Checkbox, Form, Input, Segmented } from "antd";
 import type { FC } from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,7 @@ import {
   type ExportHistoryBackupResult,
   exportHistoryBackup,
 } from "@/commands";
+import Modal from "@/components/Modal";
 import { log } from "@/utils/log";
 
 const BACKUP_EXTENSION = "ecopastebak";

@@ -65,7 +65,12 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
   }, [activeTab.id, mobile]);
 
   const handleBack = () => {
-    void router.navigate("/");
+    if (isAndroid) {
+      void router.navigate(-1);
+      return;
+    }
+
+    void router.navigate("/", { replace: true });
   };
 
   const searchInput = (

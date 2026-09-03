@@ -1,9 +1,9 @@
 import type { SelectProps } from "antd";
-import { Select } from "antd";
 import type { TFunction } from "i18next";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
+import Select from "@/components/Select";
 import { LANGUAGE_OPTIONS } from "@/constants/languages";
 import { settingsState, updateSettings } from "@/stores/settings";
 import type { Language } from "@/types/settings";

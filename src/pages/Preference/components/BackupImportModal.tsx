@@ -1,4 +1,4 @@
-import { Alert, Checkbox, Form, Input, Modal, Radio } from "antd";
+import { Alert, Checkbox, Form, Input, Radio } from "antd";
 import type { FC } from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,7 @@ import {
   type ImportHistoryBackupResult,
   importHistoryBackup,
 } from "@/commands";
+import Modal from "@/components/Modal";
 import { log } from "@/utils/log";
 
 const OVERWRITE_READ_SECONDS = 3;

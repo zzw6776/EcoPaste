@@ -5,6 +5,8 @@ import Tooltip, {
   type OverlayTooltipConfig,
   resolveOverlayTooltipProps,
 } from "@/components/Tooltip";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
+import { isAndroid } from "@/utils/is";
 
 export interface AppPopoverProps extends PopoverProps {
   tooltip?: OverlayTooltipConfig | false;
@@ -48,13 +50,17 @@ const Popover: FC<AppPopoverProps> = (props) => {
     onOpenChange?.(nextOpen);
   };
 
+  useAndroidBack(mergedOpen, () => {
+    handleOpenChange(false);
+  });
+
   return (
     <AntdPopover
       align={
         align ?? { overflow: { adjustY: true, shiftX: true, shiftY: true } }
       }
       onOpenChange={handleOpenChange}
-      open={open}
+      open={isAndroid ? mergedOpen : open}
       {...rest}
     >
       {renderPopoverTrigger(children, tooltip, mergedOpen)}

@@ -7,8 +7,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.webkit.WebView
-import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
@@ -32,22 +30,6 @@ class MainActivity : TauriActivity() {
     }
 
     private external fun initNdkContext(context: Context)
-
-    override fun onWebViewCreate(webView: WebView) {
-        super.onWebViewCreate(webView)
-        onBackPressedDispatcher.addCallback(
-            this,
-            object : OnBackPressedCallback(true) {
-                override fun handleOnBackPressed() {
-                    if (webView.canGoBack()) {
-                        webView.goBack()
-                    } else {
-                        minimizeToBackground()
-                    }
-                }
-            },
-        )
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -140,5 +122,4 @@ class MainActivity : TauriActivity() {
         @Suppress("DEPRECATION")
         overridePendingTransition(0, 0)
     }
-
 }

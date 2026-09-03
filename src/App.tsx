@@ -1,20 +1,24 @@
+import { onBackButtonPress } from "@tauri-apps/api/app";
+import type { PluginListener } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useEventListener, useMount } from "ahooks";
+import { useEventListener, useMount, useUnmount } from "ahooks";
 import type { ConfigProviderProps } from "antd";
 import { App as AntdApp, ConfigProvider } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
 import type { FC } from "react";
-import { use, useEffect } from "react";
+import { use, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { RouterProvider } from "react-router";
 import { useSnapshot } from "valtio";
 import { notifyWindowReady } from "@/commands";
+import { minimizeAndroidApp } from "@/commands/android";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
 import { router } from "./router";
 import { settingsReady, settingsState } from "./stores/settings";
 import type { Language } from "./types/settings";
+import { handleAndroidBack } from "./utils/androidBack";
 import { setMessageApi, setModalApi } from "./utils/feedback";
 import { isAndroid, isTauri } from "./utils/is";
 import { log } from "./utils/log";
@@ -69,11 +73,52 @@ import {
 const AppContent: FC = () => {
   const { message, modal } = AntdApp.useApp();
   const androidSnapshot = useSnapshot(androidState);
+  const androidBackListenerRef = useRef<PluginListener | null>(null);
+  const mountedRef = useRef(false);
+
+  async function initializeAndroidBackListener() {
+    try {
+      const listener = await onBackButtonPress(({ canGoBack }) => {
+        if (handleAndroidBack()) return;
+
+        if (canGoBack) {
+          window.history.back();
+          return;
+        }
+
+        void minimizeAndroidApp();
+      });
+      if (!mountedRef.current) {
+        await listener.unregister();
+        return;
+      }
+
+      androidBackListenerRef.current = listener;
+    } catch (error) {
+      log.error("register Android back listener failed", error);
+    }
+  }
 
   useEffect(() => {
     setMessageApi(message);
     setModalApi(modal);
   }, [message, modal]);
+
+  useMount(() => {
+    mountedRef.current = true;
+    if (!isAndroid) return;
+
+    void initializeAndroidBackListener();
+  });
+
+  useUnmount(() => {
+    mountedRef.current = false;
+    const listener = androidBackListenerRef.current;
+    androidBackListenerRef.current = null;
+    if (!listener) return;
+
+    void listener.unregister();
+  });
 
   return (
     <>
@@ -123,7 +168,7 @@ const App: FC = () => {
     await notifyWindowReady(getCurrentWebviewWindow().label);
     if (isAndroid) {
       if (!settings.onboarding.completed) {
-        void router.navigate("/onboarding");
+        void router.navigate("/onboarding", { replace: true });
       }
       void checkAndAutoPromptAndroidPermissions();
     }

@@ -1,9 +1,9 @@
 import { useMount } from "ahooks";
-import { Select } from "antd";
 import type { FC } from "react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listClipboardGroups } from "@/commands";
+import Select from "@/components/Select";
 import { TAURI_EVENT } from "@/constants/events";
 import {
   parseWindowOpenGroupId,

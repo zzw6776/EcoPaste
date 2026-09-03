@@ -1,10 +1,12 @@
-import { Button, Drawer, Empty, Image, Spin, Tag, Tooltip } from "antd";
+import { Button, Empty, Spin, Tag, Tooltip } from "antd";
 import type { FC } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Virtuoso } from "react-virtuoso";
 import { type CloudRecord, listCloudRecords } from "@/commands";
 import { toAssetUrl } from "@/components/AssetImage";
+import Drawer from "@/components/Drawer";
+import Image from "@/components/Image";
 import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
@@ -25,33 +27,6 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
   const [nextBeforeCursor, setNextBeforeCursor] = useState<number | null>(null);
   const loadGenerationRef = useRef(0);
   const loadingRef = useRef(false);
-  const navigationEntryRef = useRef(false);
-  const onCloseRef = useRef(onClose);
-
-  useEffect(() => {
-    onCloseRef.current = onClose;
-  }, [onClose]);
-
-  useEffect(() => {
-    if (!isAndroid || !open || navigationEntryRef.current) return;
-
-    window.history.pushState(
-      { ...window.history.state, ecopasteLayer: "cloud-records" },
-      "",
-    );
-    navigationEntryRef.current = true;
-    const handlePopState = () => {
-      if (!navigationEntryRef.current) return;
-
-      navigationEntryRef.current = false;
-      onCloseRef.current();
-    };
-    window.addEventListener("popstate", handlePopState);
-
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, [open]);
 
   async function load(reset: boolean) {
     if (loadingRef.current && !reset) return;
@@ -102,10 +77,6 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
   }
 
   function handleClose() {
-    if (isAndroid && navigationEntryRef.current) {
-      navigationEntryRef.current = false;
-      window.history.back();
-    }
     onClose();
   }
 

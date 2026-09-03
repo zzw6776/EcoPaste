@@ -1,8 +1,9 @@
-import { type GetRef, Input, Modal } from "antd";
+import { type GetRef, Input } from "antd";
 import type { ChangeEvent, FC } from "react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { updateClipboardItemNote } from "@/commands";
+import Modal from "@/components/Modal";
 import type { ClipboardItem } from "@/types/clipboard";
 
 interface NoteModalProps {

@@ -5,7 +5,9 @@ import Tooltip, {
   type OverlayTooltipConfig,
   resolveOverlayTooltipProps,
 } from "@/components/Tooltip";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { cn } from "@/utils/cn";
+import { isAndroid } from "@/utils/is";
 
 const DEFAULT_MENU_ICON_CLASS = "text-sm! shrink-0";
 
@@ -113,11 +115,15 @@ const Dropdown: FC<AppDropdownProps> = (props) => {
     onOpenChange?.(nextOpen, info);
   };
 
+  useAndroidBack(mergedOpen, () => {
+    handleOpenChange(false, { source: "trigger" });
+  });
+
   return (
     <AntdDropdown
       menu={normalizedMenu}
       onOpenChange={handleOpenChange}
-      open={open}
+      open={isAndroid ? mergedOpen : open}
       {...rest}
     >
       {renderDropdownTrigger(children, tooltip, mergedOpen)}

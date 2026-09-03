@@ -1,7 +1,8 @@
-import { Button, Input, type InputRef, Popover } from "antd";
+import { Button, Input, type InputRef } from "antd";
 import type { FC, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import Popover from "@/components/Popover";
 import type {
   ClipboardGroupInput,
   ClipboardGroupRecord,

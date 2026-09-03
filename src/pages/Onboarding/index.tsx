@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import { finishOnboarding, setOnboardingStep } from "@/commands";
+import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { router } from "@/router";
 import { settingsState } from "@/stores/settings";
 import { isAndroid } from "@/utils/is";
@@ -54,6 +55,14 @@ const Onboarding: FC = () => {
     await moveToStep(activeIndex - 1);
   };
 
+  const handleAndroidStepBack = () => {
+    if (actionLoading || finishLoading) return;
+
+    void handlePrevious();
+  };
+
+  useAndroidBack(activeIndex > 0, handleAndroidStepBack, "page");
+
   const handleNextStep = async () => {
     await moveToStep(activeIndex + 1);
   };
@@ -64,7 +73,7 @@ const Onboarding: FC = () => {
     try {
       await finishOnboarding();
       if (isAndroid) {
-        void router.navigate("/");
+        void router.navigate("/", { replace: true });
       }
     } finally {
       setFinishLoading(false);
