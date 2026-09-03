@@ -40,13 +40,13 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
-import kotlin.math.abs
 
 object EcoPasteBridge {
     private const val TAG = "EcoPasteBridge"
     private const val FILE_ACTION_TAG = "EcoPasteFileAction"
     private const val PREFS_NAME = "ecopaste_android"
     private const val KEY_ENGINE_MODE = "engine_mode"
+    private const val KEY_MODE_SELECTED = "mode_selected"
     private const val KEY_GESTURE_ENABLED = "gesture_enabled"
     private const val KEY_GESTURE_HIDE_OVERLAY = "gesture_hide_overlay"
     private const val KEY_GESTURE_POPUP_HEIGHT_PERCENT = "gesture_popup_height_percent"
@@ -54,6 +54,9 @@ object EcoPasteBridge {
     private const val KEY_GESTURE_LEFT_HEIGHT_DP = "gesture_left_height_dp"
     private const val KEY_GESTURE_RIGHT_WIDTH_DP = "gesture_right_width_dp"
     private const val KEY_GESTURE_RIGHT_HEIGHT_DP = "gesture_right_height_dp"
+    private const val ROOT_STATUS_UNKNOWN = "unknown"
+    private const val ROOT_STATUS_AUTHORIZED = "authorized"
+    private const val ROOT_STATUS_UNAVAILABLE = "unavailable"
     private const val CLIPBOARD_WRITEBACK_MARKER = "com.ayangweb.eco_paste.WRITEBACK"
     private var currentActivityRef: WeakReference<Activity>? = null
     private var lanDiscoveryLock: WifiManager.MulticastLock? = null
@@ -71,11 +74,11 @@ object EcoPasteBridge {
     private var pendingLanNetworkNotification: PendingNetworkNotification? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
-    private var lastAccessibilitySourcePackage: String? = null
-    private var lastAccessibilitySourceElapsedRealtime = Long.MIN_VALUE
     private val sourceAppCache = mutableMapOf<String, SourceAppMetadata>()
-    var currentEngineMode: String = "accessibility" // "accessibility", "root", "foreground"
-        private set
+    @Volatile
+    private var rootAuthorizationStatus = ROOT_STATUS_UNKNOWN
+    @Volatile
+    private var currentEngineMode: String = "foreground" // "root", "foreground"
 
     data class GestureConfig(
         val enabled: Boolean,
@@ -126,6 +129,9 @@ object EcoPasteBridge {
 
     @JvmStatic
     external fun reconnectOverlayPeer(deviceId: String): Boolean
+
+    @JvmStatic
+    external fun reconnectOverlayCloud(): Boolean
 
     @JvmStatic
     external fun captureClipboardText(
@@ -312,10 +318,12 @@ object EcoPasteBridge {
     @JvmStatic
     fun initialize(context: Context) {
         applicationContext = context.applicationContext
-        currentEngineMode = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_ENGINE_MODE, "accessibility")
-            ?.takeIf { it == "accessibility" || it == "root" || it == "foreground" }
-            ?: "accessibility"
+        val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val storedMode = preferences.getString(KEY_ENGINE_MODE, "foreground")
+        currentEngineMode = if (storedMode == "root") "root" else "foreground"
+        if (storedMode != currentEngineMode) {
+            preferences.edit().putString(KEY_ENGINE_MODE, currentEngineMode).apply()
+        }
         refreshClipboardListener()
         registerSyncNetworkCallbacks(context.applicationContext)
         replayPendingSyncNetworkNotifications()
@@ -707,13 +715,12 @@ object EcoPasteBridge {
      */
     @JvmStatic
     fun getPermissionsJson(context: Context): String {
+        val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val overlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Settings.canDrawOverlays(context)
         } else {
             true
         }
-
-        val accessibilityGranted = isAccessibilityServiceEnabled(context)
 
         val notificationGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
@@ -731,38 +738,35 @@ object EcoPasteBridge {
             true
         }
 
-        val rootAvailable = checkRootAvailable()
-        val rootClipboardGranted = rootAvailable && isRootClipboardGranted(context)
         val overlayRunning = isOverlayServiceRunning(context)
+        val clipboardMonitorRunning = rootClipboardMonitor?.isReady() == true
+        val gestureMonitorRunning = EcoPasteOverlayService.isGestureMonitorReady()
+        if (clipboardMonitorRunning || gestureMonitorRunning) {
+            rootAuthorizationStatus = ROOT_STATUS_AUTHORIZED
+        }
+        val mode = if (currentEngineMode == "root") "full" else "basic"
+        val modeSelected = preferences.getBoolean(
+            KEY_MODE_SELECTED,
+            currentEngineMode == "root",
+        )
 
         val json = JSONObject().apply {
             put("overlayGranted", overlayGranted)
-            put("accessibilityGranted", accessibilityGranted)
             put("notificationGranted", notificationGranted)
             put("batteryIgnored", batteryIgnored)
-            put("rootAvailable", rootAvailable)
-            put("rootClipboardGranted", rootClipboardGranted)
+            put("rootStatus", rootAuthorizationStatus)
             put("overlayServiceRunning", overlayRunning)
-            put("engineMode", currentEngineMode)
+            put("clipboardMonitorRunning", clipboardMonitorRunning)
+            put("gestureMonitorRunning", gestureMonitorRunning)
+            put(
+                "foregroundCaptureRunning",
+                currentEngineMode == "foreground" && foregroundCaptureActive &&
+                    clipboardListenerRegistered,
+            )
+            put("mode", mode)
+            put("modeSelected", modeSelected)
         }
         return json.toString()
-    }
-
-    /**
-     * 判断无障碍服务是否已开启
-     */
-    @JvmStatic
-    fun isAccessibilityServiceEnabled(context: Context): Boolean {
-        val expectedComponentName = "${context.packageName}/${EcoPasteAccessibilityService::class.java.canonicalName}"
-        val enabledServices = Settings.Secure.getString(
-            context.contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
-
-        return enabledServices.split(":").any {
-            it.equals(expectedComponentName, ignoreCase = true) ||
-            it.contains(EcoPasteAccessibilityService::class.java.simpleName, ignoreCase = true)
-        }
     }
 
     /**
@@ -776,7 +780,6 @@ object EcoPasteBridge {
                 Log.d(TAG, "requestPermissionByName: kind=$kind")
                 when (kind) {
                     "overlay" -> requestOverlayPermission(targetContext)
-                    "accessibility" -> requestAccessibilityPermission(targetContext)
                     "battery" -> requestBatteryOptimization(targetContext)
                     "notification" -> {
                         val act = getCurrentActivity()
@@ -817,21 +820,6 @@ object EcoPasteBridge {
                     openAppDetailsSettings(context)
                 }
             }
-        }
-    }
-
-    /**
-     * 请求打开系统无障碍设置页
-     */
-    @JvmStatic
-    fun requestAccessibilityPermission(context: Context) {
-        try {
-            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            openAppDetailsSettings(context)
         }
     }
 
@@ -914,36 +902,7 @@ object EcoPasteBridge {
         }
     }
 
-    /**
-     * 开启/停止悬浮手势服务
-     */
-    @JvmStatic
-    fun setOverlayServiceEnabled(context: Context, enable: Boolean) {
-        if (enable) {
-            startOverlayService(context)
-        } else {
-            stopOverlayService(context)
-        }
-    }
-
-    /** 仅在 Root 可用且用户已启用时启动全局输入监控服务。 */
-    @JvmStatic
-    fun startOverlayService(context: Context) {
-        if (!getGestureConfig(context).enabled || !checkRootAvailable()) {
-            Log.w(TAG, "gesture service requires enabled Root environment")
-            stopLegacyOverlayService(context)
-            return
-        }
-        startLegacyOverlayService(context)
-    }
-
-    /** 停止 Root 手势监控服务。 */
-    @JvmStatic
-    fun stopOverlayService(context: Context) {
-        stopLegacyOverlayService(context)
-    }
-
-    private fun startLegacyOverlayService(context: Context) {
+    private fun startOverlayService(context: Context) {
         val intent = Intent(context, EcoPasteOverlayService::class.java)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -956,7 +915,7 @@ object EcoPasteBridge {
         }
     }
 
-    private fun stopLegacyOverlayService(context: Context) {
+    private fun stopOverlayService(context: Context) {
         val intent = Intent(context, EcoPasteOverlayService::class.java)
         try {
             context.stopService(intent)
@@ -983,11 +942,7 @@ object EcoPasteBridge {
      */
     @JvmStatic
     fun triggerAutoPaste(): Boolean {
-        if (EcoPasteAccessibilityService.instance?.performPaste() == true) {
-            return true
-        }
-
-        if (currentEngineMode != "root" || !checkRootAvailable()) return false
+        if (currentEngineMode != "root") return false
 
         return runRootInputCommand("input keyevent 279") ||
             runRootInputCommand("input keycombination 113 50")
@@ -1030,45 +985,52 @@ object EcoPasteBridge {
         }
     }
 
-    /**
-     * 设置引擎模式
-     */
+    /** 用户明确点击授权后才探测 Root，状态查询本身不得触发 su。 */
     @JvmStatic
-    fun setEngine(context: Context, mode: String): String {
-        if (mode != "accessibility" && mode != "root" && mode != "foreground") {
-            return engineResult(false, currentEngineMode, false, "不支持的剪贴板引擎")
+    fun authorizeRoot(): String {
+        val authorized = checkRootAvailable()
+        return JSONObject().apply {
+            put("success", authorized)
+            put("rootStatus", rootAuthorizationStatus)
+            put("message", if (authorized) "" else "未取得 Root 授权")
+        }.toString()
+    }
+
+    /** 在完整与基础产品模式之间切换，并记住用户已经完成选择。 */
+    @JvmStatic
+    fun setMode(context: Context, mode: String): String {
+        if (mode != "full" && mode != "basic") {
+            return modeResult(false, currentMode(), "不支持的 Android 运行模式")
         }
 
-        if (mode == "root") {
-            if (!checkRootAvailable()) {
-                return engineResult(false, currentEngineMode, false, "未检测到 Root 权限")
-            }
-            if (!grantClipboardAccessViaRoot(context) || !isRootClipboardGranted(context)) {
-                return engineResult(false, currentEngineMode, false, "Root AppOps 授权失败")
-            }
+        if (mode == "full" && rootAuthorizationStatus != ROOT_STATUS_AUTHORIZED) {
+            return modeResult(false, currentMode(), "请先完成 Root 授权")
         }
 
-        currentEngineMode = mode
+        currentEngineMode = if (mode == "full") "root" else "foreground"
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_ENGINE_MODE, mode)
+            .putString(KEY_ENGINE_MODE, currentEngineMode)
+            .putBoolean(KEY_MODE_SELECTED, true)
             .apply()
         applicationContext = context.applicationContext
         refreshClipboardListener()
         ensureGestureService(context)
-        return engineResult(true, mode, mode != "root" || isRootClipboardGranted(context), "")
+        return modeResult(true, mode, "")
     }
 
-    private fun engineResult(
+    private fun currentMode(): String {
+        return if (currentEngineMode == "root") "full" else "basic"
+    }
+
+    private fun modeResult(
         success: Boolean,
         mode: String,
-        rootClipboardGranted: Boolean,
         message: String,
     ): String {
         return JSONObject().apply {
             put("success", success)
             put("mode", mode)
-            put("rootClipboardGranted", rootClipboardGranted)
             put("message", message)
         }.toString()
     }
@@ -1123,8 +1085,8 @@ object EcoPasteBridge {
             .putInt(KEY_GESTURE_RIGHT_HEIGHT_DP, nextRightHeightDp)
             .apply()
 
-        if (!enabled) {
-            stopLegacyOverlayService(context)
+        if (!enabled || currentEngineMode != "root") {
+            stopOverlayService(context)
             return
         }
 
@@ -1138,18 +1100,22 @@ object EcoPasteBridge {
             return
         }
 
-        if (checkRootAvailable()) {
-            startLegacyOverlayService(context)
+        val overlayGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            Settings.canDrawOverlays(context)
+        if (overlayGranted) {
+            startOverlayService(context)
         }
     }
 
     @JvmStatic
     fun ensureGestureService(context: Context) {
         val config = getGestureConfig(context)
-        if (currentEngineMode == "root" || (config.enabled && checkRootAvailable())) {
-            startLegacyOverlayService(context)
+        val overlayGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            Settings.canDrawOverlays(context)
+        if (currentEngineMode == "root" && config.enabled && overlayGranted) {
+            startOverlayService(context)
         } else {
-            stopLegacyOverlayService(context)
+            stopOverlayService(context)
         }
     }
 
@@ -1217,18 +1183,9 @@ object EcoPasteBridge {
 
             val clip = manager?.primaryClip ?: return
             if (clip.itemCount <= 0) return
-            val context = applicationContext ?: EcoPasteAccessibilityService.instance ?: return
+            val context = applicationContext ?: return
             val text = clip.getItemAt(0).coerceToText(context)?.toString() ?: return
-            val sourceHint = sourcePackage ?: lastAccessibilitySourcePackage
-            val sourceHintIsRecent =
-                SystemClock.elapsedRealtime() - lastAccessibilitySourceElapsedRealtime <= 1_500L
-            val clipboardChangeIsRecent =
-                timestamp > 0L && abs(System.currentTimeMillis() - timestamp) <= 1_500L
-            val trustedSourcePackage = sourceHint.takeIf {
-                currentEngineMode == "accessibility" &&
-                    sourceHintIsRecent && clipboardChangeIsRecent
-            }
-            onClipboardCaptured(text, timestamp, confirmedChange, trustedSourcePackage)
+            onClipboardCaptured(text, timestamp, confirmedChange, sourcePackage)
         } catch (error: Exception) {
             Log.d(TAG, "read clipboard change failed: ${error.message}")
         }
@@ -1279,15 +1236,6 @@ object EcoPasteBridge {
         }
     }
 
-    /** Records a short-lived accessibility hint; stale foreground apps must not become sources. */
-    @JvmStatic
-    @Synchronized
-    fun recordAccessibilitySource(packageName: String?) {
-        if (packageName.isNullOrBlank() || packageName == applicationContext?.packageName) return
-        lastAccessibilitySourcePackage = packageName
-        lastAccessibilitySourceElapsedRealtime = SystemClock.elapsedRealtime()
-    }
-
     private data class SourceAppMetadata(
         val packageName: String,
         val appName: String,
@@ -1329,53 +1277,26 @@ object EcoPasteBridge {
      */
     @JvmStatic
     fun checkRootAvailable(): Boolean {
-        return try {
+        val available = try {
             val process = ProcessBuilder("su", "-c", "id")
                 .redirectErrorStream(true)
                 .start()
-            if (!waitForProcess(process, 3_000L)) return false
-            process.inputStream.bufferedReader().use { reader ->
-                process.exitValue() == 0 && reader.readText().contains("uid=0")
+            if (!waitForProcess(process, 3_000L)) {
+                false
+            } else {
+                process.inputStream.bufferedReader().use { reader ->
+                    process.exitValue() == 0 && reader.readText().contains("uid=0")
+                }
             }
         } catch (_: Exception) {
             false
         }
-    }
-
-    /**
-     * 尝试通过 Root 命令授权 appops READ_CLIPBOARD
-     */
-    @JvmStatic
-    fun grantClipboardAccessViaRoot(context: Context): Boolean {
-        return try {
-            val pkg = context.packageName
-            val cmd = "cmd appops set $pkg READ_CLIPBOARD allow"
-            val process = ProcessBuilder("su", "-c", cmd)
-                .redirectErrorStream(true)
-                .start()
-            if (!waitForProcess(process, 5_000L)) return false
-            process.inputStream.bufferedReader().use { it.readText() }
-            process.exitValue() == 0
-        } catch (error: Exception) {
-            Log.e(TAG, "grant root clipboard AppOps failed: ${error.message}", error)
-            false
+        rootAuthorizationStatus = if (available) {
+            ROOT_STATUS_AUTHORIZED
+        } else {
+            ROOT_STATUS_UNAVAILABLE
         }
-    }
-
-    @JvmStatic
-    fun isRootClipboardGranted(context: Context): Boolean {
-        return try {
-            val pkg = context.packageName
-            val process = ProcessBuilder("su", "-c", "cmd appops get $pkg READ_CLIPBOARD")
-                .redirectErrorStream(true)
-                .start()
-            if (!waitForProcess(process, 3_000L)) return false
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.exitValue() == 0 && Regex("READ_CLIPBOARD:\\s*allow").containsMatchIn(output)
-        } catch (error: Exception) {
-            Log.d(TAG, "read root clipboard AppOps failed: ${error.message}")
-            false
-        }
+        return available
     }
 
     /** Waits for short root commands without depending on newer Android Process APIs. */

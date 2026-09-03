@@ -35,8 +35,16 @@ class RootClipboardMonitor(
     @Volatile
     private var worker: Thread? = null
 
+    @Volatile
+    private var ready = false
+
+    fun isReady(): Boolean {
+        return ready
+    }
+
     fun start() {
         if (worker?.isAlive == true) return
+        ready = false
         val runId = generation.incrementAndGet()
         worker = thread(name = "ecopaste-root-clipboard", start = true) {
             runLoop(runId)
@@ -60,6 +68,7 @@ class RootClipboardMonitor(
 
     fun stop() {
         generation.incrementAndGet()
+        ready = false
         val currentProcess = process
         process = null
         val currentPid = daemonPid
@@ -134,6 +143,7 @@ class RootClipboardMonitor(
                     when {
                         line.startsWith("READY ") -> {
                             readyAt = System.nanoTime()
+                            ready = true
                             daemonPid = parseDaemonPid(line)
                             Log.i(TAG, line)
                         }
@@ -154,6 +164,7 @@ class RootClipboardMonitor(
             }
         } finally {
             if (generation.get() == runId) {
+                ready = false
                 process = null
                 daemonPid = null
                 synchronized(writerLock) {

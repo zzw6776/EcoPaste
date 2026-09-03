@@ -57,7 +57,7 @@ const PREFERENCE_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+,", " ");
  * 左侧 🔍 极简搜索，中间绝对居中 Pinboards（剪贴板胶囊 + 收藏 + 自定义画板 + 新建），右侧极简 `...` 更多。
  */
 const Header: FC = () => {
-  const { t } = useTranslation("clipboard");
+  const { t } = useTranslation(["clipboard", "common"]);
   const settings = useSnapshot(settingsState);
   const snapshot = useSnapshot(clipboardViewState);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -297,7 +297,7 @@ const Header: FC = () => {
           {
             icon: "i-lucide:smartphone",
             key: "android_permissions",
-            label: "Android 权限与引擎配置",
+            label: t("common:androidPermissions.title"),
           },
         ]
       : []),

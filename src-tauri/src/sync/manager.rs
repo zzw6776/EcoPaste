@@ -43,7 +43,8 @@ use uuid::Uuid;
 
 use crate::{
     clipboard::{
-        calculate_files_total_size, fallback_accent_colors, AppIconStore, ImageStore,
+        calculate_files_total_size, fallback_accent_colors, AppIconStore, ClipboardFingerprint,
+        ClipboardFingerprintState, ClipboardObservation, FileEntryFingerprint, ImageStore,
         WritebackGuard,
     },
     db::{
@@ -102,7 +103,7 @@ fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
 }
 
 const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
-const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
 pub struct SyncManager {
@@ -117,6 +118,7 @@ pub struct SyncManager {
     lan_cycle_lock: AsyncRwLock<()>,
     cloud_cycle_lock: Mutex<()>,
     cloud_connect_lock: Mutex<()>,
+    cloud_connection_ready: Notify,
     cloud_session_lock: Mutex<()>,
     cloud_force_reconnect: AtomicBool,
     maintenance_lock: Mutex<()>,
@@ -397,6 +399,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         lan_cycle_lock: AsyncRwLock::new(()),
         cloud_cycle_lock: Mutex::new(()),
         cloud_connect_lock: Mutex::new(()),
+        cloud_connection_ready: Notify::new(),
         cloud_session_lock: Mutex::new(()),
         cloud_force_reconnect: AtomicBool::new(false),
         maintenance_lock: Mutex::new(()),
@@ -1161,6 +1164,10 @@ impl SyncManager {
         if settings.lan_enabled {
             self.refresh_android_lan_routes().await;
         }
+        if cloud_enabled {
+            self.request_cloud_connection(Duration::from_secs(8))
+                .await?;
+        }
         match (cloud_enabled, settings.lan_enabled) {
             (true, true) => {
                 let (cloud, lan) = tokio::join!(
@@ -1207,6 +1214,28 @@ impl SyncManager {
         .await
     }
 
+    /// Bypasses cloud backoff and starts fresh transfer and watch attempts.
+    pub fn reconnect_cloud(&self) -> Result<()> {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled
+            || self.identity.snapshot().group.is_none()
+            || !server_is_configured(&settings)
+        {
+            bail!("云端同步未配置");
+        }
+
+        if let Some(connection) = self.cached_cloud_connection() {
+            self.invalidate_cloud_connection(connection.stable_id());
+        }
+        self.cloud_force_reconnect.store(true, Ordering::Release);
+        self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Connecting, None, false);
+        self.set_cloud_watch_status(SyncChannelState::Connecting, None, false);
+        self.emit_updated();
+        self.wake_cloud_transfer();
+        self.watch_wake.notify_one();
+        Ok(())
+    }
+
     #[cfg(target_os = "android")]
     async fn refresh_android_lan_routes(&self) {
         let _guard = AndroidLanDiscoveryGuard::acquire();
@@ -1214,7 +1243,18 @@ impl SyncManager {
     }
 
     pub async fn enqueue_item(&self, item: ClipboardItem, force_files: bool) -> Result<()> {
-        self.enqueue_item_inner(item, force_files, true, false)
+        self.enqueue_item_inner(item, force_files, true, false, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Enqueues a clipboard event whose file fingerprint may finish asynchronously.
+    pub async fn enqueue_observed_item(
+        &self,
+        item: ClipboardItem,
+        observation: ClipboardObservation,
+    ) -> Result<()> {
+        self.enqueue_item_inner(item, false, true, false, Some(observation))
             .await?;
         Ok(())
     }
@@ -1234,9 +1274,13 @@ impl SyncManager {
         {
             bail!("局域网同步已关闭");
         }
-        self.enqueue_item_inner(item.clone(), true, false, false)
+        self.enqueue_item_inner(item.clone(), true, false, false, None)
             .await?
             .context("此记录未满足当前同步策略")?;
+        if target == SyncTarget::Cloud {
+            self.request_cloud_connection(Duration::from_secs(8))
+                .await?;
+        }
         self.run_cycle(Some(target), None, Duration::from_secs(8))
             .await?;
         let pool = self.pool().await;
@@ -1266,10 +1310,9 @@ impl SyncManager {
             .snapshot()
             .group
             .context("请先创建或加入同步设备组")?;
-        let server = server_endpoint_addr(&settings)
-            .await?
-            .context("请先完成云端 Hub 配置")?;
-        let endpoint = self.ensure_endpoint(&settings).await?;
+        let connection = self
+            .request_cloud_connection(Duration::from_secs(8))
+            .await?;
         let request = Request::ListEvents {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
@@ -1277,7 +1320,7 @@ impl SyncManager {
             limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
         };
         let (connection, response) = self
-            .request_cloud_records_page(&endpoint, &server, &group, &request)
+            .request_cloud_records_page(connection, &group, &request)
             .await?;
         let Response::EventsPage {
             events,
@@ -1348,13 +1391,11 @@ impl SyncManager {
     /// Retries one idempotent history read after evicting a stale shared cloud connection.
     async fn request_cloud_records_page(
         self: &Arc<Self>,
-        endpoint: &Endpoint,
-        server: &EndpointAddr,
+        mut connection: Connection,
         group: &GroupSecrets,
         request: &Request,
     ) -> Result<(Connection, Response)> {
         for attempt in 0..2 {
-            let connection = self.connect_cloud(endpoint, server.clone()).await?;
             let result: Result<Response> = async {
                 self.ensure_cloud_group(&connection, group).await?;
                 tokio::time::timeout(
@@ -1370,9 +1411,13 @@ impl SyncManager {
                 Err(error) if attempt == 0 => {
                     self.invalidate_cloud_connection(connection.stable_id());
                     log::debug!("retry cloud records on a fresh connection: {error}");
+                    connection = self
+                        .request_cloud_connection(Duration::from_secs(8))
+                        .await?;
                 }
                 Err(error) => {
                     self.invalidate_cloud_connection(connection.stable_id());
+                    self.watch_wake.notify_one();
                     return Err(error);
                 }
             }
@@ -1387,6 +1432,7 @@ impl SyncManager {
         force_files: bool,
         should_wake: bool,
         history_backfill: bool,
+        observation: Option<ClipboardObservation>,
     ) -> Result<Option<String>> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
@@ -1418,7 +1464,7 @@ impl SyncManager {
             }
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
-        let (envelope, blobs) = match self
+        let (envelope, blobs, fingerprint) = match self
             .build_envelope(&event_id, &item, &settings, &group, force_files)
             .await?
         {
@@ -1430,6 +1476,11 @@ impl SyncManager {
                 return Ok(None);
             }
         };
+        if let (Some(observation), Some(fingerprint)) = (observation.as_ref(), fingerprint) {
+            self.app
+                .state::<Arc<ClipboardFingerprintState>>()
+                .commit_observation(observation, fingerprint);
+        }
         if item.kind == ClipboardKind::Files {
             if let Some(size) = envelope.item.size {
                 if item.size != Some(size)
@@ -1487,12 +1538,19 @@ impl SyncManager {
         settings: &SyncSettings,
         group: &GroupSecrets,
         force_files: bool,
-    ) -> Result<Option<(ClipboardEnvelope, Vec<StoredBlob>)>> {
+    ) -> Result<
+        Option<(
+            ClipboardEnvelope,
+            Vec<StoredBlob>,
+            Option<ClipboardFingerprint>,
+        )>,
+    > {
         let key = group.content_key_bytes()?;
         let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
         let mut manifests = Vec::new();
         let mut stored_blobs = Vec::new();
         let mut envelope_size = item.size;
+        let mut clipboard_fingerprint = None;
         match item.kind {
             ClipboardKind::Text => {}
             ClipboardKind::Image => {
@@ -1549,18 +1607,19 @@ impl SyncManager {
                     }
                 }
                 let mut packed_total_size = 0_u64;
+                let mut file_fingerprints = Vec::with_capacity(paths.len());
                 for (index, source) in paths.into_iter().enumerate() {
                     let name = safe_file_name(&source);
                     let source_for_task = source.clone();
                     let root_for_task = blob_root.clone();
                     let key_for_task = key;
                     let is_directory = source.is_dir();
-                    let (blob, original_size, content_size) =
+                    let (blob, original_size, content_size, content_hash) =
                         tauri::async_runtime::spawn_blocking(move || {
                             if is_directory {
                                 let temporary = tempfile::tempdir()?;
                                 let archive_path = temporary.path().join("directory.zip");
-                                let content_size =
+                                let archived =
                                     crypto::archive_directory(&source_for_task, &archive_path)?;
                                 let archive_size = archive_path.metadata()?.len();
                                 let blob = crypto::encrypt_blob(
@@ -1568,15 +1627,20 @@ impl SyncManager {
                                     &root_for_task,
                                     &key_for_task,
                                 )?;
-                                Ok::<_, anyhow::Error>((blob, archive_size, content_size))
+                                Ok::<_, anyhow::Error>((
+                                    blob,
+                                    archive_size,
+                                    archived.content_size,
+                                    archived.fingerprint,
+                                ))
                             } else {
                                 let size = source_for_task.metadata()?.len();
-                                let blob = crypto::encrypt_blob(
+                                let encrypted = crypto::encrypt_blob_with_fingerprint(
                                     &source_for_task,
                                     &root_for_task,
                                     &key_for_task,
                                 )?;
-                                Ok((blob, size, size))
+                                Ok((encrypted.blob, size, size, encrypted.plaintext_hash))
                             }
                         })
                         .await
@@ -1584,6 +1648,11 @@ impl SyncManager {
                     packed_total_size = packed_total_size
                         .checked_add(content_size)
                         .context("clipboard file size overflow")?;
+                    file_fingerprints.push(FileEntryFingerprint {
+                        name: name.clone(),
+                        is_directory,
+                        content_hash,
+                    });
                     manifests.push(BlobManifest {
                         blob_id: blob.blob_id.clone(),
                         name,
@@ -1607,6 +1676,7 @@ impl SyncManager {
                     i64::try_from(packed_total_size)
                         .context("clipboard file size exceeds supported range")?,
                 );
+                clipboard_fingerprint = ClipboardFingerprint::from_file_entries(&file_fingerprints);
             }
         }
         let source_app = self
@@ -1636,6 +1706,7 @@ impl SyncManager {
                 source_app,
             },
             stored_blobs,
+            clipboard_fingerprint,
         )))
     }
 
@@ -1719,7 +1790,10 @@ impl SyncManager {
         let items = db::items::recent_items_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
         for item in items.into_iter().rev() {
             let item_id = item.id.clone();
-            if let Err(error) = self.enqueue_item_inner(item, false, false, true).await {
+            if let Err(error) = self
+                .enqueue_item_inner(item, false, false, true, None)
+                .await
+            {
                 log::warn!("backfill clipboard item {item_id} failed: {error}");
                 repository::mark_pending_item(pool, &item_id, "历史记录无法自动同步，请手动重试")
                     .await?;
@@ -1960,115 +2034,67 @@ impl SyncManager {
         let mut cloud_succeeded = false;
         let mut cloud_error = None;
         if target != Some(SyncTarget::Lan) {
-            for attempt in 0..2 {
-                let cloud_cycle_started_at = Instant::now();
-                let reused_connection = self.cached_cloud_connection().is_some();
-                if !reused_connection && server_is_configured(&settings) {
-                    self.set_channel_status(
-                        SyncTarget::Cloud,
-                        SyncChannelState::Connecting,
-                        None,
-                        false,
-                    );
-                }
-                match self.configured_cloud_connection(&endpoint, &settings).await {
-                    Ok(Some(connection)) => {
-                        let connection_elapsed = cloud_cycle_started_at.elapsed();
-                        let group_started_at = Instant::now();
-                        let result = async {
-                            let initialized_group =
-                                self.ensure_cloud_group(&connection, &group).await?;
-                            let group_elapsed = group_started_at.elapsed();
-                            let transfer_started_at = Instant::now();
-                            let cursor = repository::cloud_cursor(&pool).await?;
-                            let latest = self
-                                .sync_connection(
-                                    &connection,
-                                    CLOUD_TARGET,
-                                    cursor,
-                                    &group,
-                                    &endpoint,
-                                )
-                                .await?;
-                            repository::set_cloud_cursor(&pool, latest).await?;
-                            Ok::<_, anyhow::Error>((
-                                initialized_group,
-                                group_elapsed,
-                                transfer_started_at.elapsed(),
-                            ))
-                        }
-                        .await;
-                        match result {
-                            Ok((initialized_group, group_elapsed, transfer_elapsed)) => {
-                                self.set_cloud_path(&connection);
-                                cloud_succeeded = true;
-                                log::info!(
-                                    "cloud sync cycle completed: reusedConnection={reused_connection} initializedGroup={initialized_group} retryAttempt={attempt} connectionMs={} groupMs={} transferMs={} totalMs={}",
-                                    connection_elapsed.as_millis(),
-                                    group_elapsed.as_millis(),
-                                    transfer_elapsed.as_millis(),
-                                    cloud_cycle_started_at.elapsed().as_millis()
-                                );
-                            }
-                            Err(error) => {
-                                let connection_closed = connection.close_reason().is_some();
-                                let retry_immediately = attempt == 0
-                                    && (is_cloud_attempt_timeout(&error) || connection_closed);
-                                self.invalidate_cloud_connection(connection.stable_id());
-                                if retry_immediately {
-                                    log::warn!(
-                                        "cloud connection became unavailable; resolving the server again and retrying immediately"
-                                    );
-                                    continue;
-                                }
-                                cloud_error = Some(error.to_string());
-                            }
-                        }
-                        if cloud_succeeded {
-                            self.set_channel_status(
-                                SyncTarget::Cloud,
-                                SyncChannelState::Online,
-                                None,
-                                true,
-                            );
-                        } else {
-                            let pending = repository::pending_origin_events_for_target(
-                                &pool,
-                                CLOUD_TARGET,
-                                &identity.device_id,
-                                MAX_EVENTS_PER_BATCH,
-                            )
+            let cloud_cycle_started_at = Instant::now();
+            match self.configured_cloud_connection(&settings) {
+                Ok(Some(connection)) => {
+                    let group_started_at = Instant::now();
+                    let result = async {
+                        let initialized_group =
+                            self.ensure_cloud_group(&connection, &group).await?;
+                        let group_elapsed = group_started_at.elapsed();
+                        let transfer_started_at = Instant::now();
+                        let cursor = repository::cloud_cursor(&pool).await?;
+                        let latest = self
+                            .sync_connection(&connection, CLOUD_TARGET, cursor, &group, &endpoint)
                             .await?;
-                            let event_ids = pending
-                                .into_iter()
-                                .map(|stored| stored.event.event_id)
-                                .collect::<Vec<_>>();
-                            if let Some(error) = cloud_error.as_deref() {
-                                repository::mark_delivery_error(
-                                    &pool,
-                                    CLOUD_TARGET,
-                                    &event_ids,
-                                    error,
-                                )
-                                .await?;
-                            }
-                            self.set_channel_status(
-                                SyncTarget::Cloud,
-                                SyncChannelState::Error,
-                                cloud_error.as_deref(),
-                                false,
+                        repository::set_cloud_cursor(&pool, latest).await?;
+                        Ok::<_, anyhow::Error>((
+                            initialized_group,
+                            group_elapsed,
+                            transfer_started_at.elapsed(),
+                        ))
+                    }
+                    .await;
+                    match result {
+                        Ok((initialized_group, group_elapsed, transfer_elapsed)) => {
+                            self.set_cloud_path(&connection);
+                            cloud_succeeded = true;
+                            log::info!(
+                                "cloud sync cycle completed: initializedGroup={initialized_group} groupMs={} transferMs={} totalMs={}",
+                                group_elapsed.as_millis(),
+                                transfer_elapsed.as_millis(),
+                                cloud_cycle_started_at.elapsed().as_millis()
                             );
                         }
-                        break;
+                        Err(error) => {
+                            self.invalidate_cloud_connection(connection.stable_id());
+                            self.watch_wake.notify_one();
+                            cloud_error = Some(error.to_string());
+                        }
                     }
-                    Ok(None) => self.set_channel_status(
-                        SyncTarget::Cloud,
-                        SyncChannelState::Disabled,
-                        None,
-                        false,
-                    ),
-                    Err(error) => {
-                        cloud_error = Some(error.to_string());
+                    if cloud_succeeded {
+                        self.set_channel_status(
+                            SyncTarget::Cloud,
+                            SyncChannelState::Online,
+                            None,
+                            true,
+                        );
+                    } else {
+                        let pending = repository::pending_origin_events_for_target(
+                            &pool,
+                            CLOUD_TARGET,
+                            &identity.device_id,
+                            MAX_EVENTS_PER_BATCH,
+                        )
+                        .await?;
+                        let event_ids = pending
+                            .into_iter()
+                            .map(|stored| stored.event.event_id)
+                            .collect::<Vec<_>>();
+                        if let Some(error) = cloud_error.as_deref() {
+                            repository::mark_delivery_error(&pool, CLOUD_TARGET, &event_ids, error)
+                                .await?;
+                        }
                         self.set_channel_status(
                             SyncTarget::Cloud,
                             SyncChannelState::Error,
@@ -2077,7 +2103,21 @@ impl SyncManager {
                         );
                     }
                 }
-                break;
+                Ok(None) => self.set_channel_status(
+                    SyncTarget::Cloud,
+                    SyncChannelState::Disabled,
+                    None,
+                    false,
+                ),
+                Err(error) => {
+                    cloud_error = Some(error.to_string());
+                    self.set_channel_status(
+                        SyncTarget::Cloud,
+                        SyncChannelState::Error,
+                        cloud_error.as_deref(),
+                        false,
+                    );
+                }
             }
         }
 
@@ -2942,12 +2982,12 @@ impl SyncManager {
             }
             repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let (item_id, item) = self.apply_envelope(&event, envelope, group).await?;
+            let (item_id, item, fingerprint) = self.apply_envelope(&event, envelope, group).await?;
             repository::link_event_to_item(&pool, &item_id, &event.event_id, "remote").await?;
             self.reconcile_item_timestamps(&pool, group, &item_id)
                 .await?;
             repository::mark_applied(&pool, &event.event_id).await?;
-            latest_clipboard_item = Some(item);
+            latest_clipboard_item = Some((item, fingerprint));
             if let Some(icon) = source_icon {
                 match self.source_icon_blob_record(&icon) {
                     Ok(blob) => {
@@ -2967,8 +3007,8 @@ impl SyncManager {
                 applied_any = true;
             }
         }
-        if let Some(item) = latest_clipboard_item.as_ref() {
-            self.write_latest_synced_item_to_clipboard(item);
+        if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
+            self.write_latest_synced_item_to_clipboard(item, fingerprint.as_ref());
         }
         drop(_apply_guard);
         #[cfg(target_os = "android")]
@@ -3036,14 +3076,14 @@ impl SyncManager {
         event: &EncryptedEvent,
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
-    ) -> Result<(String, ClipboardItem)> {
+    ) -> Result<(String, ClipboardItem, Option<ClipboardFingerprint>)> {
         if envelope.version != 1 {
             bail!("不支持的同步事件版本");
         }
         let kind = parse_kind(&envelope.item.kind)?;
         let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
-        let content = match kind {
-            ClipboardKind::Text => envelope.item.content.clone(),
+        let (content, files_fingerprint) = match kind {
+            ClipboardKind::Text => (envelope.item.content.clone(), None),
             ClipboardKind::Image => {
                 let manifest = envelope
                     .blobs
@@ -3060,47 +3100,64 @@ impl SyncManager {
                 })
                 .await
                 .context("image decryption task failed")??;
-                image_name
+                (image_name, None)
             }
             ClipboardKind::Files => {
                 let directory = crate::core::paths::resources_dir(&self.app)?
                     .join("sync-files")
                     .join(&event.event_id);
                 let mut paths = Vec::new();
+                let mut file_fingerprints = Vec::new();
                 for manifest in &envelope.blobs {
                     if manifest.role != BlobRole::File {
                         continue;
                     }
-                    let destination = directory.join(format!(
-                        "{:03}-{}",
+                    // 不在逻辑文件名前加序号：系统剪贴板及 RustDesk 会继续
+                    // 传播落盘后的 basename，改名会让同一内容在往返中产生不同指纹。
+                    // 用独立序号目录处理同名根项，同时保留原始 basename。
+                    let destination = synced_file_destination(
+                        &directory,
                         manifest.file_index.unwrap_or(0),
-                        sanitize_name(&manifest.name)
-                    ));
+                        &manifest.name,
+                    );
                     let encrypted = crypto::blob_path(&blob_root, &manifest.blob_id)?;
                     let key = group.content_key_bytes()?;
                     let size = manifest.original_size;
                     let destination_for_task = destination.clone();
                     let is_directory = manifest.is_directory_archive;
-                    tauri::async_runtime::spawn_blocking(move || {
+                    let content_hash = tauri::async_runtime::spawn_blocking(move || {
                         if is_directory {
                             let archive_path =
                                 destination_for_task.with_extension("ecopaste-dir.zip");
                             crypto::decrypt_blob(&encrypted, &archive_path, size, &key)?;
-                            crypto::extract_directory_archive(
+                            let fingerprint = crypto::extract_directory_archive(
                                 &archive_path,
                                 &destination_for_task,
                             )?;
                             fs::remove_file(archive_path).ok();
-                            Ok(())
+                            Ok(fingerprint)
                         } else {
-                            crypto::decrypt_blob(&encrypted, &destination_for_task, size, &key)
+                            crypto::decrypt_blob_with_fingerprint(
+                                &encrypted,
+                                &destination_for_task,
+                                size,
+                                &key,
+                            )
                         }
                     })
                     .await
                     .context("file decryption task failed")??;
+                    file_fingerprints.push(FileEntryFingerprint {
+                        name: manifest.name.clone(),
+                        is_directory,
+                        content_hash,
+                    });
                     paths.push(destination.to_string_lossy().into_owned());
                 }
-                paths.join("\n")
+                (
+                    paths.join("\n"),
+                    ClipboardFingerprint::from_file_entries(&file_fingerprints),
+                )
             }
         };
         let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
@@ -3144,6 +3201,7 @@ impl SyncManager {
             content,
             search_text: envelope.item.search_text,
             summary: envelope.item.summary,
+            text_char_count: None,
             file_types: envelope.item.file_types,
             size: envelope.item.size,
             width: envelope.item.width,
@@ -3171,12 +3229,17 @@ impl SyncManager {
         let result = db::items::upsert_synced_item(&pool, &item).await?;
         item.id.clone_from(&result.id);
         self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
-        Ok((result.id, item))
+        let fingerprint = files_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
+        Ok((result.id, item, fingerprint))
     }
 
     /// A remote batch updates the system clipboard at most once. Clipboard ownership is
     /// independent from transport health, so a busy OS clipboard must never fail synchronization.
-    fn write_latest_synced_item_to_clipboard(&self, item: &ClipboardItem) {
+    fn write_latest_synced_item_to_clipboard(
+        &self,
+        item: &ClipboardItem,
+        fingerprint: Option<&ClipboardFingerprint>,
+    ) {
         if !self
             .app
             .state::<SettingsStore>()
@@ -3188,18 +3251,25 @@ impl SyncManager {
         }
 
         let guard = self.app.state::<Arc<WritebackGuard>>();
+        let fingerprints = self.app.state::<Arc<ClipboardFingerprintState>>();
         #[cfg(target_os = "android")]
         let result = if item.kind == ClipboardKind::Text {
-            crate::clipboard::write_to_clipboard_app(&self.app, &guard, item)
+            crate::clipboard::write_synced_item_to_clipboard_app(
+                &self.app,
+                &guard,
+                &fingerprints,
+                item,
+            )
         } else {
-            Ok(())
+            Ok(false)
         };
         #[cfg(not(target_os = "android"))]
-        let result = crate::clipboard::write_to_clipboard(
+        let result = crate::clipboard::write_synced_item_to_clipboard(
             &self.app.state::<ImageStore>(),
             &guard,
+            &fingerprints,
             item,
-            false,
+            fingerprint,
         );
 
         if let Err(error) = result {
@@ -3757,23 +3827,21 @@ impl SyncManager {
             SyncTarget::Lan => &self.lan_status,
             SyncTarget::Cloud => &self.cloud_status,
         };
-        let mut status = lock.write().expect("sync channel status poisoned");
-        if state == SyncChannelState::Disabled {
-            *status = SyncChannelStatus::new(state);
-            return;
-        }
-        let now = Utc::now().to_rfc3339();
-        status.state = state;
-        if matches!(
-            state,
-            SyncChannelState::Connecting | SyncChannelState::Online | SyncChannelState::Error
-        ) {
-            status.last_attempt_at = Some(now.clone());
-        }
-        if succeeded {
-            status.last_success_at = Some(now);
-        }
-        status.last_error = error.map(str::to_owned);
+        update_channel_status(lock, state, error, succeeded, None);
+    }
+
+    fn set_channel_retry_status(&self, target: SyncTarget, error: &str, next_retry_at: &str) {
+        let lock = match target {
+            SyncTarget::Lan => &self.lan_status,
+            SyncTarget::Cloud => &self.cloud_status,
+        };
+        update_channel_status(
+            lock,
+            SyncChannelState::Error,
+            Some(error),
+            false,
+            Some(next_retry_at),
+        );
     }
 
     fn set_cloud_watch_status(
@@ -3782,7 +3850,17 @@ impl SyncManager {
         error: Option<&str>,
         succeeded: bool,
     ) {
-        update_channel_status(&self.cloud_watch_status, state, error, succeeded);
+        update_channel_status(&self.cloud_watch_status, state, error, succeeded, None);
+    }
+
+    fn set_cloud_watch_retry_status(&self, error: &str, next_retry_at: &str) {
+        update_channel_status(
+            &self.cloud_watch_status,
+            SyncChannelState::Error,
+            Some(error),
+            false,
+            Some(next_retry_at),
+        );
     }
 
     fn set_cloud_path(&self, connection: &Connection) {
@@ -3846,6 +3924,7 @@ impl SyncManager {
             .cloud_connection
             .write()
             .expect("cloud connection cache poisoned") = Some(connection.clone());
+        self.cloud_connection_ready.notify_waiters();
         self.source_asset_wake.notify_one();
         self.cloud_session
             .write()
@@ -3858,20 +3937,42 @@ impl SyncManager {
         Ok(connection)
     }
 
-    /// Reuses a healthy cloud connection without repeating endpoint DNS resolution.
-    async fn configured_cloud_connection(
-        self: &Arc<Self>,
-        endpoint: &Endpoint,
-        settings: &SyncSettings,
-    ) -> Result<Option<Connection>> {
-        if let Some(connection) = self.cached_cloud_connection() {
-            return Ok(Some(connection));
+    /// Explicit user actions may interrupt backoff, but only the watch worker creates connections.
+    async fn request_cloud_connection(&self, wait_timeout: Duration) -> Result<Connection> {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled
+            || self.identity.snapshot().group.is_none()
+            || !server_is_configured(&settings)
+        {
+            bail!("云端同步未配置");
         }
-        let Some(server) = server_endpoint_addr(settings).await? else {
-            return Ok(None);
-        };
+        if let Some(connection) = self.cached_cloud_connection() {
+            return Ok(connection);
+        }
 
-        self.connect_cloud(endpoint, server).await.map(Some)
+        self.watch_wake.notify_one();
+        tokio::time::timeout(wait_timeout, async {
+            loop {
+                let notified = self.cloud_connection_ready.notified();
+                if let Some(connection) = self.cached_cloud_connection() {
+                    return connection;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .context("云端同步连接超时")
+    }
+
+    /// Background transfers consume only the connection published by the watch supervisor.
+    fn configured_cloud_connection(&self, settings: &SyncSettings) -> Result<Option<Connection>> {
+        if !server_is_configured(settings) {
+            return Ok(None);
+        }
+
+        self.cached_cloud_connection()
+            .context("云端同步连接尚未就绪")
+            .map(Some)
     }
 
     fn cached_cloud_connection(&self) -> Option<Connection> {
@@ -3902,6 +4003,7 @@ impl SyncManager {
             }
         };
         if removed {
+            self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
             self.confirmed_cloud_source_icons
                 .write()
                 .expect("confirmed cloud source icons poisoned")
@@ -3929,6 +4031,7 @@ impl SyncManager {
             .take()?;
         let stable_id = connection.stable_id();
         connection.close(0_u32.into(), b"cloud network path changed");
+        self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
         self.confirmed_cloud_source_icons
             .write()
             .expect("confirmed cloud source icons poisoned")
@@ -3992,6 +4095,7 @@ fn update_channel_status(
     state: SyncChannelState,
     error: Option<&str>,
     succeeded: bool,
+    next_retry_at: Option<&str>,
 ) {
     let mut status = lock.write().expect("sync channel status poisoned");
     if state == SyncChannelState::Disabled {
@@ -4010,6 +4114,7 @@ fn update_channel_status(
         status.last_success_at = Some(now);
     }
     status.last_error = error.map(str::to_owned);
+    status.next_retry_at = next_retry_at.map(str::to_owned);
 }
 
 fn merge_cloud_status(
@@ -4060,12 +4165,24 @@ fn merge_cloud_status(
                 .clone()
                 .or_else(|| watch.last_error.clone())
         },
+        next_retry_at: earliest_timestamp(
+            transfer.next_retry_at.as_ref(),
+            watch.next_retry_at.as_ref(),
+        ),
     }
 }
 
 fn latest_timestamp(left: Option<&String>, right: Option<&String>) -> Option<String> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right).clone()),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    }
+}
+
+fn earliest_timestamp(left: Option<&String>, right: Option<&String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right).clone()),
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
         (None, None) => None,
     }
@@ -4132,6 +4249,7 @@ async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
                 tokio::select! {
                     _ = manager.cloud_transfer_wake.notified() => {
                         if manager.cloud_force_reconnect.swap(false, Ordering::AcqRel) {
+                            cloud_failure_count = 0;
                             break;
                         }
                     },
@@ -4152,6 +4270,12 @@ async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
             cloud_next_at = None;
             continue;
         }
+        if manager.cached_cloud_connection().is_none() {
+            cloud_next_at = None;
+            manager.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
+            manager.emit_updated();
+            continue;
+        }
         match manager
             .run_cycle(Some(SyncTarget::Cloud), None, Duration::from_secs(8))
             .await
@@ -4162,8 +4286,18 @@ async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
             }
             Err(error) => {
                 cloud_failure_count = cloud_failure_count.saturating_add(1);
-                cloud_next_at = Some(Instant::now() + retry_delay(cloud_failure_count));
-                log::warn!("cloud clipboard sync cycle failed: {error}");
+                let (delay, next_retry_at) = retry_schedule(cloud_failure_count);
+                cloud_next_at = Some(Instant::now() + delay);
+                manager.set_channel_retry_status(
+                    SyncTarget::Cloud,
+                    &error.to_string(),
+                    &next_retry_at,
+                );
+                log::warn!(
+                    "cloud clipboard sync cycle failed: attempt={} retryInSecs={} error={error:#}",
+                    cloud_failure_count,
+                    delay.as_secs(),
+                );
                 manager.emit_updated();
             }
         }
@@ -4589,11 +4723,13 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
     loop {
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         let Some(group) = manager.identity.snapshot().group else {
+            failure_count = 0;
             manager.set_cloud_watch_status(SyncChannelState::Disabled, None, false);
             manager.watch_wake.notified().await;
             continue;
         };
         if !settings.enabled || !settings.cloud_enabled {
+            failure_count = 0;
             manager.set_cloud_watch_status(SyncChannelState::Disabled, None, false);
             manager.watch_wake.notified().await;
             continue;
@@ -4601,25 +4737,29 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
         let server = match server_endpoint_addr(&settings).await {
             Ok(Some(server)) => server,
             Ok(None) => {
+                failure_count = 0;
                 manager.set_cloud_watch_status(SyncChannelState::Disabled, None, false);
                 manager.watch_wake.notified().await;
                 continue;
             }
             Err(error) => {
                 failure_count = failure_count.saturating_add(1);
-                manager.set_cloud_watch_status(
-                    SyncChannelState::Error,
-                    Some(&error.to_string()),
-                    false,
+                let (delay, next_retry_at) = retry_schedule(failure_count);
+                manager.set_cloud_watch_retry_status(&error.to_string(), &next_retry_at);
+                log::warn!(
+                    "resolve cloud Hub address for watch failed: attempt={} retryInSecs={} error={error:#}",
+                    failure_count,
+                    delay.as_secs(),
                 );
                 manager.emit_updated();
                 tokio::select! {
-                    _ = manager.watch_wake.notified() => {},
-                    _ = tokio::time::sleep(retry_delay(failure_count)) => {},
+                    _ = manager.watch_wake.notified() => failure_count = 0,
+                    _ = tokio::time::sleep(delay) => {},
                 }
                 continue;
             }
         };
+        let mut watch_ready = false;
         let result = async {
             let endpoint = manager.ensure_endpoint(&settings).await?;
             manager.set_cloud_watch_status(SyncChannelState::Connecting, None, false);
@@ -4629,10 +4769,8 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
                 manager.ensure_cloud_group(&connection, &group).await?;
                 manager.set_cloud_path(&connection);
                 manager.notify_cloud_connected();
-                manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
-                manager.emit_updated();
                 let pool = manager.pool().await;
-                watch_cloud_group(&manager, &connection, &group, &pool).await
+                watch_cloud_group(&manager, &connection, &group, &pool, &mut watch_ready).await
             }
             .await;
             if connection_result.is_err() {
@@ -4644,16 +4782,19 @@ async fn cloud_watch_worker(manager: Arc<SyncManager>) {
         match result {
             Ok(()) => failure_count = 0,
             Err(error) => {
-                failure_count = failure_count.saturating_add(1);
-                manager.set_cloud_watch_status(
-                    SyncChannelState::Error,
-                    Some(&error.to_string()),
-                    false,
+                failure_count = next_cloud_watch_failure_count(failure_count, watch_ready);
+                let (delay, next_retry_at) = retry_schedule(failure_count);
+                manager.set_cloud_watch_retry_status(&error.to_string(), &next_retry_at);
+                log::warn!(
+                    "cloud watch failed: attempt={} retryInSecs={} watchReady={} error={error:#}",
+                    failure_count,
+                    delay.as_secs(),
+                    watch_ready,
                 );
                 manager.emit_updated();
                 tokio::select! {
-                    _ = manager.watch_wake.notified() => {},
-                    _ = tokio::time::sleep(retry_delay(failure_count)) => {},
+                    _ = manager.watch_wake.notified() => failure_count = 0,
+                    _ = tokio::time::sleep(delay) => {},
                 }
             }
         }
@@ -4666,6 +4807,7 @@ async fn watch_cloud_group(
     connection: &Connection,
     group: &GroupSecrets,
     pool: &SqlitePool,
+    watch_ready: &mut bool,
 ) -> Result<()> {
     let mut cursor = repository::cloud_cursor(pool).await?;
     let mut removed_at_ms = repository::latest_removed_at_ms(pool).await?;
@@ -4678,6 +4820,7 @@ async fn watch_cloud_group(
             access_token,
             cursor,
             removed_at_ms,
+            watch_ready,
         )
         .await;
     }
@@ -4712,6 +4855,7 @@ async fn watch_cloud_group(
                 access_token,
                 cursor,
                 removed_at_ms,
+                watch_ready,
             )
             .await;
         }
@@ -4725,10 +4869,12 @@ async fn watch_cloud_group(
             access_token,
             cursor,
             removed_at_ms,
+            watch_ready,
         )
         .await;
     }
     apply_cloud_watch_response(manager, first_response, &mut cursor, &mut removed_at_ms)?;
+    mark_cloud_watch_ready(manager, watch_ready);
 
     loop {
         let response = tokio::select! {
@@ -4749,48 +4895,215 @@ async fn watch_cloud_group_redundant(
     access_token: Vec<u8>,
     mut cursor: u64,
     mut removed_at_ms: i64,
+    watch_ready: &mut bool,
 ) -> Result<()> {
-    let (primary_recv, primary_response) = open_cloud_watch_stream(
-        connection,
-        group,
-        &access_token,
-        cursor,
-        removed_at_ms,
-        PRIMARY_CLOUD_WATCH_SLOT,
-    )
-    .await?;
-    apply_cloud_watch_response(manager, primary_response, &mut cursor, &mut removed_at_ms)?;
-
-    let (backup_recv, backup_response) = open_cloud_watch_stream(
-        connection,
-        group,
-        &access_token,
-        cursor,
-        removed_at_ms,
-        BACKUP_CLOUD_WATCH_SLOT,
-    )
-    .await?;
-    apply_cloud_watch_response(manager, backup_response, &mut cursor, &mut removed_at_ms)?;
-
     let (responses, mut response_rx) = mpsc::channel(4);
-    let _readers = CloudWatchReaderGuard::new(vec![
-        spawn_cloud_watch_reader(PRIMARY_CLOUD_WATCH_SLOT, primary_recv, responses.clone()),
-        spawn_cloud_watch_reader(BACKUP_CLOUD_WATCH_SLOT, backup_recv, responses),
-    ]);
+    let mut readers = CloudWatchReaderGuard::new(Vec::new());
+    let mut active_slots = [false; 2];
+    let mut slot_failure_counts = [0_usize; 2];
+    let mut slot_retry_at = [None; 2];
+    let mut last_initial_error = None;
+    let initial_streams = tokio::select! {
+        _ = manager.watch_wake.notified() => return Ok(()),
+        streams = async {
+            tokio::join!(
+                open_cloud_watch_stream(
+                    connection,
+                    group,
+                    &access_token,
+                    cursor,
+                    removed_at_ms,
+                    PRIMARY_CLOUD_WATCH_SLOT,
+                ),
+                open_cloud_watch_stream(
+                    connection,
+                    group,
+                    &access_token,
+                    cursor,
+                    removed_at_ms,
+                    BACKUP_CLOUD_WATCH_SLOT,
+                ),
+            )
+        } => streams,
+    };
+    for (watch_slot, stream) in [
+        (PRIMARY_CLOUD_WATCH_SLOT, initial_streams.0),
+        (BACKUP_CLOUD_WATCH_SLOT, initial_streams.1),
+    ] {
+        let slot_index = usize::from(watch_slot);
+        match stream {
+            Ok((recv, response)) => {
+                match apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)
+                {
+                    Ok(()) => {
+                        active_slots[slot_index] = true;
+                        readers.push(
+                            watch_slot,
+                            spawn_cloud_watch_reader(watch_slot, recv, responses.clone()),
+                        );
+                    }
+                    Err(error) => {
+                        slot_failure_counts[slot_index] = 1;
+                        let delay = retry_delay(slot_failure_counts[slot_index]);
+                        slot_retry_at[slot_index] = Some(Instant::now() + delay);
+                        log::warn!(
+                            "cloud watch slot initial response invalid: slot={} retryInSecs={} error={error:#}",
+                            watch_slot,
+                            delay.as_secs(),
+                        );
+                        last_initial_error = Some(error);
+                    }
+                }
+            }
+            Err(error) => {
+                slot_failure_counts[slot_index] = 1;
+                let delay = retry_delay(slot_failure_counts[slot_index]);
+                slot_retry_at[slot_index] = Some(Instant::now() + delay);
+                log::warn!(
+                    "cloud watch slot initial connection failed: slot={} retryInSecs={} error={error:#}",
+                    watch_slot,
+                    delay.as_secs(),
+                );
+                last_initial_error = Some(error);
+            }
+        }
+    }
+    if !active_slots.iter().any(|active| *active) {
+        let error = last_initial_error.context("云端冗余订阅未返回错误原因")?;
+        return Err(error.context("云端冗余持续订阅均不可用"));
+    }
+
+    mark_cloud_watch_ready(manager, watch_ready);
     log::info!(
-        "redundant cloud watch ready: connectionId={} slots=2",
-        connection.stable_id()
+        "redundant cloud watch ready: connectionId={} activeSlots={}",
+        connection.stable_id(),
+        active_slots.iter().filter(|active| **active).count(),
     );
 
     loop {
-        let (watch_slot, response) = tokio::select! {
+        let next_retry = next_cloud_watch_slot_retry(&slot_retry_at);
+        tokio::select! {
             _ = manager.watch_wake.notified() => return Ok(()),
-            response = response_rx.recv() => response.context("云端持续订阅读取任务已结束")?,
-        };
-        let response = response?;
-        log::debug!("cloud watch frame received: slot={watch_slot}");
-        apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+            response = response_rx.recv() => {
+                let (watch_slot, response) =
+                    response.context("云端持续订阅读取任务已结束")?;
+                let slot_index = usize::from(watch_slot);
+                let response = response.and_then(|response| {
+                    log::debug!("cloud watch frame received: slot={watch_slot}");
+                    apply_cloud_watch_response(
+                        manager,
+                        response,
+                        &mut cursor,
+                        &mut removed_at_ms,
+                    )
+                });
+                if let Err(error) = response {
+                    readers.abort_slot(watch_slot);
+                    active_slots[slot_index] = false;
+                    if connection.close_reason().is_some()
+                        || !active_slots.iter().any(|active| *active)
+                    {
+                        return Err(error.context("云端冗余持续订阅均不可用"));
+                    }
+
+                    slot_failure_counts[slot_index] =
+                        slot_failure_counts[slot_index].saturating_add(1);
+                    let delay = retry_delay(slot_failure_counts[slot_index]);
+                    slot_retry_at[slot_index] = Some(Instant::now() + delay);
+                    log::warn!(
+                        "cloud watch slot failed; surviving slot remains online: slot={} retryInSecs={} error={error:#}",
+                        watch_slot,
+                        delay.as_secs(),
+                    );
+                }
+            }
+            _ = wait_for_cloud_watch_slot_retry(next_retry.map(|(_, retry_at)| retry_at)) => {
+                let (slot_index, _) = next_retry.context("云端订阅重试状态不存在")?;
+                let watch_slot = slot_index as u8;
+                let restored_stream = tokio::select! {
+                    _ = manager.watch_wake.notified() => return Ok(()),
+                    stream = open_cloud_watch_stream(
+                        connection,
+                        group,
+                        &access_token,
+                        cursor,
+                        removed_at_ms,
+                        watch_slot,
+                    ) => stream,
+                };
+                match restored_stream {
+                    Ok((recv, response)) => {
+                        match apply_cloud_watch_response(
+                            manager,
+                            response,
+                            &mut cursor,
+                            &mut removed_at_ms,
+                        ) {
+                            Ok(()) => {
+                                active_slots[slot_index] = true;
+                                slot_failure_counts[slot_index] = 0;
+                                slot_retry_at[slot_index] = None;
+                                readers.push(
+                                    watch_slot,
+                                    spawn_cloud_watch_reader(
+                                        watch_slot,
+                                        recv,
+                                        responses.clone(),
+                                    ),
+                                );
+                                log::info!("cloud watch slot restored: slot={watch_slot}");
+                            }
+                            Err(error) => {
+                                slot_failure_counts[slot_index] =
+                                    slot_failure_counts[slot_index].saturating_add(1);
+                                let delay = retry_delay(slot_failure_counts[slot_index]);
+                                slot_retry_at[slot_index] = Some(Instant::now() + delay);
+                                log::warn!(
+                                    "cloud watch slot restore response invalid: slot={} attempt={} retryInSecs={} error={error:#}",
+                                    watch_slot,
+                                    slot_failure_counts[slot_index],
+                                    delay.as_secs(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if connection.close_reason().is_some() {
+                            return Err(error.context("云端共享连接已失效"));
+                        }
+
+                        slot_failure_counts[slot_index] =
+                            slot_failure_counts[slot_index].saturating_add(1);
+                        let delay = retry_delay(slot_failure_counts[slot_index]);
+                        slot_retry_at[slot_index] = Some(Instant::now() + delay);
+                        log::warn!(
+                            "cloud watch slot restore failed: slot={} attempt={} retryInSecs={} error={error:#}",
+                            watch_slot,
+                            slot_failure_counts[slot_index],
+                            delay.as_secs(),
+                        );
+                    }
+                }
+            }
+        }
     }
+}
+
+fn next_cloud_watch_slot_retry(retry_at: &[Option<Instant>; 2]) -> Option<(usize, Instant)> {
+    retry_at
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, retry_at)| retry_at.map(|retry_at| (slot, retry_at)))
+        .min_by_key(|(_, retry_at)| *retry_at)
+}
+
+async fn wait_for_cloud_watch_slot_retry(retry_at: Option<Instant>) {
+    let Some(retry_at) = retry_at else {
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    tokio::time::sleep_until(retry_at.into()).await;
 }
 
 /// Opens one fixed watch slot and confirms that its initial response is readable.
@@ -4826,18 +5139,34 @@ async fn open_cloud_watch_stream(
 
 /// Owns watch reader tasks and stops both whenever their shared consumer exits.
 struct CloudWatchReaderGuard {
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    handles: Vec<(u8, tokio::task::JoinHandle<()>)>,
 }
 
 impl CloudWatchReaderGuard {
-    fn new(handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
+    fn new(handles: Vec<(u8, tokio::task::JoinHandle<()>)>) -> Self {
         Self { handles }
+    }
+
+    fn push(&mut self, watch_slot: u8, handle: tokio::task::JoinHandle<()>) {
+        self.handles.retain(|(_, handle)| !handle.is_finished());
+        self.handles.push((watch_slot, handle));
+    }
+
+    fn abort_slot(&mut self, watch_slot: u8) {
+        self.handles.retain(|(slot, handle)| {
+            if *slot != watch_slot {
+                return true;
+            }
+
+            handle.abort();
+            false
+        });
     }
 }
 
 impl Drop for CloudWatchReaderGuard {
     fn drop(&mut self) {
-        for handle in &self.handles {
+        for (_, handle) in &self.handles {
             handle.abort();
         }
     }
@@ -4876,6 +5205,7 @@ async fn watch_cloud_group_legacy(
     access_token: Vec<u8>,
     mut cursor: u64,
     mut removed_at_ms: i64,
+    watch_ready: &mut bool,
 ) -> Result<()> {
     loop {
         let response = tokio::select! {
@@ -4893,6 +5223,7 @@ async fn watch_cloud_group_legacy(
         match response {
             Ok(response @ Response::GroupChanged { .. }) => {
                 apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+                mark_cloud_watch_ready(manager, watch_ready);
             }
             Ok(Response::Error { .. }) | Err(_) => {
                 let response = tokio::select! {
@@ -4907,10 +5238,21 @@ async fn watch_cloud_group_legacy(
                     ) => response?,
                 };
                 apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
+                mark_cloud_watch_ready(manager, watch_ready);
             }
             Ok(_) => bail!("云端返回了无效的订阅响应"),
         }
     }
+}
+
+/// Marks a watch healthy only after the Hub has returned a valid subscription frame.
+fn mark_cloud_watch_ready(manager: &SyncManager, watch_ready: &mut bool) {
+    if *watch_ready {
+        return;
+    }
+    *watch_ready = true;
+    manager.set_cloud_watch_status(SyncChannelState::Online, None, true);
+    manager.emit_updated();
 }
 
 fn apply_cloud_watch_response(
@@ -4979,6 +5321,19 @@ fn retry_delay(failure_count: usize) -> Duration {
     let base = RETRY_SECONDS[index];
     let jitter = (Utc::now().timestamp_subsec_millis() as u64) % (base / 4 + 1);
     Duration::from_secs(base + jitter)
+}
+
+fn retry_schedule(failure_count: usize) -> (Duration, String) {
+    let delay = retry_delay(failure_count);
+    (delay, (Utc::now() + delay).to_rfc3339())
+}
+
+/// Counts only failures that occurred without an intervening confirmed watch response.
+fn next_cloud_watch_failure_count(failure_count: usize, watch_ready: bool) -> usize {
+    if watch_ready {
+        return 1;
+    }
+    failure_count.saturating_add(1)
 }
 
 #[derive(Clone)]
@@ -5459,7 +5814,7 @@ async fn dispatch_peer(
                 if all_blobs_available {
                     let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
                     repository::attach_event_blobs(&pool, &stored.event.event_id, &blobs).await?;
-                    if let Ok((item_id, item)) = manager
+                    if let Ok((item_id, item, fingerprint)) = manager
                         .apply_envelope(&stored.event, envelope, &group)
                         .await
                     {
@@ -5478,7 +5833,7 @@ async fn dispatch_peer(
                         repository::mark_applied(&pool, &stored.event.event_id)
                             .await
                             .ok();
-                        latest_clipboard_item = Some(item);
+                        latest_clipboard_item = Some((item, fingerprint));
                         if let Some(icon) = source_icon {
                             if let Ok(blob) = manager.source_icon_blob_record(&icon) {
                                 repository::attach_event_blobs(
@@ -5498,8 +5853,8 @@ async fn dispatch_peer(
                     }
                 }
             }
-            if let Some(item) = latest_clipboard_item.as_ref() {
-                manager.write_latest_synced_item_to_clipboard(item);
+            if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
+                manager.write_latest_synced_item_to_clipboard(item, fingerprint.as_ref());
             }
             drop(apply_guard);
             #[cfg(target_os = "android")]
@@ -6405,6 +6760,13 @@ fn safe_file_name(path: &Path) -> String {
         .map(sanitize_name)
         .unwrap_or_else(|| "file".into())
 }
+
+/// 用父目录隔离同名根项，避免改变系统剪贴板会继续传播的 basename。
+fn synced_file_destination(root: &Path, file_index: u32, name: &str) -> PathBuf {
+    root.join(format!("{file_index:03}"))
+        .join(sanitize_name(name))
+}
+
 fn sanitize_name(value: &str) -> String {
     let name = value.replace(['/', '\\', '\0'], "_");
     if name.is_empty() || name == "." || name == ".." {
@@ -6476,6 +6838,17 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_files_keep_their_logical_basename() {
+        let root = Path::new("sync-files/event");
+        let first = synced_file_destination(root, 0, "report.txt");
+        let second = synced_file_destination(root, 1, "report.txt");
+
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap(), "report.txt");
+        assert_eq!(second.file_name().unwrap(), "report.txt");
+    }
+
+    #[test]
     fn lan_multicast_uses_all_private_ipv4_interfaces() {
         let interfaces = collect_lan_multicast_interfaces_v4([
             "192.168.50.84".parse().unwrap(),
@@ -6533,6 +6906,7 @@ mod tests {
             last_success_at: (state == SyncChannelState::Online)
                 .then(|| "2026-08-28T07:59:00Z".to_owned()),
             last_error: error.map(str::to_owned),
+            next_retry_at: error.map(|_| "2026-08-28T08:00:30Z".to_owned()),
         }
     }
 
@@ -6546,6 +6920,31 @@ mod tests {
         assert_eq!(merged.state, SyncChannelState::Degraded);
         assert_eq!(merged.last_error.as_deref(), Some("watch reset"));
         assert!(merged.last_success_at.is_some());
+        assert_eq!(
+            merged.next_retry_at.as_deref(),
+            Some("2026-08-28T08:00:30Z")
+        );
+    }
+
+    #[test]
+    fn confirmed_cloud_watch_resets_consecutive_failure_count() {
+        assert_eq!(next_cloud_watch_failure_count(5, true), 1);
+        assert_eq!(next_cloud_watch_failure_count(5, false), 6);
+    }
+
+    #[test]
+    fn redundant_cloud_watch_restarts_the_earliest_failed_slot() {
+        let now = Instant::now();
+        let retry_at = [
+            Some(now + Duration::from_secs(30)),
+            Some(now + Duration::from_secs(2)),
+        ];
+
+        assert_eq!(
+            next_cloud_watch_slot_retry(&retry_at).map(|(slot, _)| slot),
+            Some(1)
+        );
+        assert!(next_cloud_watch_slot_retry(&[None, None]).is_none());
     }
 
     #[test]

@@ -215,6 +215,7 @@ export interface SyncChannelStatus {
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
+  nextRetryAt: string | null;
 }
 
 export interface SyncPeerStatus {
@@ -378,6 +379,13 @@ export const reconnectSyncPeer = async (deviceId?: string) => {
     TAURI_COMMAND.RECONNECT_SYNC_PEER,
     "commands:labels.reconnectSyncPeer",
     { deviceId },
+  );
+};
+
+export const reconnectCloud = async () => {
+  return call<SyncStatus>(
+    TAURI_COMMAND.RECONNECT_CLOUD,
+    "commands:labels.reconnectCloud",
   );
 };
 

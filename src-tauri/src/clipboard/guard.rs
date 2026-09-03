@@ -12,9 +12,6 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "android"))]
-use image::ImageReader;
-
 /// 登记的写回指纹在多久内有效。写回后监听事件通常在毫秒级到达，
 /// 给足冗余但不至于长到误吞后续的真实复制。
 const SUPPRESS_TTL: Duration = Duration::from_secs(2);
@@ -91,24 +88,6 @@ impl WritebackGuard {
     }
 }
 
-/// 用解码后的 RGBA 像素生成图片写回指纹，规避系统剪贴板重新编码 PNG 后字节哈希变化。
-#[cfg(not(target_os = "android"))]
-pub fn image_pixel_fingerprint(bytes: &[u8]) -> Option<String> {
-    let image = ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?
-        .to_rgba8();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ecopaste-image-pixels-v1");
-    hasher.update(&image.width().to_le_bytes());
-    hasher.update(&image.height().to_le_bytes());
-    hasher.update(image.as_raw());
-
-    Some(format!("image-pixels:{}", hasher.finalize().to_hex()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,30 +140,5 @@ mod tests {
         guard.cancel("hash-a");
 
         assert!(!guard.should_skip("hash-a"));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "android"))]
-    fn image_fingerprint_ignores_png_encoding() {
-        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-        use image::{ExtendedColorType, ImageEncoder};
-
-        let pixels = [
-            255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 255, 255, 255, 0,
-        ];
-        let mut fast = Vec::new();
-        PngEncoder::new_with_quality(&mut fast, CompressionType::Fast, FilterType::NoFilter)
-            .write_image(&pixels, 2, 2, ExtendedColorType::Rgba8)
-            .unwrap();
-        let mut best = Vec::new();
-        PngEncoder::new_with_quality(&mut best, CompressionType::Best, FilterType::Adaptive)
-            .write_image(&pixels, 2, 2, ExtendedColorType::Rgba8)
-            .unwrap();
-
-        assert_ne!(fast, best);
-        assert_eq!(
-            image_pixel_fingerprint(&fast),
-            image_pixel_fingerprint(&best)
-        );
     }
 }

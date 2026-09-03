@@ -1615,6 +1615,7 @@ mod tests {
             content,
             search_text: None,
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: None,
             width: None,

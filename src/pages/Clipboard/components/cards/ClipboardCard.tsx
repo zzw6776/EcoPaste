@@ -101,6 +101,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     height,
     size,
     summary,
+    textCharCount,
   } = item;
   const { t } = useTranslation("clipboard");
   const [hovered, setHovered] = useState(false);
@@ -215,7 +216,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         ? t(fileCollectionMetaKey(fileCollectionMeta), {
             count: fileCollectionMeta?.count ?? 0,
           })
-        : `${summary?.length ?? size ?? 0} 个字符`;
+        : `${textCharCount ?? summary?.length ?? 0} 个字符`;
   const sizeText = formatBytes(size);
   const metaText = sizeText
     ? `${primaryMetaText} · ${sizeText}`

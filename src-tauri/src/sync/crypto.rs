@@ -30,6 +30,16 @@ struct TemporaryFileCleanup {
     path: PathBuf,
 }
 
+pub struct FingerprintedBlob {
+    pub blob: StoredBlob,
+    pub plaintext_hash: String,
+}
+
+pub struct ArchivedDirectory {
+    pub content_size: u64,
+    pub fingerprint: String,
+}
+
 impl TemporaryFileCleanup {
     fn new(path: PathBuf) -> Self {
         Self { armed: true, path }
@@ -133,6 +143,15 @@ fn event_aad(
 
 /// Encrypts a file in fixed-size authenticated chunks, keeping memory bounded for large files.
 pub fn encrypt_blob(source: &Path, blob_root: &Path, key: &[u8; 32]) -> Result<StoredBlob> {
+    Ok(encrypt_blob_with_fingerprint(source, blob_root, key)?.blob)
+}
+
+/// Encrypts once and returns the plaintext hash calculated from the same read buffer.
+pub fn encrypt_blob_with_fingerprint(
+    source: &Path,
+    blob_root: &Path,
+    key: &[u8; 32],
+) -> Result<FingerprintedBlob> {
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
     encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)
@@ -159,7 +178,7 @@ pub fn encrypt_stable_blob(
     let digest = blake3::keyed_hash(key, &nonce_input);
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     stream_nonce.copy_from_slice(&digest.as_bytes()[..STREAM_NONCE_LEN]);
-    encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)
+    Ok(encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)?.blob)
 }
 
 fn encrypt_blob_with_nonce(
@@ -167,7 +186,7 @@ fn encrypt_blob_with_nonce(
     blob_root: &Path,
     key: &[u8; 32],
     stream_nonce: [u8; STREAM_NONCE_LEN],
-) -> Result<StoredBlob> {
+) -> Result<FingerprintedBlob> {
     let source_size = source
         .metadata()
         .with_context(|| format!("failed to stat sync source {source:?}"))?
@@ -193,6 +212,7 @@ fn encrypt_blob_with_nonce(
     ));
     let mut remaining = source_size;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut plaintext_hasher = blake3::Hasher::new();
     if remaining == 0 {
         let ciphertext = encryptor
             .take()
@@ -204,6 +224,7 @@ fn encrypt_blob_with_nonce(
         while remaining > 0 {
             let length = usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE);
             reader.read_exact(&mut buffer[..length])?;
+            plaintext_hasher.update(&buffer[..length]);
             remaining -= length as u64;
             let ciphertext = if remaining == 0 {
                 encryptor
@@ -236,10 +257,13 @@ fn encrypt_blob_with_nonce(
     }
     temporary_cleanup.disarm();
     let encrypted_size = destination.metadata()?.len();
-    Ok(StoredBlob {
-        blob_id,
-        encrypted_path: destination.to_string_lossy().into_owned(),
-        size: encrypted_size,
+    Ok(FingerprintedBlob {
+        blob: StoredBlob {
+            blob_id,
+            encrypted_path: destination.to_string_lossy().into_owned(),
+            size: encrypted_size,
+        },
+        plaintext_hash: plaintext_hasher.finalize().to_hex().to_string(),
     })
 }
 
@@ -250,6 +274,16 @@ pub fn decrypt_blob(
     original_size: u64,
     key: &[u8; 32],
 ) -> Result<()> {
+    decrypt_blob_with_fingerprint(encrypted, destination, original_size, key).map(|_| ())
+}
+
+/// Decrypts once and returns the plaintext hash calculated from the authenticated chunks.
+pub fn decrypt_blob_with_fingerprint(
+    encrypted: &Path,
+    destination: &Path,
+    original_size: u64,
+    key: &[u8; 32],
+) -> Result<String> {
     let input = File::open(encrypted)
         .with_context(|| format!("failed to open encrypted sync blob {encrypted:?}"))?;
     let mut reader = BufReader::new(input);
@@ -277,6 +311,7 @@ pub fn decrypt_blob(
     let mut writer = BufWriter::new(output);
     let mut remaining = original_size;
     let mut buffer = vec![0_u8; CHUNK_SIZE + TAG_SIZE];
+    let mut plaintext_hasher = blake3::Hasher::new();
     if remaining == 0 {
         reader.read_exact(&mut buffer[..TAG_SIZE])?;
         let plaintext = decryptor
@@ -284,6 +319,7 @@ pub fn decrypt_blob(
             .expect("stream decryptor available")
             .decrypt_last(&buffer[..TAG_SIZE])
             .map_err(|_| anyhow::anyhow!("empty sync blob authentication failed"))?;
+        plaintext_hasher.update(&plaintext);
         writer.write_all(&plaintext)?;
     } else {
         while remaining > 0 {
@@ -305,6 +341,7 @@ pub fn decrypt_blob(
                     .decrypt_next(&buffer[..encrypted_length])
                     .map_err(|_| anyhow::anyhow!("sync blob authentication failed"))?
             };
+            plaintext_hasher.update(&plaintext);
             writer.write_all(&plaintext)?;
         }
     }
@@ -318,7 +355,7 @@ pub fn decrypt_blob(
     }
     fs::rename(temporary, destination)?;
     temporary_cleanup.disarm();
-    Ok(())
+    Ok(plaintext_hasher.finalize().to_hex().to_string())
 }
 
 pub fn blob_path(root: &Path, blob_id: &str) -> Result<PathBuf> {
@@ -342,58 +379,134 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// 把目录压缩为 ZIP，并返回其中实际写入的普通文件原始字节总数。
-pub fn archive_directory(source: &Path, destination: &Path) -> Result<u64> {
+/// 把目录压缩为 ZIP，并在同一次读取中计算与绝对路径、遍历顺序无关的目录树指纹。
+pub fn archive_directory(source: &Path, destination: &Path) -> Result<ArchivedDirectory> {
     let output = File::create(destination)?;
     let mut archive = ZipWriter::new(BufWriter::new(output));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut original_size = 0_u64;
-    for entry in WalkDir::new(source).follow_links(false) {
-        let entry = entry?;
+    let mut entries = WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| portable_relative_path(entry.path(), source));
+    let mut entry_hashes = Vec::new();
+    for entry in entries {
         let path = entry.path();
         let relative = path.strip_prefix(source)?;
         if relative.as_os_str().is_empty() {
             continue;
         }
-        let name = relative.to_string_lossy().replace('\\', "/");
+        let name = portable_relative_path(path, source);
         if entry.file_type().is_symlink() {
             continue;
         }
         if entry.file_type().is_dir() {
             archive.add_directory(format!("{name}/"), options)?;
+            entry_hashes.push(directory_entry_hash(&name));
         } else if entry.file_type().is_file() {
-            archive.start_file(name, options)?;
+            archive.start_file(&name, options)?;
             let mut input = File::open(path)?;
+            let (written, content_hash) = copy_with_hash(&mut input, &mut archive)?;
             original_size = original_size
-                .checked_add(std::io::copy(&mut input, &mut archive)?)
+                .checked_add(written)
                 .context("directory content size overflow")?;
+            entry_hashes.push(file_entry_hash(&name, &content_hash));
         }
     }
     archive.finish()?;
-    Ok(original_size)
+    Ok(ArchivedDirectory {
+        content_size: original_size,
+        fingerprint: directory_tree_hash(entry_hashes),
+    })
 }
 
-pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+/// 解压目录归档，并在同一次输出中重建与发送端一致的目录树指纹。
+pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Result<String> {
     let input = File::open(archive_path)?;
     let mut archive = ZipArchive::new(BufReader::new(input))?;
     fs::create_dir_all(destination)?;
+    let mut entry_hashes = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let Some(relative) = entry.enclosed_name() else {
             bail!("directory archive contains an unsafe path");
         };
-        let output = destination.join(relative);
+        let relative = relative.to_path_buf();
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let output = destination.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&output)?;
+            entry_hashes.push(directory_entry_hash(name.trim_end_matches('/')));
             continue;
         }
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = File::create(output)?;
-        std::io::copy(&mut entry, &mut file)?;
+        let (_, content_hash) = copy_with_hash(&mut entry, &mut file)?;
+        entry_hashes.push(file_entry_hash(&name, &content_hash));
     }
-    Ok(())
+    Ok(directory_tree_hash(entry_hashes))
+}
+
+fn portable_relative_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn copy_with_hash(reader: &mut impl Read, writer: &mut impl Write) -> Result<(u64, String)> {
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut written = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        written = written
+            .checked_add(read as u64)
+            .context("copied content size overflow")?;
+    }
+    Ok((written, hasher.finalize().to_hex().to_string()))
+}
+
+fn directory_entry_hash(name: &str) -> blake3::Hash {
+    tree_entry_hash(b'd', name, None)
+}
+
+fn file_entry_hash(name: &str, content_hash: &str) -> blake3::Hash {
+    tree_entry_hash(b'f', name, Some(content_hash))
+}
+
+fn tree_entry_hash(kind: u8, name: &str, content_hash: Option<&str>) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ecopaste-directory-entry-v1\0");
+    hasher.update(&[kind]);
+    update_length_prefixed(&mut hasher, name.as_bytes());
+    if let Some(content_hash) = content_hash {
+        update_length_prefixed(&mut hasher, content_hash.as_bytes());
+    }
+    hasher.finalize()
+}
+
+fn directory_tree_hash(mut entry_hashes: Vec<blake3::Hash>) -> String {
+    entry_hashes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ecopaste-directory-tree-v1\0");
+    for entry_hash in entry_hashes {
+        hasher.update(entry_hash.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn update_length_prefixed(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 #[cfg(test)]
@@ -410,9 +523,31 @@ mod tests {
         std::fs::write(source.join("first.txt"), b"abc").unwrap();
         std::fs::write(nested.join("second.txt"), b"12345").unwrap();
 
-        let original_size = archive_directory(&source, &archive).unwrap();
+        let archived = archive_directory(&source, &archive).unwrap();
 
-        assert_eq!(original_size, 8);
+        assert_eq!(archived.content_size, 8);
+        let destination = temporary.path().join("destination");
+        let extracted_fingerprint = extract_directory_archive(&archive, &destination).unwrap();
+        assert_eq!(extracted_fingerprint, archived.fingerprint);
+    }
+
+    #[test]
+    fn directory_fingerprint_ignores_absolute_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first-root");
+        let second = temporary.path().join("second-root");
+        std::fs::create_dir_all(first.join("nested")).unwrap();
+        std::fs::create_dir_all(second.join("nested")).unwrap();
+        std::fs::write(first.join("a.txt"), b"same").unwrap();
+        std::fs::write(second.join("a.txt"), b"same").unwrap();
+        std::fs::write(first.join("nested/b.txt"), b"tree").unwrap();
+        std::fs::write(second.join("nested/b.txt"), b"tree").unwrap();
+
+        let first_archive = archive_directory(&first, &temporary.path().join("first.zip")).unwrap();
+        let second_archive =
+            archive_directory(&second, &temporary.path().join("second.zip")).unwrap();
+
+        assert_eq!(first_archive.fingerprint, second_archive.fingerprint);
     }
 
     #[test]
@@ -427,7 +562,7 @@ mod tests {
         let key = [5_u8; 32];
 
         let encrypted = encrypt_blob(&source, &directory.path().join("blobs"), &key).unwrap();
-        decrypt_blob(
+        let decrypted_hash = decrypt_blob_with_fingerprint(
             Path::new(&encrypted.encrypted_path),
             &destination,
             bytes.len() as u64,
@@ -436,6 +571,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(destination).unwrap(), bytes);
+        assert_eq!(decrypted_hash, blake3::hash(&bytes).to_hex().to_string());
     }
 
     #[test]

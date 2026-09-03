@@ -1,23 +1,25 @@
 import { useMount } from "ahooks";
 import { Button, Tag } from "antd";
 import type { FC } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
-import {
-  type AndroidPermissionsStatus,
-  getAndroidPermissionsStatus,
-  requestAndroidPermission,
-} from "@/commands/android";
 import { findPreferenceSectionSettings } from "@/pages/Preference/config/preferenceSchema";
 import { commitSettingChange } from "@/pages/Preference/services/preferenceSettings";
 import type {
   PreferenceSetting,
   SettingValue,
 } from "@/pages/Preference/types/preferences";
+import {
+  androidState,
+  checkAndAutoPromptAndroidPermissions,
+  openAndroidPermissionsModal,
+} from "@/stores/android";
 import { settingsState } from "@/stores/settings";
 import type { Settings } from "@/types/settings";
+import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
+import type { OnboardingStepProps } from "../types";
 import OnboardingPreferenceCard from "./OnboardingPreferenceCard";
 import OnboardingStepLayout from "./OnboardingStepLayout";
 
@@ -28,46 +30,31 @@ const DESCRIPTION_PLATFORM = PERMISSION_SETTINGS.some((setting) => {
   ? "windows"
   : "macos";
 
-const PermissionsStep: FC = () => {
-  const { t } = useTranslation("onboarding");
+const PermissionsStep: FC<OnboardingStepProps> = (props) => {
+  const { onActionsChange } = props;
+  const { t } = useTranslation(["onboarding", "common"]);
   const settings = useSnapshot(settingsState) as Settings;
-  const [androidStatus, setAndroidStatus] =
-    useState<AndroidPermissionsStatus | null>(null);
-  const fetchingRef = useRef(false);
-
-  const fetchAndroidStatus = useCallback(async () => {
-    if (!isAndroid || fetchingRef.current) return;
-    fetchingRef.current = true;
-    try {
-      const res = await getAndroidPermissionsStatus();
-      setAndroidStatus(res);
-    } catch {
-      // ignore
-    } finally {
-      fetchingRef.current = false;
-    }
-  }, []);
+  const androidSnapshot = useSnapshot(androidState);
+  const androidStatus = androidSnapshot.status;
+  const modeSelected = androidStatus?.modeSelected ?? false;
 
   useMount(() => {
-    void fetchAndroidStatus();
+    if (isAndroid) {
+      void checkAndAutoPromptAndroidPermissions();
+    }
   });
 
   useEffect(() => {
     if (!isAndroid) return;
 
-    const handleResume = () => {
-      if (document.visibilityState === "visible") {
-        void fetchAndroidStatus();
-      }
-    };
-    window.addEventListener("focus", handleResume);
-    document.addEventListener("visibilitychange", handleResume);
+    onActionsChange?.({
+      nextDisabled: !modeSelected,
+    });
 
     return () => {
-      window.removeEventListener("focus", handleResume);
-      document.removeEventListener("visibilitychange", handleResume);
+      onActionsChange?.(null);
     };
-  }, [fetchAndroidStatus]);
+  }, [modeSelected, onActionsChange]);
 
   const handleChange = async (
     setting: PreferenceSetting,
@@ -76,117 +63,53 @@ const PermissionsStep: FC = () => {
     await commitSettingChange(setting, value);
   };
 
-  const handleRequestAndroid = async (
-    kind: "overlay" | "accessibility" | "battery" | "notification",
-  ) => {
-    await requestAndroidPermission(kind);
-    void fetchAndroidStatus();
+  const handleConfigureAndroid = () => {
+    openAndroidPermissionsModal();
   };
 
   if (isAndroid) {
     return (
       <OnboardingStepLayout
-        contentClassName="flex flex-col gap-2.5"
-        description="请授权以下系统权限以启用后台剪贴板捕获与底角上滑手势呼出："
+        contentClassName="flex flex-col gap-3"
+        description={t("common:androidPermissions.description")}
         icon={<i aria-hidden="true" className="i-lucide:shield-check" />}
-        title="系统权限配置"
+        title={t("common:androidPermissions.title")}
       >
-        {/* 1. 悬浮窗 */}
-        <div className="flex items-center justify-between rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs">
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center gap-1.5 font-medium text-xs">
-              <span>悬浮窗权限 (Overlay)</span>
-              {androidStatus?.overlayGranted ? (
-                <Tag color="success">已开启</Tag>
-              ) : (
-                <Tag color="warning">待开启</Tag>
-              )}
-            </div>
-            <span className="text-[11px] text-ant-secondary">
-              用于屏幕底角向上滑动手势唤起抽屉
-            </span>
-          </div>
-          <Button
-            disabled={androidStatus?.overlayGranted}
-            onClick={() => void handleRequestAndroid("overlay")}
-            size="small"
-            type={androidStatus?.overlayGranted ? "default" : "primary"}
-          >
-            {androidStatus?.overlayGranted ? "已就绪" : "去授权"}
-          </Button>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <OnboardingModeCard
+            description={t("common:androidPermissions.modes.full.description")}
+            icon="i-lucide:zap"
+            selected={modeSelected && androidStatus?.mode === "full"}
+            title={t("common:androidPermissions.modes.full.title")}
+          />
+          <OnboardingModeCard
+            description={t("common:androidPermissions.modes.basic.description")}
+            icon="i-lucide:panel-top"
+            selected={modeSelected && androidStatus?.mode === "basic"}
+            title={t("common:androidPermissions.modes.basic.title")}
+          />
         </div>
 
-        {/* 2. 无障碍 */}
-        <div className="flex items-center justify-between rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs">
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center gap-1.5 font-medium text-xs">
-              <span>无障碍服务 (Accessibility)</span>
-              {androidStatus?.accessibilityGranted ? (
-                <Tag color="success">已开启</Tag>
-              ) : (
-                <Tag color="warning">待开启</Tag>
-              )}
+        <div className="rounded-xl border border-ant-border-secondary bg-ant-fill-quaternary p-3">
+          <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="font-medium text-ant-text text-sm">
+                {modeSelected
+                  ? t("common:androidPermissions.onboarding.selected")
+                  : t("common:androidPermissions.onboarding.required")}
+              </span>
+              <span className="text-ant-secondary text-xs">
+                {modeSelected
+                  ? t("common:androidPermissions.onboarding.changeLater")
+                  : t("common:androidPermissions.onboarding.chooseMode")}
+              </span>
             </div>
-            <span className="text-[11px] text-ant-secondary">
-              用于后台自动采集剪贴板与模拟自动粘贴
-            </span>
+            <Button onClick={handleConfigureAndroid} type="primary">
+              {modeSelected
+                ? t("common:androidPermissions.actions.reconfigure")
+                : t("common:androidPermissions.actions.configure")}
+            </Button>
           </div>
-          <Button
-            disabled={androidStatus?.accessibilityGranted}
-            onClick={() => void handleRequestAndroid("accessibility")}
-            size="small"
-            type={androidStatus?.accessibilityGranted ? "default" : "primary"}
-          >
-            {androidStatus?.accessibilityGranted ? "已就绪" : "去开启"}
-          </Button>
-        </div>
-
-        {/* 3. 电池优化 */}
-        <div className="flex items-center justify-between rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs">
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center gap-1.5 font-medium text-xs">
-              <span>忽略电池优化 (后台保活)</span>
-              {androidStatus?.batteryIgnored ? (
-                <Tag color="success">已加白</Tag>
-              ) : (
-                <Tag color="default">建议开启</Tag>
-              )}
-            </div>
-            <span className="text-[11px] text-ant-secondary">
-              防止手机锁屏或切换后台时杀死剪贴板服务
-            </span>
-          </div>
-          <Button
-            disabled={androidStatus?.batteryIgnored}
-            onClick={() => void handleRequestAndroid("battery")}
-            size="small"
-          >
-            {androidStatus?.batteryIgnored ? "已就绪" : "去加白"}
-          </Button>
-        </div>
-
-        {/* 4. 通知权限 */}
-        <div className="flex items-center justify-between rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs">
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center gap-1.5 font-medium text-xs">
-              <span>通知权限</span>
-              {androidStatus?.notificationGranted ? (
-                <Tag color="success">已允许</Tag>
-              ) : (
-                <Tag color="default">建议允许</Tag>
-              )}
-            </div>
-            <span className="text-[11px] text-ant-secondary">
-              用于显示常驻前台服务通知以保活
-            </span>
-          </div>
-          <Button
-            disabled={androidStatus?.notificationGranted}
-            onClick={() => void handleRequestAndroid("notification")}
-            size="small"
-          >
-            {androidStatus?.notificationGranted ? "已允许" : "去允许"}
-          </Button>
         </div>
       </OnboardingStepLayout>
     );
@@ -195,9 +118,11 @@ const PermissionsStep: FC = () => {
   return (
     <OnboardingStepLayout
       contentClassName="flex flex-col gap-4"
-      description={t(`permissions.description.${DESCRIPTION_PLATFORM}`)}
+      description={t(
+        `onboarding:permissions.description.${DESCRIPTION_PLATFORM}`,
+      )}
       icon={<i aria-hidden="true" className="i-lucide:shield-check" />}
-      title={t("permissions.title")}
+      title={t("onboarding:permissions.title")}
     >
       {PERMISSION_SETTINGS.map((setting) => {
         return (
@@ -210,6 +135,45 @@ const PermissionsStep: FC = () => {
         );
       })}
     </OnboardingStepLayout>
+  );
+};
+
+interface OnboardingModeCardProps {
+  description: string;
+  icon: string;
+  selected: boolean;
+  title: string;
+}
+
+const OnboardingModeCard: FC<OnboardingModeCardProps> = (props) => {
+  const { description, icon, selected, title } = props;
+  const { t } = useTranslation("common");
+
+  return (
+    <div
+      className={cn(
+        "rounded-xl border p-3",
+        selected
+          ? "border-ant-primary bg-ant-primary-bg"
+          : "border-ant-border-secondary bg-ant-container",
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <i
+          aria-hidden="true"
+          className={cn(icon, "text-ant-primary text-lg")}
+        />
+        <span className="font-medium text-ant-text text-sm">{title}</span>
+        {selected && (
+          <Tag className="m-0" color="blue">
+            {t("androidPermissions.status.current")}
+          </Tag>
+        )}
+      </div>
+      <p className="mt-2 mb-0 text-ant-secondary text-xs leading-relaxed">
+        {description}
+      </p>
+    </div>
   );
 };
 

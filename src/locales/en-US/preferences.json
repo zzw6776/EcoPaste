@@ -81,7 +81,7 @@
         "title": "Quick Actions"
       },
       "androidGesture": {
-        "description": "Listen for bottom-corner swipe gestures on rooted Android devices only.",
+        "description": "Use Root to listen for bottom-corner swipes in full mode.",
         "title": "Android Swipe Summon"
       },
       "appearance": {
@@ -203,7 +203,7 @@
       },
       "androidGesture": {
         "enabled": {
-          "description": "Listen only while Root is available and the device is unlocked; automatically suspend on the lock screen.",
+          "description": "Listen only in full mode while Root is available and the device is unlocked; automatically suspend on the lock screen.",
           "title": "Enable Swipe Summon"
         },
         "hideOverlay": {
@@ -769,6 +769,7 @@
       "leave": "Disconnect This Device",
       "pairDevice": "Add New Device",
       "reconnectAll": "Reconnect all devices",
+      "reconnectCloud": "Reconnect cloud now",
       "reconnectDevice": "Reconnect {{device}}",
       "removeDevice": "Remove Device",
       "removeDeviceNamed": "Remove {{device}}",
@@ -853,6 +854,7 @@
       },
       "title": "Nearby Sync Spaces"
     },
+    "nextRetry": "Next retry: {{time}}",
     "noPeers": "No paired devices",
     "notPaired": "Not Connected",
     "paired": "Connected",

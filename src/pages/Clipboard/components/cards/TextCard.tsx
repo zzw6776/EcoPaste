@@ -61,7 +61,7 @@ const TextCard: FC<TextCardProps> = (props) => {
     return (
       <button
         className={cn(
-          "block w-full min-w-0 cursor-pointer whitespace-pre-wrap break-all border-0 bg-transparent p-0 text-left text-[#007AFF] text-[15px] leading-[1.4] tracking-tight underline underline-offset-2",
+          "block w-full min-w-0 cursor-pointer whitespace-pre-wrap break-all border-0 bg-transparent p-0 text-left text-[#007AFF] text-sm leading-[1.4] tracking-tight underline underline-offset-2",
           isMobile() ? "line-clamp-6" : "line-clamp-[20]",
         )}
         onClick={handleLinkClick}
@@ -76,7 +76,7 @@ const TextCard: FC<TextCardProps> = (props) => {
   return (
     <div
       className={cn(
-        "w-full min-w-0 whitespace-pre-wrap break-all font-sans text-[15px] text-neutral-900 leading-[1.4] tracking-tight dark:text-neutral-100",
+        "w-full min-w-0 whitespace-pre-wrap break-all font-sans text-neutral-900 text-sm leading-[1.4] tracking-tight dark:text-neutral-100",
         isMobile() ? "line-clamp-6" : "line-clamp-[20]",
       )}
     >

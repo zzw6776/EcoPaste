@@ -179,6 +179,7 @@ pub struct SyncChannelStatus {
     pub last_attempt_at: Option<String>,
     pub last_success_at: Option<String>,
     pub last_error: Option<String>,
+    pub next_retry_at: Option<String>,
 }
 
 impl SyncChannelStatus {
@@ -188,6 +189,7 @@ impl SyncChannelStatus {
             last_attempt_at: None,
             last_success_at: None,
             last_error: None,
+            next_retry_at: None,
         }
     }
 }

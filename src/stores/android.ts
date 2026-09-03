@@ -23,18 +23,23 @@ export const closeAndroidPermissionsModal = () => {
   androidState.permissionsModalOpen = false;
 };
 
-export const checkAndAutoPromptAndroidPermissions = async () => {
-  if (!isAndroid) return;
+/** 刷新 Android 原生权限与服务状态，并写入共享 UI 镜像。 */
+export const refreshAndroidPermissionsStatus = async () => {
+  if (!isAndroid) return null;
+
   try {
     const res = await getAndroidPermissionsStatus();
     androidState.status = res;
-    const enginePermissionMissing =
-      (res.engineMode === "accessibility" && !res.accessibilityGranted) ||
-      (res.engineMode === "root" && !res.rootClipboardGranted);
-    if (!res.overlayGranted || enginePermissionMissing) {
-      androidState.permissionsModalOpen = true;
-    }
+    return res;
   } catch {
-    // ignore
+    return null;
+  }
+};
+
+/** 只在用户尚未明确选择完整或基础模式时自动展示一次引导。 */
+export const checkAndAutoPromptAndroidPermissions = async () => {
+  const res = await refreshAndroidPermissionsStatus();
+  if (res && !res.modeSelected) {
+    androidState.permissionsModalOpen = true;
   }
 };

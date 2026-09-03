@@ -33,7 +33,6 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -125,6 +124,7 @@ class EcoPasteOverlayPanel(
         val cloudServerVersion: String,
         val cloudError: String,
         val cloudLastSuccessAt: String,
+        val cloudNextRetryAt: String,
         val pendingEvents: Int,
         val peers: List<OverlayPeerStatus>,
     )
@@ -582,6 +582,7 @@ class EcoPasteOverlayPanel(
             cloudServerVersion = optionalJsonString(root, "cloudServerVersion"),
             cloudError = optionalJsonString(cloud, "lastError"),
             cloudLastSuccessAt = optionalJsonString(cloud, "lastSuccessAt"),
+            cloudNextRetryAt = optionalJsonString(cloud, "nextRetryAt"),
             pendingEvents = root.optInt("pendingEvents"),
             peers = peers,
         )
@@ -698,6 +699,8 @@ class EcoPasteOverlayPanel(
             addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
             if (target == "lan" && status?.lanEnabled == true) {
                 addView(reconnectButton("重新连接全部设备") { reconnectPeer(null) })
+            } else if (target == "cloud" && status?.cloudEnabled == true) {
+                addView(reconnectButton("重新连接云端") { reconnectCloud() })
             }
         }
     }
@@ -834,6 +837,14 @@ class EcoPasteOverlayPanel(
 
         if (status.cloudError.isNotBlank()) {
             container.addView(errorDetails(status.cloudError))
+        }
+        if (status.cloudNextRetryAt.isNotBlank()) {
+            container.addView(
+                createInfoRow(
+                    "下次重试",
+                    formatSyncTimestamp(status.cloudNextRetryAt),
+                ),
+            )
         }
 
         val hasConnectionDetails = status.cloudEndpointId.isNotBlank() ||
@@ -1074,6 +1085,28 @@ class EcoPasteOverlayPanel(
                 requestSyncStatus()
                 if (!succeeded) {
                     Toast.makeText(context, "重新连接失败", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun reconnectCloud() {
+        if (reconnectInProgress) return
+        reconnectInProgress = true
+        Toast.makeText(context, "正在重新连接云端", Toast.LENGTH_SHORT).show()
+        actionExecutor.submit {
+            val succeeded = try {
+                EcoPasteBridge.reconnectOverlayCloud()
+            } catch (error: Throwable) {
+                Log.w(TAG, "reconnect overlay cloud failed: ${error.message}")
+                false
+            }
+            mainHandler.post {
+                reconnectInProgress = false
+                if (panelView == null) return@post
+                requestSyncStatus()
+                if (!succeeded) {
+                    Toast.makeText(context, "重新连接云端失败", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -1475,26 +1508,6 @@ class EcoPasteOverlayPanel(
                 },
             )
 
-            addView(TextView(context).apply {
-                text = "⋮"
-                textSize = 22f
-                gravity = Gravity.CENTER
-                setTextColor(primaryTextColor())
-                background = roundedBackground(cardColor(), dp(12).toFloat())
-                setOnClickListener { anchor ->
-                    closeSyncDetails()
-                    PopupMenu(context, anchor).apply {
-                        menu.add("关闭悬浮窗")
-                        setOnMenuItemClickListener {
-                            hide()
-                            true
-                        }
-                        show()
-                    }
-                }
-            }, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
-                marginStart = dp(8)
-            })
         }
     }
 

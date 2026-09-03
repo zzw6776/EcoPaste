@@ -22,8 +22,7 @@ use clipboard_rs::common::RustImage;
 #[cfg(not(target_os = "android"))]
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
-#[cfg(not(target_os = "android"))]
-use super::guard::image_pixel_fingerprint;
+use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState};
 use super::guard::WritebackGuard;
 #[cfg(not(target_os = "android"))]
 use super::storage::ImageStore;
@@ -53,16 +52,92 @@ pub fn write_to_clipboard(
     Ok(())
 }
 
+/// 同步条目仅在语义内容变化时写入系统剪贴板，返回是否实际执行了写入。
+#[cfg(not(target_os = "android"))]
+pub fn write_synced_item_to_clipboard(
+    store: &ImageStore,
+    guard: &WritebackGuard,
+    fingerprints: &ClipboardFingerprintState,
+    item: &ClipboardItem,
+    files_fingerprint: Option<&ClipboardFingerprint>,
+) -> Result<bool> {
+    let image_bytes = if item.kind == ClipboardKind::Image {
+        Some(read_image_bytes(store, item)?)
+    } else {
+        None
+    };
+    let fingerprint = match item.kind {
+        ClipboardKind::Text => ClipboardFingerprint::from_text_item(item),
+        ClipboardKind::Image => image_bytes
+            .as_deref()
+            .and_then(ClipboardFingerprint::from_image_bytes),
+        ClipboardKind::Files => files_fingerprint.cloned(),
+    };
+    if fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| fingerprints.matches(fingerprint))
+    {
+        return Ok(false);
+    }
+
+    let write = fingerprint.map(|fingerprint| fingerprints.begin_write(fingerprint));
+    let result = (|| {
+        let ctx = ClipboardContext::new().map_err(clip_err)?;
+        match item.kind {
+            ClipboardKind::Text => write_text(&ctx, guard, item, false),
+            ClipboardKind::Image => write_image_bytes(
+                &ctx,
+                guard,
+                item,
+                image_bytes.as_deref().expect("image bytes prepared"),
+            ),
+            ClipboardKind::Files => write_files(&ctx, guard, item),
+        }
+    })();
+    if result.is_err() {
+        if let Some(write) = write {
+            fingerprints.rollback_write(write);
+        }
+    }
+    result.map(|_| true)
+}
+
 #[cfg(target_os = "android")]
 pub fn write_to_clipboard_app(
     _app: &tauri::AppHandle,
     guard: &WritebackGuard,
     item: &ClipboardItem,
 ) -> Result<()> {
+    write_to_clipboard_app_with_guard(guard, item)
+}
+
+/// Android 同步文本仅在纯文本语义变化时写回系统剪贴板。
+#[cfg(target_os = "android")]
+pub fn write_synced_item_to_clipboard_app(
+    _app: &tauri::AppHandle,
+    guard: &WritebackGuard,
+    fingerprints: &ClipboardFingerprintState,
+    item: &ClipboardItem,
+) -> Result<bool> {
+    let Some(fingerprint) = ClipboardFingerprint::from_text_item(item) else {
+        return Ok(false);
+    };
+    if fingerprints.matches(&fingerprint) {
+        return Ok(false);
+    }
+
+    let write = fingerprints.begin_write(fingerprint);
+    let result = write_to_clipboard_app_with_guard(guard, item);
+    if result.is_err() {
+        fingerprints.rollback_write(write);
+    }
+    result.map(|_| true)
+}
+
+#[cfg(target_os = "android")]
+fn write_to_clipboard_app_with_guard(guard: &WritebackGuard, item: &ClipboardItem) -> Result<()> {
     let text = item.search_text.as_deref().unwrap_or(&item.content);
     if !text.is_empty() {
-        // Android 只能写纯文本。原生写入同时携带本机回环标记，
-        // 事件监听器可在入口直接忽略，guard 仍作为跨平台最后一层保护。
         guard.suppress(content_hash(ClipboardKind::Text, text));
         crate::commands::android::write_android_clipboard_text(text)
             .map_err(|error| AppError::Clipboard(error.to_string()))?;
@@ -129,12 +204,29 @@ fn write_image(
     guard: &WritebackGuard,
     item: &ClipboardItem,
 ) -> Result<()> {
+    let bytes = read_image_bytes(store, item)?;
+    write_image_bytes(ctx, guard, item, &bytes)
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_image_bytes(store: &ImageStore, item: &ClipboardItem) -> Result<Vec<u8>> {
     let path = store.origin_path(&item.content);
-    let bytes = std::fs::read(&path).map_err(|err| {
+    std::fs::read(&path).map_err(|err| {
         log::error!("read image {path:?} failed: {err}");
         AppError::Clipboard(err.to_string())
-    })?;
-    let suppression = image_pixel_fingerprint(&bytes).unwrap_or_else(|| item.content_hash.clone());
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn write_image_bytes(
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] ctx: &ClipboardContext,
+    guard: &WritebackGuard,
+    item: &ClipboardItem,
+    bytes: &[u8],
+) -> Result<()> {
+    let suppression = ClipboardFingerprint::from_image_bytes(bytes)
+        .map(|fingerprint| fingerprint.as_str().to_owned())
+        .unwrap_or_else(|| item.content_hash.clone());
     guard.suppress(suppression.clone());
 
     #[cfg(target_os = "macos")]
@@ -265,6 +357,7 @@ mod tests {
             content: content.to_owned(),
             search_text: search.map(str::to_owned),
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: None,
             width: None,
@@ -372,6 +465,7 @@ mod tests {
             content: stored.file_name.clone(),
             search_text: None,
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: Some(stored.size),
             width: Some(stored.width),
@@ -406,13 +500,13 @@ mod tests {
             .expect("should read image");
         let fingerprint = match &payload {
             crate::clipboard::ClipboardPayload::Image(image) => {
-                image_pixel_fingerprint(&image.bytes).unwrap()
+                ClipboardFingerprint::from_image_bytes(&image.bytes).unwrap()
             }
             _ => panic!("expected image payload"),
         };
         let read_item = build_item(&store, &payload).unwrap().unwrap();
         assert_eq!(read_item.kind, ClipboardKind::Image);
-        assert!(guard.should_skip(&fingerprint));
+        assert!(guard.should_skip(fingerprint.as_str()));
     }
 
     fn sample_png(w: u32, h: u32) -> Vec<u8> {

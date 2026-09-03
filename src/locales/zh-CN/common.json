@@ -8,6 +8,86 @@
     "reset": "重置",
     "save": "保存"
   },
+  "androidPermissions": {
+    "actions": {
+      "authorizeRoot": "授权 Root",
+      "basicActive": "基础模式已启用",
+      "configure": "选择运行模式",
+      "enableFull": "启用完整模式",
+      "fullActive": "完整模式已启用",
+      "openSettings": "去设置",
+      "ready": "已就绪",
+      "reconfigure": "重新配置",
+      "refresh": "刷新状态",
+      "useBasic": "使用基础模式"
+    },
+    "description": "完整能力需要 Root 与悬浮窗权限；如果暂时不授权，也可以使用不依赖无障碍服务的基础模式。",
+    "messages": {
+      "basicEnabled": "已切换到基础模式",
+      "fullEnabled": "完整模式正在启动",
+      "modeFailed": "切换 Android 运行模式失败",
+      "rootFailed": "未取得 Root 授权",
+      "rootReady": "Root 授权成功"
+    },
+    "modes": {
+      "basic": {
+        "description": "无需 Root、无障碍或悬浮窗；应用可见时采集，保留历史、同步、手动复制与粘贴。",
+        "title": "基础模式"
+      },
+      "full": {
+        "description": "后台持续采集剪贴板，支持底角上滑唤醒，并通过 Root 完成一键粘贴。",
+        "title": "完整模式"
+      }
+    },
+    "onboarding": {
+      "changeLater": "之后可从剪贴板页或偏好设置顶部重新配置。",
+      "chooseMode": "请选择完整模式或基础模式后继续。",
+      "required": "尚未选择运行模式",
+      "selected": "运行模式已选择"
+    },
+    "permissions": {
+      "battery": {
+        "description": "减少系统对完整模式后台服务的休眠和清理。",
+        "title": "忽略电池优化"
+      },
+      "notification": {
+        "description": "允许显示完整模式的常驻服务通知。",
+        "title": "通知权限"
+      },
+      "overlay": {
+        "description": "只负责显示上滑入口和剪贴板面板；全局手势由 Root 捕获。",
+        "title": "悬浮窗权限"
+      },
+      "root": {
+        "description": "仅在点击按钮时向 Root 管理器申请授权，刷新状态不会触发授权弹窗。",
+        "title": "Root 授权"
+      }
+    },
+    "rootStatus": {
+      "authorized": "已授权",
+      "unavailable": "未授权",
+      "unknown": "未检测"
+    },
+    "runtime": {
+      "capture": "后台剪贴板采集",
+      "foregroundCapture": "应用可见时采集",
+      "gesture": "全局上滑手势"
+    },
+    "sections": {
+      "recommended": "完整模式建议开启",
+      "required": "完整模式必需",
+      "runtime": "实际运行状态"
+    },
+    "status": {
+      "current": "当前",
+      "enabled": "已开启",
+      "pending": "待开启",
+      "recommended": "建议开启",
+      "running": "运行中",
+      "stopped": "未运行"
+    },
+    "title": "Android 运行模式"
+  },
   "app": {
     "tagline": "跨平台剪贴板管理器"
   },

@@ -8,6 +8,86 @@
     "reset": "Reset",
     "save": "Save"
   },
+  "androidPermissions": {
+    "actions": {
+      "authorizeRoot": "Authorize Root",
+      "basicActive": "Basic mode enabled",
+      "configure": "Choose mode",
+      "enableFull": "Enable full mode",
+      "fullActive": "Full mode enabled",
+      "openSettings": "Open settings",
+      "ready": "Ready",
+      "reconfigure": "Configure again",
+      "refresh": "Refresh status",
+      "useBasic": "Use basic mode"
+    },
+    "description": "Full functionality requires Root and overlay access. You can instead use basic mode without granting Accessibility access.",
+    "messages": {
+      "basicEnabled": "Switched to basic mode",
+      "fullEnabled": "Full mode is starting",
+      "modeFailed": "Failed to switch Android mode",
+      "rootFailed": "Root access was not granted",
+      "rootReady": "Root access granted"
+    },
+    "modes": {
+      "basic": {
+        "description": "No Root, Accessibility, or overlay access. Captures while the app is visible and keeps history, sync, copy, and manual paste.",
+        "title": "Basic mode"
+      },
+      "full": {
+        "description": "Continuously captures in the background, opens from a bottom-corner swipe, and pastes through Root.",
+        "title": "Full mode"
+      }
+    },
+    "onboarding": {
+      "changeLater": "You can change this later from the Clipboard page or the top of Preferences.",
+      "chooseMode": "Choose full mode or basic mode to continue.",
+      "required": "No mode selected yet",
+      "selected": "Mode selected"
+    },
+    "permissions": {
+      "battery": {
+        "description": "Reduces background suspension and cleanup of full-mode services.",
+        "title": "Ignore battery optimization"
+      },
+      "notification": {
+        "description": "Allows the persistent full-mode service notification.",
+        "title": "Notification permission"
+      },
+      "overlay": {
+        "description": "Only draws the swipe targets and clipboard panel; Root captures the global gesture.",
+        "title": "Overlay access"
+      },
+      "root": {
+        "description": "Requests access from the Root manager only when you tap the button. Status refresh never opens the authorization prompt.",
+        "title": "Root access"
+      }
+    },
+    "rootStatus": {
+      "authorized": "Authorized",
+      "unavailable": "Not authorized",
+      "unknown": "Not checked"
+    },
+    "runtime": {
+      "capture": "Background clipboard capture",
+      "foregroundCapture": "Capture while app is visible",
+      "gesture": "Global swipe gesture"
+    },
+    "sections": {
+      "recommended": "Recommended for full mode",
+      "required": "Required for full mode",
+      "runtime": "Actual runtime status"
+    },
+    "status": {
+      "current": "Current",
+      "enabled": "Enabled",
+      "pending": "Required",
+      "recommended": "Recommended",
+      "running": "Running",
+      "stopped": "Not running"
+    },
+    "title": "Android mode"
+  },
   "app": {
     "tagline": "Cross-platform clipboard manager"
   },

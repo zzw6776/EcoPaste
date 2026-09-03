@@ -60,6 +60,10 @@ class EcoPasteOverlayService : Service() {
                 )
             }
         }
+
+        fun isGestureMonitorReady(): Boolean {
+            return instance?.gestureMonitorReady == true
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -69,6 +73,7 @@ class EcoPasteOverlayService : Service() {
     private var rightIndicator: View? = null
     private var overlayPanel: EcoPasteOverlayPanel? = null
     private var rootInputMonitor: RootInputMonitor? = null
+    private var gestureMonitorReady = false
     private var activeMonitorSignature: String? = null
     private var rootAvailable = false
     private var panelSessionId: Long? = null
@@ -260,11 +265,13 @@ class EcoPasteOverlayService : Service() {
             context = this,
             onReady = { ready ->
                 mainHandler.post {
-                    if (ready) {
+                    if (ready && rootInputMonitor === monitor) {
+                        gestureMonitorReady = true
                         monitorFailureCount = 0
                         mainHandler.removeCallbacks(monitorRestartRunnable)
                         Log.i(TAG, "Root InputMonitor ready: $signature")
                     } else if (rootInputMonitor === monitor) {
+                        gestureMonitorReady = false
                         rootInputMonitor = null
                         activeMonitorSignature = null
                         removeIndicators()
@@ -318,6 +325,7 @@ class EcoPasteOverlayService : Service() {
 
     private fun stopRootInputMonitor() {
         mainHandler.removeCallbacks(monitorRestartRunnable)
+        gestureMonitorReady = false
         rootInputMonitor?.stop()
         rootInputMonitor = null
         activeMonitorSignature = null

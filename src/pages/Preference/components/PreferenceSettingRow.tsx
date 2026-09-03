@@ -57,12 +57,14 @@ const PreferenceSettingRow: FC<PreferenceSettingRowProps> = (props) => {
   const androidSnapshot = useSnapshot(androidState);
   const value = setting.value?.(settings);
   const parentDisabled = setting.disabledWhen?.(settings) === true;
-  const rootUnavailable =
+  const fullModeUnavailable =
     isAndroid &&
     setting.id.startsWith("androidGesture.") &&
-    androidSnapshot.status?.rootAvailable === false;
+    androidSnapshot.status !== null &&
+    (androidSnapshot.status.mode !== "full" ||
+      androidSnapshot.status.rootStatus === "unavailable");
   const disabled =
-    setting.disabled === true || parentDisabled || rootUnavailable;
+    setting.disabled === true || parentDisabled || fullModeUnavailable;
   const childSetting = setting.parentId !== void 0;
   const collapsed = childSetting && parentDisabled;
   const visual = resolveSettingVisual(setting.id);

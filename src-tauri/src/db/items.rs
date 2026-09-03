@@ -35,7 +35,11 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
           WHEN clipboard_items.kind = 'text' THEN '' ELSE clipboard_items.content END AS content, \
      clipboard_items.content_hash, \
      CASE WHEN clipboard_items.kind = 'text' THEN NULL ELSE clipboard_items.search_text END AS search_text, \
-     clipboard_items.summary, clipboard_items.file_types, clipboard_items.size, \
+     clipboard_items.summary, \
+     CASE WHEN clipboard_items.kind = 'text' \
+          THEN length(COALESCE(clipboard_items.search_text, clipboard_items.content)) \
+          ELSE NULL END AS text_char_count, \
+     clipboard_items.file_types, clipboard_items.size, \
      clipboard_items.width, clipboard_items.height, clipboard_items.use_count, \
      clipboard_items.is_favorite, clipboard_items.is_pinned, \
      clipboard_items.is_sensitive, \
@@ -798,6 +802,7 @@ mod tests {
             content,
             search_text: None,
             summary: None,
+            text_char_count: None,
             file_types: None,
             size: None,
             width: None,
@@ -886,6 +891,27 @@ mod tests {
 
         assert_eq!(listed_url.content, url.content);
         assert!(listed_plain.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_view_reports_full_plain_text_char_count() {
+        let pool = memory_pool().await;
+        let plain_text = "你😀".repeat(150);
+        let mut rich_text = sample_item("rich-text");
+        rich_text.sub_kind = Some(ClipboardSubKind::Html);
+        rich_text.content = "<p>HTML source is intentionally a different length</p>".to_owned();
+        rich_text.search_text = Some(plain_text.clone());
+        rich_text.summary = Some(plain_text.chars().take(256).collect());
+        insert_item(&pool, &rich_text).await.unwrap();
+
+        let listed = find_item_for_list_by_id(&pool, "rich-text")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(listed.content.is_empty());
+        assert_eq!(listed.summary.as_deref().unwrap().chars().count(), 256);
+        assert_eq!(listed.text_char_count, Some(300));
     }
 
     #[tokio::test]

@@ -198,6 +198,7 @@ pub fn run() {
             commands::set_cloud_relay_auth_token,
             commands::sync_now,
             commands::reconnect_sync_peer,
+            commands::reconnect_cloud,
             commands::remove_sync_peer,
             commands::discover_nearby_sync_spaces,
             commands::request_nearby_sync_join,
@@ -226,9 +227,9 @@ pub fn run() {
             commands::skip_update_version,
             commands::get_android_permissions_status,
             commands::request_android_permission,
-            commands::toggle_android_overlay_service,
             commands::minimize_android_app,
-            commands::set_android_engine_mode,
+            commands::authorize_android_root,
+            commands::set_android_mode,
             menu::clipboard_item::popup_clipboard_item_menu,
         ]);
 

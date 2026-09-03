@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
+use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation};
 use super::guard::WritebackGuard;
 use super::ingest::{build_item_with_settings, calculate_files_total_size};
 #[cfg(not(target_os = "android"))]
@@ -175,6 +176,7 @@ pub async fn persist_and_notify(
     pool: &SqlitePool,
     item: &ClipboardItem,
     source_app: Option<&ClipboardApp>,
+    observation: Option<ClipboardObservation>,
 ) -> crate::core::Result<UpsertResult> {
     let mut item_to_write = item.clone();
     if let Some(src) = source_app {
@@ -191,9 +193,9 @@ pub async fn persist_and_notify(
     notify_clipboard_updated(app, &result.id, item_to_write.kind, result.deduplicated);
     item_to_write.id = result.id.clone();
     if item_to_write.kind == ClipboardKind::Files && item_to_write.size.is_none() {
-        resolve_file_size_and_enqueue(app, pool, item_to_write);
+        resolve_file_size_and_enqueue(app, pool, item_to_write, observation);
     } else {
-        crate::sync::enqueue_local_item(app, item_to_write);
+        crate::sync::enqueue_local_item(app, item_to_write, observation);
     }
     Ok(result)
 }
@@ -220,7 +222,12 @@ fn notify_clipboard_updated(
 }
 
 /// 目录递归统计在阻塞线程池执行；完成前记录已可见，但不会用未知大小启动自动同步。
-fn resolve_file_size_and_enqueue(app: &AppHandle, pool: &SqlitePool, mut item: ClipboardItem) {
+fn resolve_file_size_and_enqueue(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    mut item: ClipboardItem,
+    observation: Option<ClipboardObservation>,
+) {
     let app = app.clone();
     let pool = pool.clone();
     let content = item.content.clone();
@@ -233,12 +240,12 @@ fn resolve_file_size_and_enqueue(app: &AppHandle, pool: &SqlitePool, mut item: C
             Ok(Ok(size)) => size,
             Ok(Err(error)) => {
                 log::warn!("calculate clipboard file size failed: {error:#}");
-                crate::sync::enqueue_local_item(&app, item);
+                crate::sync::enqueue_local_item(&app, item, observation);
                 return;
             }
             Err(error) => {
                 log::warn!("clipboard file size task failed: {error}");
-                crate::sync::enqueue_local_item(&app, item);
+                crate::sync::enqueue_local_item(&app, item, observation);
                 return;
             }
         };
@@ -246,12 +253,12 @@ fn resolve_file_size_and_enqueue(app: &AppHandle, pool: &SqlitePool, mut item: C
         match fill_file_item_size(&pool, &item.id, &item.source_revision, size).await {
             Ok(true) => {
                 notify_clipboard_updated(&app, &item.id, item.kind, true);
-                crate::sync::enqueue_local_item(&app, item);
+                crate::sync::enqueue_local_item(&app, item, observation);
             }
             Ok(false) => {}
             Err(error) => {
                 log::warn!("persist clipboard file size failed: {error:#}");
-                crate::sync::enqueue_local_item(&app, item);
+                crate::sync::enqueue_local_item(&app, item, observation);
             }
         }
     });
@@ -323,6 +330,9 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     let guard = Arc::new(WritebackGuard::new());
     app.manage(guard.clone());
 
+    let fingerprints = Arc::new(ClipboardFingerprintState::new());
+    app.manage(fingerprints.clone());
+
     let store = ImageStore::new(app)?;
     app.manage(store.clone());
 
@@ -360,7 +370,15 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     spawn_file_size_backfill(app.clone());
     super::cleanup::spawn(app.clone());
     #[cfg(not(target_os = "android"))]
-    spawn_watch_thread(app.clone(), guard, store, app_icon_store, registry, pause);
+    spawn_watch_thread(
+        app.clone(),
+        guard,
+        fingerprints,
+        store,
+        app_icon_store,
+        registry,
+        pause,
+    );
     Ok(())
 }
 
@@ -387,6 +405,8 @@ async fn persist_android_text(
 ) {
     use super::payload::{ClipboardPayload, TextPayload};
 
+    let fingerprints = app.state::<Arc<ClipboardFingerprintState>>();
+    let observation = fingerprints.begin_observation();
     if pause.is_paused() || text.trim().is_empty() {
         return;
     }
@@ -410,7 +430,13 @@ async fn persist_android_text(
         _ => return,
     };
     if guard.should_skip(&item.content_hash) {
+        if let Some(fingerprint) = ClipboardFingerprint::from_text_item(&item) {
+            fingerprints.commit_observation(&observation, fingerprint);
+        }
         return;
+    }
+    if let Some(fingerprint) = ClipboardFingerprint::from_text_item(&item) {
+        fingerprints.commit_observation(&observation, fingerprint);
     }
     let source_app = source.map(|source| {
         materialize_source(
@@ -423,7 +449,7 @@ async fn persist_android_text(
         item.source_app_id = Some(source.id.clone());
     }
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
-    if let Err(error) = persist_and_notify(app, &pool, &item, source_app.as_ref()).await {
+    if let Err(error) = persist_and_notify(app, &pool, &item, source_app.as_ref(), None).await {
         log::error!("Android clipboard capture persist failed: {error}");
     }
 }
@@ -432,6 +458,7 @@ async fn persist_android_text(
 fn spawn_watch_thread(
     app: AppHandle,
     guard: Arc<WritebackGuard>,
+    fingerprints: Arc<ClipboardFingerprintState>,
     store: ImageStore,
     app_icon_store: AppIconStore,
     registry: AppsRegistry,
@@ -462,6 +489,7 @@ fn spawn_watch_thread(
                 reader,
                 app,
                 guard,
+                fingerprints,
                 store,
                 app_icon_store,
                 registry,
@@ -480,6 +508,7 @@ struct ClipboardChangeHandler {
     reader: ClipboardReader,
     app: AppHandle,
     guard: Arc<WritebackGuard>,
+    fingerprints: Arc<ClipboardFingerprintState>,
     store: ImageStore,
     app_icon_store: AppIconStore,
     registry: AppsRegistry,
@@ -489,6 +518,7 @@ struct ClipboardChangeHandler {
 #[cfg(not(target_os = "android"))]
 impl ClipboardHandler for ClipboardChangeHandler {
     fn on_clipboard_change(&mut self) {
+        let observation = self.fingerprints.begin_observation();
         // 用户从托盘关掉「监听」时直接早退，不读取、不入库、不 emit。
         if self.pause.is_paused() {
             return;
@@ -539,7 +569,7 @@ impl ClipboardHandler for ClipboardChangeHandler {
         };
         let image_fingerprint = match &payload {
             super::payload::ClipboardPayload::Image(image) => {
-                super::guard::image_pixel_fingerprint(&image.bytes)
+                ClipboardFingerprint::from_image_bytes(&image.bytes)
             }
             _ => None,
         };
@@ -560,10 +590,33 @@ impl ClipboardHandler for ClipboardChangeHandler {
         };
 
         // 自身写回触发的变更：跳过入库，避免回环。
-        let suppression = image_fingerprint.as_deref().unwrap_or(&item.content_hash);
+        let suppression = image_fingerprint
+            .as_ref()
+            .map(ClipboardFingerprint::as_str)
+            .unwrap_or(&item.content_hash);
         if self.guard.should_skip(suppression) {
+            let fingerprint =
+                image_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
+            if let Some(fingerprint) = fingerprint {
+                self.fingerprints
+                    .commit_observation(&observation, fingerprint);
+            } else {
+                self.fingerprints.restore_observation(observation);
+            }
             return;
         }
+
+        let sync_observation = if item.kind == ClipboardKind::Files {
+            Some(observation)
+        } else {
+            let fingerprint =
+                image_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
+            if let Some(fingerprint) = fingerprint {
+                self.fingerprints
+                    .commit_observation(&observation, fingerprint);
+            }
+            None
+        };
 
         let source_app =
             source.map(|src| materialize_source(&self.app_icon_store, Some(&self.registry), src));
@@ -575,7 +628,9 @@ impl ClipboardHandler for ClipboardChangeHandler {
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
             let pool = app.state::<crate::db::DatabaseState>().pool().await;
-            if let Err(err) = persist_and_notify(&app, &pool, &item, source_app.as_ref()).await {
+            if let Err(err) =
+                persist_and_notify(&app, &pool, &item, source_app.as_ref(), sync_observation).await
+            {
                 log::error!("clipboard watcher: persist failed: {err}");
             }
         });

@@ -183,7 +183,7 @@ const PreferenceHeader: FC<PreferenceHeaderProps> = (props) => {
               type="button"
             >
               <i aria-hidden="true" className="i-lucide:shield-check" />
-              <span>权限与引擎</span>
+              <span>{t("common:androidPermissions.title")}</span>
             </button>
           ) : null}
         </div>
