@@ -200,14 +200,14 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     resetLoadingRanges,
   ]);
 
-  const reloadCurrentRange = useCallback(() => {
+  const reloadCurrentRange = useCallback(async () => {
     const token = requestTokenRef.current + 1;
     requestTokenRef.current = token;
     resetLoadingRanges();
     commitItems(new Map());
 
     const { end, start } = viewRangeRef.current;
-    void fetchRange(start - PRELOAD_ROWS, end + PRELOAD_ROWS, {
+    await fetchRange(start - PRELOAD_ROWS, end + PRELOAD_ROWS, {
       force: true,
       replace: true,
       token,

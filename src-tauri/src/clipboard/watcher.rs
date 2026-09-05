@@ -528,7 +528,7 @@ impl ClipboardHandler for ClipboardChangeHandler {
         // 自身写回的事件会在下方 guard 处被丢弃，但 detect 仍会无害地返回我们自己的 bundle id——
         // 顺序换不得：guard 判定依赖 content_hash，必须先把 payload 读出来才能判，
         // 而 read_all 期间用户可能已经切走前台。
-        let source = source::detect_frontmost();
+        let source = source::detect_frontmost(&self.app_icon_store, &self.registry);
 
         // 用户在偏好里勾选了「过滤此应用」时，本次复制整条直接丢弃——不读取、不入库、不 emit。
         // 提前到读 payload 前判定，省掉无效的 OS 调用 + 图片解码开销。
@@ -567,13 +567,6 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 return;
             }
         };
-        let image_fingerprint = match &payload {
-            super::payload::ClipboardPayload::Image(image) => {
-                ClipboardFingerprint::from_image_bytes(&image.bytes)
-            }
-            _ => None,
-        };
-
         let mut item = match build_item_with_settings(
             &self.store,
             &payload,
@@ -587,6 +580,14 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 log::warn!("clipboard watcher: build item failed: {err}");
                 return;
             }
+        };
+        // `build_item_with_settings` 会先应用 `max_image_bytes` 门禁；只有确认收录的图片
+        // 才做完整 RGBA 解码生成语义指纹，避免超限图片产生无效的大块像素分配。
+        let image_fingerprint = match &payload {
+            super::payload::ClipboardPayload::Image(image) => {
+                ClipboardFingerprint::from_image_bytes(&image.bytes)
+            }
+            _ => None,
         };
 
         // 自身写回触发的变更：跳过入库，避免回环。
@@ -828,7 +829,11 @@ mod tests {
         assert!(store.origin_path(&item.content).exists());
         assert!(!store.thumbnail_path(&item.content).exists());
         // 模拟前端首次取图：按需生成缩略图。
-        assert!(store.ensure_thumbnail(&item.content).unwrap().exists());
+        assert!(store
+            .ensure_thumbnail(&item.content)
+            .await
+            .unwrap()
+            .exists());
 
         let result = upsert_item(&pool, &item).await.unwrap();
         assert!(!result.deduplicated);

@@ -26,7 +26,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
-import java.util.concurrent.Executors
 
 /** Root-only 全局上滑监控；左右感应区窗口用于阻止点击穿透。 */
 class EcoPasteOverlayService : Service() {
@@ -67,7 +66,7 @@ class EcoPasteOverlayService : Service() {
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val rootCheckExecutor = Executors.newSingleThreadExecutor()
+    private val rootCheckExecutor = reclaimingFixedThreadPool(1)
     private var windowManager: WindowManager? = null
     private var leftIndicator: View? = null
     private var rightIndicator: View? = null

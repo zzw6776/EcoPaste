@@ -11,6 +11,7 @@ use std::sync::RwLock;
 
 use anyhow::Context;
 use tauri::AppHandle;
+use tokio::sync::watch;
 
 use crate::core::{AppError, Result};
 
@@ -24,6 +25,7 @@ const FILENAME: &str = "settings.json";
 pub struct SettingsStore {
     path: RwLock<PathBuf>,
     current: RwLock<Settings>,
+    change_revision: watch::Sender<u64>,
 }
 
 impl SettingsStore {
@@ -45,15 +47,22 @@ impl SettingsStore {
             }
         };
         log::info!("settings store ready at {path:?}");
+        let (change_revision, _) = watch::channel(0);
 
         Ok(Self {
             path: RwLock::new(path),
             current: RwLock::new(current),
+            change_revision,
         })
     }
 
     pub fn snapshot(&self) -> Settings {
         self.current.read().expect("settings poisoned").clone()
+    }
+
+    /// Subscribes to committed settings changes without polling the settings file or snapshot.
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_revision.subscribe()
     }
 
     /// 恢复默认设置并落盘，返回新的完整快照。
@@ -63,6 +72,7 @@ impl SettingsStore {
         let path = self.path();
         write_atomic(&path, &next)?;
         *self.current.write().expect("settings poisoned") = next.clone();
+        self.notify_changed();
         Ok(next)
     }
 
@@ -89,6 +99,8 @@ impl SettingsStore {
         let path = self.path();
         write_atomic(&path, &next)?;
         *guard = next.clone();
+        drop(guard);
+        self.notify_changed();
         Ok(next)
     }
 
@@ -104,6 +116,7 @@ impl SettingsStore {
         let path = self.path();
         write_atomic(&path, &next)?;
         *self.current.write().expect("settings poisoned") = next.clone();
+        self.notify_changed();
         Ok(next)
     }
 
@@ -123,7 +136,14 @@ impl SettingsStore {
 
         *self.path.write().expect("settings path poisoned") = path;
         *self.current.write().expect("settings poisoned") = current.clone();
+        self.notify_changed();
         Ok(current)
+    }
+
+    fn notify_changed(&self) {
+        self.change_revision.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
     }
 
     fn path(&self) -> PathBuf {

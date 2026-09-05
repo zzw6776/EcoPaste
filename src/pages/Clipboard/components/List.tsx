@@ -1,4 +1,4 @@
-import { useEventListener, useMount } from "ahooks";
+import { useEventListener, useMount, useUnmount } from "ahooks";
 import { Empty, Spin } from "antd";
 import type { TFunction } from "i18next";
 import type {
@@ -13,9 +13,7 @@ import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
   getClipboardPreviewPayload,
-  getSyncItemStatuses,
   hideWindow,
-  listClipboardGroups,
   openAndroidClipboardFile,
   openClipboardItemLink,
   pasteClipboardItem,
@@ -56,6 +54,10 @@ import type {
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
+import {
+  getSyncItemStatusesShared,
+  listClipboardGroupsShared,
+} from "../dataRequests";
 import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
   isSpaceKey,
@@ -67,6 +69,9 @@ import NoteModal from "./NoteModal";
 
 /** 前 10 项的快捷键：index 0-8 对应 1-9，index 9 对应 0 */
 const KEY_HINTS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+
+/** 隐藏窗口内的更新短暂合并，避免连续复制扇出多次整页查询。 */
+const HIDDEN_RANGE_REFRESH_DEBOUNCE_MS = 120;
 
 interface ClipboardUpdatedPayload {
   cleanup?: number;
@@ -124,6 +129,9 @@ const List: FC<ListProps> = (props) => {
   const reloadCurrentRangeRef = useRef<() => void>(() => {});
   const requestReloadAtTopRef = useRef<() => void>(() => {});
   const deferredReloadRef = useRef(false);
+  const hiddenRangeRefreshTimerRef = useRef<number | null>(null);
+  const hiddenRangeRefreshInFlightRef = useRef(false);
+  const hiddenRangeRefreshPendingRef = useRef(false);
   // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
   // 隐藏期间在 WebView 内预刷新当前可视范围，避免 show 后才用新数据挤开旧卡片。
   // Android 移动端与 Web 预览模式下首屏直接处于激活态，初值置为 true。
@@ -199,7 +207,7 @@ const List: FC<ListProps> = (props) => {
       setSyncStatuses(new Map());
       return;
     }
-    const statuses = await getSyncItemStatuses(itemIds);
+    const statuses = await getSyncItemStatusesShared(itemIds);
     setSyncStatuses(new Map(statuses.map((status) => [status.itemId, status])));
   }
 
@@ -258,7 +266,7 @@ const List: FC<ListProps> = (props) => {
    * 从 Rust 拉取自定义分组，用于空状态展示当前分组名称。
    */
   const loadGroups = async () => {
-    const groups = await listClipboardGroups();
+    const groups = await listClipboardGroupsShared();
 
     setCustomGroups(groups);
   };
@@ -268,6 +276,11 @@ const List: FC<ListProps> = (props) => {
    */
   useMount(() => {
     void loadGroups();
+  });
+
+  useUnmount(() => {
+    hiddenRangeRefreshPendingRef.current = false;
+    clearHiddenRangeRefreshTimer();
   });
 
   useEffect(() => {
@@ -308,10 +321,8 @@ const List: FC<ListProps> = (props) => {
    * 用 ref 读取最新滚动位置，规避闭包陷旧值（事件订阅只挂载一次）。
    */
   const handleClipboardUpdated = (payload: ClipboardUpdatedPayload) => {
-    // 隐藏期间直接在不可见 WebView 内重建当前范围；查询返回前缓存已清空，
-    // 即使用户立即唤起窗口，也不会先展示旧卡片再把新记录插到头部。
     if (!clipboardWindowVisibleRef.current) {
-      refreshHiddenRange();
+      scheduleHiddenRangeRefresh();
       return;
     }
 
@@ -365,6 +376,11 @@ const List: FC<ListProps> = (props) => {
   );
 
   useTauriListen(TAURI_EVENT.SOURCE_APP_UPDATED, () => {
+    if (!clipboardWindowVisibleRef.current) {
+      scheduleHiddenRangeRefresh();
+      return;
+    }
+
     reloadCurrentRangeRef.current();
   });
 
@@ -382,9 +398,11 @@ const List: FC<ListProps> = (props) => {
     if (!visible) {
       // 窗口可见且离开顶部时可能累积 pending；趁 hide 后预刷新，
       // 确保下次 show 的首帧已经是最新数据。
-      if (deferredReloadRef.current) refreshHiddenRange();
+      if (deferredReloadRef.current) scheduleHiddenRangeRefresh();
       return;
     }
+
+    void flushHiddenRangeRefresh();
 
     if (!active) return;
 
@@ -993,12 +1011,44 @@ const List: FC<ListProps> = (props) => {
     reload();
   }
 
-  /**
-   * 在隐藏的 WebView 内重建当前查询范围，避免窗口显示后再替换旧列表。
-   */
-  function refreshHiddenRange() {
+  /** 合并隐藏期间的连续更新，只在最后一次更新静默后重建查询范围。 */
+  function scheduleHiddenRangeRefresh() {
+    hiddenRangeRefreshPendingRef.current = true;
+    clearHiddenRangeRefreshTimer();
+    hiddenRangeRefreshTimerRef.current = window.setTimeout(() => {
+      hiddenRangeRefreshTimerRef.current = null;
+      void flushHiddenRangeRefresh();
+    }, HIDDEN_RANGE_REFRESH_DEBOUNCE_MS);
+  }
+
+  /** 窗口收到显示事件时立即消费 pending，同时保证同一时刻最多一次隐藏查询。 */
+  async function flushHiddenRangeRefresh() {
+    if (!hiddenRangeRefreshPendingRef.current) return;
+    if (hiddenRangeRefreshInFlightRef.current) return;
+
+    clearHiddenRangeRefreshTimer();
+    hiddenRangeRefreshPendingRef.current = false;
+    hiddenRangeRefreshInFlightRef.current = true;
     deferredReloadRef.current = false;
-    reloadCurrentRange();
+    try {
+      await reloadCurrentRange();
+    } finally {
+      hiddenRangeRefreshInFlightRef.current = false;
+      if (hiddenRangeRefreshPendingRef.current) {
+        if (clipboardWindowVisibleRef.current) {
+          void flushHiddenRangeRefresh();
+        } else {
+          scheduleHiddenRangeRefresh();
+        }
+      }
+    }
+  }
+
+  function clearHiddenRangeRefreshTimer() {
+    if (hiddenRangeRefreshTimerRef.current === null) return;
+
+    window.clearTimeout(hiddenRangeRefreshTimerRef.current);
+    hiddenRangeRefreshTimerRef.current = null;
   }
 
   /**

@@ -1787,9 +1787,11 @@ impl SyncManager {
             return Ok(());
         }
 
-        let items = db::items::recent_items_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
-        for item in items.into_iter().rev() {
-            let item_id = item.id.clone();
+        let item_ids = db::items::recent_item_ids_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
+        for item_id in item_ids.into_iter().rev() {
+            let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
+                continue;
+            };
             if let Err(error) = self
                 .enqueue_item_inner(item, false, false, true, None)
                 .await
@@ -5255,6 +5257,52 @@ fn mark_cloud_watch_ready(manager: &SyncManager, watch_ready: &mut bool) {
     manager.emit_updated();
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CloudWatchChanges {
+    events_changed: bool,
+    removals_changed: bool,
+}
+
+/// Advances the local watch watermarks and reports work only when the Hub moved either one.
+fn advance_cloud_watch_watermarks(
+    latest_cursor: u64,
+    latest_removed_at_ms: i64,
+    cursor: &mut u64,
+    removed_at_ms: &mut i64,
+) -> Option<CloudWatchChanges> {
+    let changes = CloudWatchChanges {
+        events_changed: latest_cursor > *cursor,
+        removals_changed: latest_removed_at_ms > *removed_at_ms,
+    };
+    *cursor = (*cursor).max(latest_cursor);
+    *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
+
+    (changes.events_changed || changes.removals_changed).then_some(changes)
+}
+
+/// Wakes change-driven workers only for a real event or removal watermark advance.
+fn apply_cloud_watch_watermarks(
+    manager: &SyncManager,
+    latest_cursor: u64,
+    latest_removed_at_ms: i64,
+    cursor: &mut u64,
+    removed_at_ms: &mut i64,
+) {
+    let Some(changes) =
+        advance_cloud_watch_watermarks(latest_cursor, latest_removed_at_ms, cursor, removed_at_ms)
+    else {
+        return;
+    };
+    let received_at_ms = Utc::now().timestamp_millis();
+    let events_changed = changes.events_changed;
+    let removals_changed = changes.removals_changed;
+    log::info!(
+        "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
+    );
+    manager.source_asset_wake.notify_one();
+    manager.wake_cloud_transfer();
+}
+
 fn apply_cloud_watch_response(
     manager: &SyncManager,
     response: Response,
@@ -5266,18 +5314,13 @@ fn apply_cloud_watch_response(
             latest_cursor,
             latest_removed_at_ms,
         } => {
-            let received_at_ms = Utc::now().timestamp_millis();
-            manager.source_asset_wake.notify_one();
-            let events_changed = latest_cursor > *cursor;
-            let removals_changed = latest_removed_at_ms > *removed_at_ms;
-            if events_changed || removals_changed {
-                log::info!(
-                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
-                );
-                manager.wake_cloud_transfer();
-            }
-            *cursor = (*cursor).max(latest_cursor);
-            *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
+            apply_cloud_watch_watermarks(
+                manager,
+                latest_cursor,
+                latest_removed_at_ms,
+                cursor,
+                removed_at_ms,
+            );
             Ok(())
         }
         Response::GroupChangedV2 {
@@ -5285,19 +5328,14 @@ fn apply_cloud_watch_response(
             latest_removed_at_ms,
             server_version,
         } => {
-            let received_at_ms = Utc::now().timestamp_millis();
             manager.update_cloud_server_version(Some(server_version));
-            manager.source_asset_wake.notify_one();
-            let events_changed = latest_cursor > *cursor;
-            let removals_changed = latest_removed_at_ms > *removed_at_ms;
-            if events_changed || removals_changed {
-                log::info!(
-                    "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
-                );
-                manager.wake_cloud_transfer();
-            }
-            *cursor = (*cursor).max(latest_cursor);
-            *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
+            apply_cloud_watch_watermarks(
+                manager,
+                latest_cursor,
+                latest_removed_at_ms,
+                cursor,
+                removed_at_ms,
+            );
             Ok(())
         }
         Response::Changed { latest_cursor } => {
@@ -6930,6 +6968,43 @@ mod tests {
     fn confirmed_cloud_watch_resets_consecutive_failure_count() {
         assert_eq!(next_cloud_watch_failure_count(5, true), 1);
         assert_eq!(next_cloud_watch_failure_count(5, false), 6);
+    }
+
+    #[test]
+    fn unchanged_cloud_group_watch_heartbeat_schedules_no_work() {
+        let mut cursor = 42;
+        let mut removed_at_ms = 1_000;
+
+        let changes = advance_cloud_watch_watermarks(42, 1_000, &mut cursor, &mut removed_at_ms);
+
+        assert_eq!(changes, None);
+        assert_eq!(cursor, 42);
+        assert_eq!(removed_at_ms, 1_000);
+    }
+
+    #[test]
+    fn cloud_group_watch_reports_only_advanced_watermarks() {
+        let mut cursor = 42;
+        let mut removed_at_ms = 1_000;
+
+        assert_eq!(
+            advance_cloud_watch_watermarks(43, 900, &mut cursor, &mut removed_at_ms),
+            Some(CloudWatchChanges {
+                events_changed: true,
+                removals_changed: false,
+            })
+        );
+        assert_eq!(cursor, 43);
+        assert_eq!(removed_at_ms, 1_000);
+        assert_eq!(
+            advance_cloud_watch_watermarks(40, 1_001, &mut cursor, &mut removed_at_ms),
+            Some(CloudWatchChanges {
+                events_changed: false,
+                removals_changed: true,
+            })
+        );
+        assert_eq!(cursor, 43);
+        assert_eq!(removed_at_ms, 1_001);
     }
 
     #[test]

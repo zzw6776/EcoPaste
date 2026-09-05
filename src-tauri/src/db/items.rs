@@ -21,6 +21,7 @@ const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clip
      clipboard_apps.accent_end AS source_app_accent_end \
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
+const HISTORY_CLEANUP_BATCH_SIZE: i64 = 256;
 
 /// 列表/单条刷新场景的精简 SELECT：普通 text 由前端用 `summary` 渲染；URL 保留完整
 /// `content`，避免长地址被摘要截断。HTML/RTF/长纯文本可能很大（用户复制整段文档），
@@ -344,14 +345,16 @@ pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Clipb
     Ok(item)
 }
 
-/// Reads the most recent local-origin records with full content for one-time sync backfill.
+/// Reads only the ids of the most recent local-origin records for one-time sync backfill.
 /// Remote-only records are already owned by another endpoint and must not be re-originated here.
-pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<ClipboardItem>> {
+/// Callers load the full records one at a time so large histories do not coexist in memory.
+pub async fn recent_item_ids_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("SELECT clipboard_items.id FROM clipboard_items");
     qb.push(
         r#"
         WHERE NOT EXISTS (
@@ -367,10 +370,10 @@ pub async fn recent_items_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<
     .push_bind(i64::from(limit));
 
     Ok(qb
-        .build_query_as::<ClipboardItem>()
+        .build_query_scalar::<String>()
         .fetch_all(pool)
         .await
-        .context("failed to query recent clipboard items for sync")?)
+        .context("failed to query recent clipboard item ids for sync")?)
 }
 
 /// 返回尚未记录总大小的文件卡片，供升级后的后台回填使用。
@@ -535,41 +538,76 @@ pub async fn cleanup_history(
     older_than: Option<chrono::DateTime<chrono::Utc>>,
     max_count: Option<u32>,
 ) -> Result<CleanupOutcome> {
+    let max_count = max_count.filter(|count| *count > 0);
+    if older_than.is_none() && max_count.is_none() {
+        return Ok(CleanupOutcome::default());
+    }
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("failed to begin clipboard history cleanup")?;
     let mut outcome = CleanupOutcome::default();
 
     if let Some(cutoff) = older_than {
-        let rows = sqlx::query_as::<_, (ClipboardKind, String)>(
-            "DELETE FROM clipboard_items \
-             WHERE is_pinned = 0 AND is_favorite = 0 AND created_at < ? \
-             RETURNING kind, content",
-        )
-        .bind(cutoff)
-        .fetch_all(pool)
-        .await
-        .context("failed to cleanup clipboard items by retention")?;
-        absorb_deleted(&mut outcome, rows);
+        loop {
+            let rows = sqlx::query_scalar::<_, Option<String>>(
+                "DELETE FROM clipboard_items WHERE id IN ( \
+                     SELECT id FROM clipboard_items \
+                     WHERE is_pinned = 0 AND is_favorite = 0 AND created_at < ? \
+                     LIMIT ? \
+                 ) \
+                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END",
+            )
+            .bind(cutoff)
+            .bind(HISTORY_CLEANUP_BATCH_SIZE)
+            .bind(ClipboardKind::Image)
+            .fetch_all(&mut *transaction)
+            .await
+            .context("failed to cleanup clipboard items by retention")?;
+            if absorb_cleanup_rows(&mut outcome, rows) < HISTORY_CLEANUP_BATCH_SIZE as usize {
+                break;
+            }
+        }
     }
 
-    if let Some(max) = max_count.filter(|n| *n > 0) {
+    if let Some(max) = max_count {
         // 仅在非置顶 / 非收藏集合内按 created_at DESC 保留前 max 条，多余的删除。
-        // SQLite 中 `LIMIT -1 OFFSET n` 表示「跳过前 n 条，剩下全要」。
-        let rows = sqlx::query_as::<_, (ClipboardKind, String)>(
-            "DELETE FROM clipboard_items WHERE id IN ( \
-                 SELECT id FROM clipboard_items \
-                 WHERE is_pinned = 0 AND is_favorite = 0 \
-                 ORDER BY created_at DESC \
-                 LIMIT -1 OFFSET ? \
-             ) \
-             RETURNING kind, content",
-        )
-        .bind(max as i64)
-        .fetch_all(pool)
-        .await
-        .context("failed to cleanup clipboard items by max_count")?;
-        absorb_deleted(&mut outcome, rows);
+        loop {
+            let rows = sqlx::query_scalar::<_, Option<String>>(
+                "DELETE FROM clipboard_items WHERE id IN ( \
+                     SELECT id FROM clipboard_items \
+                     WHERE is_pinned = 0 AND is_favorite = 0 \
+                     ORDER BY created_at DESC \
+                     LIMIT ? OFFSET ? \
+                 ) \
+                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END",
+            )
+            .bind(HISTORY_CLEANUP_BATCH_SIZE)
+            .bind(max as i64)
+            .bind(ClipboardKind::Image)
+            .fetch_all(&mut *transaction)
+            .await
+            .context("failed to cleanup clipboard items by max_count")?;
+            if absorb_cleanup_rows(&mut outcome, rows) < HISTORY_CLEANUP_BATCH_SIZE as usize {
+                break;
+            }
+        }
     }
 
+    transaction
+        .commit()
+        .await
+        .context("failed to commit clipboard history cleanup")?;
     Ok(outcome)
+}
+
+/// 只保留批量删除返回的图片文件名；文本行仅以 `NULL` 计数，不把正文载入内存。
+fn absorb_cleanup_rows(outcome: &mut CleanupOutcome, rows: Vec<Option<String>>) -> usize {
+    let removed = rows.len();
+    outcome.removed += removed as u64;
+    outcome.image_files.extend(rows.into_iter().flatten());
+    removed
 }
 
 /// 把一批被删行计入 outcome：累加行数，并收集其中的图片文件名。
@@ -915,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_items_for_sync_uses_updated_order_and_keeps_full_content() {
+    async fn recent_item_ids_for_sync_uses_updated_order() {
         let pool = memory_pool().await;
         for (id, updated_at) in [
             ("old", 1_700_000_001),
@@ -927,14 +965,13 @@ mod tests {
             insert_item(&pool, &item).await.unwrap();
         }
 
-        let items = recent_items_for_sync(&pool, 2).await.unwrap();
+        let item_ids = recent_item_ids_for_sync(&pool, 2).await.unwrap();
 
-        assert_eq!(ids(&items), ["new", "mid"]);
-        assert_eq!(items[0].content, "content-new");
+        assert_eq!(item_ids, ["new", "mid"]);
     }
 
     #[tokio::test]
-    async fn recent_items_for_sync_excludes_remote_only_records_before_limit() {
+    async fn recent_item_ids_for_sync_excludes_remote_only_records_before_limit() {
         let pool = memory_pool().await;
         for id in ["remote", "local", "unlinked"] {
             insert_item(&pool, &sample_item(id)).await.unwrap();
@@ -959,12 +996,11 @@ mod tests {
                 .unwrap();
         }
 
-        let items = recent_items_for_sync(&pool, 10).await.unwrap();
-        let ids = ids(&items);
+        let ids = recent_item_ids_for_sync(&pool, 10).await.unwrap();
 
-        assert!(ids.contains(&"local"));
-        assert!(ids.contains(&"unlinked"));
-        assert!(!ids.contains(&"remote"));
+        assert!(ids.iter().any(|id| id == "local"));
+        assert!(ids.iter().any(|id| id == "unlinked"));
+        assert!(!ids.iter().any(|id| id == "remote"));
     }
 
     #[tokio::test]

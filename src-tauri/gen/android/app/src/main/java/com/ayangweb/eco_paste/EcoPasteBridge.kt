@@ -26,6 +26,7 @@ import android.os.PersistableBundle
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.util.LruCache
 import android.webkit.MimeTypeMap
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -58,6 +59,7 @@ object EcoPasteBridge {
     private const val ROOT_STATUS_AUTHORIZED = "authorized"
     private const val ROOT_STATUS_UNAVAILABLE = "unavailable"
     private const val CLIPBOARD_WRITEBACK_MARKER = "com.ayangweb.eco_paste.WRITEBACK"
+    private const val SOURCE_APP_CACHE_BYTES = 4 * 1024 * 1024
     private var currentActivityRef: WeakReference<Activity>? = null
     private var lanDiscoveryLock: WifiManager.MulticastLock? = null
     private var lanDiscoveryLeaseCount = 0
@@ -74,7 +76,13 @@ object EcoPasteBridge {
     private var pendingLanNetworkNotification: PendingNetworkNotification? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
-    private val sourceAppCache = mutableMapOf<String, SourceAppMetadata>()
+    private val sourceAppCache = object : LruCache<String, SourceAppMetadata>(
+        SOURCE_APP_CACHE_BYTES,
+    ) {
+        override fun sizeOf(key: String, value: SourceAppMetadata): Int {
+            return value.iconPng.size + (value.packageName.length + value.appName.length) * 2
+        }
+    }
     @Volatile
     private var rootAuthorizationStatus = ROOT_STATUS_UNKNOWN
     @Volatile
@@ -1264,7 +1272,7 @@ object EcoPasteBridge {
             }
             bitmap.recycle()
             SourceAppMetadata(packageName, appName.ifBlank { packageName }, iconPng).also {
-                sourceAppCache[packageName] = it
+                sourceAppCache.put(packageName, it)
             }
         } catch (error: Exception) {
             Log.d(TAG, "resolve clipboard source app failed for $packageName: ${error.message}")

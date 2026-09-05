@@ -9,6 +9,7 @@ import { settingsState } from "@/stores/settings";
 import { log } from "@/utils/log";
 import { readCachedPayload, writeCachedPayload } from "./cache";
 import { PREVIEW_EXIT_ANIMATION_MS } from "./constants";
+import { PreviewPayloadRequestPool } from "./payloadRequest";
 
 /**
  * 保留退出动画期间的最后一帧 preview state，动画结束后再清空渲染树。
@@ -57,47 +58,53 @@ export function usePreviewPayload(
 ) {
   const [payload, setPayload] = useState<ClipboardPreviewPayload | null>(null);
   const [loadingItemId, setLoadingItemId] = useState<string | null>(null);
-  const latestRequestIdRef = useRef(0);
+  const latestLoadRef = useRef<{ resetToken: number } | null>(null);
   const cacheRef = useRef(new Map<string, ClipboardPreviewPayload>());
+  const requestPoolRef = useRef(new PreviewPayloadRequestPool());
   const { clipboard } = useSnapshot(settingsState);
   const redactSecrets = clipboard.sensitive.redactSecrets;
+  // requestId 只表示锚点/布局更新；payload 身份由条目与脱敏模式决定。
+  const previewItemId = previewState?.itemId ?? null;
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: resetToken 是销毁前清缓存的纯触发器。
   useEffect(() => {
     cacheRef.current.clear();
-    latestRequestIdRef.current += 1;
+    requestPoolRef.current.clear();
+    latestLoadRef.current = null;
     setLoadingItemId(null);
     setPayload(null);
   }, [resetToken]);
 
   useEffect(() => {
-    if (!previewState) {
+    const loadToken = { resetToken };
+    latestLoadRef.current = loadToken;
+
+    if (!previewItemId) {
       setLoadingItemId(null);
       return;
     }
 
-    const state = previewState;
+    const itemId = previewItemId;
     let cancelled = false;
-    latestRequestIdRef.current = state.requestId;
 
-    const cached = readCachedPayload(
-      cacheRef.current,
-      state.itemId,
-      redactSecrets,
-    );
+    const cached = readCachedPayload(cacheRef.current, itemId, redactSecrets);
     if (cached) {
       setPayload(cached);
       setLoadingItemId(null);
       return;
     }
 
-    setLoadingItemId(state.itemId);
+    setLoadingItemId(itemId);
 
     async function loadPayload() {
       try {
-        const nextPayload = await getClipboardPreviewPayload(state.itemId);
+        const nextPayload = await requestPoolRef.current.request(
+          itemId,
+          redactSecrets,
+          getClipboardPreviewPayload,
+        );
 
-        if (cancelled || latestRequestIdRef.current !== state.requestId) {
+        if (cancelled || latestLoadRef.current !== loadToken) {
           return;
         }
 
@@ -111,7 +118,7 @@ export function usePreviewPayload(
         setPayload(nextPayload);
         setLoadingItemId(null);
       } catch (error) {
-        if (cancelled || latestRequestIdRef.current !== state.requestId) {
+        if (cancelled || latestLoadRef.current !== loadToken) {
           return;
         }
 
@@ -125,7 +132,7 @@ export function usePreviewPayload(
     return () => {
       cancelled = true;
     };
-  }, [previewState, redactSecrets]);
+  }, [previewItemId, redactSecrets, resetToken]);
 
   return { loadingItemId, payload };
 }

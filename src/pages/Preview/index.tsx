@@ -1,7 +1,7 @@
 import { useMount } from "ahooks";
 import { Spin } from "antd";
 import { motion } from "motion/react";
-import { type FC, useRef, useState } from "react";
+import { type FC, useMemo, useRef, useState } from "react";
 import { useSnapshot } from "valtio";
 import {
   type ClipboardPreviewState,
@@ -15,6 +15,7 @@ import { cn } from "@/utils/cn";
 import { log } from "@/utils/log";
 import { cacheKey } from "./cache";
 import {
+  buildPreviewFooterMetaText,
   PreviewContent,
   PreviewFooter,
   PreviewHeader,
@@ -71,7 +72,11 @@ const Preview: FC = () => {
     previewState,
     payloadResetToken,
   );
-  const measuredPanelSize = useMeasuredPanelSize(panelMeasureRef);
+  const payloadKey = payload ? cacheKey(payload, redactSecrets) : "empty";
+  const footerMetaText = useMemo(() => {
+    return buildPreviewFooterMetaText(payload);
+  }, [payload]);
+  const measuredPanelSize = useMeasuredPanelSize(panelMeasureRef, payloadKey);
   const active = previewState !== null;
   const visibleState = previewState ?? renderState;
   const effectivePanelSize = visibleState
@@ -129,7 +134,6 @@ const Preview: FC = () => {
   }
 
   const isLoading = loadingItemId !== null;
-  const payloadKey = payload ? cacheKey(payload, redactSecrets) : "empty";
   const sourceRect = visibleState.layout.sourceRect;
   const arrowLeft =
     panelRect && panelRect.width > 0
@@ -156,7 +160,7 @@ const Preview: FC = () => {
           </div>
         )}
 
-        <PreviewFooter payload={payload} />
+        <PreviewFooter metaText={footerMetaText} />
       </div>
 
       <motion.div
@@ -182,7 +186,7 @@ const Preview: FC = () => {
               <PreviewContent payload={payload} />
             </div>
 
-            <PreviewFooter payload={payload} />
+            <PreviewFooter metaText={footerMetaText} />
           </PreviewContentTransition>
 
           {isLoading && (
