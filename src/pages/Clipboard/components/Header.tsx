@@ -8,7 +8,6 @@ import {
   clearClipboardItems,
   createClipboardGroup,
   deleteClipboardGroup,
-  listClipboardGroups,
   showWindow,
   updateClipboardGroup,
 } from "@/commands";
@@ -35,6 +34,7 @@ import { cn } from "@/utils/cn";
 import { getModalApi } from "@/utils/feedback";
 import { isAndroid, isMobile } from "@/utils/is";
 import { formatShortcutDisplay } from "@/utils/shortcut";
+import { listClipboardGroupsShared } from "../dataRequests";
 import SearchInput from "./SearchInput";
 import SyncStatusIcons from "./SyncStatusIcons";
 
@@ -82,7 +82,7 @@ const Header: FC = () => {
   const { groupId, range } = snapshot;
 
   const loadGroups = async () => {
-    const groups = await listClipboardGroups();
+    const groups = await listClipboardGroupsShared();
     setCustomGroups((groups || []).filter((g) => !g.isHidden));
   };
 

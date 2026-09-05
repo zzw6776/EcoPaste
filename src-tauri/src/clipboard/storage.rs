@@ -13,12 +13,15 @@
 //! 缩略图的解码/缩放/编码不在复制热路径上——`store` 只写原图，缩略图由
 //! [`ImageStore::ensure_thumbnail`] 在前端首次取图时懒生成并缓存。
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use blake3::Hasher;
 use tauri::AppHandle;
+use tokio::sync::{watch, Mutex, Semaphore};
 
 use super::payload::ImagePayload;
 use crate::core::{AppError, Result};
@@ -30,6 +33,101 @@ const THUMBNAIL_MAX: u32 = 300;
 const IMAGES_DIR: &str = "clipboard-images";
 const ORIGIN_DIR: &str = "origin";
 const THUMBNAILS_DIR: &str = "thumbnails";
+
+/// 同时执行的缩略图编解码任务上限。缩略图只用于列表预览，小规模串行化可以限制大图峰值内存，
+/// 同时保留两个并行槽位，避免一张慢图完全阻塞其他图片。
+const THUMBNAIL_CONCURRENCY: usize = 2;
+
+type SharedThumbnailResult = std::result::Result<PathBuf, ThumbnailFailure>;
+
+#[derive(Debug, Clone)]
+enum ThumbnailFailure {
+    Clipboard(String),
+    Other(String),
+}
+
+impl ThumbnailFailure {
+    fn from_app_error(error: AppError) -> Self {
+        match error {
+            AppError::Clipboard(message) => Self::Clipboard(message),
+            AppError::Other(error) => Self::Other(error.to_string()),
+        }
+    }
+
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::Clipboard(message) => AppError::Clipboard(message),
+            Self::Other(message) => AppError::Other(anyhow::anyhow!(message)),
+        }
+    }
+}
+
+/// 共享缩略图任务：同一路径订阅同一个后台任务，不同图片再由信号量限制并发。
+/// 后台任务由协调器独立持有，单个调用方取消不会中断生成或遗留失效任务。
+struct ThumbnailCoordinator {
+    permits: Semaphore,
+    in_flight: Mutex<HashMap<PathBuf, watch::Sender<Option<SharedThumbnailResult>>>>,
+}
+
+impl Default for ThumbnailCoordinator {
+    fn default() -> Self {
+        Self {
+            permits: Semaphore::new(THUMBNAIL_CONCURRENCY),
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ThumbnailCoordinator {
+    async fn run<F, Fut>(self: &Arc<Self>, key: PathBuf, operation: F) -> SharedThumbnailResult
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = SharedThumbnailResult> + Send + 'static,
+    {
+        let (mut result_rx, pending_task) = {
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(task) = in_flight.get(&key) {
+                (task.subscribe(), None)
+            } else {
+                let (result_tx, result_rx) = watch::channel(None);
+                in_flight.insert(key.clone(), result_tx.clone());
+                (result_rx, Some(result_tx))
+            }
+        };
+
+        if let Some(result_tx) = pending_task {
+            let coordinator = self.clone();
+            tokio::spawn(async move {
+                let result = match coordinator.permits.acquire().await {
+                    Ok(_permit) => operation().await,
+                    Err(error) => Err(ThumbnailFailure::Clipboard(format!(
+                        "thumbnail concurrency gate closed: {error}"
+                    ))),
+                };
+                let _ = result_tx.send(Some(result));
+
+                let mut in_flight = coordinator.in_flight.lock().await;
+                if in_flight
+                    .get(&key)
+                    .is_some_and(|current| current.same_channel(&result_tx))
+                {
+                    in_flight.remove(&key);
+                }
+            });
+        }
+
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result;
+            }
+            if result_rx.changed().await.is_err() {
+                return Err(ThumbnailFailure::Clipboard(
+                    "thumbnail task ended before publishing a result".to_owned(),
+                ));
+            }
+        }
+    }
+}
 
 /// 一次图片落盘的结果，交给 ingest 写入 `ClipboardItem`。
 pub struct StoredImage {
@@ -49,6 +147,7 @@ pub struct StoredImage {
 #[derive(Clone)]
 pub struct ImageStore {
     images_root: Arc<RwLock<PathBuf>>,
+    thumbnail_coordinator: Arc<ThumbnailCoordinator>,
 }
 
 impl ImageStore {
@@ -57,6 +156,7 @@ impl ImageStore {
         let images_root = crate::core::paths::resources_dir(app)?.join(IMAGES_DIR);
         Ok(Self {
             images_root: Arc::new(RwLock::new(images_root)),
+            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
         })
     }
 
@@ -64,6 +164,7 @@ impl ImageStore {
     pub(crate) fn for_test(images_root: PathBuf) -> Self {
         Self {
             images_root: Arc::new(RwLock::new(images_root)),
+            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
         }
     }
 
@@ -97,22 +198,32 @@ impl ImageStore {
         })
     }
 
-    /// 确保缩略图存在并返回其绝对路径：已存在直接返回；否则读原图 → 解码 → 缩放 → 编码 PNG → 落盘。
+    /// 确保缩略图存在并返回其绝对路径：已存在直接返回；否则进入共享有界队列，
+    /// 再执行读原图 → 解码 → 缩放 → 编码 PNG → 落盘。
     ///
     /// 供 `get_clipboard_image_path(thumbnail=true)` 调用。把生成放在「读」而非「写」侧，
     /// 既将解码/编码移出复制热路径，又因「返回前文件已确保存在」天然避免前端加载到半成品文件。
-    pub fn ensure_thumbnail(&self, file_name: &str) -> Result<PathBuf> {
+    pub async fn ensure_thumbnail(&self, file_name: &str) -> Result<PathBuf> {
         let thumb_path = self.thumbnail_path(file_name);
         if thumb_path.exists() {
             return Ok(thumb_path);
         }
 
         let origin_path = self.origin_path(file_name);
-        let origin_bytes = std::fs::read(&origin_path)
-            .with_context(|| format!("failed to read origin image {origin_path:?}"))?;
-        let thumb_bytes = encode_thumbnail(&origin_bytes)?;
-        write_if_absent(&thumb_path, &thumb_bytes)?;
-        Ok(thumb_path)
+        let task_key = thumb_path.clone();
+        self.thumbnail_coordinator
+            .run(task_key, || async move {
+                tauri::async_runtime::spawn_blocking(move || {
+                    generate_thumbnail(&origin_path, &thumb_path)
+                        .map_err(ThumbnailFailure::from_app_error)
+                })
+                .await
+                .map_err(|error| {
+                    ThumbnailFailure::Clipboard(format!("thumbnail task join failed: {error}"))
+                })?
+            })
+            .await
+            .map_err(ThumbnailFailure::into_app_error)
     }
 
     /// 删除一张图片的原图与缩略图。缩略图懒生成、可能不存在，缺失文件视作成功（幂等）。
@@ -210,6 +321,19 @@ fn remove_dir_if_empty(dir: Option<&Path>) {
     }
 }
 
+/// 从指定原图生成缩略图。路径在任务入队前固定，避免数据目录热迁移时混用新旧根目录。
+fn generate_thumbnail(origin_path: &Path, thumb_path: &Path) -> Result<PathBuf> {
+    if thumb_path.exists() {
+        return Ok(thumb_path.to_path_buf());
+    }
+
+    let origin_bytes = std::fs::read(origin_path)
+        .with_context(|| format!("failed to read origin image {origin_path:?}"))?;
+    let thumb_bytes = encode_thumbnail(&origin_bytes)?;
+    write_if_absent(thumb_path, &thumb_bytes)?;
+    Ok(thumb_path.to_path_buf())
+}
+
 /// 把原图 PNG 字节解码 → 生成缩略图（最长边 <= [`THUMBNAIL_MAX`]，保持比例）→ 重新编码 PNG。
 fn encode_thumbnail(png_bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Cursor;
@@ -277,8 +401,8 @@ mod tests {
         assert_eq!(std::fs::read(&origin).unwrap(), payload.bytes);
     }
 
-    #[test]
-    fn ensure_thumbnail_generates_then_caches() {
+    #[tokio::test]
+    async fn ensure_thumbnail_generates_then_caches() {
         let (_dir, store) = temp_store();
         let payload = ImagePayload {
             bytes: sample_png(64, 48),
@@ -288,23 +412,23 @@ mod tests {
         let stored = store.store(&payload).unwrap();
 
         // 首次：从原图生成缩略图并返回其路径。
-        let thumb = store.ensure_thumbnail(&stored.file_name).unwrap();
+        let thumb = store.ensure_thumbnail(&stored.file_name).await.unwrap();
         assert!(thumb.exists(), "thumbnail should be generated: {thumb:?}");
         assert_eq!(thumb, store.thumbnail_path(&stored.file_name));
         let first_bytes = std::fs::read(&thumb).unwrap();
         assert!(!first_bytes.is_empty());
 
         // 再次：命中缓存，路径一致、内容不变（幂等，不重复编码）。
-        let thumb2 = store.ensure_thumbnail(&stored.file_name).unwrap();
+        let thumb2 = store.ensure_thumbnail(&stored.file_name).await.unwrap();
         assert_eq!(thumb, thumb2);
         assert_eq!(std::fs::read(&thumb2).unwrap(), first_bytes);
     }
 
-    #[test]
-    fn ensure_thumbnail_errors_when_origin_missing() {
+    #[tokio::test]
+    async fn ensure_thumbnail_errors_when_origin_missing() {
         let (_dir, store) = temp_store();
         // 原图从未落盘：ensure_thumbnail 读不到原图，报错而非 panic。
-        let result = store.ensure_thumbnail("0000000000000000.png");
+        let result = store.ensure_thumbnail("0000000000000000.png").await;
         assert!(result.is_err());
     }
 
@@ -324,8 +448,8 @@ mod tests {
         assert_eq!(a.content_digest, b.content_digest);
     }
 
-    #[test]
-    fn remove_deletes_origin_and_thumbnail_idempotently() {
+    #[tokio::test]
+    async fn remove_deletes_origin_and_thumbnail_idempotently() {
         let (_dir, store) = temp_store();
         let payload = ImagePayload {
             bytes: sample_png(40, 30),
@@ -333,7 +457,7 @@ mod tests {
             height: 30,
         };
         let stored = store.store(&payload).unwrap();
-        store.ensure_thumbnail(&stored.file_name).unwrap();
+        store.ensure_thumbnail(&stored.file_name).await.unwrap();
 
         let origin = store.origin_path(&stored.file_name);
         let thumb = store.thumbnail_path(&stored.file_name);
@@ -417,6 +541,84 @@ mod tests {
                 .join("ab")
                 .join(file_name)
         );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_coordinator_runs_same_path_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CALLERS: usize = 8;
+        let coordinator = Arc::new(ThumbnailCoordinator::default());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let key = PathBuf::from("same-thumbnail.png");
+        let expected = PathBuf::from("generated-thumbnail.png");
+        let mut tasks = Vec::with_capacity(CALLERS);
+
+        for _ in 0..CALLERS {
+            let coordinator = coordinator.clone();
+            let starts = starts.clone();
+            let barrier = barrier.clone();
+            let key = key.clone();
+            let expected = expected.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                coordinator
+                    .run(key, || async move {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        Ok(expected)
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(
+                task.await.unwrap(),
+                PathBuf::from("generated-thumbnail.png")
+            );
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_coordinator_limits_distinct_paths() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CALLERS: usize = 6;
+        let coordinator = Arc::new(ThumbnailCoordinator::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut tasks = Vec::with_capacity(CALLERS);
+
+        for index in 0..CALLERS {
+            let coordinator = coordinator.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let barrier = barrier.clone();
+            let path = PathBuf::from(format!("thumbnail-{index}.png"));
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                coordinator
+                    .run(path.clone(), || async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(path)
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), THUMBNAIL_CONCURRENCY);
     }
 
     /// 极简自清理临时目录（避免引第三方 tempfile 依赖）。

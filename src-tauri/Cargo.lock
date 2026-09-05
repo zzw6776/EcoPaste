@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "EcoPaste"
-version = "1.1.114"
+version = "1.1.115"
 dependencies = [
  "anyhow",
  "argon2",

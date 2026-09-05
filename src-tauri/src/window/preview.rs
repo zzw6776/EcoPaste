@@ -12,8 +12,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(target_os = "android"))]
 use std::sync::{LazyLock, Mutex};
 #[cfg(not(target_os = "android"))]
-use std::thread;
-#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +21,8 @@ use tauri::{
     Emitter, Manager, PhysicalPosition, PhysicalRect, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
+#[cfg(not(target_os = "android"))]
+use tokio::task::AbortHandle;
 
 use crate::core::Result;
 
@@ -63,11 +63,21 @@ static PREVIEW_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 #[cfg(not(target_os = "android"))]
 static PREVIEW_STATE: LazyLock<Mutex<Option<ClipboardPreviewState>>> =
     LazyLock::new(|| Mutex::new(None));
+#[cfg(not(target_os = "android"))]
+static PREVIEW_HIDE_TASK: LazyLock<Mutex<Option<PreviewHideTask>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 /// 串行化建窗：多个预览请求（如连续 hover）可能并发走到「检查不存在 → 建窗」，
 /// 都过了存在性检查会触发重复 label 建窗报错。建窗都来自命令/后台线程、主线程从不持锁，
 /// 不会与 builder 内部的主线程派发互锁。
 #[cfg(not(target_os = "android"))]
 static PREVIEW_BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(not(target_os = "android"))]
+struct PreviewHideTask {
+    request_id: u64,
+    abort_handle: Option<AbortHandle>,
+}
 
 #[cfg(target_os = "macos")]
 tauri_panel! {
@@ -197,6 +207,7 @@ pub fn show_clipboard_preview(
     }
 
     let request_id = PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    cancel_preview_window_hide();
     let session_id = preview_session_id_for_show();
     let window = ensure_preview_window(app)?;
     let monitor = resolve_preview_monitor(app)?;
@@ -236,6 +247,7 @@ pub fn show_clipboard_preview(
 /// 隐藏预览窗口并清空当前预览状态。
 pub fn close_clipboard_preview(app: &AppHandle) -> Result<()> {
     let request_id = PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    cancel_preview_window_hide();
     set_preview_state(None);
 
     if let Some(window) = app.get_webview_window(CLIPBOARD_PREVIEW_WINDOW_LABEL) {
@@ -252,6 +264,7 @@ pub fn close_clipboard_preview(app: &AppHandle) -> Result<()> {
 /// 立即隐藏预览窗口并清空状态；用于剪贴板窗口隐藏等不需要退出动画的路径。
 pub fn close_clipboard_preview_now(app: &AppHandle) -> Result<()> {
     PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+    cancel_preview_window_hide();
     set_preview_state(None);
 
     if let Some(window) = app.get_webview_window(CLIPBOARD_PREVIEW_WINDOW_LABEL) {
@@ -359,20 +372,79 @@ fn is_clipboard_window_visible(app: &AppHandle) -> bool {
 #[cfg(not(target_os = "android"))]
 /// 延迟隐藏真实窗口，为前端退出动画留出一小段可见时间。
 fn schedule_preview_window_hide(app: AppHandle, window: WebviewWindow, request_id: u64) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(PREVIEW_HIDE_DELAY_MS));
-
-        if PREVIEW_REQUEST_ID.load(Ordering::SeqCst) != request_id {
+    {
+        let mut pending = PREVIEW_HIDE_TASK.lock().unwrap_or_else(|poisoned| {
+            log::error!("preview hide task mutex poisoned on reserve, recovering");
+            poisoned.into_inner()
+        });
+        if pending
+            .as_ref()
+            .is_some_and(|current| current.request_id > request_id)
+        {
             return;
         }
-        if get_clipboard_preview_state().ok().flatten().is_some() {
-            return;
+        if let Some(previous) = pending.replace(PreviewHideTask {
+            abort_handle: None,
+            request_id,
+        }) {
+            if let Some(abort_handle) = previous.abort_handle {
+                abort_handle.abort();
+            }
+        }
+    }
+
+    let task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(PREVIEW_HIDE_DELAY_MS)).await;
+
+        if PREVIEW_REQUEST_ID.load(Ordering::SeqCst) == request_id
+            && get_clipboard_preview_state().ok().flatten().is_none()
+        {
+            if let Err(error) = hide_preview_window(&app, &window) {
+                log::error!("hide preview window after exit animation failed: {error}");
+            }
         }
 
-        if let Err(error) = hide_preview_window(&app, &window) {
-            log::error!("hide preview window after exit animation failed: {error}");
-        }
+        clear_preview_window_hide(request_id);
     });
+
+    let abort_handle = task.inner().abort_handle();
+    let mut pending = PREVIEW_HIDE_TASK.lock().unwrap_or_else(|poisoned| {
+        log::error!("preview hide task mutex poisoned on attach, recovering");
+        poisoned.into_inner()
+    });
+    match pending.as_mut() {
+        Some(current) if current.request_id == request_id => {
+            current.abort_handle = Some(abort_handle);
+        }
+        _ => abort_handle.abort(),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn cancel_preview_window_hide() {
+    let mut pending = PREVIEW_HIDE_TASK.lock().unwrap_or_else(|poisoned| {
+        log::error!("preview hide task mutex poisoned on cancel, recovering");
+        poisoned.into_inner()
+    });
+    if let Some(task) = pending.take() {
+        if let Some(abort_handle) = task.abort_handle {
+            abort_handle.abort();
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn clear_preview_window_hide(request_id: u64) {
+    let mut pending = PREVIEW_HIDE_TASK.lock().unwrap_or_else(|poisoned| {
+        log::error!("preview hide task mutex poisoned on clear, recovering");
+        poisoned.into_inner()
+    });
+    if pending
+        .as_ref()
+        .is_some_and(|task| task.request_id == request_id)
+    {
+        pending.take();
+    }
 }
 
 #[cfg(not(target_os = "android"))]

@@ -58,11 +58,16 @@ const CloudRecordsDrawer: FC<CloudRecordsDrawerProps> = (props) => {
   function handleOpenChange(nextOpen: boolean) {
     if (nextOpen) {
       setRecords([]);
+      setTotal(0);
       setNextBeforeCursor(null);
       void load(true);
     } else {
       loadGenerationRef.current += 1;
       loadingRef.current = false;
+      setRecords([]);
+      setTotal(0);
+      setLoading(false);
+      setNextBeforeCursor(null);
     }
   }
 

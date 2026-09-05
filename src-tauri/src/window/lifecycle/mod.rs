@@ -15,10 +15,10 @@ pub use descriptor::{descriptor_for, descriptors, RetainPolicy};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::task::AbortHandle;
 
 use crate::settings::SettingsStore;
 
@@ -81,6 +81,24 @@ enum DestroyCheck {
     Proceed,
     Protected,
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum LifecycleTimerKind {
+    ClipboardDormant,
+    IdleDestroy,
+    DestroyDeadline,
+}
+
+struct LifecycleTimer {
+    id: u64,
+    abort_handle: Option<AbortHandle>,
+}
+
+#[derive(Default)]
+struct LifecycleTimers {
+    next_id: u64,
+    entries: HashMap<(String, LifecycleTimerKind), LifecycleTimer>,
 }
 
 impl RuntimeState {
@@ -189,12 +207,14 @@ pub struct LifecycleSnapshot {
 /// 窗口生命周期管理器，存入 Tauri `State`。
 pub struct WindowLifecycleManager {
     states: Mutex<HashMap<String, RuntimeState>>,
+    timers: Mutex<LifecycleTimers>,
 }
 
 impl WindowLifecycleManager {
     pub fn new() -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
+            timers: Mutex::new(LifecycleTimers::default()),
         }
     }
 
@@ -204,6 +224,72 @@ impl WindowLifecycleManager {
             poisoned.into_inner()
         });
         f(&mut guard)
+    }
+
+    fn with_timers<R>(&self, f: impl FnOnce(&mut LifecycleTimers) -> R) -> R {
+        let mut guard = self.timers.lock().unwrap_or_else(|poisoned| {
+            log::error!("window lifecycle timer mutex poisoned, recovering");
+            poisoned.into_inner()
+        });
+        f(&mut guard)
+    }
+
+    /// 为同窗口、同用途预留一个新计时器槽位，并立即取消旧任务。
+    fn reserve_timer(&self, label: &str, kind: LifecycleTimerKind) -> u64 {
+        self.with_timers(|timers| {
+            timers.next_id = timers.next_id.wrapping_add(1).max(1);
+            let id = timers.next_id;
+            let key = (label.to_owned(), kind);
+            if let Some(previous) = timers.entries.insert(
+                key,
+                LifecycleTimer {
+                    abort_handle: None,
+                    id,
+                },
+            ) {
+                if let Some(abort_handle) = previous.abort_handle {
+                    abort_handle.abort();
+                }
+            }
+            id
+        })
+    }
+
+    /// 把新任务句柄装入预留槽位；若期间已有更新任务替换它，则立即取消当前旧任务。
+    fn attach_timer(
+        &self,
+        label: &str,
+        kind: LifecycleTimerKind,
+        id: u64,
+        abort_handle: AbortHandle,
+    ) {
+        self.with_timers(|timers| {
+            let key = (label.to_owned(), kind);
+            match timers.entries.get_mut(&key) {
+                Some(timer) if timer.id == id => timer.abort_handle = Some(abort_handle),
+                _ => abort_handle.abort(),
+            }
+        });
+    }
+
+    fn clear_timer(&self, label: &str, kind: LifecycleTimerKind, id: u64) {
+        self.with_timers(|timers| {
+            let key = (label.to_owned(), kind);
+            if timers.entries.get(&key).is_some_and(|timer| timer.id == id) {
+                timers.entries.remove(&key);
+            }
+        });
+    }
+
+    fn cancel_timer(&self, label: &str, kind: LifecycleTimerKind) {
+        self.with_timers(|timers| {
+            let key = (label.to_owned(), kind);
+            if let Some(timer) = timers.entries.remove(&key) {
+                if let Some(abort_handle) = timer.abort_handle {
+                    abort_handle.abort();
+                }
+            }
+        });
     }
 
     /// 转移窗口到新阶段：更新状态、广播 `window://lifecycle`，并按需启动空闲销毁计时器。
@@ -232,10 +318,18 @@ impl WindowLifecycleManager {
             "window lifecycle: {label} {previous:?} -> {phase:?} (gen {generation}, reason {reason})"
         );
 
+        if phase != LifecyclePhase::HiddenWarm {
+            self.cancel_timer(label, LifecycleTimerKind::ClipboardDormant);
+            self.cancel_timer(label, LifecycleTimerKind::IdleDestroy);
+        }
+        if phase != LifecyclePhase::DestroyPending {
+            self.cancel_timer(label, LifecycleTimerKind::DestroyDeadline);
+        }
+
         // 首次进入 HiddenWarm 的 DestroyWhenIdle 窗口：启动空闲销毁计时器。
         // 重复进入 HiddenWarm（如剪贴板窗口隐藏时对已收起的预览窗口再次 hide）不再补计时器：
         // 每代次只需首次进入时启动的那一条，到点按代次校验决定销毁或放弃，
-        // 重复启动只会堆积休眠线程。
+        // 重复启动只会无意义地重置同一倒计时。
         if matches!(phase, LifecyclePhase::HiddenWarm)
             && previous != LifecyclePhase::HiddenWarm
             && descriptor.retain_policy == RetainPolicy::DestroyWhenIdle
@@ -479,20 +573,15 @@ pub fn rebuild_fn(label: &str) -> Option<fn(&AppHandle) -> crate::core::Result<(
 
 /// 启动一次性剪贴板窗口 dormant 计时器。捕获进入隐藏态时的 `generation`，到点回主线程校验。
 fn schedule_clipboard_dormant(app: &AppHandle, label: &str, generation: u64) {
-    let app = app.clone();
-    let label = label.to_owned();
-
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(CLIPBOARD_DORMANT_SECS));
-
-        let main_app = app.clone();
-        let main_label = label.clone();
-        if let Err(err) = app.run_on_main_thread(move || {
-            try_enter_dormant(&main_app, &main_label, generation);
-        }) {
-            log::warn!("main dormant main-thread dispatch failed for {label}: {err}");
-        }
-    });
+    schedule_lifecycle_timer(
+        app,
+        label,
+        generation,
+        LifecycleTimerKind::ClipboardDormant,
+        Duration::from_secs(CLIPBOARD_DORMANT_SECS),
+        "main dormant",
+        try_enter_dormant,
+    );
 }
 
 /// 计时器到点的 dormant 判定：剪贴板窗口仍隐藏且代次未变才进入 dormant。
@@ -518,22 +607,16 @@ fn try_enter_dormant(app: &AppHandle, label: &str, generation: u64) {
 }
 
 /// 启动一次性空闲销毁计时器。捕获进入隐藏态时的 `generation`，到点回主线程校验后销毁。
-/// 用独立线程 + `thread::sleep`（与 `preview.rs` 同模式），不依赖 async runtime。
 fn schedule_idle_destroy(app: &AppHandle, label: &str, generation: u64, timeout_secs: u64) {
-    let app = app.clone();
-    let label = label.to_owned();
-
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(timeout_secs));
-
-        let main_app = app.clone();
-        let main_label = label.clone();
-        if let Err(err) = app.run_on_main_thread(move || {
-            try_destroy_idle(&main_app, &main_label, generation);
-        }) {
-            log::warn!("idle destroy main-thread dispatch failed for {label}: {err}");
-        }
-    });
+    schedule_lifecycle_timer(
+        app,
+        label,
+        generation,
+        LifecycleTimerKind::IdleDestroy,
+        Duration::from_secs(timeout_secs),
+        "idle destroy",
+        try_destroy_idle,
+    );
 }
 
 /// 计时器到点的销毁判定（主线程）：代次未变且仍处于 HiddenWarm 才进入 DestroyPending，
@@ -592,20 +675,54 @@ fn emit_before_destroy(app: &AppHandle, label: &str, generation: u64) {
 
 /// 销毁前宽限到期后回主线程完成最终校验与释放。
 fn schedule_destroy_after_deadline(app: &AppHandle, label: &str, generation: u64) {
-    let app = app.clone();
-    let label = label.to_owned();
+    schedule_lifecycle_timer(
+        app,
+        label,
+        generation,
+        LifecycleTimerKind::DestroyDeadline,
+        Duration::from_millis(BEFORE_DESTROY_DEADLINE_MS),
+        "finish destroy",
+        finish_destroy_idle,
+    );
+}
 
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(BEFORE_DESTROY_DEADLINE_MS));
+/// 在共享异步运行时调度单个可取消计时器；同窗口、同用途的新任务会替换旧任务。
+fn schedule_lifecycle_timer(
+    app: &AppHandle,
+    label: &str,
+    generation: u64,
+    kind: LifecycleTimerKind,
+    delay: Duration,
+    action_name: &'static str,
+    action: fn(&AppHandle, &str, u64),
+) {
+    let Some(lifecycle_manager) = manager(app) else {
+        return;
+    };
+    let timer_id = lifecycle_manager.reserve_timer(label, kind);
+    let app = app.clone();
+    let timer_label = label.to_owned();
+    let task_label = timer_label.clone();
+
+    let task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
 
         let main_app = app.clone();
-        let main_label = label.clone();
+        let main_label = task_label.clone();
         if let Err(err) = app.run_on_main_thread(move || {
-            finish_destroy_idle(&main_app, &main_label, generation);
+            action(&main_app, &main_label, generation);
+            if let Some(manager) = manager(&main_app) {
+                manager.clear_timer(&main_label, kind, timer_id);
+            }
         }) {
-            log::warn!("finish destroy main-thread dispatch failed for {label}: {err}");
+            if let Some(manager) = manager(&app) {
+                manager.clear_timer(&task_label, kind, timer_id);
+            }
+            log::warn!("{action_name} main-thread dispatch failed for {task_label}: {err}");
         }
     });
+
+    lifecycle_manager.attach_timer(&timer_label, kind, timer_id, task.inner().abort_handle());
 }
 
 /// 最终销毁判定：仍处于 DestroyPending、代次未变且没有 dirty / keepalive 才释放 WebView。

@@ -1,6 +1,6 @@
 //! 历史清理后台任务：按 `clipboard.history.retention` + `maxCount` 定期裁剪。
 //!
-//! 启动即跑一次；之后按用户设置的清理周期触发，每次都从 `SettingsStore` 取最新配置——
+//! 启动即跑一次；之后睡眠到用户设置的清理周期，设置变更会提前唤醒并重新计算——
 //! 用户在偏好里调时长 / 上限后不必重启即可生效。置顶与收藏项一律保留（由 [`cleanup_history`] 保证）。
 
 use std::time::{Duration, Instant};
@@ -14,29 +14,43 @@ use super::watcher::CLIPBOARD_UPDATED_EVENT;
 use crate::db::items::cleanup_history;
 use crate::settings::{Retention, RetentionUnit, SettingsStore};
 
-/// 调度器检查设置与到期状态的频率；真正清理只在用户设置周期到期后执行。
-const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(60);
-
 /// 启动历史清理后台任务：启动立即清理一次，之后按设置周期到点清理。
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let Some(store) = app.try_state::<SettingsStore>() else {
+            return;
+        };
+        let mut settings_changes = store.subscribe_changes();
+
         run_once(&app).await;
         let mut last_cleanup_at = Instant::now();
-        let mut ticker = tokio::time::interval(SCHEDULER_TICK_INTERVAL);
-        ticker.tick().await;
 
         loop {
-            ticker.tick().await;
             let Some(interval) = cleanup_interval(&app) else {
+                if settings_changes.changed().await.is_err() {
+                    return;
+                }
                 continue;
             };
 
-            if last_cleanup_at.elapsed() < interval {
+            let remaining = interval.saturating_sub(last_cleanup_at.elapsed());
+            if remaining.is_zero() {
+                run_once(&app).await;
+                last_cleanup_at = Instant::now();
                 continue;
             }
 
-            run_once(&app).await;
-            last_cleanup_at = Instant::now();
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => {
+                    run_once(&app).await;
+                    last_cleanup_at = Instant::now();
+                }
+                changed = settings_changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
         }
     });
 }

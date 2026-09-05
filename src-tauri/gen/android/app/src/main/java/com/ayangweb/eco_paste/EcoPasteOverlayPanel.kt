@@ -44,10 +44,25 @@ import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
-import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.roundToInt
+
+/** 固定并发数不变，但允许悬浮服务长期空闲后回收核心线程。 */
+internal fun reclaimingFixedThreadPool(threadCount: Int): ThreadPoolExecutor {
+    return ThreadPoolExecutor(
+        threadCount,
+        threadCount,
+        30L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(),
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
+}
 
 /** 不切换 Activity 的原生剪贴板悬浮面板。 */
 class EcoPasteOverlayPanel(
@@ -59,6 +74,8 @@ class EcoPasteOverlayPanel(
         private const val TAG = "EcoPasteOverlayPanel"
         private const val ITEM_LIMIT = 50
         private const val CLOUD_RECORD_PAGE_SIZE = 30
+        private const val IMAGE_BITMAP_CACHE_BYTES = 16 * 1024 * 1024
+        private const val SOURCE_ICON_BITMAP_CACHE_BYTES = 2 * 1024 * 1024
     }
 
     private enum class ItemFilter {
@@ -179,13 +196,20 @@ class EcoPasteOverlayPanel(
     private var itemLoadFuture: Future<*>? = null
     private var syncStatusFuture: Future<*>? = null
     private var cloudLoadFuture: Future<*>? = null
-    private val queryExecutor = Executors.newSingleThreadExecutor()
-    private val actionExecutor = Executors.newFixedThreadPool(2)
-    private val imageDecodeExecutor = Executors.newFixedThreadPool(2)
-    private val heightPersistenceExecutor = Executors.newSingleThreadExecutor()
-    private val imageBitmapCache = object : LruCache<String, Bitmap>(16 * 1024 * 1024) {
+    @Volatile
+    private var imageLoadGeneration = 0
+    private val queryExecutor = reclaimingFixedThreadPool(1)
+    private val actionExecutor = reclaimingFixedThreadPool(2)
+    private val imageDecodeExecutor = reclaimingFixedThreadPool(2)
+    private val heightPersistenceExecutor = reclaimingFixedThreadPool(1)
+    private val bitmapCacheLock = Any()
+    private val imageBitmapCache = object : LruCache<String, Bitmap>(IMAGE_BITMAP_CACHE_BYTES) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
     }
+    private val sourceIconBitmapCache =
+        object : LruCache<String, Bitmap>(SOURCE_ICON_BITMAP_CACHE_BYTES) {
+            override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+        }
 
     fun show(heightPercent: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
@@ -403,7 +427,7 @@ class EcoPasteOverlayPanel(
         actionExecutor.shutdownNow()
         imageDecodeExecutor.shutdownNow()
         heightPersistenceExecutor.shutdownNow()
-        imageBitmapCache.evictAll()
+        releaseBitmapCaches()
     }
 
     /** 返回面板内上一层；返回 false 表示当前已在根层，可由服务收起面板。 */
@@ -485,6 +509,16 @@ class EcoPasteOverlayPanel(
         cloudImagePreview = null
         itemsLoading = false
         loadedItems = emptyList()
+        releaseBitmapCaches()
+    }
+
+    /** 面板不可见时释放解码结果；下次 show 会按现有路径重新采样并填充缓存。 */
+    private fun releaseBitmapCaches() {
+        synchronized(bitmapCacheLock) {
+            imageLoadGeneration += 1
+            imageBitmapCache.evictAll()
+            sourceIconBitmapCache.evictAll()
+        }
     }
 
     private fun requestItems(keyword: String) {
@@ -1853,7 +1887,7 @@ class EcoPasteOverlayPanel(
 
     /** 在专用线程按卡片显示尺寸采样图片，并通过有界缓存复用解码结果。 */
     private fun loadCardImage(imageView: ImageView, fallback: TextView, path: String) {
-        imageBitmapCache.get(path)?.let { bitmap ->
+        synchronized(bitmapCacheLock) { imageBitmapCache.get(path) }?.let { bitmap ->
             imageView.setImageBitmap(bitmap)
             imageView.visibility = View.VISIBLE
             fallback.visibility = View.GONE
@@ -1862,13 +1896,28 @@ class EcoPasteOverlayPanel(
 
         val maxWidth = (displayBounds().width() - dp(40)).coerceAtLeast(dp(120))
         val maxHeight = dp(46)
+        val generation = imageLoadGeneration
         imageDecodeExecutor.submit {
-            val bitmap = imageBitmapCache.get(path)
-                ?: decodeScaledBitmap(path, maxWidth, maxHeight)?.also { decoded ->
-                    imageBitmapCache.put(path, decoded)
+            val bitmap = synchronized(bitmapCacheLock) { imageBitmapCache.get(path) }
+                ?: decodeScaledBitmap(path, maxWidth, maxHeight)
+            val cacheIsCurrent = synchronized(bitmapCacheLock) {
+                if (generation != imageLoadGeneration) {
+                    false
+                } else {
+                    if (bitmap != null && imageBitmapCache.get(path) == null) {
+                        imageBitmapCache.put(path, bitmap)
+                    }
+                    true
                 }
+            }
+            if (!cacheIsCurrent) return@submit
             mainHandler.post {
-                if (panelView == null || imageView.tag != path || bitmap == null) return@post
+                if (
+                    panelView == null ||
+                    generation != imageLoadGeneration ||
+                    imageView.tag != path ||
+                    bitmap == null
+                ) return@post
                 imageView.setImageBitmap(bitmap)
                 imageView.visibility = View.VISIBLE
                 fallback.visibility = View.GONE
@@ -1903,9 +1952,14 @@ class EcoPasteOverlayPanel(
                 })
             }, LinearLayout.LayoutParams(0, dp(36), 1f))
 
-            val iconBitmap = item.sourceAppIconPath
-                .takeIf { it.isNotBlank() }
-                ?.let { path -> BitmapFactory.decodeFile(path) }
+            val iconBitmap = item.sourceAppIconPath.takeIf { it.isNotBlank() }?.let { path ->
+                synchronized(bitmapCacheLock) {
+                    sourceIconBitmapCache.get(path)
+                        ?: BitmapFactory.decodeFile(path)?.also { bitmap ->
+                            sourceIconBitmapCache.put(path, bitmap)
+                        }
+                }
+            }
             val iconView: View = if (iconBitmap != null) {
                 ImageView(context).apply {
                     setImageBitmap(iconBitmap)

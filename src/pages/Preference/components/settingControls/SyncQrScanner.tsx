@@ -72,10 +72,13 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const detectedRef = useRef(false);
+  const mountedRef = useRef(false);
+  const initializationRef = useRef(0);
   const [starting, setStarting] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
 
   function stopScanner() {
+    initializationRef.current += 1;
     releaseVideoStream(videoRef.current);
     scannerRef.current?.destroy();
     scannerRef.current = null;
@@ -84,7 +87,7 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
   useImperativeHandle(ref, () => ({ stop: stopScanner }));
 
   function handleDecoded(result: QrScanner.ScanResult) {
-    if (detectedRef.current) return;
+    if (!mountedRef.current || detectedRef.current) return;
 
     const pairingCode = result.data.trim();
     if (!isSyncPairingCode(pairingCode)) {
@@ -98,18 +101,33 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
   }
 
   async function initializeScanner() {
+    const initialization = initializationRef.current + 1;
+    initializationRef.current = initialization;
+    let initializingScanner: QrScanner | null = null;
+    let initializingVideo: HTMLVideoElement | null = null;
+
+    function isCurrentInitialization() {
+      return mountedRef.current && initializationRef.current === initialization;
+    }
+
     try {
       const video = videoRef.current;
-      if (!video) return;
+      if (!video || !isCurrentInitialization()) return;
+      initializingVideo = video;
 
       const { default: QrScannerRuntime } = await import("qr-scanner");
+      if (!isCurrentInitialization()) return;
+
       if (isAndroid) {
         // Android BarcodeDetector 无法解析当前高版本配对二维码，固定使用库内 Worker。
         (
           QrScannerRuntime as unknown as QrScannerRuntimeCompatibility
         )._disableBarcodeDetector = true;
       }
-      if (!(await QrScannerRuntime.hasCamera())) {
+      const hasCamera = await QrScannerRuntime.hasCamera();
+      if (!isCurrentInitialization()) return;
+
+      if (!hasCamera) {
         setErrorMessage(t("sync.scanner.noCamera"));
         return;
       }
@@ -122,10 +140,30 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
         preferredCamera: "environment",
         returnDetailedScanResult: true,
       });
+      initializingScanner = scanner;
+      if (!isCurrentInitialization()) {
+        scanner.destroy();
+        releaseVideoStream(video);
+        return;
+      }
+
       scannerRef.current = scanner;
       await scanner.start();
+      if (!isCurrentInitialization() || scannerRef.current !== scanner) {
+        if (scannerRef.current === scanner) {
+          scannerRef.current = null;
+        }
+        scanner.destroy();
+        releaseVideoStream(video);
+      }
     } catch (error) {
-      const video = videoRef.current;
+      const video = initializingVideo ?? videoRef.current;
+      if (!isCurrentInitialization()) {
+        initializingScanner?.destroy();
+        releaseVideoStream(video);
+        return;
+      }
+
       if (video && isVideoRendering(video)) {
         log.warn(
           "ignore sync QR scanner start rejection because camera is rendering",
@@ -134,6 +172,11 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
         return;
       }
 
+      initializingScanner?.destroy();
+      if (scannerRef.current === initializingScanner) {
+        scannerRef.current = null;
+      }
+      releaseVideoStream(video);
       log.error("start sync QR scanner failed", error);
       const detail = String(error).toLowerCase();
       setErrorMessage(
@@ -142,15 +185,19 @@ const SyncQrScanner: FC<SyncQrScannerProps> = (props) => {
           : t("sync.scanner.unavailable"),
       );
     } finally {
-      setStarting(false);
+      if (isCurrentInitialization()) {
+        setStarting(false);
+      }
     }
   }
 
   useMount(() => {
+    mountedRef.current = true;
     void initializeScanner();
   });
 
   useUnmount(() => {
+    mountedRef.current = false;
     stopScanner();
   });
 

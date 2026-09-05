@@ -1,5 +1,6 @@
 //! 「这次剪贴板变更来自哪个应用」的探测：在剪贴板事件回调里调用，
-//! 返回稳定 id（macOS bundle id / Windows exe 绝对路径）、显示名、可选的 icon PNG 字节。
+//! 返回稳定 id（macOS bundle id / Windows exe 绝对路径）、显示名、可选的 icon PNG 字节；
+//! 注册表已有完整图标缓存时只捕获身份与名称，不再重复提取图标。
 //!
 //! 必须**同步**在监听回调一发生时立即抓——延后到 await 之后再问，前台应用很可能已经切走。
 //! 探测失败（无前台应用 / 自身复制 / 平台 API 错误）一律返回 `None`，不阻断入库。
@@ -7,7 +8,10 @@
 //! 平台 API：macOS 走 `NSWorkspace.frontmostApplication`，Windows 走 `GetForegroundWindow`
 //! + `QueryFullProcessImageNameW`。图标统一交给 `crate::clipboard::icon` 跨平台抽取。
 
-use crate::db::models::Platform;
+use crate::db::models::{ClipboardApp, Platform};
+
+use super::app_store::AppIconStore;
+use super::apps_registry::AppsRegistry;
 
 #[derive(Debug, Clone)]
 pub struct FrontmostApp {
@@ -20,25 +24,54 @@ pub struct FrontmostApp {
     pub icon_png: Option<Vec<u8>>,
 }
 
-/// 探测当前前台应用。失败不报错，只在 trace 级别记日志（监听回调高频，避免噪声）。
-pub fn detect_frontmost() -> Option<FrontmostApp> {
+/// 探测当前前台应用，并在完整图标缓存命中时跳过平台图标提取。
+/// 失败不报错，只在 trace 级别记日志（监听回调高频，避免噪声）。
+pub fn detect_frontmost(
+    icon_store: &AppIconStore,
+    registry: &AppsRegistry,
+) -> Option<FrontmostApp> {
     #[cfg(target_os = "macos")]
     {
-        macos::detect()
+        macos::detect(icon_store, registry)
     }
     #[cfg(target_os = "windows")]
     {
-        windows::detect()
+        windows::detect(icon_store, registry)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        let _ = (icon_store, registry);
         None
     }
 }
 
+/// 只有图标文件、同步哈希与强调色都完整，且文件仍是当前规范尺寸时才跳过平台图标提取。
+/// 名称不参与判断：每次仍捕获最新名称，由 `materialize_source` 更新缓存。
+fn has_complete_cached_icon(
+    icon_store: &AppIconStore,
+    registry: &AppsRegistry,
+    app_id: &str,
+) -> bool {
+    let Some(cached) = registry.get(app_id) else {
+        return false;
+    };
+
+    cached_icon_is_complete(icon_store, &cached)
+}
+
+fn cached_icon_is_complete(icon_store: &AppIconStore, cached: &ClipboardApp) -> bool {
+    cached.icon_hash.is_some()
+        && cached.accent_start.is_some()
+        && cached.accent_end.is_some()
+        && cached
+            .icon_file
+            .as_deref()
+            .is_some_and(|file_name| icon_store.is_current_format(file_name))
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{FrontmostApp, Platform};
+    use super::{has_complete_cached_icon, AppIconStore, AppsRegistry, FrontmostApp, Platform};
     use crate::clipboard::icon;
 
     use std::path::PathBuf;
@@ -48,7 +81,10 @@ mod macos {
     use objc2_app_kit::{NSRunningApplication, NSWorkspace};
     use objc2_foundation::{NSString, NSURL};
 
-    pub(super) fn detect() -> Option<FrontmostApp> {
+    pub(super) fn detect(
+        icon_store: &AppIconStore,
+        registry: &AppsRegistry,
+    ) -> Option<FrontmostApp> {
         autoreleasepool(|_| {
             let workspace = NSWorkspace::sharedWorkspace();
             let app = workspace.frontmostApplication()?;
@@ -60,8 +96,11 @@ mod macos {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| id.clone());
 
-            let icon_png =
-                unsafe { bundle_path(&app) }.and_then(|path| icon::icon_png(&path, None));
+            let icon_png = if has_complete_cached_icon(icon_store, registry, &id) {
+                None
+            } else {
+                unsafe { bundle_path(&app) }.and_then(|path| icon::icon_png(&path, None))
+            };
 
             Some(FrontmostApp {
                 id,
@@ -84,7 +123,7 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{FrontmostApp, Platform};
+    use super::{has_complete_cached_icon, AppIconStore, AppsRegistry, FrontmostApp, Platform};
     use crate::clipboard::icon;
 
     use std::path::Path;
@@ -97,7 +136,10 @@ mod windows {
     use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
     use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    pub(super) fn detect() -> Option<FrontmostApp> {
+    pub(super) fn detect(
+        icon_store: &AppIconStore,
+        registry: &AppsRegistry,
+    ) -> Option<FrontmostApp> {
         let exe_path = unsafe { foreground_exe_path() }?;
         // 自身写回事件依赖 WritebackGuard 的 content_hash 判定，这里不过滤自身——
         // 与 macOS 行为一致：哪怕拿到的是 EcoPaste 自己，guard 也会在下游 short-circuit。
@@ -106,7 +148,11 @@ mod windows {
             .and_then(|s| s.to_str())
             .unwrap_or(&exe_path)
             .to_owned();
-        let icon_png = icon::icon_png(Path::new(&exe_path), None);
+        let icon_png = if has_complete_cached_icon(icon_store, registry, &exe_path) {
+            None
+        } else {
+            icon::icon_png(Path::new(&exe_path), None)
+        };
 
         Some(FrontmostApp {
             id: exe_path,
@@ -141,5 +187,44 @@ mod windows {
             return None;
         }
         Some(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    #[test]
+    fn complete_current_icon_can_skip_platform_extraction() {
+        let root = std::env::temp_dir().join(format!("ecopaste-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = AppIconStore::for_test(root.clone());
+        let file_name = "current.png";
+        let mut png_header = [0_u8; 24];
+        png_header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_header[16..20].copy_from_slice(&128_u32.to_be_bytes());
+        png_header[20..24].copy_from_slice(&128_u32.to_be_bytes());
+        std::fs::write(store.icon_path(file_name), png_header).unwrap();
+        let now = Utc::now();
+        let mut cached = ClipboardApp {
+            id: "com.example.Source".to_owned(),
+            name: "Source".to_owned(),
+            icon_file: Some(file_name.to_owned()),
+            icon_hash: Some("hash".to_owned()),
+            accent_start: Some("#112233".to_owned()),
+            accent_end: Some("#334455".to_owned()),
+            platform: Platform::Macos,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(cached_icon_is_complete(&store, &cached));
+
+        cached.accent_end = None;
+        assert!(!cached_icon_is_complete(&store, &cached));
+
+        std::fs::remove_dir_all(root).ok();
     }
 }

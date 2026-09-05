@@ -87,7 +87,7 @@ pub async fn read_clipboard(
     // 这里仍保留探测：若用户在外部应用复制后立刻命令式触发，多少能捕获到正确来源；
     // 命中我们自己也无害（apps 表只是多记一条「EcoPaste」）。
     let (item_opt, source) = {
-        let source = detect_frontmost();
+        let source = detect_frontmost(&app_icon_store, &registry);
         let reader = ClipboardReader::new()?;
         let settings = app.state::<SettingsStore>().snapshot();
         #[cfg(not(target_os = "android"))]
@@ -144,10 +144,7 @@ pub async fn get_clipboard_image_path(
     validate_image_file_name(&file_name)?;
 
     let path = if thumbnail {
-        let store = store.inner().clone();
-        tauri::async_runtime::spawn_blocking(move || store.ensure_thumbnail(&file_name))
-            .await
-            .map_err(|err| AppError::Clipboard(format!("thumbnail task join failed: {err}")))??
+        store.ensure_thumbnail(&file_name).await?
     } else {
         store.origin_path(&file_name)
     };
@@ -842,8 +839,8 @@ async fn attach_image_thumbnail_path(store: &ImageStore, item: &mut ClipboardIte
     // 缩略图不存在时后台异步预热，避免把大图缩放阻塞在列表/单条查询的返回路径上。
     if !thumb_exists {
         let store = store.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            if let Err(err) = store.ensure_thumbnail(&file_name) {
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = store.ensure_thumbnail(&file_name).await {
                 log::warn!("ensure image thumbnail failed for {:?}: {err}", file_name);
             }
         });

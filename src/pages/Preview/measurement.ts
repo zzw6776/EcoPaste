@@ -1,5 +1,5 @@
 import type { RefObject } from "react";
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { PREVIEW_PANEL_FALLBACK_SIZE } from "./constants";
 
 export interface PreviewMeasuredSize {
@@ -8,20 +8,20 @@ export interface PreviewMeasuredSize {
 }
 
 /**
- * 监听隐藏测量层尺寸，并把内容自然尺寸同步给动态面板布局。
+ * 监听隐藏测量层尺寸，并在内容 key 改变时把自然尺寸同步给动态面板布局。
  */
 export function useMeasuredPanelSize(
   ref: RefObject<HTMLDivElement | null>,
+  contentKey: string,
 ): PreviewMeasuredSize {
   const [size, setSize] = useState<PreviewMeasuredSize>(
     PREVIEW_PANEL_FALLBACK_SIZE,
   );
+  const measuredContentKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
-
-    syncMeasuredPanelSize(node, setSize);
 
     const observer = new ResizeObserver(() => {
       syncMeasuredPanelSize(node, setSize);
@@ -36,9 +36,11 @@ export function useMeasuredPanelSize(
   useLayoutEffect(() => {
     const node = ref.current;
     if (!node) return;
+    if (measuredContentKeyRef.current === contentKey) return;
 
+    measuredContentKeyRef.current = contentKey;
     syncMeasuredPanelSize(node, setSize);
-  });
+  }, [contentKey, ref]);
 
   return size;
 }
