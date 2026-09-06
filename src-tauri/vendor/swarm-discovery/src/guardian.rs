@@ -86,6 +86,7 @@ pub async fn guardian(
             ActoInput::Supervision { id, name, result } => {
                 match result {
                     Ok(Ok(_)) => tracing::warn!("actor {:?} ({}) stopped", id, name),
+                    Ok(Err(ReceiverError::Stopped)) => continue,
                     Ok(Err(e)) => {
                         tracing::warn!("actor {:?} ({}) failed: {}", id, name, e)
                     }
@@ -98,6 +99,9 @@ pub async fn guardian(
             ActoInput::Message(msg) => match &msg {
                 Input::AddInterface(addr) => {
                     if let IpAddr::V4(ipv4) = addr {
+                        if interface_receivers.contains_key(addr) {
+                            continue;
+                        }
                         if let Err(e) = sockets2.add_interface_v4(*ipv4) {
                             tracing::warn!("Failed to add interface {}: {}", addr, e);
                         } else {
@@ -119,9 +123,9 @@ pub async fn guardian(
                 Input::RemoveInterface(addr) => {
                     if let IpAddr::V4(ipv4) = addr {
                         sockets2.remove_interface_v4(*ipv4);
-                        // Remove the receiver reference for this interface
-                        if interface_receivers.remove(addr).is_some() {
-                            tracing::info!("Removed receiver reference for interface {}", addr);
+                        if let Some(receiver) = interface_receivers.remove(addr) {
+                            receiver.send(());
+                            tracing::info!("Stopped receiver for interface {}", addr);
                         }
                     }
                 }

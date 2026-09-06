@@ -24,6 +24,7 @@ import type {
   UpdateNoteResult,
 } from "@/types/clipboard";
 import type { Settings, SettingsPatch } from "@/types/settings";
+import { createCoalescedRequest } from "@/utils/coalescedRequest";
 import { getMessageApi, getModalApi } from "@/utils/feedback";
 import { log } from "@/utils/log";
 import { confirmClearClipboardItems } from "./confirmClearClipboardItems";
@@ -299,12 +300,12 @@ export interface IncomingJoinRequest {
   expiresAt: string;
 }
 
-export const getSyncStatus = async () => {
+export const getSyncStatus = createCoalescedRequest(async () => {
   return call<SyncStatus>(
     TAURI_COMMAND.GET_SYNC_STATUS,
     "commands:labels.loadSyncStatus",
   );
-};
+});
 
 export const setCloudRelayAuthToken = async (token: string | null) => {
   return call<SyncStatus>(

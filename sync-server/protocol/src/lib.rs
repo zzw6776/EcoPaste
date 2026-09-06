@@ -7,11 +7,15 @@ use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(test)]
+mod batch_tests;
+
 pub const ALPN: &[u8] = b"ecopaste/sync/1";
 pub const SYNC_V2_PROTOCOL_VERSION: u16 = 5;
 pub const ASYNC_SOURCE_ICON_PROTOCOL_VERSION: u16 = 6;
 pub const REDUNDANT_WATCH_PROTOCOL_VERSION: u16 = 7;
-pub const PROTOCOL_VERSION: u16 = REDUNDANT_WATCH_PROTOCOL_VERSION;
+pub const BYTE_LIMITED_SYNC_PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = BYTE_LIMITED_SYNC_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -140,6 +144,9 @@ pub enum Request {
         events: Vec<EncryptedEvent>,
         #[n(5)]
         limit: u16,
+        /// Opts into byte-limited responses and the explicit continuation flag.
+        #[n(6)]
+        byte_limited: Option<bool>,
     },
     #[n(3)]
     PutBlob {
@@ -244,6 +251,8 @@ pub enum Request {
         removed_devices: Vec<RemovedDevice>,
         #[n(6)]
         limit: u16,
+        #[n(7)]
+        byte_limited: Option<bool>,
     },
     /// Stores an optional source application icon and wakes group watchers after a new upload.
     #[n(13)]
@@ -294,6 +303,9 @@ pub enum Response {
         peers: Vec<PeerAnnouncement>,
         #[n(3)]
         latest_cursor: u64,
+        /// None preserves the legacy count-based completion rule.
+        #[n(4)]
+        has_more: Option<bool>,
     },
     #[n(3)]
     BlobReady {
@@ -365,6 +377,8 @@ pub enum Response {
         latest_cursor: u64,
         #[n(4)]
         removed_devices: Vec<RemovedDevice>,
+        #[n(5)]
+        has_more: Option<bool>,
     },
 }
 
@@ -394,6 +408,144 @@ pub enum FrameError {
     Encode(String),
     #[error("CBOR decode error: {0}")]
     Decode(String),
+}
+
+/// Counts the actual CBOR encoding without allocating a second payload buffer.
+#[derive(Default)]
+struct EncodedSize(usize);
+
+impl minicbor::encode::Write for EncodedSize {
+    type Error = std::convert::Infallible;
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0 += bytes.len();
+        Ok(())
+    }
+}
+
+fn encoded_size<T: Encode<()>>(value: &T) -> Result<usize, FrameError> {
+    let mut size = EncodedSize::default();
+    minicbor::encode(value, &mut size).map_err(|error| FrameError::Encode(error.to_string()))?;
+    Ok(size.0)
+}
+
+/// Fits a contiguous prefix, including growth of the initially empty CBOR array header.
+/// An oversized first event is an error; it must never be skipped or silently truncated.
+fn fitting_event_count<T: Encode<()>>(
+    events: &[T],
+    empty_frame_size: usize,
+) -> Result<usize, FrameError> {
+    if empty_frame_size > MAX_FRAME_BYTES {
+        return Err(FrameError::TooLarge {
+            actual: empty_frame_size,
+            maximum: MAX_FRAME_BYTES,
+        });
+    }
+    let mut payload_size = empty_frame_size;
+    let mut count = 0;
+    for event in events.iter().take(usize::from(MAX_EVENTS_PER_BATCH)) {
+        payload_size += encoded_size(event)?;
+        let array_growth = match count + 1 {
+            0..=23 => 0,
+            24..=255 => 1,
+            _ => 2,
+        };
+        let actual = payload_size + array_growth;
+        if actual > MAX_FRAME_BYTES {
+            if count == 0 {
+                return Err(FrameError::TooLarge {
+                    actual,
+                    maximum: MAX_FRAME_BYTES,
+                });
+            }
+            break;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Keeps only the outgoing prefix that fits in one frame. Remaining events stay in the outbox.
+pub fn limit_sync_request(request: &mut Request) -> Result<usize, FrameError> {
+    let mut events = match request {
+        Request::Sync { events, .. } | Request::SyncV2 { events, .. } => std::mem::take(events),
+        _ => return Err(FrameError::Encode("expected a sync request".into())),
+    };
+    let count = fitting_event_count(&events, encoded_size(request)?)?;
+    events.truncate(count);
+    match request {
+        Request::Sync {
+            events: outgoing, ..
+        }
+        | Request::SyncV2 {
+            events: outgoing, ..
+        } => {
+            *outgoing = events;
+        }
+        _ => unreachable!(),
+    }
+    Ok(count)
+}
+
+/// Byte-limits responses only for callers that understand explicit continuation.
+/// The cursor advances through returned events only, including when an acknowledgement is replayed.
+pub fn limit_sync_response(
+    response: &mut Response,
+    after_cursor: u64,
+    limit: u16,
+    byte_limited: bool,
+) -> Result<(), FrameError> {
+    if !byte_limited {
+        return Ok(());
+    }
+    let mut events = match response {
+        Response::Synced {
+            events,
+            latest_cursor,
+            has_more,
+            ..
+        }
+        | Response::SyncedV2 {
+            events,
+            latest_cursor,
+            has_more,
+            ..
+        } => {
+            *latest_cursor = u64::MAX;
+            *has_more = Some(false);
+            std::mem::take(events)
+        }
+        _ => return Err(FrameError::Encode("expected a sync response".into())),
+    };
+    // Reserve the largest cursor representation before selecting the returned prefix.
+    let count = fitting_event_count(&events, encoded_size(response)?)?;
+    let has_more =
+        count < events.len() || events.len() >= usize::from(limit.clamp(1, MAX_EVENTS_PER_BATCH));
+    events.truncate(count);
+    let latest_cursor = events
+        .last()
+        .map(|event| event.cursor)
+        .unwrap_or(after_cursor);
+    match response {
+        Response::Synced {
+            events: outgoing,
+            latest_cursor: cursor,
+            has_more: more,
+            ..
+        }
+        | Response::SyncedV2 {
+            events: outgoing,
+            latest_cursor: cursor,
+            has_more: more,
+            ..
+        } => {
+            *outgoing = events;
+            *cursor = latest_cursor;
+            *more = Some(has_more);
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 /// Writes one length-delimited CBOR message.
@@ -466,6 +618,7 @@ mod tests {
             after_cursor: 7,
             events: Vec::new(),
             limit: 100,
+            byte_limited: None,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 

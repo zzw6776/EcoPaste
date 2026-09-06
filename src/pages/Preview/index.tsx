@@ -10,6 +10,7 @@ import {
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { settingsState } from "@/stores/settings";
 import { cn } from "@/utils/cn";
 import { log } from "@/utils/log";
@@ -64,6 +65,7 @@ const Preview: FC = () => {
   const [previewState, setPreviewState] =
     useState<ClipboardPreviewState | null>(null);
   const [payloadResetToken, setPayloadResetToken] = useState(0);
+  const [initialized, setInitialized] = useState(false);
   const panelMeasureRef = useRef<HTMLDivElement>(null);
   const { clipboard } = useSnapshot(settingsState);
   const redactSecrets = clipboard.sensitive.redactSecrets;
@@ -72,6 +74,7 @@ const Preview: FC = () => {
     previewState,
     payloadResetToken,
   );
+  useWindowReady(initialized && (previewState === null || payload !== null));
   const payloadKey = payload ? cacheKey(payload, redactSecrets) : "empty";
   const footerMetaText = useMemo(() => {
     return buildPreviewFooterMetaText(payload);
@@ -105,6 +108,8 @@ const Preview: FC = () => {
       setPreviewState(state);
     } catch (error) {
       log.error("load preview state failed", error);
+    } finally {
+      setInitialized(true);
     }
   });
 

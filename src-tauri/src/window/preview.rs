@@ -57,6 +57,8 @@ const PREVIEW_HIDE_DELAY_MS: u64 = 180;
 #[cfg(not(target_os = "android"))]
 static PREVIEW_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_os = "android"))]
+static PREVIEW_PRESENTED_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(target_os = "android"))]
 static PREVIEW_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_os = "android"))]
 static PREVIEW_SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -90,7 +92,7 @@ tauri_panel! {
     })
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewAnchorRect {
     pub left: f64,
@@ -100,7 +102,7 @@ pub struct PreviewAnchorRect {
     pub pointer_y: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewWorkArea {
     pub x: i32,
@@ -109,7 +111,7 @@ pub struct PreviewWorkArea {
     pub height: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewClipboardWindowRect {
     pub x: i32,
@@ -118,7 +120,7 @@ pub struct PreviewClipboardWindowRect {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRect {
     pub left: f64,
@@ -127,7 +129,7 @@ pub struct PreviewRect {
     pub height: f64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewPlacement {
     #[cfg(not(target_os = "android"))]
@@ -140,7 +142,7 @@ pub enum PreviewPlacement {
     Top,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewLayout {
     pub overlay_rect: PreviewRect,
@@ -209,14 +211,11 @@ pub fn show_clipboard_preview(
     let request_id = PREVIEW_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
     cancel_preview_window_hide();
     let session_id = preview_session_id_for_show();
-    let window = ensure_preview_window(app)?;
     let monitor = resolve_preview_monitor(app)?;
     let work_area = preview_overlay_bounds(&monitor);
     let scale_factor = monitor.scale_factor();
     let clipboard_window = clipboard_window_rect(app);
     let layout = build_preview_layout(&anchor, scale_factor, &work_area, clipboard_window.as_ref());
-
-    prepare_preview_window_for_show(app, &window, &work_area)?;
 
     let state = ClipboardPreviewState {
         request_id,
@@ -234,13 +233,57 @@ pub fn show_clipboard_preview(
         clipboard_window,
     };
 
+    let previous = get_clipboard_preview_state()?;
+    let reusable = can_reuse_preview_state(
+        previous.as_ref(),
+        &state,
+        PREVIEW_PRESENTED_REQUEST_ID.load(Ordering::SeqCst),
+    );
+    let existing = app
+        .get_webview_window(CLIPBOARD_PREVIEW_WINDOW_LABEL)
+        .filter(|window| reusable && window.is_visible().unwrap_or(false));
+    let update_content = existing.is_none();
+    let window = match existing {
+        Some(window) => window,
+        None => ensure_preview_window(app)?,
+    };
+
+    if update_content {
+        prepare_preview_window_for_show(app, &window, &work_area)?;
+    } else {
+        apply_preview_window_bounds(&window, &work_area)?;
+    }
+
     set_preview_state(Some(state.clone()));
-    window
-        .emit(PREVIEW_UPDATED_EVENT, &state)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    if update_content {
+        window
+            .emit(PREVIEW_UPDATED_EVENT, &state)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
     show_preview_window(app, &window, &work_area)?;
+    PREVIEW_PRESENTED_REQUEST_ID.store(request_id, Ordering::SeqCst);
 
     Ok(Some(state))
+}
+
+#[cfg(not(target_os = "android"))]
+/// 只复用同一会话中连续且已成功展示的相同状态；关闭、失败或并发请求后完整刷新。
+fn can_reuse_preview_state(
+    previous: Option<&ClipboardPreviewState>,
+    next: &ClipboardPreviewState,
+    presented_request_id: u64,
+) -> bool {
+    previous.is_some_and(|previous| {
+        previous.request_id == presented_request_id
+            && previous.request_id.checked_add(1) == Some(next.request_id)
+            && previous.session_id == next.session_id
+            && previous.item_id == next.item_id
+            && previous.anchor == next.anchor
+            && previous.scale_factor == next.scale_factor
+            && previous.work_area == next.work_area
+            && previous.clipboard_window == next.clipboard_window
+            && previous.layout == next.layout
+    })
 }
 
 #[cfg(not(target_os = "android"))]
@@ -710,14 +753,16 @@ fn apply_preview_window_bounds(
     work_area: &PhysicalRect<i32, u32>,
 ) -> Result<()> {
     let size = preview_window_size(work_area);
+    let position = PhysicalPosition::new(work_area.position.x, work_area.position.y);
 
-    window
-        .set_position(PhysicalPosition::new(
-            work_area.position.x,
-            work_area.position.y,
-        ))
-        .map_err(|e| anyhow::anyhow!(e))?;
-    window.set_size(size).map_err(|e| anyhow::anyhow!(e))?;
+    if window.inner_position().ok() != Some(position) {
+        window
+            .set_position(position)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if window.inner_size().ok() != Some(size) {
+        window.set_size(size).map_err(|e| anyhow::anyhow!(e))?;
+    }
     Ok(())
 }
 
@@ -985,6 +1030,68 @@ impl PreviewRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_reuse_requires_the_same_successful_session_and_screen_context() {
+        let work_area = PhysicalRect {
+            position: PhysicalPosition::new(0, 0),
+            size: PhysicalSize::new(1200, 800),
+        };
+        let anchor = PreviewAnchorRect {
+            left: 20.0,
+            top: 30.0,
+            width: 100.0,
+            height: 40.0,
+            pointer_y: Some(50.0),
+        };
+        let clipboard_window = PreviewClipboardWindowRect {
+            x: 100,
+            y: 100,
+            width: 500,
+            height: 400,
+        };
+        let layout = build_preview_layout(&anchor, 1.0, &work_area, Some(&clipboard_window));
+        let previous = ClipboardPreviewState {
+            request_id: 1,
+            session_id: 1,
+            item_id: "item".into(),
+            anchor,
+            scale_factor: 1.0,
+            work_area: PreviewWorkArea {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 800,
+            },
+            clipboard_window: Some(clipboard_window),
+            layout,
+        };
+        let mut next = previous.clone();
+        next.request_id = 2;
+        assert!(can_reuse_preview_state(Some(&previous), &next, 1));
+
+        // 关闭会清空状态；上一请求失败或有其它请求插入时也必须重新展示。
+        assert!(!can_reuse_preview_state(None, &next, 1));
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 0));
+        next.request_id = 3;
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+        next.request_id = 2;
+        next.session_id = 2;
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+        next.session_id = 1;
+
+        next.scale_factor = 2.0;
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+        next.scale_factor = 1.0;
+        next.work_area.x = 1200;
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+        next.work_area.x = 0;
+        next.clipboard_window.as_mut().unwrap().x += 10;
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+        next.clipboard_window = previous.clipboard_window.clone();
+        next.anchor.pointer_y = Some(60.0);
+        assert!(!can_reuse_preview_state(Some(&previous), &next, 1));
+    }
 
     fn overlay() -> PreviewRect {
         PreviewRect {

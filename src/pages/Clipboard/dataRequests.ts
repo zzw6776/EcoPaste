@@ -56,8 +56,6 @@ export function getSyncItemStatusesShared(itemIds: string[]) {
 async function flushSyncStatusRequests() {
   const requests = pendingSyncStatusRequests;
   pendingSyncStatusRequests = [];
-  syncStatusFlushScheduled = false;
-
   const itemIds = [
     ...new Set(
       requests.flatMap((request) => {
@@ -77,5 +75,13 @@ async function flushSyncStatusRequests() {
     }
   } catch (error) {
     for (const request of requests) request.reject(error);
+  } finally {
+    if (pendingSyncStatusRequests.length > 0) {
+      queueMicrotask(() => {
+        void flushSyncStatusRequests();
+      });
+    } else {
+      syncStatusFlushScheduled = false;
+    }
   }
 }

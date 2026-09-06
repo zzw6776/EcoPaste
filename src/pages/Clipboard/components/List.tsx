@@ -40,6 +40,7 @@ import {
   useKeyboardEvent,
 } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { clipboardStatsState } from "@/stores/clipboardStats";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
@@ -184,6 +185,7 @@ const List: FC<ListProps> = (props) => {
     findItemById,
     getItem,
     getItemIndexById,
+    invalidate,
     loadRange,
     loadedInitial,
     loading,
@@ -201,19 +203,57 @@ const List: FC<ListProps> = (props) => {
     sort,
   });
 
+  useWindowReady(active && loadedInitial);
+
+  const syncStatusItemsRef = useRef(loadedItems);
+  const syncStatusPendingRef = useRef(false);
+  const syncStatusInFlightRef = useRef(false);
+  const syncStatusMountedRef = useRef(true);
+  syncStatusItemsRef.current = loadedItems;
+
+  /** 查询期间只记录一次补刷，结果过期时直接读取最新列表。 */
   async function refreshSyncStatuses() {
-    const itemIds = [...loadedItems.values()].map((item) => item.id);
-    if (itemIds.length === 0) {
-      setSyncStatuses(new Map());
-      return;
+    syncStatusPendingRef.current = true;
+    if (syncStatusInFlightRef.current) return;
+
+    syncStatusInFlightRef.current = true;
+    try {
+      while (syncStatusPendingRef.current && syncStatusMountedRef.current) {
+        syncStatusPendingRef.current = false;
+        const items = syncStatusItemsRef.current;
+        const itemIds = [...items.values()].map((item) => {
+          return item.id;
+        });
+        try {
+          const statuses = await getSyncItemStatusesShared(itemIds);
+          if (!syncStatusMountedRef.current) return;
+          if (items !== syncStatusItemsRef.current) {
+            syncStatusPendingRef.current = true;
+            continue;
+          }
+          setSyncStatuses(
+            new Map(
+              statuses.map((status) => {
+                return [status.itemId, status];
+              }),
+            ),
+          );
+        } catch {
+          // 命令层处理错误；查询期间的后续更新仍需消费。
+        }
+      }
+    } finally {
+      syncStatusInFlightRef.current = false;
     }
-    const statuses = await getSyncItemStatusesShared(itemIds);
-    setSyncStatuses(new Map(statuses.map((status) => [status.itemId, status])));
   }
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: loadedItems 是批量状态查询的唯一触发快照
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 列表更新触发状态读取，ref 提供最新快照。
   useEffect(() => {
+    syncStatusMountedRef.current = true;
     void refreshSyncStatuses();
+    return () => {
+      syncStatusMountedRef.current = false;
+    };
   }, [loadedItems]);
 
   useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
@@ -321,7 +361,15 @@ const List: FC<ListProps> = (props) => {
    * 用 ref 读取最新滚动位置，规避闭包陷旧值（事件订阅只挂载一次）。
    */
   const handleClipboardUpdated = (payload: ClipboardUpdatedPayload) => {
-    if (!clipboardWindowVisibleRef.current) {
+    if (
+      payload.cleanup === void 0 &&
+      !payload.imported &&
+      !payload.reconciled &&
+      !shouldRefreshCurrentGroup(range, category, groupId, payload.kind)
+    )
+      return;
+
+    if (!clipboardWindowVisibleRef.current || !active) {
       scheduleHiddenRangeRefresh();
       return;
     }
@@ -481,6 +529,11 @@ const List: FC<ListProps> = (props) => {
     note: string | null,
     autoFavorited: boolean,
   ) => {
+    if (keyword.trim()) {
+      void reloadCurrentRange();
+      return;
+    }
+
     patchItem(id, autoFavorited ? { isFavorite: true, note } : { note });
   };
 
@@ -596,10 +649,9 @@ const List: FC<ListProps> = (props) => {
 
     if (!current) return;
 
-    const next = await toggleClipboardItemPinned(id, !current.isPinned);
+    await toggleClipboardItemPinned(id, !current.isPinned);
 
-    patchItem(id, { isPinned: next });
-    reloadCurrentRange();
+    void reloadCurrentRange();
   };
 
   /**
@@ -1003,6 +1055,7 @@ const List: FC<ListProps> = (props) => {
    */
   function requestReloadAtTop() {
     if (!isAtTopRef.current) {
+      invalidate();
       deferredReloadRef.current = true;
       return;
     }

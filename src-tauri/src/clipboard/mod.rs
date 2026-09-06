@@ -3,6 +3,7 @@ mod apps_registry;
 mod cleanup;
 mod detect;
 mod file_icon_store;
+mod file_thumbnail;
 mod fingerprint;
 mod guard;
 mod icon;
@@ -30,7 +31,7 @@ pub use icon::{get_icon_cache_key, icon_png, DIR_CACHE_KEY};
 #[cfg(test)]
 pub use ingest::build_item;
 pub use ingest::build_item_with_settings;
-pub(crate) use ingest::calculate_files_total_size;
+pub(crate) use ingest::calculate_current_file_item_size;
 pub use payload::{ClipboardPayload, ImagePayload, TextPayload};
 pub use read::ClipboardReader;
 pub use sound::play_copy_sound;

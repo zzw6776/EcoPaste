@@ -1,3 +1,4 @@
+mod activity;
 mod crypto;
 mod identity;
 mod manager;

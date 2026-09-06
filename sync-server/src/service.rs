@@ -10,7 +10,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    ErrorCode, FrameError, MAX_EVENTS_PER_BATCH, Request, Response, read_frame, write_frame,
+    ErrorCode, FrameError, MAX_EVENTS_PER_BATCH, Request, Response, limit_sync_response,
+    read_frame, write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -272,6 +273,7 @@ impl HubService {
                 after_cursor,
                 events,
                 limit,
+                byte_limited,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
@@ -316,6 +318,28 @@ impl HubService {
                 if events_changed {
                     self.notify_group_change(&group_id).await;
                 }
+                let mut response = Response::Synced {
+                    accepted_event_ids,
+                    events,
+                    peers,
+                    latest_cursor,
+                    has_more: None,
+                };
+                limit_sync_response(
+                    &mut response,
+                    after_cursor,
+                    limit,
+                    byte_limited == Some(true),
+                )?;
+                let Response::Synced {
+                    accepted_event_ids,
+                    events,
+                    latest_cursor,
+                    ..
+                } = &response
+                else {
+                    unreachable!();
+                };
                 info!(
                     protocol = "legacy",
                     group_ref = %group_log_ref(&group_id),
@@ -330,16 +354,7 @@ impl HubService {
                     elapsed_ms = started_at.elapsed().as_millis(),
                     "cloud sync request completed"
                 );
-                write_frame(
-                    send,
-                    &Response::Synced {
-                        accepted_event_ids,
-                        events,
-                        peers,
-                        latest_cursor,
-                    },
-                )
-                .await?;
+                write_frame(send, &response).await?;
             }
             Request::SyncV2 {
                 group_id,
@@ -349,6 +364,7 @@ impl HubService {
                 events,
                 removed_devices,
                 limit,
+                byte_limited,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
@@ -409,6 +425,7 @@ impl HubService {
                             peers: Vec::new(),
                             latest_cursor: after_cursor,
                             removed_devices: merged_removals,
+                            has_more: byte_limited.filter(|enabled| *enabled).map(|_| false),
                         },
                     )
                     .await?;
@@ -443,6 +460,30 @@ impl HubService {
                 if removals_changed || events_changed {
                     self.notify_group_change(&group_id).await;
                 }
+                let returned_removal_count = merged_removals.len();
+                let mut response = Response::SyncedV2 {
+                    accepted_event_ids,
+                    events,
+                    peers,
+                    latest_cursor,
+                    removed_devices: merged_removals,
+                    has_more: None,
+                };
+                limit_sync_response(
+                    &mut response,
+                    after_cursor,
+                    limit,
+                    byte_limited == Some(true),
+                )?;
+                let Response::SyncedV2 {
+                    accepted_event_ids,
+                    events,
+                    latest_cursor,
+                    ..
+                } = &response
+                else {
+                    unreachable!();
+                };
                 info!(
                     protocol = "v2",
                     group_ref = %group_log_ref(&group_id),
@@ -451,7 +492,7 @@ impl HubService {
                     accepted_events = accepted_event_ids.len(),
                     returned_events = events.len(),
                     submitted_removals = submitted_removal_count,
-                    returned_removals = merged_removals.len(),
+                    returned_removals = returned_removal_count,
                     latest_cursor,
                     group_latest_cursor,
                     newest_submitted_event_at_ms = ?newest_submitted_event_at_ms,
@@ -459,17 +500,7 @@ impl HubService {
                     elapsed_ms = started_at.elapsed().as_millis(),
                     "cloud sync request completed"
                 );
-                write_frame(
-                    send,
-                    &Response::SyncedV2 {
-                        accepted_event_ids,
-                        events,
-                        peers,
-                        latest_cursor,
-                        removed_devices: merged_removals,
-                    },
-                )
-                .await?;
+                write_frame(send, &response).await?;
             }
             request @ (Request::PutBlob { .. } | Request::PutSourceIcon { .. }) => {
                 let notify_source_icon = matches!(request, Request::PutSourceIcon { .. });
@@ -603,13 +634,12 @@ impl HubService {
                     .authenticate(&group_id, &access_token)
                     .await?;
                 let mut changes = self.group_changes(&group_id).await;
-                let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
-                let mut latest_removed_at_ms =
-                    self.repository.latest_removed_at_ms(&group_id).await?;
+                let (mut latest_cursor, mut latest_removed_at_ms) =
+                    self.repository.group_watermarks(&group_id).await?;
                 if latest_cursor <= after_cursor && latest_removed_at_ms <= after_removed_at_ms {
                     let _ = tokio::time::timeout(Duration::from_secs(60), changes.changed()).await;
-                    latest_cursor = self.repository.latest_cursor(&group_id).await?;
-                    latest_removed_at_ms = self.repository.latest_removed_at_ms(&group_id).await?;
+                    (latest_cursor, latest_removed_at_ms) =
+                        self.repository.group_watermarks(&group_id).await?;
                 }
                 write_frame(
                     send,
@@ -648,9 +678,8 @@ impl HubService {
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 let mut changes = self.group_changes(&group_id).await;
-                let mut latest_cursor = self.repository.latest_cursor(&group_id).await?;
-                let mut latest_removed_at_ms =
-                    self.repository.latest_removed_at_ms(&group_id).await?;
+                let (mut latest_cursor, mut latest_removed_at_ms) =
+                    self.repository.group_watermarks(&group_id).await?;
                 let (watch_generation, mut cancelled) = self
                     .register_watch(&group_id, remote_endpoint_id, watch_slot)
                     .await;
@@ -695,9 +724,8 @@ impl HubService {
                                     _ = tokio::time::sleep(BACKUP_WATCH_NOTIFICATION_DELAY) => {},
                                 }
                             }
-                            latest_cursor = self.repository.latest_cursor(&group_id).await?;
-                            latest_removed_at_ms =
-                                self.repository.latest_removed_at_ms(&group_id).await?;
+                            (latest_cursor, latest_removed_at_ms) =
+                                self.repository.group_watermarks(&group_id).await?;
                         }
                         let write_started_at = Instant::now();
                         tokio::time::timeout(

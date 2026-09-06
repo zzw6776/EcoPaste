@@ -1342,6 +1342,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_index_upgrade_preserves_filters_sort_keys_and_pagination() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(9, &pool).await.unwrap();
+        for n in 0..12 {
+            let mut item = sample_item(&format!("item-{n}"));
+            item.created_at = DateTime::from_timestamp(1_700_000_000 + n / 2, 0).unwrap();
+            item.updated_at = DateTime::from_timestamp(1_700_000_020 - n, 0).unwrap();
+            item.use_count = n % 3;
+            item.is_pinned = n % 4 == 0;
+            item.is_favorite = n % 2 == 0;
+            item.search_text = Some(format!("searchable-{n}"));
+            insert_item(&pool, &item).await.unwrap();
+        }
+
+        let mut snapshots = Vec::new();
+        for sort in [
+            ClipboardItemSort::CreatedAt,
+            ClipboardItemSort::UpdatedAt,
+            ClipboardItemSort::UseCount,
+        ] {
+            for filter in [
+                ClipboardItemQuery::default(),
+                ClipboardItemQuery {
+                    favorite: Some(true),
+                    ..Default::default()
+                },
+                ClipboardItemQuery {
+                    pinned: Some(false),
+                    ..Default::default()
+                },
+                ClipboardItemQuery {
+                    kind: Some(ClipboardKind::Image),
+                    ..Default::default()
+                },
+                ClipboardItemQuery {
+                    keyword: Some("searchable-1".into()),
+                    ..Default::default()
+                },
+                ClipboardItemQuery {
+                    keyword: Some("-1".into()),
+                    ..Default::default()
+                },
+            ] {
+                let query = ClipboardItemQuery { sort, ..filter };
+                let result = query_items_page(&pool, &query).await.unwrap();
+                snapshots.push((query, result));
+            }
+        }
+
+        migrator.run(&pool).await.unwrap();
+        for (query, (before, before_total)) in snapshots {
+            let (after, after_total) = query_items_page(&pool, &query).await.unwrap();
+            assert_eq!(before_total, after_total);
+            let mut before_ids = ids(&before);
+            let mut after_ids = ids(&after);
+            before_ids.sort_unstable();
+            after_ids.sort_unstable();
+            assert_eq!(before_ids, after_ids);
+
+            let sort_key = |item: &ClipboardItem| {
+                let primary = match query.sort {
+                    ClipboardItemSort::CreatedAt => item.created_at.timestamp(),
+                    ClipboardItemSort::UpdatedAt => item.updated_at.timestamp(),
+                    ClipboardItemSort::UseCount => item.use_count,
+                };
+                (item.is_pinned, primary, item.created_at.timestamp())
+            };
+            assert_eq!(
+                before.iter().map(sort_key).collect::<Vec<_>>(),
+                after.iter().map(sort_key).collect::<Vec<_>>()
+            );
+
+            let mut paged = Vec::new();
+            for offset in (0..=after_total).step_by(2) {
+                let page_query = ClipboardItemQuery {
+                    limit: 2,
+                    offset,
+                    ..query.clone()
+                };
+                let (page, total) = query_items_page(&pool, &page_query).await.unwrap();
+                assert_eq!(total, after_total);
+                paged.extend(page);
+            }
+            assert_eq!(ids(&paged), ids(&after));
+        }
+
+        let mut plan_query: QueryBuilder<Sqlite> = QueryBuilder::new("EXPLAIN QUERY PLAN ");
+        plan_query.push(LIST_SELECT_ITEM).push(
+            " WHERE 1 = 1 ORDER BY clipboard_items.is_pinned DESC, \
+             clipboard_items.updated_at DESC, clipboard_items.created_at DESC LIMIT ",
+        );
+        plan_query
+            .push_bind(20_i64)
+            .push(" OFFSET ")
+            .push_bind(0_i64);
+        let plan: Vec<(i64, i64, i64, String)> =
+            plan_query.build_query_as().fetch_all(&pool).await.unwrap();
+        assert!(plan
+            .iter()
+            .any(|row| row.3.contains("idx_clipboard_items_updated_sort")));
+        assert!(!plan.iter().any(|row| row.3.contains("TEMP B-TREE")));
+    }
+
+    #[tokio::test]
     async fn query_orders_pinned_first_then_by_sort() {
         let pool = memory_pool().await;
         let mut a = sample_item("a");

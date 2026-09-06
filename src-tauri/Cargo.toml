@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.115"
+version = "1.1.122"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -42,7 +42,7 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-prevent-default = "5"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 tauri-plugin-os = "2"
 time = "0.3"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }

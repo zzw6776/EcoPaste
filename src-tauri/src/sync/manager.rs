@@ -1,3 +1,4 @@
+use super::activity::SyncActivityGuard;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
@@ -16,10 +17,10 @@ use std::net::IpAddr;
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
-    read_frame, write_frame, CloudEvent, DeviceAnnouncement, EncryptedEvent, ErrorCode,
-    PeerAnnouncement, RemovedDevice, Request, Response, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
-    MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
-    SYNC_V2_PROTOCOL_VERSION,
+    limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
+    DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
+    Response, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -31,7 +32,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, TransportAddr, Watcher,
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use n0_future::{boxed::BoxStream, StreamExt};
+use n0_future::{boxed::BoxStream, BufferedStreamExt, StreamExt};
 use rand::RngCore;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
@@ -43,9 +44,9 @@ use uuid::Uuid;
 
 use crate::{
     clipboard::{
-        calculate_files_total_size, fallback_accent_colors, AppIconStore, ClipboardFingerprint,
-        ClipboardFingerprintState, ClipboardObservation, FileEntryFingerprint, ImageStore,
-        WritebackGuard,
+        calculate_current_file_item_size, fallback_accent_colors, AppIconStore,
+        ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation,
+        FileEntryFingerprint, ImageStore, WritebackGuard,
     },
     db::{
         self,
@@ -107,6 +108,7 @@ const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
 pub struct SyncManager {
+    update_notification_pending: Arc<AtomicBool>,
     app: AppHandle,
     identity: Arc<IdentityStore>,
     runtime: Mutex<Option<EndpointRuntime>>,
@@ -123,6 +125,7 @@ pub struct SyncManager {
     cloud_force_reconnect: AtomicBool,
     maintenance_lock: Mutex<()>,
     apply_lock: Mutex<()>,
+    blob_download_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     inbound_stream_admission: Arc<Semaphore>,
     inbound_blob_concurrency: Arc<Semaphore>,
     lan_status: RwLock<SyncChannelStatus>,
@@ -284,11 +287,17 @@ enum LanPeerSyncOutcome {
     TransferFailed(String),
 }
 
+struct SyncConnectionOutcome {
+    cursor: u64,
+    has_more: bool,
+}
+
 struct SyncBatchResponse {
     events: Vec<CloudEvent>,
     peers: Vec<PeerAnnouncement>,
     latest_cursor: u64,
     removed_devices: Vec<RemovedDevice>,
+    has_more: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -388,6 +397,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
     let mut presence_nonce = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut presence_nonce);
     let manager = Arc::new(SyncManager {
+        update_notification_pending: Arc::new(AtomicBool::new(false)),
         app: app.clone(),
         identity,
         runtime: Mutex::new(None),
@@ -404,6 +414,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         cloud_force_reconnect: AtomicBool::new(false),
         maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
+        blob_download_locks: Mutex::new(HashMap::new()),
         inbound_stream_admission: Arc::new(Semaphore::new(128)),
         inbound_blob_concurrency: Arc::new(Semaphore::new(4)),
         lan_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Idle)),
@@ -1545,6 +1556,7 @@ impl SyncManager {
             Option<ClipboardFingerprint>,
         )>,
     > {
+        let _sync_activity = SyncActivityGuard::acquire();
         let key = group.content_key_bytes()?;
         let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
         let mut manifests = Vec::new();
@@ -1587,14 +1599,13 @@ impl SyncManager {
                     if settings.auto_upload_max_mb == 0 {
                         return Ok(None);
                     }
-                    let content = item.content.clone();
-                    let total_size = tauri::async_runtime::spawn_blocking(move || {
-                        calculate_files_total_size(&content)
-                    })
-                    .await
-                    .context("file size verification task failed")?;
+                    let total_size =
+                        calculate_current_file_item_size(&self.pool().await, item).await;
                     let total_size = match total_size {
-                        Ok(size) => u64::try_from(size).context("invalid clipboard file size")?,
+                        Ok(Some(size)) => {
+                            u64::try_from(size).context("invalid clipboard file size")?
+                        }
+                        Ok(None) => return Ok(None),
                         Err(error) => {
                             log::debug!(
                                 "defer automatic file sync because size is unavailable: {error:#}"
@@ -2049,7 +2060,10 @@ impl SyncManager {
                         let latest = self
                             .sync_connection(&connection, CLOUD_TARGET, cursor, &group, &endpoint)
                             .await?;
-                        repository::set_cloud_cursor(&pool, latest).await?;
+                        repository::set_cloud_cursor(&pool, latest.cursor).await?;
+                        if latest.has_more {
+                            self.wake_cloud_transfer();
+                        }
                         Ok::<_, anyhow::Error>((
                             initialized_group,
                             group_elapsed,
@@ -2206,7 +2220,7 @@ impl SyncManager {
             .await
         {
             Ok(latest) => {
-                repository::set_peer_cursor(&pool, &device_id, latest).await?;
+                repository::set_peer_cursor(&pool, &device_id, latest.cursor).await?;
                 let (connected_address, transport) = connection_path(&connection);
                 repository::mark_peer_online(
                     &pool,
@@ -2216,6 +2230,18 @@ impl SyncManager {
                 )
                 .await?;
                 self.clear_peer_suspension(&device_id);
+                if latest.has_more {
+                    if let Some(actor) = self
+                        .lan_peer_actors
+                        .read()
+                        .expect("LAN peer actors poisoned")
+                        .get(&device_id)
+                    {
+                        actor.notify();
+                    } else {
+                        self.wake_lan_transfer();
+                    }
+                }
                 Ok(LanPeerSyncOutcome::Succeeded)
             }
             Err(error) => {
@@ -2568,7 +2594,8 @@ impl SyncManager {
         after_cursor: u64,
         group: &GroupSecrets,
         endpoint: &Endpoint,
-    ) -> Result<u64> {
+    ) -> Result<SyncConnectionOutcome> {
+        let _sync_activity = SyncActivityGuard::acquire();
         let pool = self.pool().await;
         let identity = self.identity.snapshot();
         let use_sync_v2 =
@@ -2583,9 +2610,10 @@ impl SyncManager {
             Vec::new()
         };
         let mut cursor = after_cursor;
+        let mut has_more = false;
         for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
             let batch_started_at = Instant::now();
-            let pending = if target_id == CLOUD_TARGET {
+            let mut pending = if target_id == CLOUD_TARGET {
                 repository::pending_origin_events_for_target(
                     &pool,
                     target_id,
@@ -2597,7 +2625,34 @@ impl SyncManager {
                 repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
                     .await?
             };
-            let pending_count = pending.len();
+            let available_count = pending.len();
+            let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
+            let mut request = if use_sync_v2 {
+                Request::SyncV2 {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    device: self.device_announcement(endpoint),
+                    after_cursor: cursor,
+                    events: outgoing_events,
+                    removed_devices: removed_devices.clone(),
+                    limit: MAX_EVENTS_PER_BATCH,
+                    byte_limited: Some(true),
+                }
+            } else {
+                Request::Sync {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    device: self.device_announcement(endpoint),
+                    after_cursor: cursor,
+                    events: outgoing_events,
+                    limit: MAX_EVENTS_PER_BATCH,
+                    byte_limited: Some(true),
+                }
+            };
+            let pending_count = limit_sync_request(&mut request)?;
+            let outgoing_has_more = pending_count < available_count
+                || available_count == usize::from(MAX_EVENTS_PER_BATCH);
+            pending.truncate(pending_count);
             let event_ids = pending
                 .iter()
                 .map(|item| item.event.event_id.clone())
@@ -2674,67 +2729,43 @@ impl SyncManager {
                 }
                 source_icon_elapsed = source_icon_started_at.elapsed();
             }
-            let outgoing_events = pending
-                .iter()
-                .map(|item| item.event.clone())
-                .collect::<Vec<_>>();
             let request_started_at = Instant::now();
             let result = async {
-                let mut protocol = "legacy";
+                let protocol = if use_sync_v2 { "v2" } else { "legacy" };
                 let response = if use_sync_v2 {
-                    let response = call_cloud_hedged(
-                        connection,
-                        Request::SyncV2 {
-                            group_id: group.group_id.clone(),
-                            access_token: group.access_token_bytes()?,
-                            device: self.device_announcement(endpoint),
-                            after_cursor: cursor,
-                            events: outgoing_events.clone(),
-                            removed_devices: removed_devices.clone(),
-                            limit: MAX_EVENTS_PER_BATCH,
-                        },
-                    )
-                    .await?;
-                    protocol = "v2";
-                    response
+                    call_cloud_hedged(connection, request).await?
+                } else if target_id == CLOUD_TARGET {
+                    call_cloud(connection, request).await?
                 } else {
-                    let request = Request::Sync {
-                        group_id: group.group_id.clone(),
-                        access_token: group.access_token_bytes()?,
-                        device: self.device_announcement(endpoint),
-                        after_cursor: cursor,
-                        events: outgoing_events,
-                        limit: MAX_EVENTS_PER_BATCH,
-                    };
-                    if target_id == CLOUD_TARGET {
-                        call_cloud(connection, request).await?
-                    } else {
-                        call_lan(connection, request).await?
-                    }
+                    call_lan(connection, request).await?
                 };
                 let response = match response {
                     Response::Synced {
                         events,
                         peers,
                         latest_cursor,
+                        has_more,
                         ..
                     } => SyncBatchResponse {
                         events,
                         peers,
                         latest_cursor,
                         removed_devices: Vec::new(),
+                        has_more,
                     },
                     Response::SyncedV2 {
                         events,
                         peers,
                         latest_cursor,
                         removed_devices,
+                        has_more,
                         ..
                     } => SyncBatchResponse {
                         events,
                         peers,
                         latest_cursor,
                         removed_devices,
+                        has_more,
                     },
                     Response::Error { message, .. } => bail!(message),
                     _ => bail!("同步端返回了无效响应"),
@@ -2760,6 +2791,10 @@ impl SyncManager {
             };
             let request_elapsed = request_started_at.elapsed();
             let received_count = response.events.len();
+            has_more = outgoing_has_more
+                || response
+                    .has_more
+                    .unwrap_or(received_count == usize::from(MAX_EVENTS_PER_BATCH));
             let removed_count = response.removed_devices.len();
             if !response.removed_devices.is_empty() {
                 self.apply_removed_devices(&pool, response.removed_devices)
@@ -2800,14 +2835,12 @@ impl SyncManager {
                     batch_started_at.elapsed().as_millis()
                 );
             }
-            if pending_count < usize::from(MAX_EVENTS_PER_BATCH)
-                && received_count < usize::from(MAX_EVENTS_PER_BATCH)
-            {
+            if !has_more {
                 break;
             }
         }
         self.source_asset_wake.notify_one();
-        Ok(cursor)
+        Ok(SyncConnectionOutcome { cursor, has_more })
     }
 
     /// Exchanges group-wide removal tombstones before normal events so a removed device leaves
@@ -2896,6 +2929,7 @@ impl SyncManager {
         group: &GroupSecrets,
         source_target: &str,
     ) -> Result<()> {
+        let _sync_activity = SyncActivityGuard::acquire();
         let pool = self.pool().await;
         let removed_peers = repository::removed_peer_ids(&pool).await?;
         let mut received_event_ids = Vec::new();
@@ -2943,13 +2977,45 @@ impl SyncManager {
         let mut latest_clipboard_item = None;
         #[cfg(target_os = "android")]
         let mut applied_any = false;
-        for stored in pending_apply {
-            let event = stored.event;
-            let envelope = match crypto::decrypt_event(&group.content_key_bytes()?, &event)
-                .and_then(|envelope| {
-                    validate_envelope(&envelope)?;
-                    Ok(envelope)
-                }) {
+        // 最多准备两条记录，按原始游标顺序消费；后续下载完成也不会提前应用。
+        let preparations = n0_future::stream::iter(pending_apply)
+            .map(|stored| async move {
+                let event = stored.event;
+                let envelope = crypto::decrypt_event(&group.content_key_bytes()?, &event).and_then(
+                    |envelope| {
+                        validate_envelope(&envelope)?;
+                        Ok(envelope)
+                    },
+                );
+                let mut stored_blobs = Vec::new();
+                let mut all_blobs_available = true;
+                if let Ok(envelope) = &envelope {
+                    for manifest in &envelope.blobs {
+                        match self.ensure_blob(connection, group, manifest).await {
+                            Ok(path) => stored_blobs.push(StoredBlob {
+                                blob_id: manifest.blob_id.clone(),
+                                encrypted_path: path.to_string_lossy().into_owned(),
+                                size: manifest.encrypted_size,
+                            }),
+                            Err(error) => {
+                                log::debug!(
+                                    "defer sync event {} until blob {} is available: {error}",
+                                    event.event_id,
+                                    manifest.blob_id
+                                );
+                                all_blobs_available = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>((event, envelope, stored_blobs, all_blobs_available))
+            })
+            .buffered_ordered(2);
+        let mut preparations = std::pin::pin!(preparations);
+        while let Some(prepared) = preparations.next().await {
+            let (event, envelope, stored_blobs, all_blobs_available) = prepared?;
+            let envelope = match envelope {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     log::warn!("discard invalid sync event {}: {error}", event.event_id);
@@ -2957,28 +3023,6 @@ impl SyncManager {
                     continue;
                 }
             };
-            let mut stored_blobs = Vec::new();
-            let mut all_blobs_available = true;
-            for manifest in &envelope.blobs {
-                match self.ensure_blob(connection, group, manifest).await {
-                    Ok(path) => {
-                        stored_blobs.push(StoredBlob {
-                            blob_id: manifest.blob_id.clone(),
-                            encrypted_path: path.to_string_lossy().into_owned(),
-                            size: manifest.encrypted_size,
-                        });
-                    }
-                    Err(error) => {
-                        log::debug!(
-                            "defer sync event {} until blob {} is available: {error}",
-                            event.event_id,
-                            manifest.blob_id
-                        );
-                        all_blobs_available = false;
-                        break;
-                    }
-                }
-            }
             if !all_blobs_available {
                 continue;
             }
@@ -3035,6 +3079,19 @@ impl SyncManager {
         validate_blob_manifest(manifest)?;
         let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
         let path = crypto::blob_path(&root, &manifest.blob_id)?;
+        let download_lock = {
+            let mut locks = self.blob_download_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&path).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(path.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _download_guard = download_lock.lock().await;
         if path.is_file() && path.metadata()?.len() == manifest.encrypted_size {
             return Ok(path);
         }
@@ -3079,6 +3136,7 @@ impl SyncManager {
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
     ) -> Result<(String, ClipboardItem, Option<ClipboardFingerprint>)> {
+        let _sync_activity = SyncActivityGuard::acquire();
         if envelope.version != 1 {
             bail!("不支持的同步事件版本");
         }
@@ -4083,12 +4141,25 @@ impl SyncManager {
             .clear();
     }
 
+    /// 合并同一轮任务产生的无载荷刷新通知；消费者仍读取最后的完整状态。
     fn emit_updated(&self) {
-        if let Err(error) = self.app.emit(SYNC_UPDATED_EVENT, ()) {
-            log::debug!("emit sync update failed: {error}");
+        if self
+            .update_notification_pending
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
         }
-        #[cfg(target_os = "android")]
-        crate::commands::android::notify_overlay_sync_status_changed();
+        let pending = self.update_notification_pending.clone();
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::task::yield_now().await;
+            pending.store(false, Ordering::Release);
+            if let Err(error) = app.emit(SYNC_UPDATED_EVENT, ()) {
+                log::debug!("emit sync update failed: {error}");
+            }
+            #[cfg(target_os = "android")]
+            crate::commands::android::notify_overlay_sync_status_changed();
+        });
     }
 }
 
@@ -5695,6 +5766,7 @@ async fn dispatch_peer(
     recv: &mut RecvStream,
     request: Request,
 ) -> Result<()> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let settings = manager.app.state::<SettingsStore>().snapshot().sync;
     if !settings.enabled || !settings.lan_enabled {
         bail!("LAN sync is disabled");
@@ -5717,6 +5789,7 @@ async fn dispatch_peer(
             after_cursor,
             events,
             limit,
+            byte_limited,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             let remote_endpoint_id = connection.remote_id().to_string();
@@ -5801,16 +5874,20 @@ async fn dispatch_peer(
                     event: value.event,
                 })
                 .collect();
-            write_frame(
-                send,
-                &Response::Synced {
-                    accepted_event_ids: accepted,
-                    events: cloud_events,
-                    peers: Vec::new(),
-                    latest_cursor,
-                },
-            )
-            .await?;
+            let mut response = Response::Synced {
+                accepted_event_ids: accepted,
+                events: cloud_events,
+                peers: Vec::new(),
+                latest_cursor,
+                has_more: None,
+            };
+            limit_sync_response(
+                &mut response,
+                after_cursor,
+                limit,
+                byte_limited == Some(true),
+            )?;
+            write_frame(send, &response).await?;
             let apply_guard = manager.apply_lock.lock().await;
             let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
             let mut source_assets_pending = false;
@@ -6226,6 +6303,7 @@ async fn upload_blob(
     blob: &StoredBlob,
     kind: BlobUploadKind,
 ) -> Result<()> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let total_started_at = Instant::now();
     let open_started_at = Instant::now();
     let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
@@ -6394,6 +6472,7 @@ async fn download_blob(
     manifest: &BlobManifest,
     destination: &Path,
 ) -> Result<()> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
         .await
         .context("open blob download stream timeout")??;
@@ -6425,6 +6504,7 @@ async fn receive_blob(
     expected_hash: &str,
     size: u64,
 ) -> Result<()> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let parent = destination.parent().context("blob path has no parent")?;
     tokio::fs::create_dir_all(parent).await?;
     let temporary = destination.with_extension(format!("part-{}", uuid::Uuid::new_v4()));

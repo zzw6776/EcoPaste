@@ -1,23 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listClipboardItems } from "@/commands";
 import type { ClipboardItem, ClipboardItemQuery } from "@/types/clipboard";
+import {
+  type ClipboardItemsRange,
+  getMissingClipboardRanges,
+} from "./clipboardItemRanges";
 
 /**
- * 后端分页大小。保持略大于一屏的原有取值，range cache 以此对齐请求边界。
+ * 预加载范围按页对齐，实际请求只读取其中尚未加载的部分。
  */
 const PAGE_SIZE = 30;
 const PRELOAD_ROWS = 30;
 const CACHE_MAX_ROWS = 180;
 const CACHE_KEEP_RADIUS = 90;
 
-interface ClipboardItemsRange {
-  end: number;
-  start: number;
-}
-
 interface FetchRangeOptions {
   force?: boolean;
-  replace?: boolean;
   token: number;
 }
 
@@ -29,6 +27,7 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
   const queryRef = useRef(query);
 
   const requestTokenRef = useRef(0);
+  const staleRangeRef = useRef(false);
   const itemsRef = useRef(new Map<number, ClipboardItem>());
   const totalRef = useRef(0);
   const loadingRangesRef = useRef<ClipboardItemsRange[]>([]);
@@ -71,17 +70,19 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
 
   const removeLoadingRange = useCallback((range: ClipboardItemsRange) => {
     loadingRangesRef.current = loadingRangesRef.current.filter((current) => {
-      return current.start !== range.start || current.end !== range.end;
+      return current !== range;
     });
     setLoadingRangeCount(loadingRangesRef.current.length);
   }, []);
 
   const fetchRange = useCallback(
-    async (
+    async function fetchRange(
       rawStartIndex: number,
       rawEndIndex: number,
       options: FetchRangeOptions,
-    ) => {
+    ): Promise<void> {
+      if (options.token !== requestTokenRef.current) return;
+
       const range = normalizeFetchRange(
         rawStartIndex,
         rawEndIndex,
@@ -89,53 +90,74 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
       );
       if (range === null) return;
 
-      const currentItems = itemsRef.current;
-      if (!options.force) {
-        if (isRangeLoaded(currentItems, range)) return;
-        if (hasCoveringLoadingRange(loadingRangesRef.current, range)) return;
+      let ranges = options.force
+        ? [range]
+        : getMissingClipboardRanges(
+            itemsRef.current,
+            loadingRangesRef.current,
+            range,
+          );
+      if (ranges.length === 0) return;
+
+      if (staleRangeRef.current) {
+        // 暂缓刷新时保留已显示行；需要补读时整段换代，不能把旧位置与新分页拼接。
+        staleRangeRef.current = false;
+        itemsRef.current = new Map();
+        ranges = [range];
       }
 
-      addLoadingRange(range);
+      await Promise.all(
+        ranges.map(async (range) => {
+          addLoadingRange(range);
 
-      try {
-        const page = await listClipboardItems({
-          ...queryRef.current,
-          limit: range.end - range.start + 1,
-          offset: range.start,
-        });
+          try {
+            const page = await listClipboardItems({
+              ...queryRef.current,
+              limit: range.end - range.start + 1,
+              offset: range.start,
+            });
 
-        if (options.token !== requestTokenRef.current) return;
+            if (options.token !== requestTokenRef.current) return;
 
-        const nextTotal = Math.max(0, page.total);
-        const nextItems = options.replace
-          ? new Map<number, ClipboardItem>()
-          : new Map(itemsRef.current);
+            const nextTotal = Math.max(0, page.total);
+            const nextItems = new Map(itemsRef.current);
+            page.list.forEach((item, offset) => {
+              const index = range.start + offset;
+              if (index < nextTotal) nextItems.set(index, item);
+            });
 
-        page.list.forEach((item, offset) => {
-          const index = range.start + offset;
-          if (index < nextTotal) nextItems.set(index, item);
-        });
-
-        trimCache(nextItems, viewRangeRef.current, nextTotal);
-        commitItems(nextItems);
-        commitTotal(nextTotal);
-        commitLoadedInitial(true);
-      } catch {
-        // 命令包装层已统一 log + toast；这里只避免初始请求失败后卡在 loading。
-        if (
-          options.token === requestTokenRef.current &&
-          !loadedInitialRef.current
-        ) {
-          commitItems(new Map());
-          commitTotal(0);
-          commitLoadedInitial(true);
-        }
-      } finally {
-        if (options.token === requestTokenRef.current) {
-          removeLoadingRange(range);
-          setLoading(false);
-        }
-      }
+            trimCache(nextItems, viewRangeRef.current, nextTotal);
+            commitItems(nextItems);
+            commitTotal(nextTotal);
+            commitLoadedInitial(true);
+          } catch {
+            // 命令包装层已统一 log + toast；这里只避免初始请求失败后卡在 loading。
+            if (
+              options.token === requestTokenRef.current &&
+              !loadedInitialRef.current
+            ) {
+              commitItems(new Map());
+              commitTotal(0);
+              commitLoadedInitial(true);
+            }
+          } finally {
+            if (options.token === requestTokenRef.current) {
+              removeLoadingRange(range);
+              setLoading(false);
+            } else if (
+              staleRangeRef.current &&
+              !isRangeLoaded(itemsRef.current, viewRangeRef.current)
+            ) {
+              // 数据变化取消了正在补读的可见行时，补完该次滚动，避免占位行一直无法加载。
+              void fetchRange(
+                viewRangeRef.current.start - PRELOAD_ROWS,
+                viewRangeRef.current.end + PRELOAD_ROWS,
+                { token: requestTokenRef.current },
+              );
+            }
+          }
+        }),
+      );
     },
     [
       addLoadingRange,
@@ -146,9 +168,18 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     ],
   );
 
+  /** 标记排序位置可能已变化，但不主动刷新正在浏览的已加载行。 */
+  const invalidate = useCallback(() => {
+    requestTokenRef.current += 1;
+    staleRangeRef.current = true;
+    resetLoadingRanges();
+  }, [resetLoadingRanges]);
+
   const reload = useCallback(() => {
+    itemsRef.current = new Map();
     const token = requestTokenRef.current + 1;
     requestTokenRef.current = token;
+    staleRangeRef.current = false;
     resetLoadingRanges();
     if (!loadedInitialRef.current) {
       commitItems(new Map());
@@ -163,7 +194,6 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
 
     void fetchRange(0, PAGE_SIZE - 1, {
       force: true,
-      replace: true,
       token,
     });
   }, [
@@ -177,6 +207,7 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
   const resetAndReload = useCallback(() => {
     const token = requestTokenRef.current + 1;
     requestTokenRef.current = token;
+    staleRangeRef.current = false;
     resetLoadingRanges();
     commitItems(new Map());
     commitTotal(0);
@@ -189,7 +220,6 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
 
     void fetchRange(0, PAGE_SIZE - 1, {
       force: true,
-      replace: true,
       token,
     });
   }, [
@@ -203,13 +233,13 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
   const reloadCurrentRange = useCallback(async () => {
     const token = requestTokenRef.current + 1;
     requestTokenRef.current = token;
+    staleRangeRef.current = false;
     resetLoadingRanges();
     commitItems(new Map());
 
     const { end, start } = viewRangeRef.current;
     await fetchRange(start - PRELOAD_ROWS, end + PRELOAD_ROWS, {
       force: true,
-      replace: true,
       token,
     });
   }, [commitItems, fetchRange, resetLoadingRanges]);
@@ -262,6 +292,12 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
       const removeIndex = getItemIndexById(id);
       if (removeIndex === null) return;
 
+      const token = requestTokenRef.current + 1;
+      requestTokenRef.current = token;
+      resetLoadingRanges();
+      const wasStale = staleRangeRef.current;
+      staleRangeRef.current = false;
+
       const nextItems = new Map<number, ClipboardItem>();
       for (const [index, item] of itemsRef.current) {
         if (item.id === id) continue;
@@ -273,31 +309,46 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
       trimCache(nextItems, viewRangeRef.current, nextTotal);
       commitItems(nextItems);
       commitTotal(nextTotal);
+      if (wasStale) itemsRef.current = new Map();
       void fetchRange(
         viewRangeRef.current.start - PRELOAD_ROWS,
         viewRangeRef.current.end + PRELOAD_ROWS,
         {
           force: true,
-          token: requestTokenRef.current,
+          token,
         },
       );
     },
-    [commitItems, commitTotal, fetchRange, getItemIndexById],
+    [
+      commitItems,
+      commitTotal,
+      fetchRange,
+      getItemIndexById,
+      resetLoadingRanges,
+    ],
   );
 
   const patchItemById = useCallback(
     (id: string, patch: Partial<ClipboardItem>) => {
+      const token = requestTokenRef.current + 1;
+      requestTokenRef.current = token;
+      resetLoadingRanges();
       const index = getItemIndexById(id);
-      if (index === null) return;
+      const current = index === null ? null : itemsRef.current.get(index);
 
-      const current = itemsRef.current.get(index);
-      if (!current) return;
+      if (index !== null && current) {
+        const nextItems = new Map(itemsRef.current);
+        nextItems.set(index, { ...current, ...patch });
+        commitItems(nextItems);
+      }
 
-      const nextItems = new Map(itemsRef.current);
-      nextItems.set(index, { ...current, ...patch });
-      commitItems(nextItems);
+      void fetchRange(
+        viewRangeRef.current.start - PRELOAD_ROWS,
+        viewRangeRef.current.end + PRELOAD_ROWS,
+        { token },
+      );
     },
-    [commitItems, getItemIndexById],
+    [commitItems, fetchRange, getItemIndexById, resetLoadingRanges],
   );
 
   useEffect(() => {
@@ -311,6 +362,12 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
       sort: query.sort,
     };
     resetAndReload();
+
+    return () => {
+      requestTokenRef.current += 1;
+      staleRangeRef.current = false;
+      loadingRangesRef.current = [];
+    };
   }, [
     resetAndReload,
     query.favorite,
@@ -326,6 +383,7 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     findItemById,
     getItem,
     getItemIndexById,
+    invalidate,
     loadedInitial,
     loadedItems: items,
     loading,
@@ -372,20 +430,15 @@ function isRangeLoaded(
   return true;
 }
 
-function hasCoveringLoadingRange(
-  ranges: ClipboardItemsRange[],
-  target: ClipboardItemsRange,
-) {
-  return ranges.some((range) => {
-    return range.start <= target.start && range.end >= target.end;
-  });
-}
-
 function trimCache(
   items: Map<number, ClipboardItem>,
   viewRange: ClipboardItemsRange,
   total: number,
 ) {
+  for (const [index] of items) {
+    if (index >= total) items.delete(index);
+  }
+
   if (items.size <= CACHE_MAX_ROWS) return;
 
   const center = Math.floor((viewRange.start + viewRange.end) / 2);

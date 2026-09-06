@@ -1,3 +1,4 @@
+use super::activity::SyncActivityGuard;
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
@@ -187,6 +188,7 @@ fn encrypt_blob_with_nonce(
     key: &[u8; 32],
     stream_nonce: [u8; STREAM_NONCE_LEN],
 ) -> Result<FingerprintedBlob> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let source_size = source
         .metadata()
         .with_context(|| format!("failed to stat sync source {source:?}"))?
@@ -201,8 +203,11 @@ fn encrypt_blob_with_nonce(
         .with_context(|| format!("failed to create encrypted sync blob {temporary:?}"))?;
     let mut reader = BufReader::new(input);
     let mut writer = BufWriter::new(output);
+    let mut ciphertext_hasher = blake3::Hasher::new();
     writer.write_all(BLOB_MAGIC)?;
+    ciphertext_hasher.update(BLOB_MAGIC);
     writer.write_all(&stream_nonce)?;
+    ciphertext_hasher.update(&stream_nonce);
 
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).context("failed to initialize blob cipher")?;
@@ -220,6 +225,7 @@ fn encrypt_blob_with_nonce(
             .encrypt_last(&[][..])
             .map_err(|_| anyhow::anyhow!("failed to encrypt empty blob"))?;
         writer.write_all(&ciphertext)?;
+        ciphertext_hasher.update(&ciphertext);
     } else {
         while remaining > 0 {
             let length = usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE);
@@ -240,12 +246,13 @@ fn encrypt_blob_with_nonce(
                     .map_err(|_| anyhow::anyhow!("failed to encrypt blob chunk"))?
             };
             writer.write_all(&ciphertext)?;
+            ciphertext_hasher.update(&ciphertext);
         }
     }
     writer.flush()?;
     drop(writer);
 
-    let blob_id = hash_file(&temporary)?;
+    let blob_id = ciphertext_hasher.finalize().to_hex().to_string();
     let destination = blob_path(blob_root, &blob_id)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -274,6 +281,7 @@ pub fn decrypt_blob(
     original_size: u64,
     key: &[u8; 32],
 ) -> Result<()> {
+    let _sync_activity = SyncActivityGuard::acquire();
     decrypt_blob_with_fingerprint(encrypted, destination, original_size, key).map(|_| ())
 }
 
@@ -381,6 +389,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
 
 /// 把目录压缩为 ZIP，并在同一次读取中计算与绝对路径、遍历顺序无关的目录树指纹。
 pub fn archive_directory(source: &Path, destination: &Path) -> Result<ArchivedDirectory> {
+    let _sync_activity = SyncActivityGuard::acquire();
     let output = File::create(destination)?;
     let mut archive = ZipWriter::new(BufWriter::new(output));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -572,6 +581,85 @@ mod tests {
 
         assert_eq!(fs::read(destination).unwrap(), bytes);
         assert_eq!(decrypted_hash, blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    /// 独立按 ECOSBL01 格式组装 AEAD nonce，固定格式并避免复用被测 STREAM 写入路径。
+    fn encode_blob_reference(plaintext: &[u8], key: &[u8; 32], stream_nonce: &[u8; 19]) -> Vec<u8> {
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let mut encoded = b"ECOSBL01".to_vec();
+        encoded.extend_from_slice(stream_nonce);
+        let chunk_count = plaintext.len().div_ceil(64 * 1024).max(1);
+
+        for index in 0..chunk_count {
+            let mut nonce = [0_u8; 24];
+            nonce[..19].copy_from_slice(stream_nonce);
+            nonce[19..23].copy_from_slice(&(index as u32).to_be_bytes());
+            nonce[23] = u8::from(index + 1 == chunk_count);
+            let start = index * 64 * 1024;
+            let end = plaintext.len().min(start + 64 * 1024);
+            let ciphertext = cipher
+                .encrypt(XNonce::from_slice(&nonce), &plaintext[start..end])
+                .unwrap();
+            encoded.extend_from_slice(&ciphertext);
+        }
+
+        encoded
+    }
+
+    #[test]
+    fn blob_stream_preserves_wire_bytes_and_blob_id_at_chunk_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let blob_root = directory.path().join("blobs");
+        let key = [5_u8; 32];
+        let nonce = [9_u8; 19];
+
+        for size in [
+            0,
+            1,
+            CHUNK_SIZE - 1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            CHUNK_SIZE * 2,
+            CHUNK_SIZE * 2 + 17,
+        ] {
+            let bytes = (0..size)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            fs::write(&source, &bytes).unwrap();
+            let reference = encode_blob_reference(&bytes, &key, &nonce);
+            let expected_id = blake3::hash(&reference).to_hex().to_string();
+            let expected_plaintext_hash = blake3::hash(&bytes).to_hex().to_string();
+
+            let encrypted = encrypt_blob_with_nonce(&source, &blob_root, &key, nonce).unwrap();
+            let encrypted_path = Path::new(&encrypted.blob.encrypted_path);
+
+            assert_eq!(fs::read(encrypted_path).unwrap(), reference, "size={size}");
+            assert_eq!(encrypted.blob.blob_id, expected_id, "size={size}");
+            assert_eq!(
+                hash_file(encrypted_path).unwrap(),
+                expected_id,
+                "size={size}"
+            );
+            assert_eq!(encrypted.blob.size, reference.len() as u64, "size={size}");
+            assert_eq!(
+                encrypted.plaintext_hash, expected_plaintext_hash,
+                "size={size}"
+            );
+            assert_eq!(
+                encrypted_path,
+                blob_path(&blob_root, &expected_id).unwrap(),
+                "size={size}"
+            );
+
+            let decrypted_hash =
+                decrypt_blob_with_fingerprint(encrypted_path, &destination, size as u64, &key)
+                    .unwrap();
+
+            assert_eq!(fs::read(&destination).unwrap(), bytes, "size={size}");
+            assert_eq!(decrypted_hash, expected_plaintext_hash, "size={size}");
+        }
     }
 
     #[test]

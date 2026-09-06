@@ -1,5 +1,5 @@
 use crate::{sender::MdnsMsg, Peer, TxtData};
-use acto::{ActoCell, ActoRef, ActoRuntime};
+use acto::{ActoCell, ActoInput, ActoRef, ActoRuntime};
 use hickory_proto::{
     op::Message,
     rr::{DNSClass, Name, RData, RecordType},
@@ -10,24 +10,32 @@ use tokio::net::UdpSocket;
 
 /// Errors that can occur when receiving on the socket.
 #[derive(Debug, Error)]
-#[error("Could not receive from the socket")]
-pub struct ReceiverError {
-    #[from]
-    source: std::io::Error,
+pub enum ReceiverError {
+    #[error("Could not receive from the socket")]
+    Io(#[from] std::io::Error),
+    #[error("Interface receiver was stopped")]
+    Stopped,
 }
 
 pub async fn receiver(
-    _ctx: ActoCell<(), impl ActoRuntime>,
+    mut ctx: ActoCell<(), impl ActoRuntime>,
     service_name: Name,
     socket: Arc<UdpSocket>,
     target: ActoRef<MdnsMsg>,
 ) -> Result<(), ReceiverError> {
     let mut buf = [0; 1472];
+    let mut accept_stop = true;
     loop {
-        let (len, addr) = socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(ReceiverError::from)?;
+        let (len, addr) = tokio::select! {
+            input = ctx.recv(), if accept_stop => {
+                if matches!(input, ActoInput::Message(())) {
+                    return Err(ReceiverError::Stopped);
+                }
+                accept_stop = false;
+                continue;
+            }
+            received = socket.recv_from(&mut buf) => received.map_err(ReceiverError::from)?,
+        };
         let msg = &buf[..len];
         tracing::trace!("received {} bytes from {}", len, addr);
         if let Some(msg) = handle_msg(msg, &service_name, addr.ip()) {

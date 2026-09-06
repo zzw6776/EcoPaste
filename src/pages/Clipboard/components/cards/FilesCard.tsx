@@ -18,7 +18,12 @@ const FilesCard: FC<ClipboardItem> = (props) => {
 
   if (props.filesPreviewKind === "imagePreview") {
     const [first] = entries;
-    return <ImageCard {...props} imageThumbnailPath={first?.path} />;
+    return (
+      <ImageCard
+        {...props}
+        imageThumbnailPath={props.imageThumbnailPath ?? first?.path}
+      />
+    );
   }
 
   return (

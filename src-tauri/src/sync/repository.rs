@@ -1446,6 +1446,145 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn origin_index_upgrade_preserves_per_target_outbox_and_cursor_order() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(10, &pool).await.unwrap();
+        for (id, sequence, origin) in [
+            ("first", 8, "local"),
+            ("remote", 4, "other"),
+            ("last", 2, "local"),
+        ] {
+            let mut event = test_event(id, sequence);
+            event.origin_device_id = origin.to_owned();
+            insert_event(&pool, &event, true, &[]).await.unwrap();
+        }
+        mark_delivered(&pool, "cloud", &["first".to_owned()])
+            .await
+            .unwrap();
+        let ids = |events: Vec<StoredSyncEvent>| {
+            events
+                .into_iter()
+                .map(|stored| stored.event.event_id)
+                .collect::<Vec<_>>()
+        };
+        let before = ids(
+            pending_origin_events_for_target(&pool, "cloud", "local", 10)
+                .await
+                .unwrap(),
+        );
+        migrator.run(&pool).await.unwrap();
+        assert_eq!(
+            ids(
+                pending_origin_events_for_target(&pool, "cloud", "local", 10)
+                    .await
+                    .unwrap()
+            ),
+            before
+        );
+        assert_eq!(before, ["last"]);
+        assert_eq!(
+            ids(
+                pending_origin_events_for_target(&pool, "another", "local", 10)
+                    .await
+                    .unwrap()
+            ),
+            ["first", "last"]
+        );
+        assert_eq!(
+            ids(
+                pending_origin_events_for_target(&pool, "another", "local", 1)
+                    .await
+                    .unwrap()
+            ),
+            ["first"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unapplied_index_upgrade_preserves_order_limits_and_applied_state() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(8, &pool).await.unwrap();
+        for (id, sequence, applied) in [
+            ("already-applied", 1, true),
+            ("pending-z", 4, false),
+            ("pending-a", 2, false),
+            ("pending-m", 3, false),
+        ] {
+            insert_event(&pool, &test_event(id, sequence), applied, &[])
+                .await
+                .unwrap();
+        }
+        let before = unapplied_events(&pool, 10).await.unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|stored| stored.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["pending-z", "pending-a", "pending-m"]
+        );
+
+        migrator.run(&pool).await.unwrap();
+
+        for limit in [0, 1, 2, 10] {
+            let after = unapplied_events(&pool, limit).await.unwrap();
+            let expected_len = usize::from(limit).min(before.len());
+            assert_eq!(after.len(), expected_len);
+            for (actual, expected) in after.iter().zip(&before[..expected_len]) {
+                assert_eq!(actual.cursor, expected.cursor);
+                assert_eq!(actual.event, expected.event);
+            }
+        }
+        let plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT cursor, event_id, origin_device_id, origin_sequence,
+                   event_created_at_ms, nonce, ciphertext
+            FROM sync_events
+            WHERE is_applied = 0
+            ORDER BY cursor ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(10_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get("detail")).collect();
+        assert!(details
+            .iter()
+            .any(|detail| detail.contains("idx_sync_events_unapplied_cursor")));
+        assert!(!details.iter().any(|detail| detail.contains("TEMP B-TREE")));
+
+        mark_applied(&pool, "pending-z").await.unwrap();
+        insert_event(&pool, &test_event("pending-new", 5), false, &[])
+            .await
+            .unwrap();
+        let pending = unapplied_events(&pool, 10).await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|stored| stored.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["pending-a", "pending-m", "pending-new"]
+        );
+
+        for stored in pending {
+            mark_applied(&pool, &stored.event.event_id).await.unwrap();
+        }
+        assert!(unapplied_events(&pool, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn any_successful_route_clears_the_pending_event_count() {
         let pool = memory_pool().await;
         insert_test_event(&pool, "event-1").await;

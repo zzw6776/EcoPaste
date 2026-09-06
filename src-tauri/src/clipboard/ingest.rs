@@ -103,10 +103,23 @@ fn inspect_file_payload(files: &[String]) -> (String, Option<i64>) {
 }
 
 /// 统计一张文件卡片的原始内容总大小；目录只累计其内部普通文件，不计目录节点与压缩开销。
-pub(crate) fn calculate_files_total_size(content: &str) -> AnyhowResult<i64> {
+#[cfg(test)]
+fn calculate_files_total_size(content: &str) -> AnyhowResult<i64> {
+    calculate_files_total_size_cancellable(content, || false)?
+        .context("file size calculation cancelled")
+}
+
+/// 每个目录条目检查取消信号；已失效的记录无需遍历剩余目录。
+fn calculate_files_total_size_cancellable(
+    content: &str,
+    cancelled: impl Fn() -> bool,
+) -> AnyhowResult<Option<i64>> {
     let mut total_size = 0_u64;
     let mut has_path = false;
     for value in content.lines().filter(|value| !value.is_empty()) {
+        if cancelled() {
+            return Ok(None);
+        }
         has_path = true;
         let path = Path::new(value);
         let metadata = path
@@ -120,6 +133,9 @@ pub(crate) fn calculate_files_total_size(content: &str) -> AnyhowResult<i64> {
         }
 
         for entry in WalkDir::new(path).follow_links(false) {
+            if cancelled() {
+                return Ok(None);
+            }
             let entry = entry.with_context(|| format!("failed to walk clipboard path {path:?}"))?;
             if !entry.file_type().is_file() {
                 continue;
@@ -137,7 +153,56 @@ pub(crate) fn calculate_files_total_size(content: &str) -> AnyhowResult<i64> {
         anyhow::bail!("clipboard file list is empty");
     }
 
-    i64::try_from(total_size).context("clipboard file size exceeds supported range")
+    i64::try_from(total_size)
+        .map(Some)
+        .context("clipboard file size exceeds supported range")
+}
+
+/// 统计期间低频核对数据库版本，删除或重新复制后取消旧任务；并发限制在两次遍历。
+pub(crate) async fn calculate_current_file_item_size(
+    pool: &sqlx::SqlitePool,
+    item: &ClipboardItem,
+) -> AnyhowResult<Option<i64>> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    };
+    static PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let permit = PERMITS.clone().acquire_owned().await?;
+    let is_current = async || -> AnyhowResult<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM clipboard_items WHERE id = ? AND source_revision = ?)",
+        )
+        .bind(&item.id)
+        .bind(&item.source_revision)
+        .fetch_one(pool)
+        .await?)
+    };
+    if !is_current().await? {
+        return Ok(None);
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let content = item.content.clone();
+    let mut task = tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        calculate_files_total_size_cancellable(&content, || cancelled.load(Ordering::Relaxed))
+    });
+    loop {
+        tokio::select! {
+            result = &mut task => return result.context("file size task failed")?,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if !is_current().await? { return Ok(None); }
+            }
+        }
+    }
 }
 
 /// 文本载荷 → 草稿。优先级来自用户配置：
@@ -827,6 +892,26 @@ mod tests {
 
         assert_eq!(item.size, Some(8));
         assert_eq!(item.file_types.as_deref(), Some("f,f"));
+    }
+
+    #[test]
+    fn obsolete_directory_walk_stops_before_reading_remaining_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..10 {
+            std::fs::write(temp.path().join(index.to_string()), b"content").unwrap();
+        }
+        let checks = std::cell::Cell::new(0);
+        let result = calculate_files_total_size_cancellable(&temp.path().to_string_lossy(), || {
+            checks.set(checks.get() + 1);
+            checks.get() == 4
+        })
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(checks.get(), 4);
+        assert_eq!(
+            calculate_files_total_size(&temp.path().to_string_lossy()).unwrap(),
+            70
+        );
     }
 
     #[test]

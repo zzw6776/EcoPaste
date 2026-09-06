@@ -22,6 +22,7 @@ import ScrollArea from "@/components/ScrollArea";
 import { TAURI_EVENT } from "@/constants/events";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { settingsState } from "@/stores/settings";
 import { preloadSourceApps, reloadSourceApps } from "@/stores/sourceApps";
 import type { Settings } from "@/types/settings";
@@ -70,6 +71,7 @@ interface AppMetadata {
  * EcoPaste 偏好设置：以用户心智组织设置，而非代码模块。
  */
 const Preference: FC = () => {
+  useWindowReady();
   const { t } = useTranslation("preferences");
   const settings = useSnapshot(settingsState) as Settings;
   const shouldReduceMotion = useReducedMotion();
