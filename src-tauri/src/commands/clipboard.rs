@@ -765,9 +765,9 @@ pub async fn list_clipboard_items(
     let file_entry_limit = settings.clipboard.display.file_entry_limit();
     let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
     for item in &mut items {
-        attach_image_thumbnail_path(&image_store, item).await?;
         attach_source_app_icon_path(&app_icon_store, item);
         attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
+        attach_image_thumbnail_path(&image_store, item).await?;
         attach_color_preview(item);
         attach_display_created_at(item, &now);
         redact_sensitive_list_item(item, redact_sensitive);
@@ -801,9 +801,9 @@ pub async fn get_clipboard_item(
         let settings = app.state::<SettingsStore>().snapshot();
         let file_entry_limit = settings.clipboard.display.file_entry_limit();
         let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
-        attach_image_thumbnail_path(&image_store, item).await?;
         attach_source_app_icon_path(&app_icon_store, item);
         attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
+        attach_image_thumbnail_path(&image_store, item).await?;
         attach_color_preview(item);
         attach_display_created_at(item, &Local::now());
         redact_sensitive_list_item(item, redact_sensitive);
@@ -815,6 +815,18 @@ pub async fn get_clipboard_item(
 /// 为 image 条目补齐缩略图绝对路径，前端可直接渲染。
 /// 历史脏数据（非 `<hash>.png`）或缩略图生成失败时降级为 `None`，不影响列表返回。
 async fn attach_image_thumbnail_path(store: &ImageStore, item: &mut ClipboardItem) -> Result<()> {
+    if item.files_preview_kind == Some(crate::db::models::FilesPreviewKind::ImagePreview) {
+        if let Some(entry) = item
+            .file_entries
+            .as_deref()
+            .and_then(|entries| entries.first())
+        {
+            if let Ok(path) = store.file_thumbnail_for_list(std::path::Path::new(&entry.path)) {
+                item.image_thumbnail_path = path.to_str().map(str::to_owned);
+            }
+        }
+        return Ok(());
+    }
     if item.kind != ClipboardKind::Image {
         return Ok(());
     }

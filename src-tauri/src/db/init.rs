@@ -252,9 +252,165 @@ mod tests {
     fn decode_checksum(checksum: &str) -> Vec<u8> {
         checksum
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn search_index_upgrade_preserves_content_and_skips_unchanged_text() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str("sqlite::memory:")
+                    .unwrap()
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(8, &pool).await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO clipboard_items (
+                id, kind, content, content_hash, search_text, note,
+                platform, created_at, updated_at
+            ) VALUES (
+                'retained', 'text', 'alphabody', 'hash', 'alphabody', 'alphamemo',
+                'macos', '2026-01-01', '2026-01-01'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrator.run(&pool).await.unwrap();
+        migrator.run(&pool).await.unwrap();
+        assert_fts_matches(&pool, "alphabody", &["retained"]).await;
+        assert_fts_matches(&pool, "alphamemo", &["retained"]).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO clipboard_groups (id, name, icon, created_at, updated_at)
+            VALUES ('group', 'group', 'folder', '2026-01-01', '2026-01-01')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = total_changes(&pool).await;
+        sqlx::query(
+            r#"
+            UPDATE clipboard_items SET
+                is_favorite = 1, is_pinned = 1, group_id = 'group',
+                use_count = use_count + 1, updated_at = '2026-01-02'
+            WHERE id = 'retained'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total_changes(&pool).await - before, 1);
+
+        let mut previous = (Some("alphabody"), Some("alphamemo"));
+        for (search_text, note) in [
+            previous,
+            (Some("betabody"), Some("alphamemo")),
+            (Some("betabody"), Some("betamemo")),
+            (None, Some("betamemo")),
+            (None, None),
+            (None, None),
+            (Some(""), Some("")),
+            (Some(""), Some("")),
+            (Some("alphabody"), None),
+            (Some("alphabody"), Some("alphamemo")),
+        ] {
+            let before = total_changes(&pool).await;
+            sqlx::query(
+                "UPDATE clipboard_items SET search_text = ?, note = ? WHERE id = 'retained'",
+            )
+            .bind(search_text)
+            .bind(note)
+            .execute(&pool)
+            .await
+            .unwrap();
+            if previous == (search_text, note) {
+                assert_eq!(total_changes(&pool).await - before, 1);
+            }
+
+            for token in ["alphabody", "betabody", "alphamemo", "betamemo"] {
+                let expected: &[&str] = if search_text == Some(token) || note == Some(token) {
+                    &["retained"]
+                } else {
+                    &[]
+                };
+                assert_fts_matches(&pool, token, expected).await;
+            }
+            sqlx::query(
+                "INSERT INTO clipboard_items_fts(clipboard_items_fts, rank) VALUES ('integrity-check', 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            previous = (search_text, note);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO clipboard_items (
+                id, kind, content, content_hash, search_text, platform, created_at, updated_at
+            ) VALUES (
+                'inserted', 'text', 'alphabody', 'new-hash', 'alphabody',
+                'macos', '2026-01-02', '2026-01-02'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_fts_matches(&pool, "alphabody", &["inserted", "retained"]).await;
+
+        sqlx::query("DELETE FROM clipboard_items WHERE id = 'retained'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_fts_matches(&pool, "alphabody", &["inserted"]).await;
+        assert_fts_matches(&pool, "alphamemo", &[]).await;
+        sqlx::query(
+            "INSERT INTO clipboard_items_fts(clipboard_items_fts, rank) VALUES ('integrity-check', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    /// 单连接测试库的累计写入数包含 FTS 影子表，可区分仅更新主表和重建索引。
+    async fn total_changes(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// 通过 MATCH 读取真实倒排索引，避免外部内容表的普通 SELECT 掩盖失效索引。
+    async fn assert_fts_matches(pool: &SqlitePool, token: &str, expected: &[&str]) {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM clipboard_items
+            WHERE rowid IN (
+                SELECT rowid FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ?
+            )
+            ORDER BY id
+            "#,
+        )
+        .bind(token)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(ids, expected, "search token: {token}");
     }
 
     #[tokio::test]

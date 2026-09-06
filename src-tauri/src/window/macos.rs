@@ -183,12 +183,13 @@ fn supports_liquid_glass() -> bool {
     unsafe { NSAppKitVersionNumber >= MIN_APPKIT_VERSION_LIQUID_GLASS }
 }
 
-/// 禁用 macOS App Nap，确保长时间未唤醒时依然保持 0 毫秒即时响应。
+/// 保留交互响应与 App Nap 策略，允许系统按用户设置自动休眠。
 pub fn disable_app_nap() {
     use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
     let process_info = NSProcessInfo::processInfo();
     let reason = NSString::from_str("Keep clipboard manager responsive for global hotkeys");
-    let options = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+    let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+        | NSActivityOptions::LatencyCritical;
     let activity = process_info.beginActivityWithOptions_reason(options, &reason);
     std::mem::forget(activity);
 }

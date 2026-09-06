@@ -279,21 +279,11 @@ impl Repository {
             .collect()
     }
 
+    #[cfg(test)]
     pub async fn latest_removed_at_ms(&self, group_id: &str) -> Result<i64> {
-        let value: Option<i64> = sqlx::query_scalar(
-            r#"
-                SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0)))
-                FROM removed_devices WHERE group_id = ?
-                "#,
-        )
-        .bind(group_id)
-        .fetch_one(&self.pool)
-        .await
-        .context("read latest removed device timestamp")?;
-        Ok(value.unwrap_or(0))
+        Ok(self.group_watermarks(group_id).await?.1)
     }
 
-    /// Inserts encrypted events and returns the IDs accepted by this hub.
     pub async fn insert_events(
         &self,
         group_id: &str,
@@ -391,6 +381,24 @@ impl Repository {
             .map(|value| u64::try_from(value).context("negative event cursor"))
             .transpose()
             .map(|value| value.unwrap_or(0))
+    }
+
+    /// 同一快照读取事件与成员变更水位，减少长连接唤醒时的数据库往返。
+    pub async fn group_watermarks(&self, group_id: &str) -> Result<(u64, i64)> {
+        let (cursor, removed): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0), \
+             COALESCE((SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0))) \
+             FROM removed_devices WHERE group_id = ?), 0)",
+        )
+        .bind(group_id)
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("read sync group watermarks")?;
+        Ok((
+            u64::try_from(cursor).context("negative event cursor")?,
+            removed,
+        ))
     }
 
     /// Reads one newest-first page without changing any device delivery cursor.
@@ -586,6 +594,61 @@ fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn combined_watermarks_preserve_group_isolation_and_restoration() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        for group in ["group_123", "group_456"] {
+            repository.create_group(group, &[7; 32]).await.unwrap();
+        }
+        assert_eq!(
+            repository.group_watermarks("group_123").await.unwrap(),
+            (0, 0)
+        );
+        let event = EncryptedEvent {
+            event_id: "event_123".into(),
+            origin_device_id: "device_123".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![1],
+        };
+        repository
+            .insert_events("group_123", &[event])
+            .await
+            .unwrap();
+        let removed = RemovedDevice {
+            device_id: "device_456".into(),
+            endpoint_id: "endpoint_456".into(),
+            removed_at_ms: 100,
+            restored_at_ms: Some(200),
+        };
+        repository
+            .merge_removed_devices("group_123", std::slice::from_ref(&removed))
+            .await
+            .unwrap();
+        repository
+            .merge_removed_devices(
+                "group_456",
+                &[RemovedDevice {
+                    removed_at_ms: 999,
+                    ..removed
+                }],
+            )
+            .await
+            .unwrap();
+        let (cursor, removed) = repository.group_watermarks("group_123").await.unwrap();
+        assert_eq!(cursor, repository.latest_cursor("group_123").await.unwrap());
+        assert!(cursor > 0);
+        assert_eq!(removed, 200);
+        assert_eq!(
+            repository.group_watermarks("group_456").await.unwrap(),
+            (0, 999)
+        );
+    }
 
     #[tokio::test]
     async fn group_authentication_is_idempotent() {

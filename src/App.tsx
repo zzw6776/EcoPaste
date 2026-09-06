@@ -11,7 +11,6 @@ import { use, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { RouterProvider } from "react-router";
 import { useSnapshot } from "valtio";
-import { notifyWindowReady } from "@/commands";
 import { minimizeAndroidApp } from "@/commands/android";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
@@ -162,10 +161,7 @@ const App: FC = () => {
     void i18n.changeLanguage(language);
   }, [i18n, language]);
 
-  // settingsReady 已由 use() gate，挂载即视为前端基础初始化完成；回报 Rust 推进窗口到 ready 阶段。
-  // notifyWindowReady 内部已吞掉并记录失败，这里无需再 try/catch。
-  useMount(async () => {
-    await notifyWindowReady(getCurrentWebviewWindow().label);
+  useMount(() => {
     if (isAndroid) {
       if (!settings.onboarding.completed) {
         void router.navigate("/onboarding", { replace: true });

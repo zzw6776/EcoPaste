@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use blake3::Hasher;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::{watch, Mutex, Semaphore};
 
 use super::payload::ImagePayload;
@@ -148,6 +148,7 @@ pub struct StoredImage {
 pub struct ImageStore {
     images_root: Arc<RwLock<PathBuf>>,
     thumbnail_coordinator: Arc<ThumbnailCoordinator>,
+    file_thumbnail_root: Arc<PathBuf>,
 }
 
 impl ImageStore {
@@ -155,6 +156,12 @@ impl ImageStore {
     pub fn new(app: &AppHandle) -> Result<Self> {
         let images_root = crate::core::paths::resources_dir(app)?.join(IMAGES_DIR);
         Ok(Self {
+            file_thumbnail_root: Arc::new(
+                app.path()
+                    .app_cache_dir()
+                    .context("failed to resolve thumbnail cache")?
+                    .join("file-thumbnails"),
+            ),
             images_root: Arc::new(RwLock::new(images_root)),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
         })
@@ -163,6 +170,7 @@ impl ImageStore {
     #[cfg(test)]
     pub(crate) fn for_test(images_root: PathBuf) -> Self {
         Self {
+            file_thumbnail_root: Arc::new(images_root.join("file-thumbnails")),
             images_root: Arc::new(RwLock::new(images_root)),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
         }
@@ -224,6 +232,41 @@ impl ImageStore {
             })
             .await
             .map_err(ThumbnailFailure::into_app_error)
+    }
+
+    /// 列表立即使用已有缩略图，首次访问在共享有界队列中生成，保留原图作为当前回退。
+    pub fn file_thumbnail_for_list(&self, source: &Path) -> Result<PathBuf> {
+        let Some(target) = super::file_thumbnail::cache_path(&self.file_thumbnail_root, source)?
+        else {
+            return Ok(source.to_path_buf());
+        };
+        if target.exists() {
+            return Ok(target);
+        }
+        if target.with_extension("original").exists() {
+            return Ok(source.to_path_buf());
+        }
+        let store = self.clone();
+        let origin = source.to_path_buf();
+        tauri::async_runtime::spawn(async move {
+            let root = store.file_thumbnail_root.clone();
+            let key = target.clone();
+            let result = store
+                .thumbnail_coordinator
+                .run(key, || async move {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        super::file_thumbnail::generate(&root, &origin, &target)
+                            .map_err(|error| ThumbnailFailure::Other(error.to_string()))
+                    })
+                    .await
+                    .map_err(|error| ThumbnailFailure::Other(error.to_string()))?
+                })
+                .await;
+            if let Err(error) = result {
+                log::debug!("file thumbnail generation failed: {error:?}");
+            }
+        });
+        Ok(source.to_path_buf())
     }
 
     /// 删除一张图片的原图与缩略图。缩略图懒生成、可能不存在，缺失文件视作成功（幂等）。

@@ -21,6 +21,7 @@ import {
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import type { ClipboardAction } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
 import { formatShortcutDisplay } from "@/utils/shortcut";
@@ -55,6 +56,7 @@ const ContextMenu: FC = () => {
   const [payload, setPayload] = useState<ContextMenuShowPayload | null>(null);
   const [activeSubmenuAction, setActiveSubmenuAction] =
     useState<ClipboardAction | null>(null);
+  useWindowReady(payload !== null);
 
   useTauriListen<ContextMenuShowPayload>(
     TAURI_EVENT.CONTEXT_MENU_SHOW,
@@ -235,6 +237,7 @@ const ContextMenuItem: FC<ContextMenuItemProps> = (props) => {
  */
 export const ContextSubmenu: FC = () => {
   const [payload, setPayload] = useState<ShowContextSubmenuInput | null>(null);
+  useWindowReady(payload !== null);
 
   useTauriListen<ShowContextSubmenuInput>(
     TAURI_EVENT.CONTEXT_SUBMENU_SHOW,

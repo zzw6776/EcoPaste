@@ -1,7 +1,7 @@
 //! OS 级剪贴板监听：把 [`clipboard_rs`] 的 watcher 接到「读取 → 去重入库 → emit」闭环。
 //!
-//! [`clipboard_rs`] 内部已实现 macOS（`NSPasteboard.changeCount` 轮询）/ Windows
-//! （`AddClipboardFormatListener` → `WM_CLIPBOARDUPDATE`）的平台监听，这里不重复造。
+//! macOS 使用可暂停的 `NSPasteboard.changeCount` 轮询；Windows 复用
+//! [`clipboard_rs`] 的 `AddClipboardFormatListener` → `WM_CLIPBOARDUPDATE` 事件监听。
 //!
 //! 线程模型：`ClipboardWatcherContext::start_watch()` 是阻塞调用，故整个监听跑在独立
 //! `std::thread` 上。`ClipboardContext` 等平台句柄**在该线程内构造**，不跨线程移动，
@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 #[cfg(not(target_os = "android"))]
-use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
+use clipboard_rs::ClipboardHandler;
+#[cfg(target_os = "windows")]
+use clipboard_rs::{ClipboardWatcher, ClipboardWatcherContext};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
@@ -24,7 +26,7 @@ use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
 use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation};
 use super::guard::WritebackGuard;
-use super::ingest::{build_item_with_settings, calculate_files_total_size};
+use super::ingest::{build_item_with_settings, calculate_current_file_item_size};
 #[cfg(not(target_os = "android"))]
 use super::read::ClipboardReader;
 use super::sound;
@@ -40,9 +42,8 @@ use crate::settings::SettingsStore;
 /// 剪贴板更新事件名。前端监听此事件后增量刷新 / 重新拉取列表。
 pub const CLIPBOARD_UPDATED_EVENT: &str = "clipboard://updated";
 
-/// macOS 轮询 `changeCount` 的间隔。上游 clipboard-rs 默认 500ms，对复制响应（尤其图片）
-/// 偏慢；我们 fork 出 `new_with_interval` 后调到 120ms，跟手且 CPU 开销可忽略。
-/// Windows 走事件驱动（`WM_CLIPBOARDUPDATE`），此值被忽略。
+/// macOS 正常监听的 changeCount 采样间隔，暂停期间由条件变量等待恢复。
+/// Windows 使用事件驱动（WM_CLIPBOARDUPDATE），此值被忽略。
 #[cfg(not(target_os = "android"))]
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
@@ -71,18 +72,82 @@ fn read_with_retry<T, E>(
     result
 }
 
-/// 监听暂停开关。托盘菜单「停止监听」翻转，handler 早返回跳过整条入库链路。
-/// 用 `Arc<AtomicBool>` 跨线程共享；不停 watcher 线程本身，避免反复重建平台句柄。
-#[derive(Debug, Default, Clone)]
-pub struct WatcherPause(Arc<AtomicBool>);
+/// 暂停时保留平台句柄；macOS 通过条件变量休眠，恢复时重置变化计数基线。
+#[derive(Default, Clone)]
+pub struct WatcherPause(Arc<WatcherPauseState>);
+
+#[derive(Default)]
+struct WatcherPauseState {
+    paused: AtomicBool,
+    fingerprints: Arc<ClipboardFingerprintState>,
+    #[cfg(target_os = "macos")]
+    signal: std::sync::Mutex<(u64, isize)>,
+    #[cfg(target_os = "macos")]
+    wake: std::sync::Condvar,
+}
 
 impl WatcherPause {
     pub fn is_paused(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.paused.load(Ordering::Relaxed)
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.0.store(paused, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        let mut signal = self.0.signal.lock().expect("watcher pause poisoned");
+        if self.0.paused.swap(paused, Ordering::Relaxed) == paused {
+            return;
+        }
+        self.0.fingerprints.begin_observation();
+        #[cfg(target_os = "macos")]
+        {
+            signal.0 = signal.0.wrapping_add(1);
+            if !paused {
+                signal.1 = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
+            }
+            self.0.wake.notify_all();
+        }
+    }
+}
+
+/// 与上游保持相同的 changeCount 判断和采集间隔，暂停期间不再周期唤醒。
+#[cfg(target_os = "macos")]
+fn watch_macos(mut handler: ClipboardChangeHandler) {
+    let pause = handler.pause.clone();
+    let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+    let mut last_count = pasteboard.changeCount();
+    let mut signal = pause.0.signal.lock().expect("watcher pause poisoned");
+    let mut generation = signal.0;
+    loop {
+        if pause.is_paused() {
+            signal = pause
+                .0
+                .wake
+                .wait_while(signal, |_| pause.is_paused())
+                .expect("watcher pause poisoned");
+        }
+        if generation != signal.0 {
+            generation = signal.0;
+            last_count = signal.1;
+        }
+        let (next_signal, timeout) = pause
+            .0
+            .wake
+            .wait_timeout_while(signal, CLIPBOARD_POLL_INTERVAL, |value| {
+                !pause.is_paused() && value.0 == generation
+            })
+            .expect("watcher pause poisoned");
+        signal = next_signal;
+        if !timeout.timed_out() || pause.is_paused() || generation != signal.0 {
+            continue;
+        }
+        let count = pasteboard.changeCount();
+        let changed = last_count != 0 && count != last_count;
+        last_count = count;
+        drop(signal);
+        if changed {
+            handler.on_clipboard_change();
+        }
+        signal = pause.0.signal.lock().expect("watcher pause poisoned");
     }
 }
 
@@ -230,21 +295,12 @@ fn resolve_file_size_and_enqueue(
 ) {
     let app = app.clone();
     let pool = pool.clone();
-    let content = item.content.clone();
     tauri::async_runtime::spawn(async move {
-        let size = match tauri::async_runtime::spawn_blocking(move || {
-            calculate_files_total_size(&content)
-        })
-        .await
-        {
-            Ok(Ok(size)) => size,
-            Ok(Err(error)) => {
-                log::warn!("calculate clipboard file size failed: {error:#}");
-                crate::sync::enqueue_local_item(&app, item, observation);
-                return;
-            }
+        let size = match calculate_current_file_item_size(&pool, &item).await {
+            Ok(Some(size)) => size,
+            Ok(None) => return,
             Err(error) => {
-                log::warn!("clipboard file size task failed: {error}");
+                log::warn!("calculate clipboard file size failed: {error:#}");
                 crate::sync::enqueue_local_item(&app, item, observation);
                 return;
             }
@@ -278,22 +334,14 @@ fn spawn_file_size_backfill(app: AppHandle) {
         let candidate_count = items.len();
         let mut updated_count = 0_usize;
         for item in items {
-            let content = item.content.clone();
-            let size = match tauri::async_runtime::spawn_blocking(move || {
-                calculate_files_total_size(&content)
-            })
-            .await
-            {
-                Ok(Ok(size)) => size,
-                Ok(Err(error)) => {
+            let size = match calculate_current_file_item_size(&pool, &item).await {
+                Ok(Some(size)) => size,
+                Ok(None) => continue,
+                Err(error) => {
                     log::debug!(
                         "skip clipboard file size backfill for {}: {error:#}",
                         item.id
                     );
-                    continue;
-                }
-                Err(error) => {
-                    log::warn!("clipboard file size backfill task failed: {error}");
                     continue;
                 }
             };
@@ -345,7 +393,10 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     let registry = AppsRegistry::new(app.clone(), app_icon_store.clone());
     app.manage(registry.clone());
 
-    let pause = WatcherPause::default();
+    let pause = WatcherPause(Arc::new(WatcherPauseState {
+        fingerprints: fingerprints.clone(),
+        ..Default::default()
+    }));
     app.manage(pause.clone());
 
     // 启动期只把已落库的应用读进缓存；运行中应用由偏好页打开/刷新时补齐。
@@ -476,16 +527,7 @@ fn spawn_watch_thread(
                 }
             };
 
-            let mut watcher =
-                match ClipboardWatcherContext::new_with_interval(CLIPBOARD_POLL_INTERVAL) {
-                    Ok(watcher) => watcher,
-                    Err(err) => {
-                        log::error!("clipboard watcher: failed to create watcher: {err}");
-                        return;
-                    }
-                };
-
-            watcher.add_handler(ClipboardChangeHandler {
+            let handler = ClipboardChangeHandler {
                 reader,
                 app,
                 guard,
@@ -494,11 +536,24 @@ fn spawn_watch_thread(
                 app_icon_store,
                 registry,
                 pause,
-            });
+            };
 
             log::info!("clipboard watcher started");
-            // 阻塞直至进程退出。
-            watcher.start_watch();
+            #[cfg(target_os = "macos")]
+            watch_macos(handler);
+            #[cfg(target_os = "windows")]
+            {
+                let mut watcher =
+                    match ClipboardWatcherContext::new_with_interval(CLIPBOARD_POLL_INTERVAL) {
+                        Ok(watcher) => watcher,
+                        Err(err) => {
+                            log::error!("clipboard watcher: failed to create watcher: {err}");
+                            return;
+                        }
+                    };
+                watcher.add_handler(handler);
+                watcher.start_watch();
+            }
         })
         .expect("failed to spawn clipboard watcher thread");
 }

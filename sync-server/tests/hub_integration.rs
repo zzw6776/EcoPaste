@@ -150,6 +150,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         events: vec![next_event.clone()],
         removed_devices: vec![removed_device.clone()],
         limit: 100,
+        byte_limited: None,
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -311,6 +312,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
             restored_at_ms: None,
         }],
         limit: 100,
+        byte_limited: None,
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -358,6 +360,7 @@ fn sync_request(
         after_cursor,
         events,
         limit: 100,
+        byte_limited: None,
     }
 }
 

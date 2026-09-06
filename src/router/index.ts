@@ -1,38 +1,53 @@
 import { createHashRouter } from "react-router";
-import Clipboard from "@/pages/Clipboard";
-import ContextMenu, { ContextSubmenu } from "@/pages/ContextMenu";
-import Onboarding from "@/pages/Onboarding";
-import Preference from "@/pages/Preference";
-import Preview from "@/pages/Preview";
-import Update from "@/pages/Update";
 
 export const router = createHashRouter([
   {
-    Component: Clipboard,
+    lazy: async () => {
+      const page = await import("@/pages/Clipboard");
+      return { Component: page.default };
+    },
     path: "/",
   },
   {
-    Component: Preference,
+    lazy: async () => {
+      const page = await import("@/pages/Preference");
+      return { Component: page.default };
+    },
     path: "/preference",
   },
   {
-    Component: Onboarding,
+    lazy: async () => {
+      const page = await import("@/pages/Onboarding");
+      return { Component: page.default };
+    },
     path: "/onboarding",
   },
   {
-    Component: ContextMenu,
+    lazy: async () => {
+      const page = await import("@/pages/ContextMenu");
+      return { Component: page.default };
+    },
     path: "/context-menu",
   },
   {
-    Component: ContextSubmenu,
+    lazy: async () => {
+      const page = await import("@/pages/ContextMenu");
+      return { Component: page.ContextSubmenu };
+    },
     path: "/context-submenu",
   },
   {
-    Component: Preview,
+    lazy: async () => {
+      const page = await import("@/pages/Preview");
+      return { Component: page.default };
+    },
     path: "/preview",
   },
   {
-    Component: Update,
+    lazy: async () => {
+      const page = await import("@/pages/Update");
+      return { Component: page.default };
+    },
     path: "/update",
   },
 ]);

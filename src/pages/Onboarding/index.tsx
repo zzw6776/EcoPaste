@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import { finishOnboarding, setOnboardingStep } from "@/commands";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { router } from "@/router";
 import { settingsState } from "@/stores/settings";
 import { isAndroid } from "@/utils/is";
@@ -15,6 +16,7 @@ import type { OnboardingStepActions } from "./types";
 const LAST_STEP_INDEX = ONBOARDING_STEPS.length - 1;
 
 const Onboarding: FC = () => {
+  useWindowReady();
   const { t } = useTranslation("onboarding");
   const settings = useSnapshot(settingsState);
   const [activeIndex, setActiveIndex] = useState(() => {

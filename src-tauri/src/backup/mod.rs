@@ -11,9 +11,10 @@ use std::sync::{LazyLock, Mutex};
 
 use anyhow::{anyhow, Context};
 use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, Utc};
+use n0_future::StreamExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -46,6 +47,8 @@ const DB_ARCHIVE_DIR: &str = "db";
 const RESOURCES_ARCHIVE_DIR: &str = "resources";
 const CONFIG_ARCHIVE_DIR: &str = "config";
 const MANIFEST_FILENAME: &str = "manifest.json";
+
+static BACKUP_IO_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// 偏好窗口被销毁时暂存的待处理备份接收事件。
 ///
@@ -226,14 +229,29 @@ pub async fn export_history_backup(
     let exported_at = Utc::now();
     let counts = load_counts(pool).await?;
     let source_paths = backup_source_paths(app)?;
-    let resource_bytes = dir_size(&source_paths.resources_dir)?;
+    let permit = BACKUP_IO_PERMITS
+        .acquire()
+        .await
+        .context("backup worker closed")?;
+    let resources_dir = source_paths.resources_dir.clone();
+    let resource_bytes = tauri::async_runtime::spawn_blocking(move || dir_size(&resources_dir))
+        .await
+        .context("backup size task failed")??;
     let manifest = build_manifest(app, exported_at, options.mode, counts, resource_bytes)?;
 
     checkpoint_database(pool).await?;
 
-    let payload_file = NamedTempFile::new().context("failed to create temporary backup payload")?;
-    write_payload_zip(&source_paths, payload_file.path(), &manifest, &target)?;
-    let total_bytes = write_container(&target, payload_file.path(), options.mode, password)?;
+    let output_path = target.clone();
+    let mode = options.mode;
+    let total_bytes = tauri::async_runtime::spawn_blocking(move || -> Result<u64> {
+        let _permit = permit;
+        let payload_file =
+            NamedTempFile::new().context("failed to create temporary backup payload")?;
+        write_payload_zip(&source_paths, payload_file.path(), &manifest, &output_path)?;
+        write_container(&output_path, payload_file.path(), mode, password)
+    })
+    .await
+    .context("backup export task failed")??;
 
     Ok(ExportHistoryBackupResult {
         path: target.to_string_lossy().into_owned(),
@@ -259,9 +277,19 @@ pub async fn import_history_backup(
 
     let path = PathBuf::from(input.path);
     ensure_backup_extension(&path)?;
-    let payload = read_backup_payload(&path, input.password.as_deref())?;
-    let temp = extract_payload_zip(&payload)?;
-    validate_extracted_payload(temp.path())?;
+    let permit = BACKUP_IO_PERMITS
+        .acquire()
+        .await
+        .context("backup worker closed")?;
+    let temp = tauri::async_runtime::spawn_blocking(move || -> Result<TempDir> {
+        let _permit = permit;
+        let payload = read_backup_payload(&path, input.password.as_deref())?;
+        let temp = extract_payload_zip(payload)?;
+        validate_extracted_payload(temp.path())?;
+        Ok(temp)
+    })
+    .await
+    .context("backup import preparation task failed")??;
 
     match options.strategy {
         BackupImportStrategy::Merge => {
@@ -722,13 +750,23 @@ fn write_container(
         }
         BackupExportMode::Encrypted => {
             let password = password.ok_or_else(|| anyhow!("missing backup password"))?;
-            let mut payload = Vec::new();
-            File::open(payload_path)
-                .with_context(|| format!("failed to open payload {payload_path:?}"))?
+            let mut source = File::open(payload_path)
+                .with_context(|| format!("failed to open payload {payload_path:?}"))?;
+            let capacity = usize::try_from(
+                source
+                    .metadata()
+                    .context("failed to stat backup payload")?
+                    .len(),
+            )
+            .context("backup payload is too large")?
+            .checked_add(16)
+            .context("backup payload is too large")?;
+            let mut payload = Vec::with_capacity(capacity);
+            source
                 .read_to_end(&mut payload)
                 .context("failed to read backup payload")?;
 
-            let encrypted = encrypt_payload(&payload, &password)?;
+            let encrypted = encrypt_payload(payload, &password)?;
             write_header(&mut temp, &encrypted.header)?;
             temp.write_all(&encrypted.ciphertext)
                 .context("failed to write encrypted backup payload")?;
@@ -755,7 +793,7 @@ struct EncryptedPayload {
     ciphertext: Vec<u8>,
 }
 
-fn encrypt_payload(payload: &[u8], password: &str) -> Result<EncryptedPayload> {
+fn encrypt_payload(mut payload: Vec<u8>, password: &str) -> Result<EncryptedPayload> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -777,8 +815,8 @@ fn encrypt_payload(payload: &[u8], password: &str) -> Result<EncryptedPayload> {
     let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
         .context("failed to initialize backup cipher")?;
     let nonce = XNonce::from(nonce);
-    let ciphertext = cipher
-        .encrypt(&nonce, payload)
+    cipher
+        .encrypt_in_place(&nonce, b"", &mut payload)
         .map_err(|_| anyhow!("failed to encrypt backup payload"))?;
 
     Ok(EncryptedPayload {
@@ -797,7 +835,7 @@ fn encrypt_payload(payload: &[u8], password: &str) -> Result<EncryptedPayload> {
                 nonce: nonce.to_vec(),
             }),
         },
-        ciphertext,
+        ciphertext: payload,
     })
 }
 
@@ -821,23 +859,24 @@ fn write_header<W: Write>(writer: &mut W, header: &ContainerHeader) -> Result<()
     Ok(())
 }
 
-fn read_backup_payload(path: &Path, password: Option<&str>) -> Result<Vec<u8>> {
-    let mut file = File::open(path).with_context(|| format!("failed to open backup {path:?}"))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read backup {path:?}"))?;
+enum BackupPayload {
+    Plain(BufReader<File>),
+    Decrypted(Cursor<Vec<u8>>),
+}
 
-    if bytes.starts_with(ZIP_MAGIC) {
-        return Ok(bytes);
+/// 明文 ZIP 直接从文件解压；加密内容只保留一份可原地解密的缓冲区。
+fn read_backup_payload(path: &Path, password: Option<&str>) -> Result<BackupPayload> {
+    let mut file = BufReader::new(
+        File::open(path).with_context(|| format!("failed to open backup {path:?}"))?,
+    );
+    let mode = inspect_backup_reader(&mut file)?;
+    if mode == BackupContainerMode::Plain {
+        file.rewind().context("failed to rewind backup")?;
+        return Ok(BackupPayload::Plain(file));
     }
-    if !bytes.starts_with(MAGIC) {
-        return app_error("不是有效的 EcoPaste 备份文件");
-    }
-
-    let mut cursor = Cursor::new(bytes.as_slice());
-    cursor.set_position(MAGIC.len() as u64);
-    let header = read_container_header_after_magic(&mut cursor)?;
-    let ciphertext_start = cursor.position() as usize;
+    file.seek(std::io::SeekFrom::Start(MAGIC.len() as u64))
+        .context("failed to seek backup header")?;
+    let header = read_container_header_after_magic(&mut file)?;
     let Some(kdf) = header.kdf else {
         return app_error("加密备份文件头无效");
     };
@@ -847,12 +886,25 @@ fn read_backup_payload(path: &Path, password: Option<&str>) -> Result<Vec<u8>> {
     let Some(password) = password else {
         return app_error("请输入备份密码");
     };
-
-    decrypt_payload(&bytes[ciphertext_start..], password, &kdf, &cipher)
+    let remaining = file
+        .get_ref()
+        .metadata()
+        .context("failed to stat backup")?
+        .len()
+        .saturating_sub(
+            file.stream_position()
+                .context("failed to locate backup payload")?,
+        );
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(remaining).context("backup payload is too large")?);
+    file.read_to_end(&mut bytes)
+        .context("failed to read backup payload")?;
+    let payload = decrypt_payload(bytes, password, &kdf, &cipher)?;
+    Ok(BackupPayload::Decrypted(Cursor::new(payload)))
 }
 
 fn decrypt_payload(
-    ciphertext: &[u8],
+    mut ciphertext: Vec<u8>,
     password: &str,
     kdf: &KdfHeader,
     cipher_header: &CipherHeader,
@@ -883,14 +935,21 @@ fn decrypt_payload(
     nonce.copy_from_slice(&cipher_header.nonce);
     let nonce = XNonce::from(nonce);
     cipher
-        .decrypt(&nonce, ciphertext)
-        .map_err(|_| AppError::Other(anyhow!("备份密码不正确或文件已损坏")))
+        .decrypt_in_place(&nonce, b"", &mut ciphertext)
+        .map_err(|_| AppError::Other(anyhow!("备份密码不正确或文件已损坏")))?;
+    Ok(ciphertext)
 }
 
-fn extract_payload_zip(payload: &[u8]) -> Result<TempDir> {
+fn extract_payload_zip(payload: BackupPayload) -> Result<TempDir> {
+    match payload {
+        BackupPayload::Plain(reader) => extract_zip_reader(reader),
+        BackupPayload::Decrypted(reader) => extract_zip_reader(reader),
+    }
+}
+
+fn extract_zip_reader(reader: impl Read + Seek) -> Result<TempDir> {
     let temp = tempfile::tempdir().context("failed to create temporary import directory")?;
-    let cursor = Cursor::new(payload);
-    let mut archive = ZipArchive::new(cursor).context("failed to read backup zip payload")?;
+    let mut archive = ZipArchive::new(reader).context("failed to read backup zip payload")?;
     archive
         .extract(temp.path())
         .context("failed to extract backup payload")?;
@@ -1061,7 +1120,7 @@ async fn merge_history(current: &SqlitePool, backup: &SqlitePool) -> Result<Merg
 }
 
 async fn merge_groups(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool) -> Result<()> {
-    let rows = sqlx::query_as::<
+    let mut rows = sqlx::query_as::<
         _,
         (
             String,
@@ -1075,11 +1134,10 @@ async fn merge_groups(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePoo
     >(
         "SELECT id, name, icon, is_hidden, sort_order, created_at, updated_at FROM clipboard_groups",
     )
-    .fetch_all(backup)
-    .await
-    .context("failed to read backup groups")?;
+    .fetch(backup);
 
-    for row in rows {
+    while let Some(row) = rows.next().await {
+        let row = row.context("failed to read backup groups")?;
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_groups \
              (id, name, icon, is_hidden, sort_order, created_at, updated_at) \
@@ -1112,7 +1170,7 @@ async fn merge_apps(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool)
     } else {
         "SELECT id, name, icon_file, NULL AS icon_hash, NULL AS accent_start, NULL AS accent_end, platform, created_at, updated_at FROM clipboard_apps"
     };
-    let rows = sqlx::query_as::<
+    let mut rows = sqlx::query_as::<
         _,
         (
             String,
@@ -1126,11 +1184,10 @@ async fn merge_apps(tx: &mut sqlx::Transaction<'_, Sqlite>, backup: &SqlitePool)
             DateTime<Utc>,
         ),
     >(select)
-    .fetch_all(backup)
-    .await
-    .context("failed to read backup apps")?;
+    .fetch(backup);
 
-    for row in rows {
+    while let Some(row) = rows.next().await {
+        let row = row.context("failed to read backup apps")?;
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_apps \
              (id, name, icon_file, icon_hash, accent_start, accent_end, platform, created_at, updated_at) \
@@ -1157,14 +1214,13 @@ async fn merge_file_type_icons(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     backup: &SqlitePool,
 ) -> Result<()> {
-    let rows = sqlx::query_as::<_, (String, String, String, DateTime<Utc>, DateTime<Utc>)>(
+    let mut rows = sqlx::query_as::<_, (String, String, String, DateTime<Utc>, DateTime<Utc>)>(
         "SELECT cache_key, platform, icon_file, created_at, updated_at FROM file_type_icons",
     )
-    .fetch_all(backup)
-    .await
-    .context("failed to read backup file type icons")?;
+    .fetch(backup);
 
-    for row in rows {
+    while let Some(row) = rows.next().await {
+        let row = row.context("failed to read backup file type icons")?;
         sqlx::query(
             "INSERT OR IGNORE INTO file_type_icons \
              (cache_key, platform, icon_file, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -1186,18 +1242,17 @@ async fn merge_items(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     backup: &SqlitePool,
 ) -> Result<MergeOutcome> {
-    let rows = sqlx::query_as::<_, BackupItemRow>(
+    let mut rows = sqlx::query_as::<_, BackupItemRow>(
         "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, search_text, \
          summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
          created_at, updated_at FROM clipboard_items ORDER BY created_at ASC",
     )
-    .fetch_all(backup)
-    .await
-    .context("failed to read backup items")?;
+    .fetch(backup);
 
     let mut imported_items = 0;
     let mut skipped_items = 0;
-    for row in rows {
+    while let Some(row) = rows.next().await {
+        let row = row.context("failed to read backup items")?;
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM clipboard_items WHERE kind = ? AND content_hash = ? LIMIT 1",
         )
@@ -1496,8 +1551,65 @@ mod tests {
     }
 
     #[test]
+    fn in_place_backup_crypto_preserves_legacy_ciphertext_contract() {
+        use chacha20poly1305::aead::Aead;
+        let mut payload = Vec::with_capacity(1024 + 16);
+        payload.resize(1024, 42);
+        let allocation = payload.as_ptr();
+        let encrypted = encrypt_payload(payload, "password-123").unwrap();
+        assert_eq!(encrypted.ciphertext.as_ptr(), allocation);
+        let kdf = encrypted.header.kdf.as_ref().unwrap();
+        let header = encrypted.header.cipher.as_ref().unwrap();
+        let mut key = [0_u8; KEY_LEN];
+        Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(
+                kdf.memory_kib,
+                kdf.time_cost,
+                kdf.parallelism,
+                Some(KEY_LEN),
+            )
+            .unwrap(),
+        )
+        .hash_password_into(b"password-123", &kdf.salt, &mut key)
+        .unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let nonce = XNonce::from_slice(&header.nonce);
+        let plain = cipher
+            .decrypt(nonce, encrypted.ciphertext.as_slice())
+            .unwrap();
+        assert_eq!(plain, vec![42; 1024]);
+        let legacy = cipher.encrypt(nonce, plain.as_slice()).unwrap();
+        assert_eq!(legacy, encrypted.ciphertext);
+        assert!(decrypt_payload(legacy.clone(), "wrong", kdf, header).is_err());
+        let allocation = legacy.as_ptr();
+        let decrypted = decrypt_payload(legacy, "password-123", kdf, header).unwrap();
+        assert_eq!(decrypted.as_ptr(), allocation);
+        assert_eq!(decrypted, plain);
+    }
+
+    #[test]
+    fn plain_backup_extracts_directly_from_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("plain.ecopastebak");
+        let mut zip = ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file("example.txt", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"example").unwrap();
+        zip.finish().unwrap();
+        let payload = read_backup_payload(&path, None).unwrap();
+        assert!(matches!(&payload, BackupPayload::Plain(_)));
+        let extracted = extract_payload_zip(payload).unwrap();
+        assert_eq!(
+            fs::read(extracted.path().join("example.txt")).unwrap(),
+            b"example"
+        );
+    }
+
+    #[test]
     fn encrypted_payload_header_round_trips() {
-        let encrypted = encrypt_payload(b"hello", "password-123").unwrap();
+        let encrypted = encrypt_payload(b"hello".to_vec(), "password-123").unwrap();
         let mut bytes = Vec::new();
         write_header(&mut bytes, &encrypted.header).unwrap();
         bytes.extend_from_slice(&encrypted.ciphertext);
@@ -1522,7 +1634,7 @@ mod tests {
 
     #[test]
     fn inspect_backup_reader_recognizes_encrypted_container() {
-        let encrypted = encrypt_payload(b"hello", "password-123").unwrap();
+        let encrypted = encrypt_payload(b"hello".to_vec(), "password-123").unwrap();
         let mut bytes = Vec::new();
         write_header(&mut bytes, &encrypted.header).unwrap();
         bytes.extend_from_slice(&encrypted.ciphertext);

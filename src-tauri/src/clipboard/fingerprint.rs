@@ -3,7 +3,10 @@
 //! 数据库 `content_hash` 负责历史去重；这里的指纹只用于判断同步内容是否已经是当前
 //! 系统剪贴板内容，从而避免远程桌面与 EcoPaste 双向同步形成反馈循环。
 
-use std::sync::Mutex;
+use std::{
+    collections::VecDeque,
+    sync::{LazyLock, Mutex},
+};
 
 use image::ImageReader;
 
@@ -34,8 +37,21 @@ impl ClipboardFingerprint {
         Some(Self(hash_parts(TEXT_DOMAIN, [text.as_bytes()])))
     }
 
-    /// 图片使用解码后的 RGBA 像素，避免 PNG/TIFF/DIB 重新编码改变字节哈希。
+    /// 图片使用 RGBA 语义指纹；最多缓存 64 个字节摘要到指纹的映射，不保留原图或像素。
+    /// 编码字节变化时重新解码，PNG/TIFF/DIB 重新编码仍按像素判等。
     pub fn from_image_bytes(bytes: &[u8]) -> Option<Self> {
+        static CACHE: LazyLock<Mutex<VecDeque<(blake3::Hash, ClipboardFingerprint)>>> =
+            LazyLock::new(|| Mutex::new(VecDeque::new()));
+        let key = blake3::hash(bytes);
+        {
+            let mut cache = CACHE.lock().expect("image fingerprint cache poisoned");
+            if let Some(index) = cache.iter().position(|(digest, _)| *digest == key) {
+                let entry = cache.remove(index)?;
+                let fingerprint = entry.1.clone();
+                cache.push_back(entry);
+                return Some(fingerprint);
+            }
+        }
         let image = ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .ok()?
@@ -45,10 +61,18 @@ impl ClipboardFingerprint {
         let width = image.width().to_le_bytes();
         let height = image.height().to_le_bytes();
 
-        Some(Self(hash_parts(
+        let fingerprint = Self(hash_parts(
             IMAGE_DOMAIN,
             [width.as_slice(), height.as_slice(), image.as_raw()],
-        )))
+        ));
+        let mut cache = CACHE.lock().expect("image fingerprint cache poisoned");
+        if !cache.iter().any(|(digest, _)| *digest == key) {
+            if cache.len() == 64 {
+                cache.pop_front();
+            }
+            cache.push_back((key, fingerprint.clone()));
+        }
+        Some(fingerprint)
     }
 
     /// 文件卡片忽略绝对路径和选择顺序，保留逻辑名称、类型及内容指纹。

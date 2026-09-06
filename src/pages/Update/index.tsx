@@ -17,6 +17,7 @@ import {
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { log } from "@/utils/log";
 
 type UpdateViewState =
@@ -41,6 +42,7 @@ const PROGRESS_INDETERMINATE_PERCENT = 82;
  * 独立软件更新窗口。Rust updater 负责检查、签名校验和安装，React 只渲染状态。
  */
 const Update: FC = () => {
+  useWindowReady();
   const { t } = useTranslation(["update", "common"]);
   const [state, setState] = useState<UpdateViewState>("idle");
   const [currentVersion, setCurrentVersion] = useState("");
