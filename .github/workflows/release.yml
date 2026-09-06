@@ -238,6 +238,13 @@ jobs:
           tagName: ${{ needs.release-metadata.outputs.tag_name }}
           uploadUpdaterJson: false
 
+      - name: Verify macOS app signatures and DMG contents before publishing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+        run: bash scripts/verifyMacosBundle.sh "src-tauri/target/${TAURI_TARGET}/release/bundle"
+
   build-android:
     name: Build Android ${{ matrix.label }}
     needs: release-metadata

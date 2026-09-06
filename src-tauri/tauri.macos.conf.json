@@ -1,5 +1,9 @@
 {
   "bundle": {
+    "macOS": {
+      "hardenedRuntime": false,
+      "signingIdentity": "-"
+    },
     "resources": ["assets/tray-mac.ico"]
   },
   "identifier": "com.ayangweb.eco-paste"
