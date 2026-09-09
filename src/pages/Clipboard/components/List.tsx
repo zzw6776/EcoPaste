@@ -55,6 +55,7 @@ import type {
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
+import { log } from "@/utils/log";
 import {
   getSyncItemStatusesShared,
   listClipboardGroupsShared,
@@ -73,6 +74,26 @@ const KEY_HINTS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 
 /** 隐藏窗口内的更新短暂合并，避免连续复制扇出多次整页查询。 */
 const HIDDEN_RANGE_REFRESH_DEBOUNCE_MS = 120;
+const SLOW_CLIPBOARD_SHOW_MS = 100;
+
+/** 经过两次动画帧后记录首个已提交绘制，生产环境只保留慢于阈值的记录。 */
+function logClipboardShowFrame(payload: WindowVisibilityPayload) {
+  const { showRequestId, showRequestedAtMs } = payload;
+  if (showRequestId === void 0 || showRequestedAtMs === void 0) return;
+
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      const elapsedMs = Math.max(0, Date.now() - showRequestedAtMs);
+      const timing = { elapsedMs, requestId: showRequestId };
+
+      if (elapsedMs >= SLOW_CLIPBOARD_SHOW_MS) {
+        log.warn("slow clipboard first frame", timing);
+      } else {
+        log.debug("clipboard first frame", timing);
+      }
+    });
+  });
+}
 
 interface ClipboardUpdatedPayload {
   cleanup?: number;
@@ -449,6 +470,8 @@ const List: FC<ListProps> = (props) => {
       if (deferredReloadRef.current) scheduleHiddenRangeRefresh();
       return;
     }
+
+    logClipboardShowFrame(event.payload);
 
     void flushHiddenRangeRefresh();
 
