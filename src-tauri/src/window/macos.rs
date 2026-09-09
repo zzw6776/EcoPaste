@@ -3,24 +3,33 @@
 
 #![allow(clippy::unused_unit)]
 
+use std::ptr::NonNull;
+
+use block2::RcBlock;
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAutoresizingMaskOptions, NSGlassEffectView, NSGlassEffectViewStyle,
     NSView as AppKitView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode,
+    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode, NSWorkspace,
+    NSWorkspaceScreensDidWakeNotification,
 };
-use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
+use objc2_foundation::{MainThreadMarker as ObjcMainThreadMarker, NSOperationQueue};
 use objc2_web_kit::WKWebView;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_nspanel::{
     tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt,
 };
 
-use super::{get_window, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
+use super::{
+    get_window, ClipboardShowRequest, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL,
+    PREFERENCE_WINDOW_LABEL,
+};
 use crate::core::Result;
 use crate::settings::SettingsStore;
 
 const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
 const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
+const SLOW_CLIPBOARD_SHOW_MS: u128 = 100;
+const CLIPBOARD_PREWARM_SCRIPT: &str = "void document.documentElement.getBoundingClientRect();";
 
 tauri_panel! {
     panel!(MainPanel {
@@ -43,7 +52,8 @@ pub fn register_plugin(app_handle: &AppHandle) {
 
 /// setup 末尾调用：转 NSPanel + 绑事件 emit。
 pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
-    disable_app_nap();
+    configure_idle_activity();
+    register_screen_wake_prewarm(app_handle);
     show_taskbar_icon(app_handle, false)?;
 
     let clipboard_window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
@@ -183,8 +193,8 @@ fn supports_liquid_glass() -> bool {
     unsafe { NSAppKitVersionNumber >= MIN_APPKIT_VERSION_LIQUID_GLASS }
 }
 
-/// 保留交互响应与 App Nap 策略，允许系统按用户设置自动休眠。
-pub fn disable_app_nap() {
+/// 保留后台交互响应，同时允许系统按用户设置自动休眠。
+fn configure_idle_activity() {
     use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
     let process_info = NSProcessInfo::processInfo();
     let reason = NSString::from_str("Keep clipboard manager responsive for global hotkeys");
@@ -194,9 +204,78 @@ pub fn disable_app_nap() {
     std::mem::forget(activity);
 }
 
-pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
+/// 监听屏幕唤醒；关闭轻量模式时提前唤醒隐藏的 WebContent 并准备下一次绘制。
+fn register_screen_wake_prewarm(app_handle: &AppHandle) {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let center = workspace.notificationCenter();
+    let queue = NSOperationQueue::mainQueue();
+    let wake_handle = app_handle.clone();
+    let block = RcBlock::new(
+        move |_notification: NonNull<objc2_foundation::NSNotification>| {
+            prewarm_clipboard_webview(&wake_handle);
+        },
+    );
+
+    // observer 与应用同生命周期；NotificationCenter 持有 block，进程退出时统一释放。
+    let observer = unsafe {
+        center.addObserverForName_object_queue_usingBlock(
+            Some(NSWorkspaceScreensDidWakeNotification),
+            None,
+            Some(&queue),
+            &block,
+        )
+    };
+    std::mem::forget(observer);
+}
+
+/// 通过一次同步布局读取唤醒 WebContent，并把原生视图标记为待重绘。
+fn prewarm_clipboard_webview(app_handle: &AppHandle) {
+    let Some(settings) = app_handle.try_state::<SettingsStore>() else {
+        return;
+    };
+    if settings.snapshot().clipboard.window.lightweight_mode {
+        return;
+    }
+
+    let Some(window) = app_handle.get_webview_window(CLIPBOARD_WINDOW_LABEL) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    if let Err(err) = window.eval(CLIPBOARD_PREWARM_SCRIPT) {
+        log::warn!("prewarm clipboard WebContent after screen wake failed: {err}");
+        return;
+    }
+    if let Err(err) = window.with_webview(|platform_webview| {
+        let webview_ptr = platform_webview.inner().cast::<WKWebView>();
+        if !webview_ptr.is_null() {
+            let webview = unsafe { &*webview_ptr };
+            webview.setNeedsDisplay(true);
+        }
+    }) {
+        log::warn!("prepare clipboard WebView redraw after screen wake failed: {err}");
+        return;
+    }
+
+    log::info!(
+        "prewarmed clipboard WebView after screen wake: elapsedMs={}",
+        started.elapsed().as_millis()
+    );
+}
+
+pub fn show_window(
+    app_handle: &AppHandle,
+    label: &str,
+    clipboard_show_request: Option<ClipboardShowRequest>,
+) -> Result<()> {
     if label == CLIPBOARD_WINDOW_LABEL {
-        show_clipboard_panel(app_handle)
+        let request = clipboard_show_request
+            .ok_or_else(|| anyhow::anyhow!("clipboard show request is missing"))?;
+
+        show_clipboard_panel(app_handle, request)
     } else {
         let window = get_window(app_handle, label)?;
         window.show().map_err(|e| anyhow::anyhow!(e))?;
@@ -239,16 +318,17 @@ pub fn handle_reopen(app_handle: &AppHandle, has_visible_windows: bool) {
         }
     }
 
-    if let Err(err) = show_window(app_handle, PREFERENCE_WINDOW_LABEL) {
+    if let Err(err) = show_window(app_handle, PREFERENCE_WINDOW_LABEL, None) {
         log::error!("show preference window on reopen failed: {err:?}");
     }
 }
 
 /// 所有 panel 方法必须在主线程。
-fn show_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
+fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -> Result<()> {
     let panel_handle = app_handle.clone();
     app_handle
         .run_on_main_thread(move || {
+            let main_thread_started = std::time::Instant::now();
             if let Ok(panel) = panel_handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 panel.show_and_make_key();
                 // show 时切到 can_join_all_spaces：跟随用户当前 space 出现。
@@ -260,8 +340,28 @@ fn show_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
                         .into(),
                 );
                 super::preview::resume_after_clipboard_show(&panel_handle);
-                super::emit_visibility(&panel_handle, CLIPBOARD_WINDOW_LABEL, true);
+                super::emit_clipboard_visibility_after_show(&panel_handle, request);
                 super::lifecycle::on_shown(&panel_handle, CLIPBOARD_WINDOW_LABEL);
+
+                let total_ms = request.requested_at.elapsed().as_millis();
+                let main_thread_ms = main_thread_started.elapsed().as_millis();
+                if total_ms >= SLOW_CLIPBOARD_SHOW_MS {
+                    log::warn!(
+                        "slow clipboard native show: requestId={} beforeMainMs={} mainThreadMs={} totalMs={}",
+                        request.id,
+                        total_ms.saturating_sub(main_thread_ms),
+                        main_thread_ms,
+                        total_ms
+                    );
+                } else {
+                    log::debug!(
+                        "clipboard native show: requestId={} beforeMainMs={} mainThreadMs={} totalMs={}",
+                        request.id,
+                        total_ms.saturating_sub(main_thread_ms),
+                        main_thread_ms,
+                        total_ms
+                    );
+                }
             }
         })
         .map_err(|e| anyhow::anyhow!(e))?;

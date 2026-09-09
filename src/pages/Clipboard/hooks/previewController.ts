@@ -20,6 +20,8 @@ export interface PreviewSession {
 
 export interface WindowVisibilityPayload {
   label: string;
+  showRequestId?: number;
+  showRequestedAtMs?: number;
   visible: boolean;
 }
 

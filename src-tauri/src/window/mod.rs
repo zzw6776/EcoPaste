@@ -12,8 +12,12 @@ pub mod windows;
 pub use macos::handle_reopen;
 pub use state::WindowStateStore;
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
+#[cfg(target_os = "macos")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow, Window};
 #[cfg(not(target_os = "android"))]
@@ -50,6 +54,32 @@ struct PreferenceHighlightPayload {
 static CLIPBOARD_WINDOW_PINNED: AtomicBool = AtomicBool::new(false);
 /// 剪贴板窗口自动隐藏的临时暂停状态，用于系统文件选择等会短暂转移焦点的原生交互。
 static CLIPBOARD_WINDOW_AUTO_HIDE_SUSPENDED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static CLIPBOARD_SHOW_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(super) struct ClipboardShowRequest {
+    pub id: u64,
+    pub requested_at: Instant,
+    pub requested_at_unix_ms: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl ClipboardShowRequest {
+    fn new() -> Self {
+        let requested_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+
+        Self {
+            id: CLIPBOARD_SHOW_REQUEST_ID.fetch_add(1, Ordering::Relaxed) + 1,
+            requested_at: Instant::now(),
+            requested_at_unix_ms,
+        }
+    }
+}
 
 /// 返回用户是否显式固定剪贴板窗口；复制后隐藏等路径仍需读取这个用户态开关。
 pub fn is_clipboard_window_pinned() -> bool {
@@ -126,15 +156,51 @@ pub fn cancel_clipboard_search_handoff(
 const WINDOW_VISIBILITY_EVENT: &str = "window://visibility";
 
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WindowVisibilityPayload<'a> {
     label: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    show_request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    show_requested_at_ms: Option<u64>,
     visible: bool,
 }
 
 pub(super) fn emit_visibility(app_handle: &AppHandle, label: &str, visible: bool) {
+    emit_visibility_with_show_request(app_handle, label, visible, None);
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn emit_clipboard_visibility_after_show(
+    app_handle: &AppHandle,
+    request: ClipboardShowRequest,
+) {
+    emit_visibility_with_show_request(
+        app_handle,
+        CLIPBOARD_WINDOW_LABEL,
+        true,
+        Some((request.id, request.requested_at_unix_ms)),
+    );
+}
+
+fn emit_visibility_with_show_request(
+    app_handle: &AppHandle,
+    label: &str,
+    visible: bool,
+    show_request: Option<(u64, u64)>,
+) {
+    let (show_request_id, show_requested_at_ms) = show_request
+        .map(|(id, requested_at_ms)| (Some(id), Some(requested_at_ms)))
+        .unwrap_or((None, None));
+
     if let Err(err) = app_handle.emit(
         WINDOW_VISIBILITY_EVENT,
-        WindowVisibilityPayload { label, visible },
+        WindowVisibilityPayload {
+            label,
+            show_request_id,
+            show_requested_at_ms,
+            visible,
+        },
     ) {
         log::error!("emit window visibility failed: {err:?}");
     }
@@ -147,6 +213,9 @@ pub(super) fn get_window(app_handle: &AppHandle, label: &str) -> Result<WebviewW
 }
 
 pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let clipboard_show_request = (label == CLIPBOARD_WINDOW_LABEL).then(ClipboardShowRequest::new);
+
     // 销毁后重建：`DestroyWhenIdle` 窗口空闲超时后 WebView 已被销毁，打开时按 descriptor
     // 的 build fn 重新建窗。重建后窗口为 `visible: false`，下方走与既有一致的恢复 + show 流程。
     if app_handle.get_webview_window(label).is_none() {
@@ -176,7 +245,7 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     }
 
     #[cfg(target_os = "macos")]
-    let result = macos::show_window(app_handle, label);
+    let result = macos::show_window(app_handle, label, clipboard_show_request);
     #[cfg(target_os = "windows")]
     let result = windows::show_window(app_handle, label);
     #[cfg(target_os = "android")]
