@@ -76,23 +76,61 @@ const KEY_HINTS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 const HIDDEN_RANGE_REFRESH_DEBOUNCE_MS = 120;
 const SLOW_CLIPBOARD_SHOW_MS = 100;
 
-/** 经过两次动画帧后记录首个已提交绘制，生产环境只保留慢于阈值的记录。 */
-function logClipboardShowFrame(payload: WindowVisibilityPayload) {
-  const { showRequestId, showRequestedAtMs } = payload;
+/** 记录原生显示完成、JS 事件投递、同步处理与连续两帧之间的分段耗时。 */
+function startClipboardShowFrameTrace(payload: WindowVisibilityPayload) {
+  const { showNativeTiming, showRequestId, showRequestedAtMs } = payload;
   if (showRequestId === void 0 || showRequestedAtMs === void 0) return;
 
-  window.requestAnimationFrame(() => {
-    window.requestAnimationFrame(() => {
-      const elapsedMs = Math.max(0, Date.now() - showRequestedAtMs);
-      const timing = { elapsedMs, requestId: showRequestId };
+  const receivedAtMs = Date.now();
+  const receivedAtPerformanceMs = performance.now();
+  const visibilityStateAtReceive = document.visibilityState;
+  const focusedAtReceive = document.hasFocus();
+  let handlerCompletedAtPerformanceMs = receivedAtPerformanceMs;
 
-      if (elapsedMs >= SLOW_CLIPBOARD_SHOW_MS) {
-        log.warn("slow clipboard first frame", timing);
+  window.requestAnimationFrame(() => {
+    const firstFrameAtMs = Date.now();
+    const firstFrameAtPerformanceMs = performance.now();
+    window.requestAnimationFrame(() => {
+      const secondFrameAtMs = Date.now();
+      const secondFrameAtPerformanceMs = performance.now();
+      const nativeCompletedMs = showNativeTiming?.nativeCompletedMs ?? 0;
+      const timing = {
+        eventDeliveryMs: Math.max(
+          0,
+          receivedAtMs - showRequestedAtMs - nativeCompletedMs,
+        ),
+        firstFrameMs: Math.max(0, firstFrameAtMs - showRequestedAtMs),
+        firstToSecondFrameMs: Math.max(
+          0,
+          secondFrameAtPerformanceMs - firstFrameAtPerformanceMs,
+        ),
+        focusedAtReceive,
+        handlerMs: Math.max(
+          0,
+          handlerCompletedAtPerformanceMs - receivedAtPerformanceMs,
+        ),
+        handlerToFirstFrameMs: Math.max(
+          0,
+          firstFrameAtPerformanceMs - handlerCompletedAtPerformanceMs,
+        ),
+        native: showNativeTiming,
+        requestId: showRequestId,
+        totalMs: Math.max(0, secondFrameAtMs - showRequestedAtMs),
+        visibilityStateAtFirstFrame: document.visibilityState,
+        visibilityStateAtReceive,
+      };
+
+      if (timing.totalMs >= SLOW_CLIPBOARD_SHOW_MS) {
+        log.warn("slow clipboard show trace", timing);
       } else {
-        log.debug("clipboard first frame", timing);
+        log.info("clipboard show trace", timing);
       }
     });
   });
+
+  return () => {
+    handlerCompletedAtPerformanceMs = performance.now();
+  };
 }
 
 interface ClipboardUpdatedPayload {
@@ -471,8 +509,6 @@ const List: FC<ListProps> = (props) => {
       return;
     }
 
-    logClipboardShowFrame(event.payload);
-
     void flushHiddenRangeRefresh();
 
     if (!active) return;
@@ -517,7 +553,13 @@ const List: FC<ListProps> = (props) => {
 
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
-    handleWindowVisibility,
+    (event) => {
+      const completeTrace = event.payload.visible
+        ? startClipboardShowFrameTrace(event.payload)
+        : void 0;
+      handleWindowVisibility(event);
+      completeTrace?.();
+    },
   );
 
   /**
