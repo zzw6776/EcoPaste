@@ -3,16 +3,12 @@
 
 #![allow(clippy::unused_unit)]
 
-use std::ptr::NonNull;
-
-use block2::RcBlock;
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAutoresizingMaskOptions, NSGlassEffectView, NSGlassEffectViewStyle,
     NSView as AppKitView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode, NSWorkspace,
-    NSWorkspaceScreensDidWakeNotification,
+    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode,
 };
-use objc2_foundation::{MainThreadMarker as ObjcMainThreadMarker, NSOperationQueue};
+use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
 use objc2_web_kit::WKWebView;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_nspanel::{
@@ -29,7 +25,6 @@ use crate::settings::SettingsStore;
 const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
 const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
 const SLOW_CLIPBOARD_SHOW_MS: u128 = 100;
-const CLIPBOARD_PREWARM_SCRIPT: &str = "void document.documentElement.getBoundingClientRect();";
 
 tauri_panel! {
     panel!(MainPanel {
@@ -53,7 +48,6 @@ pub fn register_plugin(app_handle: &AppHandle) {
 /// setup 末尾调用：转 NSPanel + 绑事件 emit。
 pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     configure_idle_activity();
-    register_screen_wake_prewarm(app_handle);
     show_taskbar_icon(app_handle, false)?;
 
     let clipboard_window = get_window(app_handle, CLIPBOARD_WINDOW_LABEL)?;
@@ -202,68 +196,6 @@ fn configure_idle_activity() {
         | NSActivityOptions::LatencyCritical;
     let activity = process_info.beginActivityWithOptions_reason(options, &reason);
     std::mem::forget(activity);
-}
-
-/// 监听屏幕唤醒；关闭轻量模式时提前唤醒隐藏的 WebContent 并准备下一次绘制。
-fn register_screen_wake_prewarm(app_handle: &AppHandle) {
-    let workspace = NSWorkspace::sharedWorkspace();
-    let center = workspace.notificationCenter();
-    let queue = NSOperationQueue::mainQueue();
-    let wake_handle = app_handle.clone();
-    let block = RcBlock::new(
-        move |_notification: NonNull<objc2_foundation::NSNotification>| {
-            prewarm_clipboard_webview(&wake_handle);
-        },
-    );
-
-    // observer 与应用同生命周期；NotificationCenter 持有 block，进程退出时统一释放。
-    let observer = unsafe {
-        center.addObserverForName_object_queue_usingBlock(
-            Some(NSWorkspaceScreensDidWakeNotification),
-            None,
-            Some(&queue),
-            &block,
-        )
-    };
-    std::mem::forget(observer);
-}
-
-/// 通过一次同步布局读取唤醒 WebContent，并把原生视图标记为待重绘。
-fn prewarm_clipboard_webview(app_handle: &AppHandle) {
-    let Some(settings) = app_handle.try_state::<SettingsStore>() else {
-        return;
-    };
-    if settings.snapshot().clipboard.window.lightweight_mode {
-        return;
-    }
-
-    let Some(window) = app_handle.get_webview_window(CLIPBOARD_WINDOW_LABEL) else {
-        return;
-    };
-    if window.is_visible().unwrap_or(false) {
-        return;
-    }
-
-    let started = std::time::Instant::now();
-    if let Err(err) = window.eval(CLIPBOARD_PREWARM_SCRIPT) {
-        log::warn!("prewarm clipboard WebContent after screen wake failed: {err}");
-        return;
-    }
-    if let Err(err) = window.with_webview(|platform_webview| {
-        let webview_ptr = platform_webview.inner().cast::<WKWebView>();
-        if !webview_ptr.is_null() {
-            let webview = unsafe { &*webview_ptr };
-            webview.setNeedsDisplay(true);
-        }
-    }) {
-        log::warn!("prepare clipboard WebView redraw after screen wake failed: {err}");
-        return;
-    }
-
-    log::info!(
-        "prewarmed clipboard WebView after screen wake: elapsedMs={}",
-        started.elapsed().as_millis()
-    );
 }
 
 pub fn show_window(

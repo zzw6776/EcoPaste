@@ -16,6 +16,7 @@
       {
         "acceptFirstMouse": true,
         "alwaysOnTop": true,
+        "backgroundThrottling": "disabled",
         "decorations": false,
         "focusable": false,
         "height": 350,
