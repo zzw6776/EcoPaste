@@ -79,7 +79,7 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     panel.set_collection_behavior(
         CollectionBehavior::new()
             .stationary()
-            .move_to_active_space()
+            .can_join_all_spaces()
             .full_screen_auxiliary()
             .into(),
     );
@@ -329,23 +329,11 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
                 panel.make_key_window();
                 let make_key_us = elapsed_us(make_key_started);
 
-                // show 时切到 can_join_all_spaces：跟随用户当前 space 出现。
-                let collection_behavior_started = Instant::now();
-                panel.set_collection_behavior(
-                    CollectionBehavior::new()
-                        .stationary()
-                        .can_join_all_spaces()
-                        .full_screen_auxiliary()
-                        .into(),
-                );
-                let collection_behavior_us = elapsed_us(collection_behavior_started);
-
                 let preview_resume_started = Instant::now();
                 super::preview::resume_after_clipboard_show(&panel_handle);
                 let preview_resume_us = elapsed_us(preview_resume_started);
 
                 let native_timing = ClipboardNativeShowTiming {
-                    collection_behavior_us,
                     content_view_us,
                     first_responder_accepted,
                     first_responder_us,
@@ -369,7 +357,7 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
 
                 let total_ms = request.requested_at.elapsed().as_millis();
                 let message = format!(
-                    "clipboard show native trace: requestId={} layoutRestoreUs={} layoutPositionUs={} mainQueueUs={} panelLookupUs={} contentViewUs={} firstResponderUs={} firstResponderAccepted={} orderFrontUs={} makeKeyUs={} collectionBehaviorUs={} previewResumeUs={} emitUs={} lifecycleUs={} totalMs={}",
+                    "clipboard show native trace: requestId={} layoutRestoreUs={} layoutPositionUs={} mainQueueUs={} panelLookupUs={} contentViewUs={} firstResponderUs={} firstResponderAccepted={} orderFrontUs={} makeKeyUs={} previewResumeUs={} emitUs={} lifecycleUs={} totalMs={}",
                     request.id,
                     native_timing.layout_restore_us,
                     native_timing.layout_position_us,
@@ -380,7 +368,6 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
                     native_timing.first_responder_accepted,
                     native_timing.order_front_us,
                     native_timing.make_key_us,
-                    native_timing.collection_behavior_us,
                     native_timing.preview_resume_us,
                     emit_us,
                     lifecycle_us,
@@ -407,14 +394,6 @@ fn hide_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
             }
             if let Ok(panel) = handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 panel.hide();
-                // hide 后切回 move_to_active_space：下次 show 时按当前 space 重新落位。
-                panel.set_collection_behavior(
-                    CollectionBehavior::new()
-                        .stationary()
-                        .move_to_active_space()
-                        .full_screen_auxiliary()
-                        .into(),
-                );
             }
         })
         .map_err(|e| anyhow::anyhow!(e))?;
