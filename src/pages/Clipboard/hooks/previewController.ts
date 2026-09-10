@@ -21,7 +21,6 @@ export interface PreviewSession {
 export interface WindowVisibilityPayload {
   label: string;
   showNativeTiming?: {
-    collectionBehaviorUs: number;
     contentViewUs: number;
     firstResponderAccepted: boolean;
     firstResponderUs: number;

@@ -93,7 +93,6 @@ impl ClipboardShowRequest {
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ClipboardNativeShowTiming {
-    pub collection_behavior_us: u64,
     pub content_view_us: u64,
     pub first_responder_accepted: bool,
     pub first_responder_us: u64,
