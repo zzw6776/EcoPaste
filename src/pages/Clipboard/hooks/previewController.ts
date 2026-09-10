@@ -20,6 +20,20 @@ export interface PreviewSession {
 
 export interface WindowVisibilityPayload {
   label: string;
+  showNativeTiming?: {
+    collectionBehaviorUs: number;
+    contentViewUs: number;
+    firstResponderAccepted: boolean;
+    firstResponderUs: number;
+    layoutPositionUs: number;
+    layoutRestoreUs: number;
+    mainQueueUs: number;
+    makeKeyUs: number;
+    nativeCompletedMs: number;
+    orderFrontUs: number;
+    panelLookupUs: number;
+    previewResumeUs: number;
+  };
   showRequestId?: number;
   showRequestedAtMs?: number;
   visible: boolean;
