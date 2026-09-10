@@ -26,6 +26,8 @@ use crate::settings::Shortcuts;
 use crate::window::{self, CLIPBOARD_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL};
 
 #[cfg(target_os = "windows")]
+mod alt_menu;
+#[cfg(target_os = "windows")]
 mod win_v;
 
 #[cfg(not(target_os = "android"))]
@@ -192,6 +194,9 @@ pub fn apply(app: &AppHandle, shortcuts: &Shortcuts) -> Result<()> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    alt_menu::set_shortcuts(active.iter().map(|(_, shortcut)| shortcut));
+
     *app.state::<ShortcutManager>()
         .active
         .lock()
@@ -245,6 +250,9 @@ fn should_run_scheduled_resume(app: &AppHandle, epoch: u64) -> bool {
 #[cfg(not(target_os = "android"))]
 /// 取消当前轮所有已注册快捷键，并清空内部 active 状态。
 fn unregister_active(app: &AppHandle) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    alt_menu::set_shortcuts(std::iter::empty());
+
     let plugin = app.global_shortcut();
     let manager = app.state::<ShortcutManager>();
 
