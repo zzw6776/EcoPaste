@@ -1,8 +1,8 @@
 //! 统一窗口生命周期管理器。
 //!
 //! 持有所有窗口的 phase / generation 状态，把 show / hide / toggle / close / 销毁重建
-//! 路径收口到这里。在 `window://visibility` 之外广播单一 `window://lifecycle` 事件
-//! （带 `phase` 字段），前端据此镜像每个窗口的生命周期阶段。
+//! 路径收口到这里。在 `window://visibility` 之外向目标窗口投递单一
+//! `window://lifecycle` 事件（带 `phase` 字段），前端据此镜像自身生命周期阶段。
 //!
 //! 销毁策略：`DestroyWhenIdle` 窗口（当前为 preference 与 clipboard-preview）隐藏后
 //! 启动空闲计时器，超过用户设置的空闲秒数仍隐藏则销毁 WebView 释放资源；再次打开时
@@ -292,7 +292,7 @@ impl WindowLifecycleManager {
         });
     }
 
-    /// 转移窗口到新阶段：更新状态、广播 `window://lifecycle`，并按需启动空闲销毁计时器。
+    /// 转移窗口到新阶段：更新状态、向目标窗口投递 `window://lifecycle`，并按需启动空闲销毁计时器。
     ///
     /// `reason` 是触发本次转换的语义来源（如 `"show"` / `"hide"` / `"ready"` /
     /// `"idle-destroy"`），仅用于日志与前端调试，不参与逻辑分支。
@@ -351,7 +351,8 @@ impl WindowLifecycleManager {
         }
 
         let visible = matches!(phase, LifecyclePhase::Visible);
-        if let Err(err) = app.emit(
+        if let Err(err) = app.emit_to(
+            label,
             WINDOW_LIFECYCLE_EVENT,
             LifecyclePayload {
                 label,
@@ -659,9 +660,10 @@ fn try_destroy_idle(app: &AppHandle, label: &str, generation: u64) {
     schedule_destroy_after_deadline(app, label, generation);
 }
 
-/// 广播销毁前事件，给前端保存草稿或申请 keepalive 的短暂窗口。
+/// 定向投递销毁前事件，给目标窗口保存草稿或申请 keepalive 的短暂窗口。
 fn emit_before_destroy(app: &AppHandle, label: &str, generation: u64) {
-    if let Err(err) = app.emit(
+    if let Err(err) = app.emit_to(
+        label,
         WINDOW_BEFORE_DESTROY_EVENT,
         BeforeDestroyPayload {
             deadline_ms: BEFORE_DESTROY_DEADLINE_MS,

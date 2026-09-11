@@ -43,7 +43,7 @@ impl RetainPolicy {
 pub struct WindowDescriptor {
     /// Tauri window label。
     pub label: &'static str,
-    /// 是否向前端广播生命周期事件（`window://lifecycle`）。
+    /// 是否向对应窗口前端投递生命周期事件（`window://lifecycle`）。
     pub emits_lifecycle: bool,
     /// 保留 / 销毁策略。
     pub retain_policy: RetainPolicy,

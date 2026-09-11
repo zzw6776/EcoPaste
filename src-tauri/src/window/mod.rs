@@ -182,7 +182,7 @@ pub fn cancel_clipboard_search_handoff(
 }
 
 /// 剪贴板窗口显隐变化事件。前端用以做默认聚焦 / 自动清空搜索等 UI 副作用。
-/// 由 [`show_window`] / [`hide_window`] 在统一入口处发出，平台一致，
+/// 由 [`show_window`] / [`hide_window`] 在统一入口处向对应窗口发出，平台一致，
 /// 不依赖 `tauri://focus` / `tauri://blur`（Windows 剪贴板窗口 `focusable: false` 不可靠）。
 const WINDOW_VISIBILITY_EVENT: &str = "window://visibility";
 
@@ -231,7 +231,8 @@ fn emit_visibility_with_show_request(
         .map(|(id, requested_at_ms)| (Some(id), Some(requested_at_ms)))
         .unwrap_or((None, None));
 
-    if let Err(err) = app_handle.emit(
+    if let Err(err) = app_handle.emit_to(
+        label,
         WINDOW_VISIBILITY_EVENT,
         WindowVisibilityPayload {
             label,
@@ -242,7 +243,7 @@ fn emit_visibility_with_show_request(
             visible,
         },
     ) {
-        log::error!("emit window visibility failed: {err:?}");
+        log::error!("emit window visibility failed for {label}: {err:?}");
     }
 }
 
@@ -311,7 +312,7 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
 
     if result.is_ok() && !delays_clipboard_visibility_event(label) {
         if label == CLIPBOARD_WINDOW_LABEL {
-            preview::resume_after_clipboard_show(app_handle);
+            preview::resume_after_clipboard_show();
         }
         emit_visibility(app_handle, label, true);
         lifecycle::on_shown(app_handle, label);
