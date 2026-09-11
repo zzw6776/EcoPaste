@@ -1,4 +1,4 @@
-import { useDebounceFn, useMount } from "ahooks";
+import { useDebounceFn, useEventListener, useMount } from "ahooks";
 import type { MenuProps } from "antd";
 import type { ChangeEvent, FC } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -20,6 +20,10 @@ import Dropdown, {
   type DropdownMenuItems,
 } from "@/components/Dropdown";
 import { TAURI_EVENT } from "@/constants/events";
+import {
+  CLIPBOARD_FOCUS_SEARCH_EVENT,
+  CLIPBOARD_TYPE_TO_SEARCH_EVENT,
+} from "@/constants/keyboard";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { router } from "@/router";
@@ -152,39 +156,39 @@ const Header: FC = () => {
     setSearchFocusToken((c) => c + 1);
   };
 
-  useMount(() => {
-    void loadGroups();
+  const handleFocusSearch = () => {
+    setSearchOpen(true);
+    setSearchFocusCursor("end");
+    setSearchFocusToken((current) => current + 1);
+  };
 
-    const handleTypeToSearch = (event: Event) => {
-      const activeEl = document.activeElement;
-      if (
-        activeEl &&
-        (activeEl.tagName === "INPUT" ||
-          activeEl.tagName === "TEXTAREA" ||
-          (activeEl as HTMLElement).isContentEditable)
-      ) {
-        return;
-      }
+  const handleTypeToSearch = (event: Event) => {
+    const activeEl = document.activeElement;
+    if (
+      activeEl &&
+      (activeEl.tagName === "INPUT" ||
+        activeEl.tagName === "TEXTAREA" ||
+        (activeEl as HTMLElement).isContentEditable)
+    ) {
+      return;
+    }
 
-      const customEvent = event as CustomEvent<{ key?: string }>;
-      const key = customEvent.detail?.key;
-      if (!key) return;
+    const customEvent = event as CustomEvent<{ key?: string }>;
+    const key = customEvent.detail?.key;
+    if (!key) return;
 
-      setSearchOpen(true);
-      setSearchValue((prev) => {
-        const next = prev ? prev + key : key;
-        debouncedSetKeyword(next.trim());
-        return next;
-      });
-      setSearchFocusCursor("end");
-      setSearchFocusToken((c) => c + 1);
-    };
+    setSearchOpen(true);
+    setSearchValue((prev) => {
+      const next = prev ? prev + key : key;
+      debouncedSetKeyword(next.trim());
+      return next;
+    });
+    setSearchFocusCursor("end");
+    setSearchFocusToken((current) => current + 1);
+  };
 
-    window.addEventListener("ecopaste:type-to-search", handleTypeToSearch);
-    return () => {
-      window.removeEventListener("ecopaste:type-to-search", handleTypeToSearch);
-    };
-  });
+  useEventListener(CLIPBOARD_FOCUS_SEARCH_EVENT, handleFocusSearch);
+  useEventListener(CLIPBOARD_TYPE_TO_SEARCH_EVENT, handleTypeToSearch);
 
   const handleWindowVisibility = (event: {
     payload: WindowVisibilityPayload;
