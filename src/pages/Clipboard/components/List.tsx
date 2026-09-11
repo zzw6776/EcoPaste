@@ -29,6 +29,10 @@ import {
 import { TAURI_EVENT } from "@/constants/events";
 import { buildItemActionLabels } from "@/constants/itemActions";
 import {
+  CLIPBOARD_FOCUS_SEARCH_EVENT,
+  CLIPBOARD_TYPE_TO_SEARCH_EVENT,
+} from "@/constants/keyboard";
+import {
   parseWindowOpenGroupId,
   WINDOW_OPEN_SELECTION_ALL,
   WINDOW_OPEN_SELECTION_PRESERVE,
@@ -182,6 +186,8 @@ const List: FC<ListProps> = (props) => {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const isAtTopRef = useRef(true);
   const itemElementMapRef = useRef(new Map<string, HTMLDivElement>());
+  const cardKeyboardModeRef = useRef(false);
+  const pendingCardFocusRef = useRef<string | null>(null);
   const fileDetailsRequestRef = useRef(0);
   const closePreviewRef = useRef<(reason: string) => void>(() => {});
   const displaySettingsMountedRef = useRef(false);
@@ -218,6 +224,13 @@ const List: FC<ListProps> = (props) => {
       target: listContainerRef,
     },
   );
+
+  useEventListener("focusin", (event: FocusEvent) => {
+    if (!allowsEditableGlobalKeyboard(event.target)) return;
+
+    cardKeyboardModeRef.current = false;
+    pendingCardFocusRef.current = null;
+  });
 
   const snapshot = useSnapshot(clipboardViewState);
   const settings = useSnapshot(settingsState);
@@ -503,6 +516,8 @@ const List: FC<ListProps> = (props) => {
 
     clipboardWindowVisibleRef.current = visible;
     if (!visible) {
+      cardKeyboardModeRef.current = false;
+      pendingCardFocusRef.current = null;
       // 窗口可见且离开顶部时可能累积 pending；趁 hide 后预刷新，
       // 确保下次 show 的首帧已经是最新数据。
       if (deferredReloadRef.current) scheduleHiddenRangeRefresh();
@@ -654,6 +669,20 @@ const List: FC<ListProps> = (props) => {
     return (node: HTMLDivElement | null) => {
       if (node) {
         itemElementMapRef.current.set(id, node);
+        if (cardKeyboardModeRef.current && pendingCardFocusRef.current === id) {
+          window.requestAnimationFrame(() => {
+            if (
+              !cardKeyboardModeRef.current ||
+              pendingCardFocusRef.current !== id ||
+              itemElementMapRef.current.get(id) !== node
+            ) {
+              return;
+            }
+
+            pendingCardFocusRef.current = null;
+            node.focus({ preventScroll: true });
+          });
+        }
         return;
       }
 
@@ -822,7 +851,10 @@ const List: FC<ListProps> = (props) => {
   const handleKeyDown = (event: KeyboardEvent) => {
     if (!active) return;
 
-    const target = document.activeElement as HTMLElement | null;
+    const eventTarget =
+      event.target instanceof HTMLElement ? event.target : null;
+    const target =
+      eventTarget ?? (document.activeElement as HTMLElement | null);
     const isInputActive =
       target &&
       (target.tagName === "INPUT" ||
@@ -835,6 +867,36 @@ const List: FC<ListProps> = (props) => {
       !event.isComposing &&
       event.keyCode !== 229 &&
       allowsEditableGlobalKeyboard(target);
+
+    if (
+      isInputActive &&
+      event.key === "ArrowDown" &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !event.isComposing &&
+      event.keyCode !== 229 &&
+      allowsEditableGlobalKeyboard(target)
+    ) {
+      event.preventDefault();
+
+      const activeItem = getActiveItem();
+      if (!activeItem) {
+        target.focus();
+        return;
+      }
+
+      const activeIndex = getItemIndexById(activeItem.id) ?? firstVisibleIndex;
+      setSelectedId(activeItem.id);
+      virtuosoRef.current?.scrollIntoView({
+        behavior: "auto",
+        index: activeIndex,
+      });
+      focusClipboardCard(activeItem.id);
+
+      return;
+    }
 
     if (isInputActive) {
       if (event.key === "Escape") {
@@ -851,6 +913,22 @@ const List: FC<ListProps> = (props) => {
     if (event.key === "Escape") {
       event.preventDefault();
       closeTopEscapeLayer();
+
+      return;
+    }
+
+    if (
+      event.key === "ArrowUp" &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      isClipboardCardNavigationActive(target)
+    ) {
+      event.preventDefault();
+      cardKeyboardModeRef.current = false;
+      pendingCardFocusRef.current = null;
+      window.dispatchEvent(new Event(CLIPBOARD_FOCUS_SEARCH_EVENT));
 
       return;
     }
@@ -972,8 +1050,10 @@ const List: FC<ListProps> = (props) => {
         event.key.length === 1 &&
         ![" ", "Enter", "Tab", "Escape"].includes(event.key)
       ) {
+        cardKeyboardModeRef.current = false;
+        pendingCardFocusRef.current = null;
         window.dispatchEvent(
-          new CustomEvent("ecopaste:type-to-search", {
+          new CustomEvent(CLIPBOARD_TYPE_TO_SEARCH_EVENT, {
             detail: { key: event.key },
           }),
         );
@@ -993,6 +1073,7 @@ const List: FC<ListProps> = (props) => {
       behavior: "auto",
       index: next.index,
     });
+    focusClipboardCard(next.item.id);
 
     handleKeyboardPreviewMove(next.item);
   };
@@ -1521,6 +1602,28 @@ const List: FC<ListProps> = (props) => {
     }
 
     return { index: nextIndex, item };
+  }
+
+  /**
+   * 进入卡片键盘导航态，并把真实 DOM 焦点同步到当前选中卡片。
+   * 虚拟列表尚未挂载目标节点时，由 ref 回调在挂载后完成聚焦。
+   */
+  function focusClipboardCard(id: string) {
+    cardKeyboardModeRef.current = true;
+    pendingCardFocusRef.current = id;
+
+    const node = itemElementMapRef.current.get(id);
+    if (!node) return;
+
+    pendingCardFocusRef.current = null;
+    node.focus({ preventScroll: true });
+  }
+
+  /** Windows 恢复不可聚焦窗口后 activeElement 会丢失，因此同时信任显式导航态。 */
+  function isClipboardCardNavigationActive(target: HTMLElement | null) {
+    return (
+      cardKeyboardModeRef.current || Boolean(target?.closest('[role="option"]'))
+    );
   }
 
   /**

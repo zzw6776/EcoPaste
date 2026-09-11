@@ -8,9 +8,6 @@ type KeyboardEventType = "keydown" | "keyup";
 
 const EDITABLE_GLOBAL_HANDOFF_KEYS = new Set([
   "ArrowDown",
-  "ArrowLeft",
-  "ArrowRight",
-  "ArrowUp",
   "Control",
   "Enter",
   "Escape",
@@ -102,6 +99,17 @@ function shouldHandoffEditableKeyboard(
 ) {
   if (event.type !== "keydown") return false;
   if (!target.closest(EDITABLE_GLOBAL_KEYBOARD_SELECTOR)) return false;
+
+  if (event.key === "ArrowDown") {
+    return (
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !event.isComposing &&
+      event.keyCode !== 229
+    );
+  }
 
   return EDITABLE_GLOBAL_HANDOFF_KEYS.has(event.key);
 }
