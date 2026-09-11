@@ -330,7 +330,7 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
                 let make_key_us = elapsed_us(make_key_started);
 
                 let preview_resume_started = Instant::now();
-                super::preview::resume_after_clipboard_show(&panel_handle);
+                super::preview::resume_after_clipboard_show();
                 let preview_resume_us = elapsed_us(preview_resume_started);
 
                 let native_timing = ClipboardNativeShowTiming {

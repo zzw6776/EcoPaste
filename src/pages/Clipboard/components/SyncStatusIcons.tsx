@@ -42,6 +42,8 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     null,
   );
   const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
+  const deferredRefreshFrameRef = useRef<number | null>(null);
+  const deferredRefreshTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(false);
   const unlistenRef = useRef<null | (() => void)>(null);
 
@@ -56,7 +58,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   async function initialize() {
     try {
       await refresh();
-      const unlisten = await listen(TAURI_EVENT.SYNC_UPDATED, refresh);
+      const unlisten = await listen(TAURI_EVENT.SYNC_UPDATED, handleSyncUpdated);
       if (!mountedRef.current) {
         unlisten();
         return;
@@ -74,17 +76,51 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
   useUnmount(() => {
     mountedRef.current = false;
+    cancelDeferredRefresh();
     unlistenRef.current?.();
   });
+
+  function cancelDeferredRefresh() {
+    if (deferredRefreshFrameRef.current !== null) {
+      window.cancelAnimationFrame(deferredRefreshFrameRef.current);
+      deferredRefreshFrameRef.current = null;
+    }
+    if (deferredRefreshTimerRef.current !== null) {
+      window.clearTimeout(deferredRefreshTimerRef.current);
+      deferredRefreshTimerRef.current = null;
+    }
+  }
+
+  /** 主窗口连续两帧恢复后再查询状态，避免 Tauri IPC 与 WebKit 首次图层提交竞争。 */
+  function scheduleRefreshAfterClipboardPaint() {
+    cancelDeferredRefresh();
+    deferredRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      deferredRefreshFrameRef.current = window.requestAnimationFrame(() => {
+        deferredRefreshFrameRef.current = null;
+        deferredRefreshTimerRef.current = window.setTimeout(() => {
+          deferredRefreshTimerRef.current = null;
+          if (!mountedRef.current) return;
+
+          void refresh();
+        }, 0);
+      });
+    });
+  }
+
+  function handleSyncUpdated() {
+    cancelDeferredRefresh();
+    void refresh();
+  }
 
   function handleWindowVisibility(event: { payload: WindowVisibilityPayload }) {
     if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
 
     if (event.payload.visible) {
-      void refresh();
+      scheduleRefreshAfterClipboardPaint();
       return;
     }
 
+    cancelDeferredRefresh();
     setDetailsTarget(null);
     setRecordsOpen(false);
   }

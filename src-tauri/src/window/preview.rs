@@ -182,7 +182,7 @@ pub fn close_clipboard_preview(_app: &AppHandle) -> Result<()> {
 pub fn suppress_for_clipboard_hide(_app: &AppHandle) {}
 
 #[cfg(target_os = "android")]
-pub fn resume_after_clipboard_show(_app: &AppHandle) {}
+pub fn resume_after_clipboard_show() {}
 
 #[cfg(target_os = "android")]
 pub fn get_clipboard_preview_state() -> Result<Option<ClipboardPreviewState>> {
@@ -330,14 +330,12 @@ pub fn suppress_for_clipboard_hide(app: &AppHandle) {
 }
 
 #[cfg(not(target_os = "android"))]
-/// 剪贴板窗口重新显示后允许新的预览请求进入，并在后台静默预热预览窗口，
-/// 确保用户按下空格键时能够 0 延迟秒开预览。
-pub fn resume_after_clipboard_show(app: &AppHandle) {
+/// 剪贴板窗口重新显示后允许新的预览请求进入。
+///
+/// 不在主窗口显示热路径创建预览 WebView：macOS 会在隐藏 WebView 收到事件时恢复其
+/// WebContent 与图层树，和主窗口首次提交竞争。预览继续由真实预览请求按需创建并复用。
+pub fn resume_after_clipboard_show() {
     PREVIEW_SUPPRESSED.store(false, Ordering::SeqCst);
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = ensure_preview_window(&app_handle);
-    });
 }
 
 #[cfg(not(target_os = "android"))]
