@@ -662,6 +662,20 @@ impl ClipboardHandler for ClipboardChangeHandler {
             return;
         }
 
+        // RustDesk 等远程剪贴板可能重新采样像素，使精确 RGBA 指纹失效。这里只与最近
+        // 真正参与同步的同尺寸图片做短期感知匹配，不改变数据库的精确历史去重语义。
+        if image_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| self.fingerprints.matches_recent_synced_image(fingerprint))
+        {
+            if let Some(fingerprint) = image_fingerprint {
+                self.fingerprints
+                    .commit_observation(&observation, fingerprint);
+            }
+            log::debug!("clipboard watcher: suppressed perceptually matching synchronized image");
+            return;
+        }
+
         let sync_observation = if item.kind == ClipboardKind::Files {
             Some(observation)
         } else {
@@ -669,9 +683,15 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 image_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
             if let Some(fingerprint) = fingerprint {
                 self.fingerprints
-                    .commit_observation(&observation, fingerprint);
+                    .commit_observation(&observation, fingerprint.clone());
+                if item.kind == ClipboardKind::Image {
+                    Some(observation.with_outbound_image(fingerprint))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            None
         };
 
         let source_app =

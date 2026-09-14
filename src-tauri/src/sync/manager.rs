@@ -1259,7 +1259,8 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Enqueues a clipboard event whose file fingerprint may finish asynchronously.
+    /// Enqueues a clipboard event with watcher context for delayed file fingerprints and image
+    /// echo tracking.
     pub async fn enqueue_observed_item(
         &self,
         item: ClipboardItem,
@@ -1535,6 +1536,14 @@ impl SyncManager {
         }
         repository::link_event_to_item(&pool, &item.id, &event.event_id, "local").await?;
         repository::clear_pending_item(&pool, &item.id).await?;
+        if let Some(fingerprint) = observation
+            .as_ref()
+            .and_then(ClipboardObservation::outbound_image)
+        {
+            self.app
+                .state::<Arc<ClipboardFingerprintState>>()
+                .remember_synced_image(fingerprint);
+        }
         if should_wake {
             self.wake_transfer();
         }
