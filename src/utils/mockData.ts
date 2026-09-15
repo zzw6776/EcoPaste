@@ -7,6 +7,7 @@ import type { Settings } from "@/types/settings";
 
 export const DEFAULT_MOCK_SETTINGS: Settings = {
   android: {
+    backgroundKeepAlive: true,
     gesture: {
       enabled: false,
       hideOverlay: true,

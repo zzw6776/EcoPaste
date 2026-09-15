@@ -272,10 +272,8 @@ pub fn run() {
                 #[cfg(target_os = "android")]
                 {
                     commands::android::set_app_handle(handle_db.clone());
-                    if let Err(err) =
-                        commands::android::apply_android_gesture_settings(&settings.android.gesture)
-                    {
-                        log::warn!("sync initial Android gesture settings failed: {err}");
+                    if let Err(err) = commands::android::apply_android_settings(&settings.android) {
+                        log::warn!("sync initial Android settings failed: {err}");
                     }
                 }
                 Ok::<_, anyhow::Error>(())

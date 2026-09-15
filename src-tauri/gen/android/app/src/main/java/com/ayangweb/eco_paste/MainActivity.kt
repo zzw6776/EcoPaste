@@ -41,14 +41,13 @@ class MainActivity : TauriActivity() {
         }
         EcoPasteBridge.setCurrentActivity(this)
         EcoPasteBridge.initialize(applicationContext)
-
-        EcoPasteBridge.ensureGestureService(this)
     }
 
     override fun onResume() {
         super.onResume()
         EcoPasteBridge.setCurrentActivity(this)
         EcoPasteBridge.setForegroundCaptureActive(true)
+        EcoPasteBridge.ensureGestureService(this)
         try {
             EcoPasteBridge.notifySyncStatusRefresh()
         } catch (error: Throwable) {

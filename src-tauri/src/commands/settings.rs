@@ -76,10 +76,8 @@ pub async fn update_settings(app: AppHandle, patch: serde_json::Value) -> Result
     }
 
     if touches_android {
-        if let Err(err) =
-            crate::commands::android::apply_android_gesture_settings(&next.android.gesture)
-        {
-            log::warn!("apply Android gesture settings failed: {err}");
+        if let Err(err) = crate::commands::android::apply_android_settings(&next.android) {
+            log::warn!("apply Android settings failed: {err}");
         }
     }
 
@@ -124,10 +122,8 @@ fn apply_reset_side_effects(app: &AppHandle, settings: &Settings) {
 
     admin::sync_scheduled_task(settings.general.run_as_admin);
 
-    if let Err(err) =
-        crate::commands::android::apply_android_gesture_settings(&settings.android.gesture)
-    {
-        log::warn!("reset Android gesture settings failed: {err}");
+    if let Err(err) = crate::commands::android::apply_android_settings(&settings.android) {
+        log::warn!("reset Android settings failed: {err}");
     }
 }
 

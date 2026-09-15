@@ -48,6 +48,7 @@ object EcoPasteBridge {
     private const val PREFS_NAME = "ecopaste_android"
     private const val KEY_ENGINE_MODE = "engine_mode"
     private const val KEY_MODE_SELECTED = "mode_selected"
+    private const val KEY_BACKGROUND_KEEP_ALIVE = "background_keep_alive"
     private const val KEY_GESTURE_ENABLED = "gesture_enabled"
     private const val KEY_GESTURE_HIDE_OVERLAY = "gesture_hide_overlay"
     private const val KEY_GESTURE_POPUP_HEIGHT_PERCENT = "gesture_popup_height_percent"
@@ -911,9 +912,11 @@ object EcoPasteBridge {
     }
 
     private fun startOverlayService(context: Context) {
+        val keepAlive = isBackgroundKeepAliveEnabled(context)
         val intent = Intent(context, EcoPasteOverlayService::class.java)
+            .putExtra(EcoPasteOverlayService.EXTRA_FOREGROUND_REQUESTED, keepAlive)
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (keepAlive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
@@ -932,7 +935,7 @@ object EcoPasteBridge {
         }
     }
 
-    /** 判断 Root 手势监控前台服务是否正在运行。 */
+    /** 判断 Root 手势监控服务是否正在运行。 */
     @JvmStatic
     fun isOverlayServiceRunning(context: Context): Boolean {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
@@ -1066,9 +1069,15 @@ object EcoPasteBridge {
             .apply()
     }
 
+    fun isBackgroundKeepAliveEnabled(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_BACKGROUND_KEEP_ALIVE, true)
+    }
+
     @JvmStatic
-    fun applyGestureConfig(
+    fun applyAndroidConfig(
         context: Context,
+        backgroundKeepAlive: Boolean,
         enabled: Boolean,
         hideOverlay: Boolean,
         popupHeightPercent: Int,
@@ -1084,6 +1093,7 @@ object EcoPasteBridge {
         val nextRightHeightDp = rightHeightDp.coerceIn(0, 96)
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
+            .putBoolean(KEY_BACKGROUND_KEEP_ALIVE, backgroundKeepAlive)
             .putBoolean(KEY_GESTURE_ENABLED, enabled)
             .putBoolean(KEY_GESTURE_HIDE_OVERLAY, hideOverlay)
             .putInt(KEY_GESTURE_POPUP_HEIGHT_PERCENT, popupHeightPercent.coerceIn(30, 90))
@@ -1121,7 +1131,9 @@ object EcoPasteBridge {
         val overlayGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             Settings.canDrawOverlays(context)
         if (currentEngineMode == "root" && config.enabled && overlayGranted) {
-            startOverlayService(context)
+            if (!isOverlayServiceRunning(context)) {
+                startOverlayService(context)
+            }
         } else {
             stopOverlayService(context)
         }

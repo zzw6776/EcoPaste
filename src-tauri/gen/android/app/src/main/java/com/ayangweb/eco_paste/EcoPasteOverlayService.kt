@@ -31,6 +31,7 @@ import androidx.core.app.NotificationCompat
 class EcoPasteOverlayService : Service() {
 
     companion object {
+        const val EXTRA_FOREGROUND_REQUESTED = "com.ayangweb.eco_paste.FOREGROUND_REQUESTED"
         private const val TAG = "EcoPasteOverlayService"
         private const val CHANNEL_ID = "ecopaste_overlay_channel"
         private const val NOTIFICATION_ID = 1002
@@ -52,6 +53,7 @@ class EcoPasteOverlayService : Service() {
 
         fun notifyConfigChanged(monitorGeometryChanged: Boolean) {
             instance?.mainHandler?.post {
+                instance?.applyForegroundMode()
                 instance?.monitorFailureCount = 0
                 instance?.reconcileState(
                     refreshRoot = false,
@@ -73,6 +75,7 @@ class EcoPasteOverlayService : Service() {
     private var overlayPanel: EcoPasteOverlayPanel? = null
     private var rootInputMonitor: RootInputMonitor? = null
     private var gestureMonitorReady = false
+    private var foregroundActive = false
     private var activeMonitorSignature: String? = null
     private var rootAvailable = false
     private var panelSessionId: Long? = null
@@ -116,13 +119,17 @@ class EcoPasteOverlayService : Service() {
                 rootInputMonitor?.setPanelSession(sessionId)
             }
         }
-        startForegroundNotification()
         registerScreenStateReceiver()
         reconcileState(refreshRoot = true, forceMonitorRestart = false)
         Log.i(TAG, "Root gesture service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 即使设置在启动途中关闭，也先履行 startForegroundService 的前台升级要求。
+        if (intent?.getBooleanExtra(EXTRA_FOREGROUND_REQUESTED, false) == true) {
+            startForegroundNotification()
+        }
+        applyForegroundMode()
         monitorFailureCount = 0
         reconcileState(refreshRoot = true, forceMonitorRestart = false)
         return START_STICKY
@@ -148,6 +155,16 @@ class EcoPasteOverlayService : Service() {
         } else {
             @Suppress("DEPRECATION")
             registerReceiver(screenStateReceiver, filter)
+        }
+    }
+
+    /** 原地切换服务级别，不重启 Root 监听或关闭面板。 */
+    private fun applyForegroundMode() {
+        if (EcoPasteBridge.isBackgroundKeepAliveEnabled(this)) {
+            if (!foregroundActive) startForegroundNotification()
+        } else if (foregroundActive) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundActive = false
         }
     }
 
@@ -182,6 +199,7 @@ class EcoPasteOverlayService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .build()
         startForeground(NOTIFICATION_ID, notification)
+        foregroundActive = true
     }
 
     /** 统一按开关、Root、亮屏和解锁状态决定是否运行。 */

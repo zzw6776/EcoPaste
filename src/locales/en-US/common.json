@@ -22,6 +22,10 @@
       "useBasic": "Use basic mode"
     },
     "description": "Full functionality requires Root and overlay access. You can instead use basic mode without granting Accessibility access.",
+    "keepAlive": {
+      "description": "Applies only in full mode with swipe activation enabled. On: uses a foreground service with a persistent notification. Off: uses an ordinary service without a persistent notification, but Android may stop swipe detection; reopen the app to restore it. Turning this off does not stop Root clipboard capture. If the entire app process is killed, capture and sync will also stop.",
+      "title": "Enhanced background keep-alive"
+    },
     "messages": {
       "basicEnabled": "Switched to basic mode",
       "fullEnabled": "Full mode is starting",
@@ -51,7 +55,7 @@
         "title": "Ignore battery optimization"
       },
       "notification": {
-        "description": "Allows the persistent full-mode service notification.",
+        "description": "Allows the service notification in the notification drawer when enhanced background keep-alive is enabled.",
         "title": "Notification permission"
       },
       "overlay": {

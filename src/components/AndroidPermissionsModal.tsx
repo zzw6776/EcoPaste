@@ -1,5 +1,5 @@
 import { useInterval, useMount } from "ahooks";
-import { Button, Tag } from "antd";
+import { Button, Switch, Tag } from "antd";
 import type { TFunction } from "i18next";
 import type { FC, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -47,10 +47,11 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   const { open, onClose, onFinish } = props;
   const { t } = useTranslation("common");
   const androidSnapshot = useSnapshot(androidState);
+  const { android } = useSnapshot(settingsState);
   const status = androidSnapshot.status ?? INITIAL_STATUS;
-  const [activeAction, setActiveAction] = useState<AndroidMode | "root" | null>(
-    null,
-  );
+  const [activeAction, setActiveAction] = useState<
+    AndroidMode | "root" | "keepAlive" | null
+  >(null);
   const fetchingRef = useRef(false);
   const mobile = isAndroid || isMobile();
 
@@ -181,6 +182,19 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
         }
       }
       getMessageApi().error(t("androidPermissions.messages.modeFailed"));
+    } finally {
+      setActiveAction(null);
+    }
+  };
+
+  /** 通过 Rust 持久化并通知原生服务原地切换前台状态。 */
+  const handleKeepAliveChange = async (checked: boolean) => {
+    setActiveAction("keepAlive");
+    try {
+      await updateSettings({ android: { backgroundKeepAlive: checked } });
+      await fetchStatus();
+    } catch {
+      // 设置命令统一显示保存失败的具体原因。
     } finally {
       setActiveAction(null);
     }
@@ -407,6 +421,24 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
           <span className="font-medium text-ant-text">
             {t("androidPermissions.sections.recommended")}
           </span>
+
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-ant-border-secondary bg-ant-container p-3 shadow-xs">
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="font-medium text-ant-text">
+                {t("androidPermissions.keepAlive.title")}
+              </span>
+              <span className="text-ant-secondary text-xs leading-relaxed">
+                {t("androidPermissions.keepAlive.description")}
+              </span>
+            </div>
+            <Switch
+              aria-label={t("androidPermissions.keepAlive.title")}
+              checked={android.backgroundKeepAlive}
+              disabled={busy}
+              loading={activeAction === "keepAlive"}
+              onChange={handleKeepAliveChange}
+            />
+          </div>
 
           <PermissionCard
             action={
