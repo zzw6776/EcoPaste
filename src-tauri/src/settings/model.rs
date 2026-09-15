@@ -75,10 +75,21 @@ pub enum CloudRelayMode {
     Custom,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AndroidSettings {
+    pub background_keep_alive: bool,
     pub gesture: AndroidGesture,
+}
+
+impl Default for AndroidSettings {
+    fn default() -> Self {
+        Self {
+            // 旧配置缺少此字段时保留原有前台服务行为。
+            background_keep_alive: true,
+            gesture: AndroidGesture::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

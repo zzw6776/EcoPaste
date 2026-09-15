@@ -1114,24 +1114,26 @@ mod jni_bridge {
         file_action("saveClipboardFile", path)
     }
 
-    pub fn apply_gesture_settings(settings: &crate::settings::AndroidGesture) -> Result<()> {
+    pub fn apply_android_settings(settings: &crate::settings::AndroidSettings) -> Result<()> {
+        let gesture = &settings.gesture;
         with_jni_env(|env, context, bridge_class| {
             env.call_static_method(
                 bridge_class,
-                "applyGestureConfig",
-                "(Landroid/content/Context;ZZIIIII)V",
+                "applyAndroidConfig",
+                "(Landroid/content/Context;ZZZIIIII)V",
                 &[
                     JValue::Object(context),
-                    JValue::Bool(settings.enabled as u8),
-                    JValue::Bool(settings.hide_overlay as u8),
-                    JValue::Int(settings.popup_height_percent as i32),
-                    JValue::Int(settings.left_width_dp as i32),
-                    JValue::Int(settings.left_height_dp as i32),
-                    JValue::Int(settings.right_width_dp as i32),
-                    JValue::Int(settings.right_height_dp as i32),
+                    JValue::Bool(settings.background_keep_alive as u8),
+                    JValue::Bool(gesture.enabled as u8),
+                    JValue::Bool(gesture.hide_overlay as u8),
+                    JValue::Int(gesture.popup_height_percent as i32),
+                    JValue::Int(gesture.left_width_dp as i32),
+                    JValue::Int(gesture.left_height_dp as i32),
+                    JValue::Int(gesture.right_width_dp as i32),
+                    JValue::Int(gesture.right_height_dp as i32),
                 ],
             )
-            .map_err(|e| anyhow!("call applyGestureConfig failed: {e}"))?;
+            .map_err(|e| anyhow!("call applyAndroidConfig failed: {e}"))?;
 
             Ok(())
         })
@@ -1412,10 +1414,10 @@ pub async fn set_android_mode(mode: String) -> Result<AndroidModeResult> {
     }
 }
 
-pub fn apply_android_gesture_settings(settings: &crate::settings::AndroidGesture) -> Result<()> {
+pub fn apply_android_settings(settings: &crate::settings::AndroidSettings) -> Result<()> {
     #[cfg(target_os = "android")]
     {
-        jni_bridge::apply_gesture_settings(settings)
+        jni_bridge::apply_android_settings(settings)
     }
     #[cfg(not(target_os = "android"))]
     {

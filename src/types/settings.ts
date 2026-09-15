@@ -90,6 +90,7 @@ export interface AndroidGesture {
 }
 
 export interface AndroidSettings {
+  backgroundKeepAlive: boolean;
   gesture: AndroidGesture;
 }
 

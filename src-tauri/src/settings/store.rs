@@ -391,6 +391,7 @@ mod tests {
         let parsed: Settings = serde_json::from_str(partial).unwrap();
         assert!(parsed.general.auto_start);
         assert!(!parsed.general.run_as_admin);
+        assert!(parsed.android.background_keep_alive);
         assert!(!parsed.android.gesture.enabled);
         assert!(parsed.android.gesture.hide_overlay);
         assert_eq!(parsed.android.gesture.popup_height_percent, 64);
@@ -439,6 +440,39 @@ mod tests {
             parsed.clipboard.window.select_group_on_open,
             crate::settings::WINDOW_OPEN_SELECTION_PRESERVE
         );
+    }
+
+    #[test]
+    fn android_keep_alive_preserves_legacy_behavior_and_explicit_choice() {
+        let legacy: Settings = serde_json::from_value(serde_json::json!({
+            "android": {"gesture": {"enabled": true}}
+        }))
+        .unwrap();
+        assert!(legacy.android.background_keep_alive);
+        assert!(legacy.android.gesture.enabled);
+
+        let mut value = serde_json::to_value(legacy).unwrap();
+        deep_merge(
+            &mut value,
+            serde_json::json!({"android": {"backgroundKeepAlive": false}}),
+        );
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert!(!parsed.android.background_keep_alive);
+        assert!(parsed.android.gesture.enabled);
+
+        let saved = serde_json::to_string(&parsed).unwrap();
+        let restored: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.android.background_keep_alive);
+        assert!(restored.android.gesture.enabled);
+
+        let mut value = serde_json::to_value(restored).unwrap();
+        deep_merge(
+            &mut value,
+            serde_json::json!({"android": {"gesture": {"enabled": false}}}),
+        );
+        let changed_mode: Settings = serde_json::from_value(value).unwrap();
+        assert!(!changed_mode.android.background_keep_alive);
+        assert!(!changed_mode.android.gesture.enabled);
     }
 
     #[test]
