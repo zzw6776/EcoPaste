@@ -578,8 +578,8 @@ pub async fn write_to_clipboard(
 
 /// 「点击列表项 → 自动粘贴」的组合命令：写回剪贴板 + 隐藏剪贴板窗口 + 触发系统级粘贴。
 ///
-/// 窗口已是非激活面板（macOS NSPanel `nonactivating_panel` / Windows `focusable=false`），
-/// show 时不会把前台 App 推走，前台焦点始终在用户原窗口。
+/// 窗口使用非激活面板（macOS NSPanel `nonactivating_panel` / Windows `focusable=false`）。
+/// 当鼠标点击面板激活了 EcoPaste，粘贴前显式恢复已记录的外部应用。
 /// macOS 上 panel 会成为 key window，CGEvent ⌘V 若不先 hide 会被 panel 自己吞掉，
 /// hide 后插入 50ms 让 panel 真正 order_out（hide_window 是 run_on_main_thread 异步派发，
 /// 右键菜单触发时主线程仍在处理菜单关闭，不等会出现 ⌘V 早于 hide 完成的竞态）。
@@ -592,6 +592,9 @@ pub async fn paste_clipboard_item(
     id: String,
     _plain: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let paste_target_pid = window::macos::clipboard_paste_target_pid()?;
+
     #[cfg(target_os = "macos")]
     ensure_macos_paste_permission(&app).await?;
 
@@ -623,7 +626,9 @@ pub async fn paste_clipboard_item(
     }
     #[cfg(not(target_os = "android"))]
     {
-        if window::is_clipboard_window_pinned() {
+        let clipboard_window_pinned = window::is_clipboard_window_pinned();
+
+        if clipboard_window_pinned {
             // 固定时窗口保持可见：macOS 上 panel 仍是 key window 会吞掉 ⌘V，需先 resign key
             // 让键焦点回到前台 App 的窗口；Windows 剪贴板窗口 focusable=false，无需处理。
             #[cfg(target_os = "macos")]
@@ -635,7 +640,39 @@ pub async fn paste_clipboard_item(
         }
 
         #[cfg(target_os = "macos")]
-        window::macos::wait_for_clipboard_panel_focus_release(&app).await?;
+        window::macos::wait_for_clipboard_panel_main_thread(&app).await?;
+
+        #[cfg(target_os = "macos")]
+        if let Err(err) =
+            window::macos::restore_clipboard_paste_target(&app, paste_target_pid).await
+        {
+            log::warn!("restore clipboard paste target failed: {err:?}");
+            if !clipboard_window_pinned {
+                match window::show_window(&app, CLIPBOARD_WINDOW_LABEL) {
+                    Ok(()) => {
+                        if let Err(show_err) =
+                            window::macos::wait_for_clipboard_panel_main_thread(&app).await
+                        {
+                            log::warn!(
+                                "wait for clipboard panel after paste failure failed: {show_err:?}"
+                            );
+                        }
+                    }
+                    Err(show_err) => {
+                        log::warn!(
+                            "show clipboard window after paste target restore failed: {show_err:?}"
+                        );
+                    }
+                }
+            }
+            return Err(AppError::Clipboard(
+                crate::i18n::commands::label(
+                    crate::i18n::current_language(&app),
+                    crate::i18n::commands::Key::PasteTargetUnavailable,
+                )
+                .to_owned(),
+            ));
+        }
 
         // hide / resign 都是 run_on_main_thread 异步派发；不等一拍，simulate_paste 的 ⌘V
         // 会赶在 panel 真正 order_out / 让出 key 前命中 panel 自己（webview 吞掉）。

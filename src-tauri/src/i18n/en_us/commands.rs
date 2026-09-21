@@ -19,6 +19,10 @@ pub fn label(key: Key) -> &'static str {
         Key::PasteAccessibilityRequired => {
             "Allow EcoPaste in System Settings → Privacy & Security → Accessibility, then paste again"
         }
+        #[cfg(target_os = "macos")]
+        Key::PasteTargetUnavailable => {
+            "The original input window could not be restored. Open EcoPaste and try again"
+        }
         Key::SaveImage => "Save Image",
     }
 }

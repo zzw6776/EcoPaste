@@ -36,6 +36,8 @@ pub enum CommandKey {
     ExternalUrlUnsupported,
     #[cfg(target_os = "macos")]
     PasteAccessibilityRequired,
+    #[cfg(target_os = "macos")]
+    PasteTargetUnavailable,
     SaveImage,
 }
 
