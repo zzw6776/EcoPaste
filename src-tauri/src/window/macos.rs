@@ -3,13 +3,18 @@
 
 #![allow(clippy::unused_unit)]
 
+use std::cell::RefCell;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+use objc2::rc::autoreleasepool;
+use objc2::sel;
 use objc2_app_kit::{
-    NSAppKitVersionNumber, NSAutoresizingMaskOptions, NSGlassEffectView, NSGlassEffectViewStyle,
-    NSView as AppKitView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow as AppKitWindow, NSWindowOrderingMode,
+    NSAppKitVersionNumber, NSApplicationActivationOptions, NSAutoresizingMaskOptions,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSRunningApplication, NSView as AppKitView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow as AppKitWindow, NSWindowOrderingMode, NSWorkspace, NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
 use objc2_web_kit::WKWebView;
@@ -27,10 +32,63 @@ use crate::settings::SettingsStore;
 
 const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
 const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
+const MIN_MACOS_VERSION_PREVENTS_ACTIVATION_COMPAT: isize = 27;
+const PASTE_TARGET_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PASTE_TARGET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const SLOW_CLIPBOARD_SHOW_MS: u128 = 100;
 
 static ACTIVE_CLIPBOARD_SHOW_TRACE: LazyLock<Mutex<Option<ClipboardShowRequest>>> =
     LazyLock::new(|| Mutex::new(None));
+static CLIPBOARD_PASTE_TARGET_PID: LazyLock<Mutex<Option<i32>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+thread_local! {
+    static PASTE_TARGET_OBSERVER: RefCell<Option<Retained<PasteTargetObserver>>> = const {
+        RefCell::new(None)
+    };
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "EcoPastePasteTargetObserver"]
+    #[ivars = AppHandle]
+    struct PasteTargetObserver;
+
+    unsafe impl NSObjectProtocol for PasteTargetObserver {}
+
+    impl PasteTargetObserver {
+        /// 固定面板保持可见时，跟随用户主动切换的外部应用更新粘贴目标。
+        #[unsafe(method(applicationDidActivate:))]
+        fn application_did_activate(&self, notification: &NSNotification) {
+            let Some(info) = notification.userInfo() else {
+                return;
+            };
+            let Some(application) = info.objectForKey(unsafe { NSWorkspaceApplicationKey }) else {
+                return;
+            };
+            let Some(application) = application.downcast_ref::<NSRunningApplication>() else {
+                return;
+            };
+            let pid = application.processIdentifier();
+            if pid <= 0 || pid == NSRunningApplication::currentApplication().processIdentifier() {
+                return;
+            }
+
+            let visible = self
+                .ivars()
+                .get_webview_panel(CLIPBOARD_WINDOW_LABEL)
+                .is_ok_and(|panel| panel.is_visible());
+            if !visible {
+                return;
+            }
+
+            if let Ok(mut target) = CLIPBOARD_PASTE_TARGET_PID.lock() {
+                *target = Some(pid);
+            }
+        }
+    }
+);
 
 tauri_panel! {
     panel!(MainPanel {
@@ -75,6 +133,7 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
             .nonactivating_panel()
             .into(),
     );
+    synchronize_panel_prevents_activation(panel.as_panel());
     panel.set_transparent(true);
     panel.set_collection_behavior(
         CollectionBehavior::new()
@@ -139,6 +198,61 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     });
 
     panel.set_event_handler(Some(handler.as_ref()));
+    register_paste_target_observer(app_handle)?;
+
+    Ok(())
+}
+
+/// 修正 macOS 27 中运行时从 NSWindow 转换为 NSPanel 后未同步的禁止激活标记。
+/// tauri-nspanel 无法走 NSPanel 初始化器，只能在转换后通过仍存在的 AppKit selector 同步标记；
+/// selector 缺失时保留公共 API 的粘贴前焦点恢复兜底。
+fn synchronize_panel_prevents_activation(panel: &objc2_app_kit::NSPanel) {
+    let major_version = objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion;
+    if major_version < MIN_MACOS_VERSION_PREVENTS_ACTIVATION_COMPAT {
+        return;
+    }
+
+    let selector = objc2::sel!(_setPreventsActivation:);
+    let responds: bool = unsafe { objc2::msg_send![panel, respondsToSelector: selector] };
+    if !responds {
+        log::warn!("NSPanel does not support _setPreventsActivation: compatibility selector");
+        return;
+    }
+
+    unsafe {
+        let _: () = objc2::msg_send![panel, _setPreventsActivation: true];
+    }
+    log::info!("synchronized NSPanel prevents-activation state for macOS {major_version}");
+}
+
+/// 在 AppKit 主线程保留一个工作区观察者，避免重建面板时重复注册。
+fn register_paste_target_observer(app_handle: &AppHandle) -> Result<()> {
+    let main_thread = ObjcMainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("clipboard target observer requires the main thread"))?;
+
+    PASTE_TARGET_OBSERVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+
+        let observer = PasteTargetObserver::alloc(main_thread).set_ivars(app_handle.clone());
+        // NSWorkspace 的应用激活通知在主线程交付；slot 持有观察者直到主线程退出。
+        let observer: Retained<PasteTargetObserver> = unsafe { msg_send![super(observer), init] };
+        unsafe {
+            NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .addObserver_selector_name_object(
+                    &observer,
+                    sel!(applicationDidActivate:),
+                    Some(NSWorkspaceDidActivateApplicationNotification),
+                    None,
+                );
+        }
+        *slot = Some(observer);
+    });
 
     Ok(())
 }
@@ -308,6 +422,7 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
             let main_thread_started = Instant::now();
             let panel_lookup_started = Instant::now();
             if let Ok(panel) = panel_handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
+                remember_clipboard_paste_target();
                 let panel_lookup_us = elapsed_us(panel_lookup_started);
                 if let Ok(mut trace) = ACTIVE_CLIPBOARD_SHOW_TRACE.lock() {
                     *trace = Some(request);
@@ -429,9 +544,10 @@ pub fn resign_clipboard_panel_key(app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// 等待此前投递到 AppKit 主线程的 panel hide / resign 操作真正执行完毕。
-/// `run_on_main_thread` 本身只保证入队；没有这个屏障时，模拟粘贴可能先于 panel 让出焦点。
-pub async fn wait_for_clipboard_panel_focus_release(app_handle: &AppHandle) -> Result<()> {
+/// 等待此前投递到 AppKit 主线程的 panel 操作真正执行完毕。
+/// `run_on_main_thread` 本身只保证入队；hide / resign 后需要屏障再模拟粘贴，
+/// 失败后重新 show 也需要屏障保证前端错误提示可见。
+pub async fn wait_for_clipboard_panel_main_thread(app_handle: &AppHandle) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
     app_handle
@@ -442,10 +558,105 @@ pub async fn wait_for_clipboard_panel_focus_release(app_handle: &AppHandle) -> R
 
     tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
         .await
-        .map_err(|_| anyhow::anyhow!("wait for clipboard panel focus release timed out"))?
-        .map_err(|_| anyhow::anyhow!("clipboard panel focus release was cancelled"))?;
+        .map_err(|_| anyhow::anyhow!("wait for clipboard panel main thread timed out"))?
+        .map_err(|_| anyhow::anyhow!("clipboard panel main thread wait was cancelled"))?;
 
     Ok(())
+}
+
+/// 在粘贴开始时固定目标，避免数据库等待期间应用切换改变本次粘贴的接收方。
+pub fn clipboard_paste_target_pid() -> Result<Option<i32>> {
+    let target = CLIPBOARD_PASTE_TARGET_PID
+        .lock()
+        .map_err(|_| anyhow::anyhow!("clipboard paste target state poisoned"))?;
+
+    Ok(*target)
+}
+
+/// 面板让出 key 状态后恢复原前台应用；应用活动状态不等同于输入控件焦点。
+/// 此处兼容鼠标点击面板会激活 EcoPaste 的系统行为，仍需先执行 hide / resign 屏障。
+pub async fn restore_clipboard_paste_target(
+    app_handle: &AppHandle,
+    target_pid: Option<i32>,
+) -> Result<()> {
+    let Some(target_pid) = target_pid else {
+        return Err(anyhow::anyhow!("clipboard paste target was not captured").into());
+    };
+
+    if is_clipboard_paste_target_active(target_pid)? {
+        return Ok(());
+    }
+
+    let (activation_tx, activation_rx) = tokio::sync::oneshot::channel();
+    app_handle
+        .run_on_main_thread(move || {
+            let front_pid = NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .map(|application| application.processIdentifier());
+            let own_pid = NSRunningApplication::currentApplication().processIdentifier();
+            // 数据准备期间用户若切换到了第三个应用，不抢回焦点执行已过期的粘贴。
+            if front_pid.is_some_and(|pid| pid != own_pid && pid != target_pid) {
+                let _ = activation_tx.send(false);
+                return;
+            }
+
+            log::info!(
+                "clipboard paste focus restore: targetPid={target_pid} frontPid={front_pid:?}"
+            );
+            let accepted =
+                NSRunningApplication::runningApplicationWithProcessIdentifier(target_pid)
+                    .filter(|target| !target.isTerminated())
+                    .is_some_and(|target| {
+                        target.activateWithOptions(NSApplicationActivationOptions::empty())
+                    });
+            let _ = activation_tx.send(accepted);
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    let accepted = tokio::time::timeout(PASTE_TARGET_ACTIVATION_TIMEOUT, activation_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("restore clipboard paste target request timed out"))?
+        .map_err(|_| anyhow::anyhow!("restore clipboard paste target request was cancelled"))?;
+    if !accepted {
+        return Err(anyhow::anyhow!("clipboard paste target rejected activation").into());
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < PASTE_TARGET_ACTIVATION_TIMEOUT {
+        if is_clipboard_paste_target_active(target_pid)? {
+            return Ok(());
+        }
+        tokio::time::sleep(PASTE_TARGET_POLL_INTERVAL).await;
+    }
+
+    Err(anyhow::anyhow!("clipboard paste target did not become active").into())
+}
+
+/// 在面板取得 key 状态前记录真正接收键盘事件的外部应用。
+fn remember_clipboard_paste_target() {
+    let target_pid = autoreleasepool(|_| {
+        let current_pid = NSRunningApplication::currentApplication().processIdentifier();
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|application| application.processIdentifier())
+            .filter(|pid| *pid > 0 && *pid != current_pid)
+    });
+
+    if let Ok(mut target) = CLIPBOARD_PASTE_TARGET_PID.lock() {
+        *target = target_pid;
+    }
+}
+
+fn is_clipboard_paste_target_active(target_pid: i32) -> Result<bool> {
+    autoreleasepool(|_| {
+        let target = NSRunningApplication::runningApplicationWithProcessIdentifier(target_pid)
+            .ok_or_else(|| anyhow::anyhow!("clipboard paste target is no longer running"))?;
+        if target.isTerminated() {
+            return Err(anyhow::anyhow!("clipboard paste target has terminated").into());
+        }
+
+        Ok(target.isActive())
+    })
 }
 
 /// 粘贴完成后把 key 状态拿回来：固定窗口模式下用户还要继续用键盘 / 列表操作。

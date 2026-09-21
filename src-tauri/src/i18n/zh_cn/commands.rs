@@ -19,6 +19,8 @@ pub fn label(key: Key) -> &'static str {
         Key::PasteAccessibilityRequired => {
             "请在“系统设置 → 隐私与安全性 → 辅助功能”中允许 EcoPaste，然后重新粘贴"
         }
+        #[cfg(target_os = "macos")]
+        Key::PasteTargetUnavailable => "无法恢复原输入窗口，请重新唤起后再试",
         Key::SaveImage => "保存图片",
     }
 }
