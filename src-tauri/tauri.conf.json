@@ -64,7 +64,6 @@
       "icons/icon.ico"
     ],
     "license": "Apache-2.0",
-    "licenseFile": "../LICENSE",
     "resources": ["assets/tray.ico"],
     "shortDescription": "EcoPaste",
     "targets": ["nsis", "dmg", "app"]
