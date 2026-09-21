@@ -13,8 +13,8 @@ use objc2_app_kit::{
     NSAppKitVersionNumber, NSApplicationActivationOptions, NSAutoresizingMaskOptions,
     NSGlassEffectView, NSGlassEffectViewStyle, NSRunningApplication, NSView as AppKitView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow as AppKitWindow, NSWindowOrderingMode, NSWorkspace, NSWorkspaceApplicationKey,
-    NSWorkspaceDidActivateApplicationNotification,
+    NSWindow as AppKitWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWorkspace,
+    NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
 use objc2_web_kit::WKWebView;
@@ -32,6 +32,7 @@ use crate::settings::SettingsStore;
 
 const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
 const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
+const MIN_MACOS_VERSION_JOIN_ALL_APPLICATIONS: isize = 26;
 const MIN_MACOS_VERSION_PREVENTS_ACTIVATION_COMPAT: isize = 27;
 const PASTE_TARGET_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const PASTE_TARGET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -125,7 +126,6 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
         .to_panel::<MainPanel>()
         .map_err(|e| anyhow::anyhow!("to_panel failed: {e:?}"))?;
 
-    panel.set_level(PanelLevel::Dock.value());
     panel.set_style_mask(
         StyleMask::empty()
             .borderless()
@@ -135,13 +135,7 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     );
     synchronize_panel_prevents_activation(panel.as_panel());
     panel.set_transparent(true);
-    panel.set_collection_behavior(
-        CollectionBehavior::new()
-            .stationary()
-            .can_join_all_spaces()
-            .full_screen_auxiliary()
-            .into(),
-    );
+    configure_clipboard_panel_spaces(panel.as_panel());
 
     panel.set_corner_radius(CLIPBOARD_CORNER_RADIUS);
 
@@ -201,6 +195,29 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     register_paste_target_observer(app_handle)?;
 
     Ok(())
+}
+
+/// macOS 26 起允许非激活面板覆盖其他应用的全屏 Space，同时避免失活时自动隐藏。
+fn configure_clipboard_panel_spaces(panel: &objc2_app_kit::NSPanel) {
+    let major_version = objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion;
+    let mut behavior = CollectionBehavior::new()
+        .stationary()
+        .can_join_all_spaces()
+        .full_screen_auxiliary()
+        .value();
+
+    let level = if major_version >= MIN_MACOS_VERSION_JOIN_ALL_APPLICATIONS {
+        behavior |= NSWindowCollectionBehavior::CanJoinAllApplications;
+        panel.setHidesOnDeactivate(false);
+        PanelLevel::ScreenSaver
+    } else {
+        PanelLevel::Dock
+    };
+
+    panel.setLevel(level.value() as isize);
+    panel.setCollectionBehavior(behavior);
 }
 
 /// 修正 macOS 27 中运行时从 NSWindow 转换为 NSPanel 后未同步的禁止激活标记。
