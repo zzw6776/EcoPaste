@@ -7,9 +7,10 @@ use std::sync::{Mutex, OnceLock};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::um::winuser::{
-    CallNextHookEx, GetAsyncKeyState, GetMessageW, SendInput, SetWindowsHookExW, UnhookWindowsHookEx,
-    INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, LLKHF_INJECTED, MSG,
-    VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, GetAsyncKeyState, GetMessageW, SendInput, SetWindowsHookExW,
+    UnhookWindowsHookEx, INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP,
+    LLKHF_INJECTED, MSG, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 /// 未分配的虚拟键；在 Alt 仍按住时注入它，打断 Windows 的“单独按 Alt”菜单语义。
@@ -54,9 +55,7 @@ impl AltShortcut {
             ctrl: shortcut.mods.contains(Modifiers::CONTROL),
             key: virtual_key(shortcut.key)?,
             shift: shortcut.mods.contains(Modifiers::SHIFT),
-            super_key: shortcut
-                .mods
-                .intersects(Modifiers::SUPER | Modifiers::META),
+            super_key: shortcut.mods.intersects(Modifiers::SUPER | Modifiers::META),
         })
     }
 
@@ -148,10 +147,7 @@ fn suppress_alt_menu() {
         )
     };
     if sent as usize != inputs.len() {
-        log::warn!(
-            "inject Alt menu mask key sent {sent}/{}",
-            inputs.len()
-        );
+        log::warn!("inject Alt menu mask key sent {sent}/{}", inputs.len());
     }
 }
 
