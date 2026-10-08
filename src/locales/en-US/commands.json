@@ -37,6 +37,7 @@
     "inspectBackup": "Inspect backup",
     "inspectSyncPairingCode": "Read device QR code",
     "installUpdate": "Install update",
+    "isClipboardWindowPinned": "Query pinned status",
     "joinSyncGroup": "Connect existing device",
     "leaveSyncGroup": "Disconnect this device",
     "loadApps": "Load apps",

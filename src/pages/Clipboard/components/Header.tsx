@@ -19,6 +19,7 @@ import Dropdown, {
   type AppDropdownProps,
   type DropdownMenuItems,
 } from "@/components/Dropdown";
+import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import {
   CLIPBOARD_FOCUS_SEARCH_EVENT,
@@ -28,6 +29,11 @@ import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { router } from "@/router";
 import { openAndroidPermissionsModal } from "@/stores/android";
+import {
+  clipboardPinState,
+  syncClipboardWindowPinned,
+  toggleClipboardWindowPinned,
+} from "@/stores/clipboardPin";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
 import type {
@@ -51,10 +57,11 @@ interface SearchHandoffPayload {
   sessionId: number;
 }
 
-type HeaderMoreMenuKey = "clear" | "preference" | "android_permissions";
+type HeaderMoreMenuKey = "clear" | "preference" | "android_permissions" | "pin";
 
 const MORE_ACTION_TRIGGER: AppDropdownProps["trigger"] = ["click"];
 const PREFERENCE_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+,", " ");
+const PIN_WINDOW_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+P", " ");
 
 /**
  * 1:1 复刻 Paste 官方顶部栏：
@@ -64,6 +71,7 @@ const Header: FC = () => {
   const { t } = useTranslation(["clipboard", "common"]);
   const settings = useSnapshot(settingsState);
   const snapshot = useSnapshot(clipboardViewState);
+  const { isPinned } = useSnapshot(clipboardPinState);
   const [searchOpen, setSearchOpen] = useState(false);
   const [customGroups, setCustomGroups] = useState<ClipboardGroupRecord[]>([]);
   const [popoverOpen, setPopoverOpen] = useState(false);
@@ -92,6 +100,7 @@ const Header: FC = () => {
 
   useMount(() => {
     void loadGroups();
+    void syncClipboardWindowPinned();
   });
 
   useTauriListen(TAURI_EVENT.CLIPBOARD_GROUPS_UPDATED, () => {
@@ -112,6 +121,10 @@ const Header: FC = () => {
 
   const handleMoreMenuClick: MenuProps["onClick"] = async (info) => {
     const key = info.key as HeaderMoreMenuKey;
+    if (key === "pin") {
+      void toggleClipboardWindowPinned();
+      return;
+    }
     if (key === "clear") {
       await handleClearClipboardItems();
       return;
@@ -296,6 +309,16 @@ const Header: FC = () => {
   };
 
   const moreMenuItems: DropdownMenuItems = [
+    ...(!isMobile()
+      ? [
+          {
+            extra: PIN_WINDOW_SHORTCUT,
+            icon: isPinned ? "i-lucide:pin-off" : "i-lucide:pin rotate-45",
+            key: "pin",
+            label: isPinned ? t("header.unpin") : t("header.pin"),
+          },
+        ]
+      : []),
     ...(isAndroid
       ? [
           {
@@ -746,6 +769,30 @@ const Header: FC = () => {
       {/* 右侧：极简 `...` 更多操作 */}
       <div className="z-10 flex items-center gap-1">
         <SyncStatusIcons />
+        {!isMobile() && (
+          <Tooltip title={isPinned ? t("header.unpin") : t("header.pin")}>
+            <button
+              aria-label={isPinned ? t("header.unpin") : t("header.pin")}
+              className={cn(
+                "flex size-7 cursor-pointer items-center justify-center rounded-full transition-all",
+                isPinned
+                  ? "bg-ant-primary/15 text-ant-primary opacity-100"
+                  : "text-neutral-500 opacity-40 hover:bg-black/5 hover:text-neutral-800 hover:opacity-100 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white",
+              )}
+              onClick={() => {
+                void toggleClipboardWindowPinned();
+              }}
+              type="button"
+            >
+              <i
+                className={cn(
+                  "size-3.5 transition-transform",
+                  isPinned ? "i-lucide:pin-off" : "i-lucide:pin rotate-45",
+                )}
+              />
+            </button>
+          </Tooltip>
+        )}
         <Dropdown
           menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
           tooltip={t("header.moreActions")}

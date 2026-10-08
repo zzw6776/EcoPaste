@@ -37,6 +37,7 @@
     "inspectBackup": "识别备份",
     "inspectSyncPairingCode": "读取设备二维码",
     "installUpdate": "安装更新",
+    "isClipboardWindowPinned": "读取窗口固定状态",
     "joinSyncGroup": "连接已有设备",
     "leaveSyncGroup": "断开本机连接",
     "loadApps": "加载应用",

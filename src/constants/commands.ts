@@ -49,6 +49,7 @@ export const TAURI_COMMAND = {
   INSPECT_HISTORY_BACKUP: "inspect_history_backup",
   INSPECT_SYNC_PAIRING_CODE: "inspect_sync_pairing_code",
   INSTALL_UPDATE: "install_update",
+  IS_CLIPBOARD_WINDOW_PINNED: "is_clipboard_window_pinned",
   JOIN_SYNC_GROUP: "join_sync_group",
   LEAVE_SYNC_GROUP: "leave_sync_group",
   LIST_ALL_APPS: "list_all_apps",

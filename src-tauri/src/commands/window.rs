@@ -108,6 +108,11 @@ pub async fn set_clipboard_window_pinned(pinned: bool) {
     window::set_clipboard_window_pinned(pinned);
 }
 
+#[tauri::command]
+pub async fn is_clipboard_window_pinned() -> bool {
+    window::is_clipboard_window_pinned()
+}
+
 /// 临时暂停剪贴板窗口自动隐藏，避免系统文件选择等原生交互触发失焦收窗。
 #[tauri::command]
 pub async fn set_clipboard_window_auto_hide_suspended(suspended: bool) {

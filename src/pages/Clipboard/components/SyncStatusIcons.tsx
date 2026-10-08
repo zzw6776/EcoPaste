@@ -58,7 +58,10 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   async function initialize() {
     try {
       await refresh();
-      const unlisten = await listen(TAURI_EVENT.SYNC_UPDATED, handleSyncUpdated);
+      const unlisten = await listen(
+        TAURI_EVENT.SYNC_UPDATED,
+        handleSyncUpdated,
+      );
       if (!mountedRef.current) {
         unlisten();
         return;

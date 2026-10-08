@@ -45,6 +45,7 @@ import {
 } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { useWindowReady } from "@/hooks/useWindowReady";
+import { toggleClipboardWindowPinned } from "@/stores/clipboardPin";
 import { clipboardStatsState } from "@/stores/clipboardStats";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
@@ -1022,6 +1023,14 @@ const List: FC<ListProps> = (props) => {
       if (!activeItem) return;
 
       handleTogglePinned(activeItem.id);
+
+      return;
+    }
+
+    if (eventModifierPressed && event.key.toLowerCase() === "p") {
+      event.preventDefault();
+
+      void toggleClipboardWindowPinned();
 
       return;
     }

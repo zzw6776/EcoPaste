@@ -1650,6 +1650,16 @@ export const setClipboardWindowPinned = (pinned: boolean) => {
 };
 
 /**
+ * 查询剪贴板窗口当前是否固定。
+ */
+export const isClipboardWindowPinned = () => {
+  return call<boolean>(
+    TAURI_COMMAND.IS_CLIPBOARD_WINDOW_PINNED,
+    "commands:labels.isClipboardWindowPinned",
+  );
+};
+
+/**
  * 动态调整剪贴板主窗口高度（顶部边框拖拽拉伸）。
  */
 export const resizeClipboardWindow = (height: number) => {

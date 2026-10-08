@@ -23,6 +23,7 @@ dist-ssr
 /.cache/
 /.pnpm-store/
 /.workbuddy-ai/
+/.freebuff/
 /apk/
 
 # Editor directories and files

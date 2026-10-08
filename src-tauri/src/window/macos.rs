@@ -13,8 +13,9 @@ use objc2_app_kit::{
     NSAppKitVersionNumber, NSApplicationActivationOptions, NSAutoresizingMaskOptions,
     NSGlassEffectView, NSGlassEffectViewStyle, NSRunningApplication, NSView as AppKitView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow as AppKitWindow, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWorkspace,
-    NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification,
+    NSWindow as AppKitWindow, NSWindowOrderingMode, NSWorkspace,
+    NSWorkspaceActiveSpaceDidChangeNotification, NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::MainThreadMarker as ObjcMainThreadMarker;
 use objc2_web_kit::WKWebView;
@@ -32,7 +33,6 @@ use crate::settings::SettingsStore;
 
 const CLIPBOARD_CORNER_RADIUS: f64 = 26.0;
 const MIN_APPKIT_VERSION_LIQUID_GLASS: f64 = 2685.0;
-const MIN_MACOS_VERSION_JOIN_ALL_APPLICATIONS: isize = 26;
 const MIN_MACOS_VERSION_PREVENTS_ACTIVATION_COMPAT: isize = 27;
 const PASTE_TARGET_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const PASTE_TARGET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -86,6 +86,27 @@ define_class!(
 
             if let Ok(mut target) = CLIPBOARD_PASTE_TARGET_PID.lock() {
                 *target = Some(pid);
+            }
+        }
+
+        /// 当用户离开当前虚拟桌面/全屏 Space 时，若未开启固定模式，立即静默收起面板，
+        /// 避免跨 Space 切换时在新桌面短暂闪烁后失焦隐藏。
+        #[unsafe(method(activeSpaceDidChange:))]
+        fn active_space_did_change(&self, _notification: &NSNotification) {
+            if !super::should_auto_hide_clipboard_window() {
+                return;
+            }
+
+            let app_handle = self.ivars();
+            let visible = app_handle
+                .get_webview_panel(CLIPBOARD_WINDOW_LABEL)
+                .is_ok_and(|panel| panel.is_visible());
+            if !visible {
+                return;
+            }
+
+            if let Err(err) = super::hide_window(app_handle, CLIPBOARD_WINDOW_LABEL) {
+                log::warn!("auto-hide clipboard window on active-space change failed: {err}");
             }
         }
     }
@@ -197,27 +218,17 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// macOS 26 起允许非激活面板覆盖其他应用的全屏 Space，同时避免失活时自动隐藏。
+/// 允许非激活剪贴板面板覆盖其他应用的全屏 Space，同时避免失活时被系统自动隐藏。
 fn configure_clipboard_panel_spaces(panel: &objc2_app_kit::NSPanel) {
-    let major_version = objc2_foundation::NSProcessInfo::processInfo()
-        .operatingSystemVersion()
-        .majorVersion;
-    let mut behavior = CollectionBehavior::new()
-        .stationary()
+    let behavior = CollectionBehavior::new()
         .can_join_all_spaces()
         .full_screen_auxiliary()
+        .ignores_cycle()
         .value();
 
-    let level = if major_version >= MIN_MACOS_VERSION_JOIN_ALL_APPLICATIONS {
-        behavior |= NSWindowCollectionBehavior::CanJoinAllApplications;
-        panel.setHidesOnDeactivate(false);
-        PanelLevel::ScreenSaver
-    } else {
-        PanelLevel::Dock
-    };
-
-    panel.setLevel(level.value() as isize);
+    panel.setLevel(PanelLevel::PopUpMenu.value() as isize);
     panel.setCollectionBehavior(behavior);
+    panel.setHidesOnDeactivate(false);
 }
 
 /// 修正 macOS 27 中运行时从 NSWindow 转换为 NSPanel 后未同步的禁止激活标记。
@@ -259,14 +270,19 @@ fn register_paste_target_observer(app_handle: &AppHandle) -> Result<()> {
         // NSWorkspace 的应用激活通知在主线程交付；slot 持有观察者直到主线程退出。
         let observer: Retained<PasteTargetObserver> = unsafe { msg_send![super(observer), init] };
         unsafe {
-            NSWorkspace::sharedWorkspace()
-                .notificationCenter()
-                .addObserver_selector_name_object(
-                    &observer,
-                    sel!(applicationDidActivate:),
-                    Some(NSWorkspaceDidActivateApplicationNotification),
-                    None,
-                );
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            center.addObserver_selector_name_object(
+                &observer,
+                sel!(applicationDidActivate:),
+                Some(NSWorkspaceDidActivateApplicationNotification),
+                None,
+            );
+            center.addObserver_selector_name_object(
+                &observer,
+                sel!(activeSpaceDidChange:),
+                Some(NSWorkspaceActiveSpaceDidChangeNotification),
+                None,
+            );
         }
         *slot = Some(observer);
     });

@@ -174,6 +174,7 @@ pub fn run() {
             commands::show_taskbar_icon,
             commands::position_window,
             commands::set_clipboard_window_pinned,
+            commands::is_clipboard_window_pinned,
             commands::set_clipboard_window_auto_hide_suspended,
             commands::set_clipboard_window_editing,
             commands::prepare_clipboard_search_handoff,
