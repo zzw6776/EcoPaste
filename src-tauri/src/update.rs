@@ -26,15 +26,8 @@ const UPDATE_PROGRESS_EVENT: &str = "update://progress";
 #[cfg(not(target_os = "android"))]
 const STABLE_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_ENDPOINT";
 #[cfg(not(target_os = "android"))]
-const BETA_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_BETA_ENDPOINT";
-#[cfg(not(target_os = "android"))]
-const NIGHTLY_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_NIGHTLY_ENDPOINT";
-#[cfg(not(target_os = "android"))]
-const DEFAULT_STABLE_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=stable";
-#[cfg(not(target_os = "android"))]
-const DEFAULT_BETA_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=beta";
-#[cfg(not(target_os = "android"))]
-const DEFAULT_NIGHTLY_ENDPOINT: &str = "https://releases.ecopaste.cn/update?channel=nightly";
+const DEFAULT_STABLE_ENDPOINT: &str =
+    "https://github.com/zzw6776/EcoPaste/releases/latest/download/latest.json";
 #[cfg(not(target_os = "android"))]
 const AUTO_CHECK_INITIAL_DELAY_SECONDS: u64 = 8;
 #[cfg(not(target_os = "android"))]
@@ -228,10 +221,7 @@ pub async fn check(app: &AppHandle, mode: CheckMode) -> Result<AppUpdateStatus> 
     }
 
     let settings = app.state::<SettingsStore>().snapshot();
-    let endpoints = update_endpoints(
-        settings.update.include_beta,
-        settings.update.include_nightly,
-    )?;
+    let endpoints = update_endpoints()?;
     let updater = app
         .updater_builder()
         .endpoints(endpoints)
@@ -308,6 +298,16 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
 
 #[cfg(not(target_os = "android"))]
 pub fn install(app: &AppHandle, version: String) -> Result<()> {
+    if cfg!(debug_assertions) {
+        let lang = crate::i18n::current_language(app);
+        return Err(AppError::Other(anyhow::anyhow!(
+            crate::i18n::commands::label(
+                lang,
+                crate::i18n::commands::Key::UpdateInstallRequiresRelease,
+            )
+        )));
+    }
+
     log::info!("installing downloaded update {version}");
     app.state::<UpdateState>().install_downloaded(&version)?;
     log::info!("update {version} installed, requesting app restart");
@@ -334,6 +334,10 @@ pub fn skip(app: &AppHandle, version: String) -> Result<AppUpdateStatus> {
 
 #[cfg(not(target_os = "android"))]
 pub fn schedule_auto_check(app: &AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(AUTO_CHECK_INITIAL_DELAY_SECONDS)).await;
@@ -383,41 +387,10 @@ fn metadata_from_update(update: &TauriUpdate) -> UpdateMetadata {
 }
 
 #[cfg(not(target_os = "android"))]
-fn update_endpoints(include_beta: bool, include_nightly: bool) -> Result<Vec<Url>> {
+fn update_endpoints() -> Result<Vec<Url>> {
     let stable_endpoint =
         std::env::var(STABLE_ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_STABLE_ENDPOINT.to_owned());
-    let beta_endpoint =
-        std::env::var(BETA_ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_BETA_ENDPOINT.to_owned());
-    let nightly_endpoint =
-        std::env::var(NIGHTLY_ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_NIGHTLY_ENDPOINT.to_owned());
-
-    update_endpoints_from_values(
-        include_beta,
-        include_nightly,
-        &stable_endpoint,
-        &beta_endpoint,
-        &nightly_endpoint,
-    )
-}
-
-#[cfg(not(target_os = "android"))]
-fn update_endpoints_from_values(
-    include_beta: bool,
-    include_nightly: bool,
-    stable_endpoint: &str,
-    beta_endpoint: &str,
-    nightly_endpoint: &str,
-) -> Result<Vec<Url>> {
-    let mut endpoints = Vec::new();
-    if include_nightly {
-        endpoints.push(parse_endpoint(nightly_endpoint)?);
-    }
-    if include_beta {
-        endpoints.push(parse_endpoint(beta_endpoint)?);
-    }
-    endpoints.push(parse_endpoint(stable_endpoint)?);
-
-    Ok(endpoints)
+    Ok(vec![parse_endpoint(&stable_endpoint)?])
 }
 
 #[cfg(not(target_os = "android"))]
@@ -582,23 +555,17 @@ mod tests {
     }
 
     #[test]
-    fn update_endpoints_include_enabled_channels_before_stable() {
-        let endpoints = update_endpoints_from_values(
-            true,
-            true,
-            "https://example.com/update?channel=stable",
-            "https://example.com/update?channel=beta",
-            "https://example.com/update?channel=nightly",
-        )
-        .unwrap();
+    fn stable_endpoint_matches_bundled_config() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
 
         assert_eq!(
-            endpoints.iter().map(Url::as_str).collect::<Vec<_>>(),
-            [
-                "https://example.com/update?channel=nightly",
-                "https://example.com/update?channel=beta",
-                "https://example.com/update?channel=stable",
-            ]
+            config["plugins"]["updater"]["endpoints"],
+            serde_json::json!([DEFAULT_STABLE_ENDPOINT])
+        );
+        assert_eq!(
+            parse_endpoint(DEFAULT_STABLE_ENDPOINT).unwrap().scheme(),
+            "https"
         );
     }
 }

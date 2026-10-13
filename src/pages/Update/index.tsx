@@ -15,6 +15,7 @@ import {
   type UpdateMetadata,
 } from "@/commands";
 import { TAURI_EVENT } from "@/constants/events";
+import { UPDATE_RELEASES_URL } from "@/constants/urls";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { useWindowReady } from "@/hooks/useWindowReady";
@@ -364,7 +365,7 @@ function resolveProgressPercent(
 function resolveReleaseNotesUrl(version: string) {
   const tag = version.startsWith("v") ? version : `v${version}`;
 
-  return `https://github.com/EcoPasteHub/EcoPaste/releases/tag/${tag}`;
+  return `${UPDATE_RELEASES_URL}/tag/${tag}`;
 }
 
 function formatBytes(value: number) {

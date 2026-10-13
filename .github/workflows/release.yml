@@ -145,6 +145,8 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      # tauri-action merges latest.json by reading and replacing the shared asset.
+      max-parallel: 1
       matrix:
         include:
           - label: macOS Apple Silicon
@@ -162,6 +164,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-metadata.outputs.tag_name }}
+
+      - name: Check updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured."
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
@@ -252,6 +264,8 @@ jobs:
           CI: false
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           PLATFORM: ${{ matrix.os }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
@@ -259,7 +273,8 @@ jobs:
           releaseId: ${{ needs.release-metadata.outputs.release_id }}
           retryAttempts: 3
           tagName: ${{ needs.release-metadata.outputs.tag_name }}
-          uploadUpdaterJson: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
 
       - name: Verify macOS app signatures and DMG contents before publishing
         if: runner.os == 'macOS'
@@ -383,6 +398,35 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-metadata.outputs.tag_name }}
+
+      - name: Validate updater manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          UPDATER_MANIFEST_PATH: ${{ runner.temp }}/ecopaste-updater/latest.json
+        run: |
+          set -euo pipefail
+          gh release download "${TAG_NAME}" --pattern latest.json --dir "$(dirname "${UPDATER_MANIFEST_PATH}")" --clobber
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync(process.env.UPDATER_MANIFEST_PATH, 'utf8'));
+          if (manifest.version !== process.env.RELEASE_VERSION) throw new Error('Updater version mismatch');
+          const repository = process.env.GH_REPO;
+          for (const platform of ['darwin-aarch64', 'darwin-x86_64', 'windows-x86_64']) {
+            const entry = manifest.platforms?.[platform];
+            if (!entry?.signature?.trim()) throw new Error(`Missing updater signature for ${platform}`);
+            const url = new URL(entry.url);
+            const apiAsset = url.origin === 'https://api.github.com' &&
+              url.pathname.startsWith(`/repos/${repository}/releases/assets/`);
+            const releaseAsset = url.origin === 'https://github.com' &&
+              url.pathname.startsWith(`/${repository}/releases/download/${process.env.TAG_NAME}/`);
+            if (!apiAsset && !releaseAsset) throw new Error(`Unexpected updater asset for ${platform}`);
+          }
+          console.log(`Validated updater ${manifest.version} for macOS ARM64, macOS Intel and Windows x64`);
+          NODE
 
       - name: Publish completed release
         shell: bash

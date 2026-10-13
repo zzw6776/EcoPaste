@@ -3,4 +3,7 @@
  */
 export const GITHUB_URL = "https://github.com/EcoPasteHub/EcoPaste";
 
+export const UPDATE_RELEASES_URL =
+  "https://github.com/zzw6776/EcoPaste/releases";
+
 export const SVG_ICON_HELP_URL = "https://yesicon.app/lets-icons";
