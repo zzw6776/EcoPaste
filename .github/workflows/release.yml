@@ -33,6 +33,22 @@ jobs:
         with:
           node-version: 24
 
+      - name: Validate release notes
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (!/^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$/.test(version)) throw new Error('Invalid release version');
+          const path = `docs/releases/${version}.md`;
+          const [title, ...body] = readFileSync(path, 'utf8').replace(/\r\n/g, '\n').split('\n');
+          if (title !== `# ${version}`) throw new Error(`${path}: first line must be # ${version}`);
+          if (!body.some(line => /^[-*]\s+\S/.test(line) && /\p{Script=Han}/u.test(line))) {
+            throw new Error(`${path}: at least one nonempty Chinese change entry is required`);
+          }
+          console.log(`Validated ${path}`);
+          NODE
+
       - name: Validate version and create draft release
         id: release
         shell: bash
@@ -43,6 +59,7 @@ jobs:
 
           target_sha="${GITHUB_SHA}"
           version="$(node -p "require('./package.json').version")"
+          notes_file="docs/releases/${version}.md"
           previous_version="$(git show "${target_sha}^:package.json" 2>/dev/null | node -e "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).version));" || true)"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
           lock_version="$(awk '
@@ -96,11 +113,12 @@ jobs:
               echo "::error::Release '${tag_name}' is already published. Bump the project version for a new commit."
               exit 1
             fi
+            gh release edit "${tag_name}" --notes-file "${notes_file}"
           else
             release_args=(
               "${tag_name}"
               --draft
-              --generate-notes
+              --notes-file "${notes_file}"
               --target "${target_sha}"
               --title "${tag_name}"
               --verify-tag
@@ -361,6 +379,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-metadata.outputs.tag_name }}
+
       - name: Publish completed release
         shell: bash
         env:
@@ -368,10 +391,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
 
-          args=("${TAG_NAME}" --draft=false)
+          args=("${TAG_NAME}" --draft=false --notes-file "docs/releases/${RELEASE_VERSION}.md")
           if [[ "${PRERELEASE}" == "true" ]]; then
             args+=(--prerelease)
           else
