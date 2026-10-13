@@ -318,16 +318,35 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
         lifecycle::on_shown(app_handle, label);
 
         if matches!(label, CLIPBOARD_WINDOW_LABEL | PREFERENCE_WINDOW_LABEL) {
-            if let Some(update_window) = app_handle.get_webview_window(UPDATE_WINDOW_LABEL) {
-                if update_window.is_visible().unwrap_or(false) {
-                    if let Err(err) = update_window.set_focus() {
-                        log::warn!("focus existing update window failed: {err}");
-                    }
-                }
+            if let Err(err) = raise_visible_update_window(app_handle) {
+                log::warn!("raise existing update window failed: {err}");
             }
         }
     }
     result
+}
+
+/// 唤出 EcoPaste 时找回已打开的更新窗口，不重建窗口或重置更新状态。
+#[cfg(not(target_os = "android"))]
+pub(super) fn raise_visible_update_window(app_handle: &AppHandle) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos::set_update_window_foreground(app_handle, true);
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::set_update_window_foreground(app_handle, true)?;
+        if let Some(window) = app_handle.get_webview_window(UPDATE_WINDOW_LABEL) {
+            if window.is_visible().unwrap_or(false) {
+                window.set_focus().map_err(|err| anyhow::anyhow!(err))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+fn raise_visible_update_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
 }
 
 /// macOS 剪贴板窗口有延迟 show，visibility 需等 NSPanel 真的显示后再 emit。
@@ -550,7 +569,6 @@ pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
     .maximizable(false)
     .resizable(false)
     .minimizable(false)
-    .always_on_top(true)
     .visible_on_all_workspaces(true)
     .skip_taskbar(false)
     .accept_first_mouse(true)
@@ -568,9 +586,9 @@ pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
         .build()
         .map_err(|err| anyhow::anyhow!("build update window: {err}"))?;
 
-    #[cfg(target_os = "macos")]
-    macos::configure_update_window(&window)?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    windows::configure_update_window(&window)?;
+    #[cfg(not(target_os = "windows"))]
     let _ = window;
 
     Ok(())

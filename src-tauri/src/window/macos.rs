@@ -72,7 +72,12 @@ define_class!(
                 return;
             };
             let pid = application.processIdentifier();
-            if pid <= 0 || pid == NSRunningApplication::currentApplication().processIdentifier() {
+            let foreground = pid == NSRunningApplication::currentApplication().processIdentifier();
+            if let Err(err) = set_update_window_foreground(self.ivars(), foreground) {
+                log::warn!("update window activation ordering failed: {err}");
+            }
+
+            if pid <= 0 || foreground {
                 return;
             }
 
@@ -201,6 +206,12 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
 
     let resign_handle = app_handle.clone();
     handler.window_did_resign_key(move |_| {
+        if !NSRunningApplication::currentApplication().isActive() {
+            if let Err(err) = set_update_window_foreground(&resign_handle, false) {
+                log::warn!("lower update window on clipboard resign-key failed: {err}");
+            }
+        }
+
         if !super::should_auto_hide_clipboard_window() {
             return;
         }
@@ -405,6 +416,9 @@ pub fn show_window(
         window.show().map_err(|e| anyhow::anyhow!(e))?;
         window.unminimize().map_err(|e| anyhow::anyhow!(e))?;
         window.set_focus().map_err(|e| anyhow::anyhow!(e))?;
+        if label == UPDATE_WINDOW_LABEL {
+            set_update_window_foreground(app_handle, true)?;
+        }
         Ok(())
     }
 }
@@ -427,10 +441,17 @@ pub fn show_taskbar_icon(app_handle: &AppHandle, visible: bool) -> Result<()> {
     Ok(())
 }
 
-/// 保持更新窗口高于剪贴板 NSPanel；普通置顶窗口的 floating 层级仍低于 PopUpMenu。
-pub fn configure_update_window(window: &WebviewWindow) -> Result<()> {
+/// 只在 EcoPaste 前台交互期间提升更新窗口；切到外部应用后退回普通窗口层级。
+pub(super) fn set_update_window_foreground(app_handle: &AppHandle, foreground: bool) -> Result<()> {
+    let Some(window) = app_handle.get_webview_window(UPDATE_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return Ok(());
+    }
+
     window
-        .with_webview(|webview| {
+        .with_webview(move |webview| {
             let native = webview.ns_window().cast::<AppKitWindow>();
             if native.is_null() {
                 log::error!("update NSWindow pointer is null");
@@ -439,8 +460,13 @@ pub fn configure_update_window(window: &WebviewWindow) -> Result<()> {
 
             // with_webview 保证回调运行在 AppKit 主线程且指针在回调期间有效。
             let native = unsafe { &*native };
-            native.setLevel(PanelLevel::PopUpMenu.value() as isize + 1);
-            native.setHidesOnDeactivate(false);
+            if foreground {
+                native.setLevel(PanelLevel::PopUpMenu.value() as isize + 1);
+                native.orderFrontRegardless();
+            } else {
+                native.setLevel(PanelLevel::Normal.value() as isize);
+                native.orderBack(None);
+            }
         })
         .map_err(|err| anyhow::anyhow!(err).into())
 }
@@ -504,6 +530,10 @@ fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -
                 let make_key_started = Instant::now();
                 panel.make_key_window();
                 let make_key_us = elapsed_us(make_key_started);
+
+                if let Err(err) = super::raise_visible_update_window(&panel_handle) {
+                    log::warn!("raise update window after clipboard show failed: {err}");
+                }
 
                 let preview_resume_started = Instant::now();
                 super::preview::resume_after_clipboard_show();
@@ -570,6 +600,11 @@ fn hide_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
             }
             if let Ok(panel) = handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 panel.hide();
+            }
+            if !NSRunningApplication::currentApplication().isActive() {
+                if let Err(err) = set_update_window_foreground(&handle, false) {
+                    log::warn!("lower update window after clipboard hide failed: {err}");
+                }
             }
         })
         .map_err(|e| anyhow::anyhow!(e))?;
