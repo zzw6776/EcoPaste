@@ -26,7 +26,7 @@ use tauri_nspanel::{
 
 use super::{
     get_window, ClipboardNativeShowTiming, ClipboardShowRequest, CLIPBOARD_WINDOW_LABEL,
-    ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL,
+    ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL, UPDATE_WINDOW_LABEL,
 };
 use crate::core::Result;
 use crate::settings::SettingsStore;
@@ -427,8 +427,36 @@ pub fn show_taskbar_icon(app_handle: &AppHandle, visible: bool) -> Result<()> {
     Ok(())
 }
 
-/// 点击 dock 图标 reopen 时，无可见窗口则唤起偏好窗口。
+/// 保持更新窗口高于剪贴板 NSPanel；普通置顶窗口的 floating 层级仍低于 PopUpMenu。
+pub fn configure_update_window(window: &WebviewWindow) -> Result<()> {
+    window
+        .with_webview(|webview| {
+            let native = webview.ns_window().cast::<AppKitWindow>();
+            if native.is_null() {
+                log::error!("update NSWindow pointer is null");
+                return;
+            }
+
+            // with_webview 保证回调运行在 AppKit 主线程且指针在回调期间有效。
+            let native = unsafe { &*native };
+            native.setLevel(PanelLevel::PopUpMenu.value() as isize + 1);
+            native.setHidesOnDeactivate(false);
+        })
+        .map_err(|err| anyhow::anyhow!(err).into())
+}
+
+/// 点击 dock 图标优先找回已打开的更新窗口，其余情况下沿用偏好窗口入口。
 pub fn handle_reopen(app_handle: &AppHandle, has_visible_windows: bool) {
+    if app_handle
+        .get_webview_window(UPDATE_WINDOW_LABEL)
+        .is_some_and(|window| window.is_visible().unwrap_or(false))
+    {
+        if let Err(err) = super::show_window(app_handle, UPDATE_WINDOW_LABEL) {
+            log::error!("show update window on reopen failed: {err:?}");
+        }
+        return;
+    }
+
     if has_visible_windows {
         return;
     }

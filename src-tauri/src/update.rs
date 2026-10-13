@@ -143,8 +143,18 @@ impl UpdateState {
         }
     }
 
+    /// 相同版本、下载地址和签名的候选包保留已下载内容。
     fn set_update(&self, update: Option<PendingUpdate>) {
         self.with_current(|current| {
+            if let (Some(existing), Some(next)) = (current.as_ref(), update.as_ref()) {
+                if existing.metadata.version == next.metadata.version
+                    && existing.metadata.download_url == next.metadata.download_url
+                    && existing.update.signature == next.update.signature
+                {
+                    return;
+                }
+            }
+
             *current = update;
         });
     }

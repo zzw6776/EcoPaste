@@ -5,8 +5,10 @@ import type { FC } from "react";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  type AppUpdateStatus,
   checkForUpdates,
   downloadUpdate,
+  getUpdateStatus,
   hideWindow,
   installUpdate,
   openExternalUrl,
@@ -53,7 +55,7 @@ const Update: FC = () => {
     progress: null,
     total: null,
   });
-  const checkingRef = useRef(false);
+  const operationRef = useRef(false);
   const [errorPhase, setErrorPhase] = useState<UpdateErrorPhase>("checking");
   const [errorMessage, setErrorMessage] = useState("");
   const statusText = resolveStatusText(t, state, errorPhase);
@@ -77,9 +79,9 @@ const Update: FC = () => {
   }, [progress.downloaded, progress.total, state]);
 
   const checkUpdates = async () => {
-    if (checkingRef.current) return;
+    if (operationRef.current) return;
 
-    checkingRef.current = true;
+    operationRef.current = true;
     setUpdateState("checking");
     setErrorPhase("checking");
     setErrorMessage("");
@@ -88,22 +90,50 @@ const Update: FC = () => {
 
     try {
       const status = await checkForUpdates();
-      setCurrentVersion(status.currentVersion);
-      setUpdate(status.update);
-      setUpdateState(status.update ? "available" : "latest");
+      applyUpdateStatus(status);
     } catch (error) {
       log.warn("check for updates failed", error);
       setErrorPhase("checking");
       setUpdateState("error");
       setErrorMessage(resolveUnknownError(error));
     } finally {
-      checkingRef.current = false;
+      operationRef.current = false;
     }
   };
 
-  const downloadCurrentUpdate = async () => {
-    if (!update) return;
+  /**
+   * 重新展示时恢复 Rust 中的更新状态，避免清空已下载包或重复启动下载。
+   */
+  const restoreUpdateStatus = async () => {
+    if (operationRef.current) return;
 
+    operationRef.current = true;
+
+    try {
+      const status = await getUpdateStatus();
+      setCurrentVersion(status.currentVersion);
+
+      if (status.update) {
+        applyUpdateStatus(status);
+        return;
+      }
+    } catch (error) {
+      log.warn("restore update status failed", error);
+      setErrorPhase("checking");
+      setUpdateState("error");
+      setErrorMessage(resolveUnknownError(error));
+      return;
+    } finally {
+      operationRef.current = false;
+    }
+
+    await checkUpdates();
+  };
+
+  const downloadCurrentUpdate = async () => {
+    if (!update || operationRef.current) return;
+
+    operationRef.current = true;
     setUpdateState("downloading");
     setErrorPhase("updating");
     setErrorMessage("");
@@ -123,12 +153,15 @@ const Update: FC = () => {
       setErrorPhase("updating");
       setUpdateState("error");
       setErrorMessage(resolveUnknownError(error));
+    } finally {
+      operationRef.current = false;
     }
   };
 
   const installCurrentUpdate = async () => {
-    if (!update) return;
+    if (!update || operationRef.current) return;
 
+    operationRef.current = true;
     try {
       await installUpdate(update.version);
     } catch (error) {
@@ -136,11 +169,15 @@ const Update: FC = () => {
       setErrorPhase("updating");
       setUpdateState("error");
       setErrorMessage(resolveUnknownError(error));
+    } finally {
+      operationRef.current = false;
     }
   };
 
   const skipCurrentVersion = async () => {
-    if (!update) return;
+    if (!update || operationRef.current) return;
+
+    operationRef.current = true;
 
     try {
       const status = await skipUpdateVersion(update.version);
@@ -150,6 +187,8 @@ const Update: FC = () => {
       log.warn("skip update failed", error);
       setUpdateState("error");
       setErrorMessage(resolveUnknownError(error));
+    } finally {
+      operationRef.current = false;
     }
   };
 
@@ -171,8 +210,23 @@ const Update: FC = () => {
     setState(nextState);
   };
 
+  /**
+   * 同步 Rust 更新状态，确保缓存下载完成后仍显示安装入口。
+   */
+  const applyUpdateStatus = (status: AppUpdateStatus) => {
+    setCurrentVersion(status.currentVersion);
+    setUpdate(status.update);
+
+    if (!status.update) {
+      setUpdateState("latest");
+      return;
+    }
+
+    setUpdateState(status.update.downloaded ? "downloaded" : "available");
+  };
+
   useMount(async () => {
-    await checkUpdates();
+    await restoreUpdateStatus();
   });
 
   useTauriListen<WindowVisibilityPayload>(
@@ -181,7 +235,7 @@ const Update: FC = () => {
       if (event.payload.label !== WINDOW_LABEL.UPDATE) return;
       if (!event.payload.visible) return;
 
-      void checkUpdates();
+      void restoreUpdateStatus();
     },
   );
 
@@ -193,7 +247,8 @@ const Update: FC = () => {
   );
 
   return (
-    <div className="flex h-screen bg-ant-container text-ant-text">
+    <div className="relative flex h-screen bg-ant-container text-ant-text">
+      <div className="absolute inset-x-0 top-0 h-10" data-tauri-drag-region />
       <main className="flex min-h-0 flex-1 flex-col px-7 pt-12 pb-5">
         <div className="grid min-h-0 grid-cols-[4.5rem_minmax(0,1fr)] gap-5">
           <div className="flex justify-center">
@@ -213,13 +268,22 @@ const Update: FC = () => {
             </p>
 
             {showReleaseNotesLink ? (
-              <Button
-                className="mt-1 h-auto p-0 text-sm"
-                onClick={openReleaseNotes}
-                type="link"
-              >
-                {t("update:actions.releaseNotes")}
-              </Button>
+              <div className="mt-1 flex items-center gap-3">
+                <Button
+                  className="h-auto p-0 text-sm"
+                  onClick={openReleaseNotes}
+                  type="link"
+                >
+                  {t("update:actions.releaseNotes")}
+                </Button>
+                <Button
+                  className="h-auto p-0 text-sm"
+                  onClick={checkUpdates}
+                  type="link"
+                >
+                  {t("update:actions.checkAgain")}
+                </Button>
+              </div>
             ) : null}
 
             {state === "error" && errorMessage ? (
@@ -267,7 +331,7 @@ const Update: FC = () => {
             </Button>
           ) : null}
 
-          {state === "idle" || state === "error" ? (
+          {state === "idle" || state === "latest" || state === "error" ? (
             <Button onClick={checkUpdates} shape="round">
               {t("update:actions.checkAgain")}
             </Button>
