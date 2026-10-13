@@ -316,6 +316,16 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
         }
         emit_visibility(app_handle, label, true);
         lifecycle::on_shown(app_handle, label);
+
+        if matches!(label, CLIPBOARD_WINDOW_LABEL | PREFERENCE_WINDOW_LABEL) {
+            if let Some(update_window) = app_handle.get_webview_window(UPDATE_WINDOW_LABEL) {
+                if update_window.is_visible().unwrap_or(false) {
+                    if let Err(err) = update_window.set_focus() {
+                        log::warn!("focus existing update window failed: {err}");
+                    }
+                }
+            }
+        }
     }
     result
 }
@@ -539,7 +549,10 @@ pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
     .center()
     .maximizable(false)
     .resizable(false)
-    .skip_taskbar(true)
+    .minimizable(false)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(false)
     .accept_first_mouse(true)
     .disable_drag_drop_handler()
     .decorations(true)
@@ -551,9 +564,14 @@ pub fn build_update_window(app_handle: &AppHandle) -> Result<()> {
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
 
-    builder
+    let window = builder
         .build()
         .map_err(|err| anyhow::anyhow!("build update window: {err}"))?;
+
+    #[cfg(target_os = "macos")]
+    macos::configure_update_window(&window)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
 
     Ok(())
 }

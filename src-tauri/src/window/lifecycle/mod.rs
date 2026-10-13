@@ -566,7 +566,7 @@ fn snapshot_phase(state: &RuntimeState, has_window: bool) -> LifecyclePhase {
     state.phase
 }
 
-/// 取窗口的按需重建函数；非 `DestroyWhenIdle` 或未登记窗口返回 `None`。
+/// 取窗口的按需创建函数；没有创建入口或未登记的窗口返回 `None`。
 /// 供 `show_window` 在窗口已销毁时重建 WebView。
 pub fn rebuild_fn(label: &str) -> Option<fn(&AppHandle) -> crate::core::Result<()>> {
     descriptor_for(label).and_then(|descriptor| descriptor.build)
