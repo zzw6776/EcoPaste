@@ -31,6 +31,9 @@ const validation = workflowRun("Validate release notes")
   .split("\nNODE")[0];
 const preparation = workflowRun("Validate version and create draft release");
 const publication = workflowRun("Publish completed release");
+const updaterValidation = workflowRun("Validate updater manifest")
+  .split("<<'NODE'\n")[1]
+  .split("\nNODE")[0];
 
 /** Create disposable version files without accessing the real release CLI. */
 async function fixture(
@@ -118,6 +121,75 @@ test("发布校验拒绝缺失、空白、错误版本和只有 Full Changelog �
         return (
           error.code === 1 &&
           /ENOENT|first line|Chinese change entry/.test(error.stderr)
+        );
+      },
+    );
+  }
+});
+
+test("更新清单必须包含当前版本及三个桌面平台的签名和本仓库下载地址", async (t) => {
+  const directory = await fixture(t);
+  const path = join(directory, "latest.json");
+  const platforms = Object.fromEntries(
+    ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"].map((platform) => {
+      return [
+        platform,
+        {
+          signature: "fixture-signature",
+          url: "https://api.github.com/repos/zzw6776/EcoPaste/releases/assets/123",
+        },
+      ];
+    }),
+  );
+  const valid = { platforms, version: "1.1.141" };
+  const env = {
+    ...process.env,
+    GH_REPO: "zzw6776/EcoPaste",
+    RELEASE_VERSION: valid.version,
+    TAG_NAME: `v${valid.version}`,
+    UPDATER_MANIFEST_PATH: path,
+  };
+
+  for (const url of [
+    platforms["windows-x86_64"].url,
+    "https://github.com/zzw6776/EcoPaste/releases/download/v1.1.141/EcoPaste.exe",
+  ]) {
+    const manifest = structuredClone(valid);
+    manifest.platforms["windows-x86_64"].url = url;
+    await writeFile(path, JSON.stringify(manifest));
+    await exec(
+      process.execPath,
+      ["--input-type=module", "-e", updaterValidation],
+      { env },
+    );
+  }
+
+  const wrongVersion = { ...valid, version: "1.1.140" };
+  const missingPlatform = structuredClone(valid);
+  delete missingPlatform.platforms["darwin-aarch64"];
+  const missingSignature = structuredClone(valid);
+  missingSignature.platforms["darwin-x86_64"].signature = " ";
+  const foreignAsset = structuredClone(valid);
+  foreignAsset.platforms["windows-x86_64"].url =
+    "https://github.com/other/repo/releases/download/v1.1.141/app.exe";
+
+  for (const manifest of [
+    wrongVersion,
+    missingPlatform,
+    missingSignature,
+    foreignAsset,
+  ]) {
+    await writeFile(path, JSON.stringify(manifest));
+    await assert.rejects(
+      exec(process.execPath, ["--input-type=module", "-e", updaterValidation], {
+        env,
+      }),
+      (error) => {
+        return (
+          error.code === 1 &&
+          /Updater version mismatch|Missing updater signature|Unexpected updater asset/.test(
+            error.stderr,
+          )
         );
       },
     );

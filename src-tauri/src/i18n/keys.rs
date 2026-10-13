@@ -33,6 +33,8 @@ pub enum CommandKey {
     DragImageMissing,
     #[cfg(not(target_os = "android"))]
     DragTextEmpty,
+    #[cfg(not(target_os = "android"))]
+    UpdateInstallRequiresRelease,
     ExternalUrlUnsupported,
     #[cfg(target_os = "macos")]
     PasteAccessibilityRequired,

@@ -14,6 +14,10 @@ pub fn label(key: Key) -> &'static str {
         Key::DragImageMissing => "图片文件已不存在",
         #[cfg(not(target_os = "android"))]
         Key::DragTextEmpty => "文本内容为空",
+        #[cfg(not(target_os = "android"))]
+        Key::UpdateInstallRequiresRelease => {
+            "开发构建仅支持检查和下载更新，请在已安装的正式版中安装更新"
+        }
         Key::ExternalUrlUnsupported => "只能打开 http 或 https 开头的链接",
         #[cfg(target_os = "macos")]
         Key::PasteAccessibilityRequired => {

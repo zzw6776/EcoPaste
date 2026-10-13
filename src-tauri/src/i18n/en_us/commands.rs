@@ -14,6 +14,8 @@ pub fn label(key: Key) -> &'static str {
         Key::DragImageMissing => "The image file no longer exists",
         #[cfg(not(target_os = "android"))]
         Key::DragTextEmpty => "Text content is empty",
+        #[cfg(not(target_os = "android"))]
+        Key::UpdateInstallRequiresRelease => "Development builds can only check and download updates. Install updates from the installed release build",
         Key::ExternalUrlUnsupported => "Only links starting with http or https can be opened",
         #[cfg(target_os = "macos")]
         Key::PasteAccessibilityRequired => {
