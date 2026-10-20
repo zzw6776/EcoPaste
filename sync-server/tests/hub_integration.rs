@@ -73,6 +73,26 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         Response::GroupCreated
     );
 
+    let Response::Error { code, message } = call(
+        &connection,
+        Request::Sync {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            device: device("legacy_device", "Legacy", &client_endpoint_id),
+            after_cursor: 0,
+            events: Vec::new(),
+            limit: 100,
+            byte_limited: Some(true),
+            events_complete: None,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected legacy client rejection");
+    };
+    assert_eq!(code, ErrorCode::InvalidRequest);
+    assert!(message.contains("版本过低"));
+
     let event = EncryptedEvent {
         event_id: "event_123456".into(),
         origin_device_id: "device_123456".into(),

@@ -20,9 +20,10 @@ import { WINDOW_LABEL } from "@/constants/windows";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { cn } from "@/utils/cn";
-import { isAndroid } from "@/utils/is";
+import { isAndroid, isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
 import CloudRecordsDrawer from "./CloudRecordsDrawer";
+import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
 
 interface SyncStatusIconsProps {
   compact?: boolean;
@@ -44,20 +45,26 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
   const deferredRefreshFrameRef = useRef<number | null>(null);
   const deferredRefreshTimerRef = useRef<number | null>(null);
+  const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
   const mountedRef = useRef(false);
   const unlistenRef = useRef<null | (() => void)>(null);
-
-  async function refresh() {
-    try {
-      setStatus(await getSyncStatus());
-    } catch (error) {
-      log.error("load clipboard sync status failed", error);
-    }
+  const refreshRef = useRef<null | (() => Promise<void> | undefined)>(null);
+  if (!refreshRef.current) {
+    refreshRef.current = createSyncStatusRefresh({
+      isActive: () => {
+        return mountedRef.current && clipboardWindowVisibleRef.current;
+      },
+      onError: (error) => {
+        log.error("load clipboard sync status failed", error);
+      },
+      read: getSyncStatus,
+      write: setStatus,
+    });
   }
+  const refresh = refreshRef.current;
 
   async function initialize() {
     try {
-      await refresh();
       const unlisten = await listen(
         TAURI_EVENT.SYNC_UPDATED,
         handleSyncUpdated,
@@ -67,6 +74,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
         return;
       }
       unlistenRef.current = unlisten;
+      if (clipboardWindowVisibleRef.current) void refresh();
     } catch (error) {
       log.error("initialize clipboard sync status failed", error);
     }
@@ -79,6 +87,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
   useUnmount(() => {
     mountedRef.current = false;
+    clipboardWindowVisibleRef.current = false;
     cancelDeferredRefresh();
     unlistenRef.current?.();
   });
@@ -111,6 +120,8 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   }
 
   function handleSyncUpdated() {
+    if (!clipboardWindowVisibleRef.current) return;
+
     cancelDeferredRefresh();
     void refresh();
   }
@@ -118,6 +129,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   function handleWindowVisibility(event: { payload: WindowVisibilityPayload }) {
     if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
 
+    clipboardWindowVisibleRef.current = event.payload.visible;
     if (event.payload.visible) {
       scheduleRefreshAfterClipboardPaint();
       return;

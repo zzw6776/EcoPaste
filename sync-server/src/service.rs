@@ -274,7 +274,7 @@ impl HubService {
                 events,
                 limit,
                 byte_limited,
-                events_complete: _,
+                events_complete,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
@@ -283,6 +283,7 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
+                require_typed_events_client(events_complete)?;
                 if device.endpoint_id != remote_endpoint_id {
                     bail!("device endpoint identity does not match the connection");
                 }
@@ -366,7 +367,7 @@ impl HubService {
                 removed_devices,
                 limit,
                 byte_limited,
-                events_complete: _,
+                events_complete,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
@@ -376,6 +377,7 @@ impl HubService {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
+                require_typed_events_client(events_complete)?;
                 if device.endpoint_id != remote_endpoint_id {
                     bail!("device endpoint identity does not match the connection");
                 }
@@ -989,6 +991,15 @@ fn response_for_error(error: &anyhow::Error) -> Response {
         ErrorCode::InvalidRequest
     };
     Response::Error { code, message }
+}
+
+/// 协议 9 的发送端总会携带批次完成标记；缺失表示旧客户端，不能继续解码类型化事件。
+fn require_typed_events_client(events_complete: Option<bool>) -> Result<()> {
+    if events_complete.is_none() {
+        bail!("同步客户端版本过低，请升级后重试");
+    }
+
+    Ok(())
 }
 
 fn group_log_ref(group_id: &str) -> String {

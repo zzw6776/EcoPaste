@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Debug, Encode, Decode)]
+#[cbor(map)]
+struct LegacyEncryptedEvent {
+    #[n(0)]
+    event_id: String,
+    #[n(1)]
+    origin_device_id: String,
+    #[n(2)]
+    origin_sequence: u64,
+    #[n(3)]
+    created_at_ms: i64,
+    #[n(4)]
+    nonce: Vec<u8>,
+    #[n(5)]
+    ciphertext: Vec<u8>,
+}
+
 /// Keeps the pre-batching wire shape independent of the current protocol types.
 #[derive(Debug, Encode, Decode)]
 enum LegacyRequest {
@@ -177,6 +194,22 @@ fn optional_batch_fields_are_compatible_in_both_directions() {
         let restored: Response = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(restored, expected);
     }
+}
+
+#[test]
+fn legacy_event_without_kind_decodes_as_content() {
+    let legacy = LegacyEncryptedEvent {
+        event_id: "legacy".into(),
+        origin_device_id: "device".into(),
+        origin_sequence: 1,
+        created_at_ms: 100,
+        nonce: vec![1; 24],
+        ciphertext: vec![2; 32],
+    };
+
+    let decoded: EncryptedEvent = minicbor::decode(&minicbor::to_vec(legacy).unwrap()).unwrap();
+
+    assert_eq!(decoded.kind, SyncEventKind::Content);
 }
 
 #[test]
