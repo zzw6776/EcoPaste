@@ -147,15 +147,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: macOS Apple Silicon
+          - apple_candidate: native
+            label: macOS Apple Silicon (native)
             os: macos-26
+            publish_release: false
+            redundant: true
             target: aarch64-apple-darwin
-          - label: macOS Intel
+          - apple_candidate: cross
+            label: macOS Apple Silicon (Intel fallback)
             os: macos-26-intel
+            publish_release: false
+            redundant: true
+            target: aarch64-apple-darwin
+          - apple_candidate: ""
+            label: macOS Intel
+            os: macos-26-intel
+            publish_release: true
+            redundant: false
             target: x86_64-apple-darwin
-          - label: Windows x64
+          - apple_candidate: ""
+            label: Windows x64
             os: windows-latest
+            publish_release: true
+            redundant: false
             target: x86_64-pc-windows-msvc
+    continue-on-error: ${{ matrix.redundant }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout release
@@ -253,7 +269,7 @@ jobs:
             -k /Library/Keychains/System.keychain \
             "${certificate_pem}"
 
-      - name: Build and upload desktop app
+      - name: Build desktop app
         uses: tauri-apps/tauri-action@v1
         env:
           APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_CERTIFICATE || '' }}
@@ -268,9 +284,9 @@ jobs:
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true
-          releaseId: ${{ needs.release-metadata.outputs.release_id }}
+          releaseId: ${{ matrix.publish_release && needs.release-metadata.outputs.release_id || '' }}
           retryAttempts: 3
-          tagName: ${{ needs.release-metadata.outputs.tag_name }}
+          tagName: ${{ matrix.publish_release && needs.release-metadata.outputs.tag_name || '' }}
           uploadUpdaterJson: false
 
       - name: Verify macOS app signatures and DMG contents before publishing
@@ -279,6 +295,76 @@ jobs:
         env:
           TAURI_TARGET: ${{ matrix.target }}
         run: bash scripts/verifyMacosBundle.sh "src-tauri/target/${TAURI_TARGET}/release/bundle"
+
+      - name: Upload Apple Silicon candidate
+        if: matrix.apple_candidate != ''
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: macos-aarch64-${{ matrix.apple_candidate }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+
+  upload-macos-apple:
+    name: Upload macOS Apple Silicon
+    needs:
+      - release-metadata
+      - build-desktop
+    if: ${{ always() && needs.release-metadata.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download successful candidates
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/macos-aarch64
+          pattern: macos-aarch64-*
+
+      - name: Upload preferred candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          artifact_root="${RUNNER_TEMP}/macos-aarch64"
+          if [[ -d "${artifact_root}/macos-aarch64-native" ]]; then
+            selected="${artifact_root}/macos-aarch64-native"
+          elif [[ -d "${artifact_root}/macos-aarch64-cross" ]]; then
+            selected="${artifact_root}/macos-aarch64-cross"
+          else
+            echo "::error::Both Apple Silicon builds failed."
+            exit 1
+          fi
+
+          source_assets=(
+            "${selected}/dmg/EcoPaste_${RELEASE_VERSION}_aarch64.dmg"
+            "${selected}/macos/EcoPaste.app.tar.gz"
+            "${selected}/macos/EcoPaste.app.tar.gz.sig"
+          )
+          for asset in "${source_assets[@]}"; do
+            if [[ ! -f "${asset}" ]]; then
+              echo "::error::Missing Apple Silicon release asset: ${asset}"
+              exit 1
+            fi
+          done
+
+          release_assets="${RUNNER_TEMP}/macos-aarch64-release"
+          mkdir -p "${release_assets}"
+          cp "${source_assets[1]}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz"
+          cp "${source_assets[2]}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"
+          assets=(
+            "${source_assets[0]}"
+            "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz"
+            "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"
+          )
+          gh release upload "${TAG_NAME}" "${assets[@]}" --clobber
 
   build-android:
     name: Build Android ${{ matrix.label }}
@@ -385,7 +471,7 @@ jobs:
     name: Publish Release
     needs:
       - release-metadata
-      - build-desktop
+      - upload-macos-apple
       - build-android
     runs-on: ubuntu-latest
     permissions:
