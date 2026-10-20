@@ -148,10 +148,10 @@ jobs:
       matrix:
         include:
           - label: macOS Apple Silicon
-            os: macos-latest
+            os: macos-26
             target: aarch64-apple-darwin
           - label: macOS Intel
-            os: macos-latest
+            os: macos-26-intel
             target: x86_64-apple-darwin
           - label: Windows x64
             os: windows-latest

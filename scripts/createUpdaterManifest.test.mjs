@@ -59,6 +59,8 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
   );
 
   assert.doesNotMatch(workflow, /max-parallel:\s*1/);
+  assert.match(workflow, /os: macos-26\n\s+target: aarch64-apple-darwin/);
+  assert.match(workflow, /os: macos-26-intel\n\s+target: x86_64-apple-darwin/);
   assert.match(workflow, /uploadUpdaterJson: false/);
   assert.equal(
     workflow.match(/node scripts\/createUpdaterManifest\.mjs/g)?.length,
