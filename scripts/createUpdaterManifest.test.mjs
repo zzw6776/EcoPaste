@@ -59,8 +59,17 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
   );
 
   assert.doesNotMatch(workflow, /max-parallel:\s*1/);
-  assert.match(workflow, /os: macos-26\n\s+target: aarch64-apple-darwin/);
-  assert.match(workflow, /os: macos-26-intel\n\s+target: x86_64-apple-darwin/);
+  assert.equal(workflow.match(/target: aarch64-apple-darwin/g)?.length, 2);
+  assert.match(
+    workflow,
+    /name: macos-aarch64-\$\{\{ matrix\.apple_candidate }}/,
+  );
+  assert.match(workflow, /name: Upload macOS Apple Silicon/);
+  assert.match(workflow, /EcoPaste_\$\{RELEASE_VERSION}_aarch64\.app\.tar\.gz/);
+  assert.match(
+    workflow,
+    /label: macOS Intel\n\s+os: macos-26-intel[\s\S]*?target: x86_64-apple-darwin/,
+  );
   assert.match(workflow, /uploadUpdaterJson: false/);
   assert.equal(
     workflow.match(/node scripts\/createUpdaterManifest\.mjs/g)?.length,
