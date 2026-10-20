@@ -48,6 +48,10 @@ pub struct ClipboardItem {
     pub content: String,
     /// 去重指纹：`blake3(kind:content)`，由 `db::items::content_hash` 计算并在入库前比对。
     pub content_hash: String,
+    /// 跨设备稳定键。文件卡片的本地去重哈希会随落盘路径变化，不能用于同步状态关联。
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub sync_key: String,
     pub search_text: Option<String>,
     /// 列表渲染用的纯文本摘要（最多 256 字符）。HTML/RTF 也只存纯文本截断
     /// （来源是 OS 同时提供的纯文本，不解析富文本）；Image/Files 为 `None`。
@@ -74,7 +78,6 @@ pub struct ClipboardItem {
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-
     /// 来源应用名称。仅 list 查询通过 LEFT JOIN `clipboard_apps` 填充；
     /// 单条 `SELECT_ITEM` 路径与 `INSERT` 不读不写，`#[sqlx(default)]` 保证缺列时为 `None`。
     #[sqlx(default)]

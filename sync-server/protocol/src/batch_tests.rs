@@ -73,6 +73,7 @@ fn event(index: u64, size: usize) -> EncryptedEvent {
         created_at_ms: 100,
         nonce: vec![255; 24],
         ciphertext: vec![255; size],
+        kind: SyncEventKind::Content,
     }
 }
 
@@ -95,6 +96,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             removed_devices: Vec::new(),
             limit: MAX_EVENTS_PER_BATCH,
             byte_limited: Some(true),
+            events_complete: Some(true),
         }
     } else {
         Request::Sync {
@@ -105,6 +107,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             events,
             limit: MAX_EVENTS_PER_BATCH,
             byte_limited: Some(true),
+            events_complete: Some(true),
         }
     }
 }
@@ -142,8 +145,18 @@ fn optional_batch_fields_are_compatible_in_both_directions() {
         let restored: Request = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
         let mut expected = current;
         match &mut expected {
-            Request::Sync { byte_limited, .. } | Request::SyncV2 { byte_limited, .. } => {
+            Request::Sync {
+                byte_limited,
+                events_complete,
+                ..
+            }
+            | Request::SyncV2 {
+                byte_limited,
+                events_complete,
+                ..
+            } => {
                 *byte_limited = None;
+                *events_complete = None;
             }
             _ => unreachable!(),
         }

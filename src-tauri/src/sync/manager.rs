@@ -19,8 +19,9 @@ use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
     DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
-    Response, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
+    Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
+    TYPED_EVENTS_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -63,10 +64,11 @@ use super::{
     },
     model::{
         BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage,
-        IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice,
-        NearbySyncSpace, SourceAppRef, SourceIconRef, StoredBlob, StoredSyncEvent,
-        SyncChannelState, SyncChannelStatus, SyncItemStatus, SyncPairingPreview, SyncPeer,
-        SyncStatus, SyncTarget, SyncedClipboardItem,
+        DecryptedSyncEvent, IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt,
+        NearbyJoinState, NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef,
+        StoredBlob, StoredSyncEvent, SyncChannelState, SyncChannelStatus, SyncItemStatus,
+        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
+        SyncedItemStatePatch,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -125,6 +127,8 @@ pub struct SyncManager {
     cloud_force_reconnect: AtomicBool,
     maintenance_lock: Mutex<()>,
     apply_lock: Mutex<()>,
+    /// 串行化本地事件入队，保证序号分配与写入之间不被并发打断。
+    enqueue_lock: Mutex<()>,
     blob_download_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     inbound_stream_admission: Arc<Semaphore>,
     inbound_blob_concurrency: Arc<Semaphore>,
@@ -414,6 +418,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         cloud_force_reconnect: AtomicBool::new(false),
         maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
+        enqueue_lock: Mutex::new(()),
         blob_download_locks: Mutex::new(HashMap::new()),
         inbound_stream_admission: Arc::new(Semaphore::new(128)),
         inbound_blob_concurrency: Arc::new(Semaphore::new(4)),
@@ -1519,18 +1524,26 @@ impl SyncManager {
                 }
             }
         }
+        let _enqueue_guard = self.enqueue_lock.lock().await;
         let sequence = repository::next_origin_sequence(&pool).await?;
         let created_at_ms = Utc::now().timestamp_millis();
         let key = group.content_key_bytes()?;
         let event = crypto::encrypt_event(
             &key,
             event_id,
-            identity.device_id,
+            identity.device_id.clone(),
             sequence,
             created_at_ms,
             &envelope,
         )?;
-        let stored = repository::insert_event(&pool, &event, true, &blobs).await?;
+        let stored = repository::insert_content_event(
+            &pool,
+            &event,
+            &blobs,
+            &item.sync_key,
+            item.is_sensitive,
+        )
+        .await?;
         if !stored.stored {
             bail!("同步事件序号冲突，请重新复制内容");
         }
@@ -1718,7 +1731,7 @@ impl SyncManager {
                     is_sensitive: item.is_sensitive,
                     source_platform: platform_string(item.platform).into(),
                     created_at_ms: item.created_at.timestamp_millis(),
-                    content_hash: item.content_hash.clone(),
+                    sync_key: item.sync_key.clone(),
                     updated_at_ms: Some(item.updated_at.timestamp_millis()),
                     source_revision: Some(item.source_revision.clone()),
                 },
@@ -1823,6 +1836,66 @@ impl SyncManager {
         }
         repository::mark_history_backfill_completed(pool, &group.group_id).await?;
         self.emit_updated();
+        Ok(())
+    }
+
+    /// Converts durable local item-state mutations into encrypted events. Rows remain dirty until
+    /// their exact local revision has been stored, so disabling sync or exiting the app cannot
+    /// lose a favorite, pin, note, or delete mutation.
+    async fn flush_dirty_item_states(&self, pool: &SqlitePool, group: &GroupSecrets) -> Result<()> {
+        let identity = self.identity.snapshot();
+        let key = group.content_key_bytes()?;
+        let _enqueue_guard = self.enqueue_lock.lock().await;
+        let mut stored_any = false;
+        let sync_sensitive = self
+            .app
+            .state::<SettingsStore>()
+            .snapshot()
+            .sync
+            .sync_sensitive;
+
+        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            let states =
+                db::sync_item_state::dirty_states(pool, MAX_EVENTS_PER_BATCH, sync_sensitive)
+                    .await?;
+            if states.is_empty() {
+                break;
+            }
+
+            for state in states {
+                let sequence = repository::next_origin_sequence(pool).await?;
+                let event = crypto::encrypt_item_state(
+                    &key,
+                    Uuid::new_v4().simple().to_string(),
+                    identity.device_id.clone(),
+                    sequence,
+                    Utc::now().timestamp_millis(),
+                    &state.patch(),
+                )?;
+                let stored = repository::insert_event(pool, &event, true, &[]).await?;
+                if !stored.stored {
+                    bail!("同步状态事件序号冲突");
+                }
+                if let Some(item) = db::items::find_item_by_sync_key(pool, &state.sync_key).await? {
+                    repository::link_event_to_item(pool, &item.id, &event.event_id, "local")
+                        .await?;
+                }
+                db::sync_item_state::mark_state_sent(
+                    pool,
+                    &state,
+                    &db::sync_item_state::SyncEventVersion {
+                        origin_sequence: sequence,
+                        origin_device_id: identity.device_id.clone(),
+                    },
+                )
+                .await?;
+                stored_any = true;
+            }
+        }
+
+        if stored_any {
+            self.emit_updated();
+        }
         Ok(())
     }
 
@@ -1971,6 +2044,7 @@ impl SyncManager {
         let pool = self.pool().await;
         {
             let _maintenance_guard = self.maintenance_lock.lock().await;
+            self.flush_dirty_item_states(&pool, &group).await?;
             self.backfill_recent_history(&pool, &group).await?;
             self.repair_history_timestamps(&pool, &group).await?;
         }
@@ -2540,6 +2614,9 @@ impl SyncManager {
                 0
             }
         };
+        if protocol_version < TYPED_EVENTS_PROTOCOL_VERSION {
+            bail!("同步服务版本过低，请升级到支持新版同步协议的版本");
+        }
         *self
             .cloud_session
             .write()
@@ -2605,6 +2682,16 @@ impl SyncManager {
         endpoint: &Endpoint,
     ) -> Result<SyncConnectionOutcome> {
         let _sync_activity = SyncActivityGuard::acquire();
+        if target_id != CLOUD_TARGET {
+            match call(connection, Request::Health).await? {
+                Response::Health {
+                    protocol_version, ..
+                } if protocol_version >= TYPED_EVENTS_PROTOCOL_VERSION => {}
+                Response::Health { .. } => bail!("对端设备版本过低，请先升级后再同步"),
+                Response::Error { message, .. } => bail!(message),
+                _ => bail!("对端设备返回了无效的协议版本响应"),
+            }
+        }
         let pool = self.pool().await;
         let identity = self.identity.snapshot();
         let use_sync_v2 =
@@ -2636,6 +2723,8 @@ impl SyncManager {
             };
             let available_count = pending.len();
             let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
+            // Keep the field present while byte-limiting so the final continuation value cannot
+            // make an otherwise fitting request exceed the frame limit.
             let mut request = if use_sync_v2 {
                 Request::SyncV2 {
                     group_id: group.group_id.clone(),
@@ -2646,6 +2735,7 @@ impl SyncManager {
                     removed_devices: removed_devices.clone(),
                     limit: MAX_EVENTS_PER_BATCH,
                     byte_limited: Some(true),
+                    events_complete: Some(false),
                 }
             } else {
                 Request::Sync {
@@ -2656,11 +2746,21 @@ impl SyncManager {
                     events: outgoing_events,
                     limit: MAX_EVENTS_PER_BATCH,
                     byte_limited: Some(true),
+                    events_complete: Some(false),
                 }
             };
             let pending_count = limit_sync_request(&mut request)?;
             let outgoing_has_more = pending_count < available_count
                 || available_count == usize::from(MAX_EVENTS_PER_BATCH);
+            match &mut request {
+                Request::Sync {
+                    events_complete, ..
+                }
+                | Request::SyncV2 {
+                    events_complete, ..
+                } => *events_complete = Some(!outgoing_has_more),
+                _ => unreachable!("sync request variant was constructed above"),
+            }
             pending.truncate(pending_count);
             let event_ids = pending
                 .iter()
@@ -2800,10 +2900,10 @@ impl SyncManager {
             };
             let request_elapsed = request_started_at.elapsed();
             let received_count = response.events.len();
-            has_more = outgoing_has_more
-                || response
-                    .has_more
-                    .unwrap_or(received_count == usize::from(MAX_EVENTS_PER_BATCH));
+            let incoming_has_more = response
+                .has_more
+                .unwrap_or(received_count == usize::from(MAX_EVENTS_PER_BATCH));
+            has_more = outgoing_has_more || incoming_has_more;
             let removed_count = response.removed_devices.len();
             if !response.removed_devices.is_empty() {
                 self.apply_removed_devices(&pool, response.removed_devices)
@@ -2824,8 +2924,16 @@ impl SyncManager {
                 }
             }
             let apply_started_at = Instant::now();
-            self.accept_remote_events(connection, response.events, group, target_id)
+            let content_has_more = self
+                .accept_remote_events(
+                    connection,
+                    response.events,
+                    group,
+                    target_id,
+                    !incoming_has_more,
+                )
                 .await?;
+            has_more |= content_has_more;
             let apply_elapsed = apply_started_at.elapsed();
             if publish_source_icons_after_event {
                 queued_source_icon_count = deferred_source_icon_blobs.len();
@@ -2937,7 +3045,8 @@ impl SyncManager {
         events: Vec<CloudEvent>,
         group: &GroupSecrets,
         source_target: &str,
-    ) -> Result<()> {
+        allow_content: bool,
+    ) -> Result<bool> {
         let _sync_activity = SyncActivityGuard::acquire();
         let pool = self.pool().await;
         let removed_peers = repository::removed_peer_ids(&pool).await?;
@@ -2976,85 +3085,217 @@ impl SyncManager {
             repository::mark_delivered(&pool, CLOUD_TARGET, &remote_event_ids).await?;
         }
 
-        // Replaying every still-unapplied event makes a download/apply interruption
-        // recoverable even when the hub no longer returns the duplicate event.
+        let content_has_more = self
+            .apply_pending_events(connection, &pool, group, allow_content)
+            .await?;
+        if received_new_events && source_target == CLOUD_TARGET {
+            self.wake_lan_transfer();
+        }
+        Ok(content_has_more)
+    }
+
+    /// Replays state before content so a later tombstone suppresses content even across pages.
+    async fn apply_pending_events(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        allow_content: bool,
+    ) -> Result<bool> {
         // LAN 入站请求与本机主动拉取可能同时看到同一事件；从查询到标记完成必须串行，
         // 否则同一远端事件会被并发写入剪贴板历史两次。
         let _apply_guard = self.apply_lock.lock().await;
-        let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
+        let key = group.content_key_bytes()?;
         let mut source_assets_pending = false;
         let mut latest_clipboard_item = None;
         #[cfg(target_os = "android")]
         let mut applied_any = false;
-        // 最多准备两条记录，按原始游标顺序消费；后续下载完成也不会提前应用。
-        let preparations = n0_future::stream::iter(pending_apply)
-            .map(|stored| async move {
+
+        loop {
+            let pending_states = repository::unapplied_events_by_kind(
+                pool,
+                SyncEventKind::ItemState,
+                MAX_EVENTS_PER_BATCH,
+            )
+            .await?;
+            if pending_states.is_empty() {
+                break;
+            }
+            for stored in pending_states {
                 let event = stored.event;
-                let envelope = crypto::decrypt_event(&group.content_key_bytes()?, &event).and_then(
-                    |envelope| {
-                        validate_envelope(&envelope)?;
-                        Ok(envelope)
-                    },
-                );
-                let mut stored_blobs = Vec::new();
-                let mut all_blobs_available = true;
-                if let Ok(envelope) = &envelope {
-                    for manifest in &envelope.blobs {
-                        match self.ensure_blob(connection, group, manifest).await {
-                            Ok(path) => stored_blobs.push(StoredBlob {
-                                blob_id: manifest.blob_id.clone(),
-                                encrypted_path: path.to_string_lossy().into_owned(),
-                                size: manifest.encrypted_size,
-                            }),
-                            Err(error) => {
-                                log::debug!(
-                                    "defer sync event {} until blob {} is available: {error}",
-                                    event.event_id,
-                                    manifest.blob_id
-                                );
-                                all_blobs_available = false;
-                                break;
+                let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
+                    validate_decrypted_sync_event(&event)?;
+                    Ok(event)
+                });
+                match decrypted {
+                    Ok(DecryptedSyncEvent::ItemState(patch)) => {
+                        self.apply_item_state_event(pool, &event, patch).await?;
+                        #[cfg(target_os = "android")]
+                        {
+                            applied_any = true;
+                        }
+                    }
+                    Ok(DecryptedSyncEvent::Clipboard(_)) => {
+                        log::warn!(
+                            "discard synchronized state event {} with content payload",
+                            event.event_id
+                        );
+                        repository::mark_applied(pool, &event.event_id).await?;
+                    }
+                    Err(error) => {
+                        log::warn!("discard invalid sync event {}: {error}", event.event_id);
+                        repository::mark_applied(pool, &event.event_id).await?;
+                    }
+                }
+            }
+        }
+
+        if !allow_content {
+            drop(_apply_guard);
+            #[cfg(target_os = "android")]
+            if applied_any {
+                crate::commands::android::notify_overlay_clipboard_changed();
+            }
+            return Ok(false);
+        }
+
+        // Replaying still-unapplied content makes a download/apply interruption recoverable even
+        // when the Hub no longer returns the duplicate event.
+        let pending_apply = repository::unapplied_events_by_kind(
+            pool,
+            SyncEventKind::Content,
+            MAX_EVENTS_PER_BATCH,
+        )
+        .await?;
+        let mut pending_content = Vec::new();
+        let mut made_content_progress = false;
+        for stored in pending_apply {
+            let event = stored.event;
+            let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
+                validate_decrypted_sync_event(&event)?;
+                Ok(event)
+            });
+            match decrypted {
+                Ok(DecryptedSyncEvent::Clipboard(envelope)) => {
+                    pending_content.push((event, *envelope));
+                }
+                Ok(DecryptedSyncEvent::ItemState(_)) => {
+                    log::warn!(
+                        "discard synchronized content event {} with state payload",
+                        event.event_id
+                    );
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    made_content_progress = true;
+                }
+                Err(error) => {
+                    log::warn!("discard invalid sync event {}: {error}", event.event_id);
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    made_content_progress = true;
+                }
+            }
+        }
+
+        // 状态事件已经全部合并；内容只有在没有被更新删除状态压制时才请求 Blob。
+        let preparations = n0_future::stream::iter(pending_content)
+            .map(|(event, envelope)| {
+                let pool = pool.clone();
+                async move {
+                    let presence = SyncedItemStatePatch {
+                        sync_key: envelope.item.sync_key.clone(),
+                        is_favorite: None,
+                        is_pinned: None,
+                        note: None,
+                        note_changed: false,
+                        is_present: Some(true),
+                    };
+                    let outcome = db::sync_item_state::apply_remote_patch(
+                        &pool,
+                        &presence,
+                        &db::sync_item_state::SyncEventVersion {
+                            origin_sequence: event.origin_sequence,
+                            origin_device_id: event.origin_device_id.clone(),
+                        },
+                    )
+                    .await?;
+                    let should_apply = outcome.canonical_presence != Some(false);
+                    let mut stored_blobs = Vec::new();
+                    let mut all_blobs_available = true;
+                    if should_apply {
+                        for manifest in &envelope.blobs {
+                            match self.ensure_blob(connection, group, manifest).await {
+                                Ok(path) => stored_blobs.push(StoredBlob {
+                                    blob_id: manifest.blob_id.clone(),
+                                    encrypted_path: path.to_string_lossy().into_owned(),
+                                    size: manifest.encrypted_size,
+                                }),
+                                Err(error) => {
+                                    log::debug!(
+                                        "defer sync event {} until blob {} is available: {error}",
+                                        event.event_id,
+                                        manifest.blob_id
+                                    );
+                                    all_blobs_available = false;
+                                    break;
+                                }
                             }
                         }
                     }
+                    Ok::<_, anyhow::Error>((
+                        event,
+                        envelope,
+                        stored_blobs,
+                        all_blobs_available,
+                        should_apply,
+                        outcome.image_files,
+                    ))
                 }
-                Ok::<_, anyhow::Error>((event, envelope, stored_blobs, all_blobs_available))
             })
             .buffered_ordered(2);
         let mut preparations = std::pin::pin!(preparations);
         while let Some(prepared) = preparations.next().await {
-            let (event, envelope, stored_blobs, all_blobs_available) = prepared?;
-            let envelope = match envelope {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                    repository::mark_applied(&pool, &event.event_id).await?;
-                    continue;
+            let (event, envelope, stored_blobs, all_blobs_available, should_apply, image_files) =
+                prepared?;
+            if !image_files.is_empty() {
+                let store = self.app.state::<ImageStore>();
+                for file_name in image_files {
+                    if let Err(error) = store.remove(&file_name) {
+                        log::warn!("remove deleted synchronized image {file_name} failed: {error}");
+                    }
                 }
-            };
+            }
+            if !should_apply {
+                repository::mark_applied(pool, &event.event_id).await?;
+                made_content_progress = true;
+                continue;
+            }
             if !all_blobs_available {
                 continue;
             }
-            repository::attach_event_blobs(&pool, &event.event_id, &stored_blobs).await?;
+            repository::attach_event_blobs(pool, &event.event_id, &stored_blobs).await?;
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
             let (item_id, item, fingerprint) = self.apply_envelope(&event, envelope, group).await?;
-            repository::link_event_to_item(&pool, &item_id, &event.event_id, "remote").await?;
-            self.reconcile_item_timestamps(&pool, group, &item_id)
-                .await?;
-            repository::mark_applied(&pool, &event.event_id).await?;
-            latest_clipboard_item = Some((item, fingerprint));
+            if !item_id.is_empty() {
+                repository::link_event_to_item(pool, &item_id, &event.event_id, "remote").await?;
+                self.reconcile_item_timestamps(pool, group, &item_id)
+                    .await?;
+                latest_clipboard_item = Some((item, fingerprint));
+            }
+            repository::mark_applied(pool, &event.event_id).await?;
+            made_content_progress = true;
             if let Some(icon) = source_icon {
                 match self.source_icon_blob_record(&icon) {
                     Ok(blob) => {
                         if let Err(error) =
-                            repository::attach_event_blobs(&pool, &event.event_id, &[blob]).await
+                            repository::attach_event_blobs(pool, &event.event_id, &[blob]).await
                         {
                             log::warn!("attach optional source app icon blob failed: {error}");
                         } else {
                             source_assets_pending = true;
                         }
                     }
-                    Err(error) => log::warn!("prepare optional source app icon failed: {error}"),
+                    Err(error) => {
+                        log::warn!("prepare optional source app icon failed: {error}")
+                    }
                 }
             }
             #[cfg(target_os = "android")]
@@ -3073,9 +3314,51 @@ impl SyncManager {
         if source_assets_pending {
             self.source_asset_wake.notify_one();
         }
-        if received_new_events && source_target == CLOUD_TARGET {
-            self.wake_lan_transfer();
+        Ok(made_content_progress
+            && repository::has_unapplied_events_by_kind(pool, SyncEventKind::Content).await?)
+    }
+
+    /// Merges a metadata or presence event even when its clipboard content has not arrived yet.
+    async fn apply_item_state_event(
+        &self,
+        pool: &SqlitePool,
+        event: &EncryptedEvent,
+        patch: SyncedItemStatePatch,
+    ) -> Result<()> {
+        let sync_key = patch.sync_key.clone();
+        let outcome = db::sync_item_state::apply_remote_patch(
+            pool,
+            &patch,
+            &db::sync_item_state::SyncEventVersion {
+                origin_sequence: event.origin_sequence,
+                origin_device_id: event.origin_device_id.clone(),
+            },
+        )
+        .await?;
+
+        if let Some(item_id) = outcome.item_id.as_deref() {
+            repository::link_event_to_item(pool, item_id, &event.event_id, "remote").await?;
+            self.app.emit(
+                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                serde_json::json!({ "id": item_id, "reconciled": true }),
+            )?;
+        } else if outcome.presence_accepted && patch.is_present == Some(false) {
+            self.app.emit(
+                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                serde_json::json!({ "deletedHash": sync_key, "reconciled": true }),
+            )?;
         }
+
+        if !outcome.image_files.is_empty() {
+            let store = self.app.state::<ImageStore>();
+            for file_name in outcome.image_files {
+                if let Err(error) = store.remove(&file_name) {
+                    log::warn!("remove deleted synchronized image {file_name} failed: {error}");
+                }
+            }
+        }
+
+        repository::mark_applied(pool, &event.event_id).await?;
         Ok(())
     }
 
@@ -3250,6 +3533,8 @@ impl SyncManager {
         } else {
             None
         };
+        let sync_key = envelope.item.sync_key.clone();
+
         let mut item = ClipboardItem {
             id: uuid::Uuid::new_v4().to_string(),
             kind,
@@ -3265,8 +3550,9 @@ impl SyncManager {
             content_hash: if kind == ClipboardKind::Files {
                 db::items::content_hash(kind, &content)
             } else {
-                envelope.item.content_hash
+                sync_key.clone()
             },
+            sync_key: sync_key.clone(),
             content,
             search_text: envelope.item.search_text,
             summary: envelope.item.summary,
@@ -3296,7 +3582,14 @@ impl SyncManager {
             display_created_at: String::new(),
         };
         let result = db::items::upsert_synced_item(&pool, &item).await?;
+        if result.id.is_empty() {
+            return Ok((String::new(), item, None));
+        }
         item.id.clone_from(&result.id);
+        db::sync_item_state::materialize_for_content(&pool, &sync_key).await?;
+        if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
+            item = materialized;
+        }
         self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
         let fingerprint = files_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
         Ok((result.id, item, fingerprint))
@@ -5799,6 +6092,7 @@ async fn dispatch_peer(
             events,
             limit,
             byte_limited,
+            events_complete,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             let remote_endpoint_id = connection.remote_id().to_string();
@@ -5897,98 +6191,10 @@ async fn dispatch_peer(
                 byte_limited == Some(true),
             )?;
             write_frame(send, &response).await?;
-            let apply_guard = manager.apply_lock.lock().await;
-            let pending_apply = repository::unapplied_events(&pool, MAX_EVENTS_PER_BATCH).await?;
-            let mut source_assets_pending = false;
-            let mut latest_clipboard_item = None;
-            #[cfg(target_os = "android")]
-            let mut applied_any = false;
-            for stored in pending_apply {
-                let envelope =
-                    match crypto::decrypt_event(&group.content_key_bytes()?, &stored.event)
-                        .and_then(|envelope| {
-                            validate_envelope(&envelope)?;
-                            Ok(envelope)
-                        }) {
-                        Ok(envelope) => envelope,
-                        Err(error) => {
-                            log::warn!(
-                                "discard invalid LAN sync event {}: {error}",
-                                stored.event.event_id
-                            );
-                            repository::mark_applied(&pool, &stored.event.event_id).await?;
-                            continue;
-                        }
-                    };
-                let root = crate::core::paths::resources_dir(&manager.app)?.join("sync-blobs");
-                let mut blobs = Vec::with_capacity(envelope.blobs.len());
-                let mut all_blobs_available = true;
-                for blob in &envelope.blobs {
-                    let path = crypto::blob_path(&root, &blob.blob_id)?;
-                    if !path.is_file() || path.metadata()?.len() != blob.encrypted_size {
-                        all_blobs_available = false;
-                        break;
-                    }
-                    blobs.push(StoredBlob {
-                        blob_id: blob.blob_id.clone(),
-                        encrypted_path: path.to_string_lossy().into_owned(),
-                        size: blob.encrypted_size,
-                    });
-                }
-                if all_blobs_available {
-                    let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-                    repository::attach_event_blobs(&pool, &stored.event.event_id, &blobs).await?;
-                    if let Ok((item_id, item, fingerprint)) = manager
-                        .apply_envelope(&stored.event, envelope, &group)
-                        .await
-                    {
-                        repository::link_event_to_item(
-                            &pool,
-                            &item_id,
-                            &stored.event.event_id,
-                            "remote",
-                        )
-                        .await
-                        .ok();
-                        manager
-                            .reconcile_item_timestamps(&pool, &group, &item_id)
-                            .await
-                            .ok();
-                        repository::mark_applied(&pool, &stored.event.event_id)
-                            .await
-                            .ok();
-                        latest_clipboard_item = Some((item, fingerprint));
-                        if let Some(icon) = source_icon {
-                            if let Ok(blob) = manager.source_icon_blob_record(&icon) {
-                                repository::attach_event_blobs(
-                                    &pool,
-                                    &stored.event.event_id,
-                                    &[blob],
-                                )
-                                .await
-                                .ok();
-                                source_assets_pending = true;
-                            }
-                        }
-                        #[cfg(target_os = "android")]
-                        {
-                            applied_any = true;
-                        }
-                    }
-                }
-            }
-            if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
-                manager.write_latest_synced_item_to_clipboard(item, fingerprint.as_ref());
-            }
-            drop(apply_guard);
-            #[cfg(target_os = "android")]
-            if applied_any {
-                crate::commands::android::notify_overlay_clipboard_changed();
-            }
-            if source_assets_pending {
-                manager.source_asset_wake.notify_one();
-            }
-            if received_new_events {
+            let content_has_more = manager
+                .apply_pending_events(connection, &pool, &group, events_complete == Some(true))
+                .await?;
+            if received_new_events || content_has_more {
                 manager.wake_lan_transfer();
             }
         }
@@ -6697,6 +6903,9 @@ fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
     if envelope.version != 1 {
         bail!("unsupported sync event version");
     }
+    if !is_hex_identifier(&envelope.item.sync_key) {
+        bail!("invalid synchronized item key");
+    }
     let kind = parse_kind(&envelope.item.kind)?;
     envelope
         .item
@@ -6738,6 +6947,25 @@ fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_decrypted_sync_event(event: &DecryptedSyncEvent) -> Result<()> {
+    match event {
+        DecryptedSyncEvent::Clipboard(envelope) => validate_envelope(envelope),
+        DecryptedSyncEvent::ItemState(patch) => {
+            if !is_hex_identifier(&patch.sync_key)
+                || (patch.is_favorite.is_none()
+                    && patch.is_pinned.is_none()
+                    && !patch.note_changed
+                    && patch.is_present.is_none())
+                || patch.is_present == Some(true)
+                || (!patch.note_changed && patch.note.is_some())
+            {
+                bail!("invalid synchronized item state");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_source_app_ref(source: &SourceAppRef) -> Result<()> {
@@ -7314,6 +7542,7 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             nonce: vec![0; 24],
             ciphertext: vec![1],
+            kind: ecopaste_sync_protocol::SyncEventKind::Content,
         };
         let envelope = ClipboardEnvelope {
             version: 1,
@@ -7330,7 +7559,7 @@ mod tests {
                 is_sensitive: true,
                 source_platform: "android".into(),
                 created_at_ms: 1_700_000_000_000,
-                content_hash: "hash".into(),
+                sync_key: "hash".into(),
                 updated_at_ms: Some(1_700_000_000_000),
                 source_revision: Some("revision".into()),
             },

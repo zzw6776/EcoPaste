@@ -10,7 +10,7 @@ use crate::db::models::{
 
 const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clipboard_items.sub_kind, \
      clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, clipboard_items.content, \
-     clipboard_items.content_hash, clipboard_items.search_text, clipboard_items.summary, \
+     clipboard_items.content_hash, clipboard_items.sync_key, clipboard_items.search_text, clipboard_items.summary, \
      clipboard_items.file_types, clipboard_items.size, clipboard_items.width, clipboard_items.height, \
      clipboard_items.use_count, clipboard_items.is_favorite, clipboard_items.is_pinned, \
      clipboard_items.is_sensitive, clipboard_items.platform, clipboard_items.note, \
@@ -34,7 +34,7 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
      clipboard_items.sub_kind, clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, \
      CASE WHEN clipboard_items.sub_kind = 'url' THEN clipboard_items.content \
           WHEN clipboard_items.kind = 'text' THEN '' ELSE clipboard_items.content END AS content, \
-     clipboard_items.content_hash, \
+     clipboard_items.content_hash, clipboard_items.sync_key, \
      CASE WHEN clipboard_items.kind = 'text' THEN NULL ELSE clipboard_items.search_text END AS search_text, \
      clipboard_items.summary, \
      CASE WHEN clipboard_items.kind = 'text' \
@@ -102,7 +102,7 @@ pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<Upse
 
 /// Merges a synchronized record without turning network receipt into local reuse time.
 pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
-    if let Some(existing) = find_item_by_content_hash(pool, &item.content_hash).await? {
+    if let Some(existing) = find_item_by_sync_key(pool, &item.sync_key).await? {
         sqlx::query(
             r#"
             UPDATE clipboard_items
@@ -188,14 +188,31 @@ pub async fn find_item_by_content_hash(
     Ok(item)
 }
 
+/// Finds the newest local row associated with a stable cross-device item key.
+pub async fn find_item_by_sync_key(
+    pool: &SqlitePool,
+    sync_key: &str,
+) -> Result<Option<ClipboardItem>> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
+    qb.push(" WHERE clipboard_items.sync_key = ")
+        .push_bind(sync_key.to_owned())
+        .push(" ORDER BY clipboard_items.created_at DESC LIMIT 1");
+
+    Ok(qb
+        .build_query_as::<ClipboardItem>()
+        .fetch_optional(pool)
+        .await
+        .context("failed to find clipboard item by sync key")?)
+}
+
 /// 插入一条剪贴板记录（不做去重；去重请走 [`upsert_item`]）。
 pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> {
     sqlx::query(
         "INSERT INTO clipboard_items \
-         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, search_text, \
+         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
           summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
           created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(item.id.as_str())
     .bind(item.kind)
@@ -206,6 +223,7 @@ pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> 
     .bind(item.updated_at)
     .bind(item.content.as_str())
     .bind(item.content_hash.as_str())
+    .bind(item.sync_key.as_str())
     .bind(item.search_text.as_deref())
     .bind(item.summary.as_deref())
     .bind(item.file_types.as_deref())
@@ -411,48 +429,99 @@ pub async fn find_item_for_list_by_id(
     Ok(item)
 }
 
-/// 翻转 `is_favorite`（收藏 / 取消收藏），返回翻转后的新状态。
-pub async fn toggle_item_favorite(pool: &SqlitePool, id: &str) -> Result<bool> {
-    let new_value: bool = sqlx::query_scalar(
-        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite",
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToggleFavoriteOutcome {
+    pub is_favorite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TogglePinnedOutcome {
+    pub is_pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteItemOutcome {
+    pub image_file_name: Option<String>,
+}
+
+/// 翻转 `is_favorite`（收藏 / 取消收藏），原子记录待同步状态并返回新值。
+pub async fn toggle_item_favorite(pool: &SqlitePool, id: &str) -> Result<ToggleFavoriteOutcome> {
+    let mut transaction = pool.begin().await.context("begin favorite update")?;
+    let row: (bool, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite, sync_key, is_sensitive",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_one(&mut *transaction)
     .await
     .context("failed to toggle clipboard item favorite")?;
-    Ok(new_value)
+    crate::db::sync_item_state::mark_local_favorite(&mut transaction, &row.1, row.2, row.0).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit favorite update")?;
+    Ok(ToggleFavoriteOutcome { is_favorite: row.0 })
 }
 
 /// 幂等地将 `is_favorite` 置为 true（已收藏的无变化）。auto-favorite 场景用。
-pub async fn mark_item_favorite(pool: &SqlitePool, id: &str) -> Result<()> {
-    sqlx::query("UPDATE clipboard_items SET is_favorite = 1 WHERE id = ?")
-        .bind(id)
-        .execute(pool)
+pub async fn mark_item_favorite(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<ToggleFavoriteOutcome>> {
+    let mut transaction = pool
+        .begin()
         .await
-        .context("failed to mark clipboard item favorite")?;
-    Ok(())
-}
-
-/// 翻转 `is_pinned`（置顶 / 取消置顶），返回翻转后的新状态。
-pub async fn toggle_item_pinned(pool: &SqlitePool, id: &str) -> Result<bool> {
-    let new_value: bool = sqlx::query_scalar(
-        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_pinned",
+        .context("begin automatic favorite update")?;
+    let row: Option<(bool, String, bool)> = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = 1 WHERE id = ? AND is_favorite = 0 RETURNING is_favorite, sync_key, is_sensitive",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_optional(&mut *transaction)
     .await
-    .context("failed to toggle clipboard item pinned")?;
-    Ok(new_value)
+    .context("failed to mark clipboard item favorite")?;
+    if let Some((is_favorite, sync_key, is_sensitive)) = row.as_ref() {
+        crate::db::sync_item_state::mark_local_favorite(
+            &mut transaction,
+            sync_key,
+            *is_sensitive,
+            *is_favorite,
+        )
+        .await?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit automatic favorite update")?;
+    Ok(row.map(|(is_favorite, _, _)| ToggleFavoriteOutcome { is_favorite }))
 }
 
-/// 更新备注，传 `None` 清空备注。
+/// 翻转 `is_pinned`（置顶 / 取消置顶），原子记录待同步状态并返回新值。
+pub async fn toggle_item_pinned(pool: &SqlitePool, id: &str) -> Result<TogglePinnedOutcome> {
+    let mut transaction = pool.begin().await.context("begin pinned update")?;
+    let row: (bool, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_pinned, sync_key, is_sensitive",
+    )
+    .bind(id)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("failed to toggle clipboard item pinned")?;
+    crate::db::sync_item_state::mark_local_pinned(&mut transaction, &row.1, row.2, row.0).await?;
+    transaction.commit().await.context("commit pinned update")?;
+    Ok(TogglePinnedOutcome { is_pinned: row.0 })
+}
+
+/// 更新备注，传 `None` 清空备注，并在同一事务中记录待同步状态。
 pub async fn update_item_note(pool: &SqlitePool, id: &str, note: Option<&str>) -> Result<()> {
-    sqlx::query("UPDATE clipboard_items SET note = ? WHERE id = ?")
-        .bind(note)
-        .bind(id)
-        .execute(pool)
-        .await
-        .context("failed to update clipboard item note")?;
+    let mut transaction = pool.begin().await.context("begin note update")?;
+    let row: (String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET note = ? WHERE id = ? RETURNING sync_key, is_sensitive",
+    )
+    .bind(note)
+    .bind(id)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("failed to update clipboard item note")?;
+    crate::db::sync_item_state::mark_local_note(&mut transaction, &row.0, row.1, note).await?;
+    transaction.commit().await.context("commit note update")?;
     Ok(())
 }
 
@@ -480,20 +549,36 @@ pub async fn increment_item_use_count(pool: &SqlitePool, id: &str) -> Result<()>
     Ok(())
 }
 
-/// 删除单条记录。若删除的是图片记录，返回其落盘文件名（`<hash>.png`），供调用方删图；
-/// 否则返回 `None`。记录不存在时也返回 `None`。
-///
-/// image 去重指纹源自 PNG 字节、落盘文件名即字节哈希，故库里同图至多一行，
-/// 删行后该文件必为孤儿，调用方可直接删，无需引用计数。
-pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<Option<String>> {
-    let row = sqlx::query_as::<_, (ClipboardKind, String)>(
-        "DELETE FROM clipboard_items WHERE id = ? RETURNING kind, content",
+/// 删除单条记录并记录墓碑。
+pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<Option<DeleteItemOutcome>> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin clipboard item deletion")?;
+    let row = sqlx::query_as::<_, (ClipboardKind, String, String, bool)>(
+        "DELETE FROM clipboard_items WHERE id = ? RETURNING kind, content, sync_key, is_sensitive",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await
     .context("failed to delete clipboard item")?;
-    Ok(row.and_then(|(kind, content)| image_file_name(kind, content)))
+
+    let Some((kind, content, sync_key, is_sensitive)) = row else {
+        transaction
+            .commit()
+            .await
+            .context("commit empty clipboard item deletion")?;
+        return Ok(None);
+    };
+
+    crate::db::sync_item_state::mark_local_deleted(&mut transaction, &sync_key, is_sensitive)
+        .await?;
+    transaction
+        .commit()
+        .await
+        .context("commit clipboard item deletion")?;
+    let image_file_name = image_file_name(kind, content);
+    Ok(Some(DeleteItemOutcome { image_file_name }))
 }
 
 /// 取被删行里需要连带删除的图片文件名：kind 为 image 时 `content` 即文件名，否则 `None`。
@@ -610,21 +695,13 @@ fn absorb_cleanup_rows(outcome: &mut CleanupOutcome, rows: Vec<Option<String>>) 
     removed
 }
 
-/// 把一批被删行计入 outcome：累加行数，并收集其中的图片文件名。
-fn absorb_deleted(outcome: &mut CleanupOutcome, rows: Vec<(ClipboardKind, String)>) {
-    outcome.removed += rows.len() as u64;
-    outcome.image_files.extend(
-        rows.into_iter()
-            .filter_map(|(kind, content)| image_file_name(kind, content)),
-    );
-}
-
 /// 清空记录，返回删除行数与被删图片文件名；未显式删除的收藏 / 置顶项会保留。
 pub async fn clear_items(
     pool: &SqlitePool,
     delete_favorites: bool,
     delete_pinned: bool,
 ) -> Result<CleanupOutcome> {
+    let mut transaction = pool.begin().await.context("begin clipboard item clear")?;
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("DELETE FROM clipboard_items");
 
     let mut has_condition = false;
@@ -636,16 +713,27 @@ pub async fn clear_items(
         qb.push(if has_condition { " AND " } else { " WHERE " });
         qb.push("is_pinned = 0");
     }
-    qb.push(" RETURNING kind, content");
+    qb.push(" RETURNING kind, content, sync_key, is_sensitive");
 
     let rows = qb
-        .build_query_as::<(ClipboardKind, String)>()
-        .fetch_all(pool)
+        .build_query_as::<(ClipboardKind, String, String, bool)>()
+        .fetch_all(&mut *transaction)
         .await
         .context("failed to clear clipboard items")?;
 
     let mut outcome = CleanupOutcome::default();
-    absorb_deleted(&mut outcome, rows);
+    for (kind, content, sync_key, is_sensitive) in rows {
+        outcome.removed += 1;
+        if let Some(file_name) = image_file_name(kind, content) {
+            outcome.image_files.push(file_name);
+        }
+        crate::db::sync_item_state::mark_local_deleted(&mut transaction, &sync_key, is_sensitive)
+            .await?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit clipboard item clear")?;
     Ok(outcome)
 }
 
@@ -717,27 +805,30 @@ async fn fetch_items(
     q: &ClipboardItemQuery,
     keyword: KeywordFilter,
 ) -> Result<Vec<ClipboardItem>> {
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(LIST_SELECT_ITEM);
-    qb.push(" WHERE 1 = 1");
-    push_filter_clauses(&mut qb, q, &keyword);
+    let build_query = |select_clause: &str| {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(select_clause);
+        qb.push(" WHERE 1 = 1");
+        push_filter_clauses(&mut qb, q, &keyword);
 
-    qb.push(" ORDER BY clipboard_items.is_pinned DESC, ");
-    match q.sort {
-        ClipboardItemSort::CreatedAt => {
-            qb.push("clipboard_items.created_at DESC");
+        qb.push(" ORDER BY clipboard_items.is_pinned DESC, ");
+        match q.sort {
+            ClipboardItemSort::CreatedAt => {
+                qb.push("clipboard_items.created_at DESC");
+            }
+            ClipboardItemSort::UpdatedAt => {
+                qb.push("clipboard_items.updated_at DESC, clipboard_items.created_at DESC");
+            }
+            ClipboardItemSort::UseCount => {
+                qb.push("clipboard_items.use_count DESC, clipboard_items.created_at DESC");
+            }
         }
-        ClipboardItemSort::UpdatedAt => {
-            qb.push("clipboard_items.updated_at DESC, clipboard_items.created_at DESC");
-        }
-        ClipboardItemSort::UseCount => {
-            qb.push("clipboard_items.use_count DESC, clipboard_items.created_at DESC");
-        }
-    }
 
-    qb.push(" LIMIT ").push_bind(q.limit);
-    qb.push(" OFFSET ").push_bind(q.offset);
+        qb.push(" LIMIT ").push_bind(q.limit);
+        qb.push(" OFFSET ").push_bind(q.offset);
+        qb
+    };
 
-    let items = qb
+    let items = build_query(LIST_SELECT_ITEM)
         .build_query_as::<ClipboardItem>()
         .fetch_all(pool)
         .await
@@ -837,6 +928,7 @@ mod tests {
             source_app_id: None,
             source_revision: id.to_owned(),
             content_hash: content_hash(ClipboardKind::Text, &content),
+            sync_key: content_hash(ClipboardKind::Text, &content),
             content,
             search_text: None,
             summary: None,
@@ -987,6 +1079,7 @@ mod tests {
                 created_at_ms: sequence as i64,
                 nonce: vec![0; 24],
                 ciphertext: vec![1],
+                kind: ecopaste_sync_protocol::SyncEventKind::Content,
             };
             crate::sync::repository::insert_event(&pool, &event, true, &[])
                 .await
@@ -1063,6 +1156,7 @@ mod tests {
         let mut incoming = sample_item("incoming");
         incoming.content = existing.content.clone();
         incoming.content_hash = existing.content_hash.clone();
+        incoming.sync_key = existing.sync_key.clone();
         incoming.created_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         incoming.updated_at = DateTime::from_timestamp(1_700_000_030, 0).unwrap();
 
@@ -1090,6 +1184,7 @@ mod tests {
         let mut older_revision = sample_item("incoming-old");
         older_revision.content = existing.content.clone();
         older_revision.content_hash = existing.content_hash.clone();
+        older_revision.sync_key = existing.sync_key.clone();
         older_revision.source_app_id = Some("new-app".into());
         older_revision.source_revision = "revision-a".into();
         upsert_synced_item(&pool, &older_revision).await.unwrap();
@@ -1342,14 +1437,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_index_upgrade_preserves_filters_sort_keys_and_pagination() {
+    async fn history_index_preserves_filters_sort_keys_and_pagination() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         let migrator = sqlx::migrate!("./migrations");
-        migrator.run_to(9, &pool).await.unwrap();
+        migrator.run(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_clipboard_items_updated_sort")
+            .execute(&pool)
+            .await
+            .unwrap();
         for n in 0..12 {
             let mut item = sample_item(&format!("item-{n}"));
             item.created_at = DateTime::from_timestamp(1_700_000_000 + n / 2, 0).unwrap();
@@ -1396,7 +1495,13 @@ mod tests {
             }
         }
 
-        migrator.run(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_clipboard_items_updated_sort \
+             ON clipboard_items(is_pinned DESC, updated_at DESC, created_at DESC)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         for (query, (before, before_total)) in snapshots {
             let (after, after_total) = query_items_page(&pool, &query).await.unwrap();
             assert_eq!(before_total, after_total);
@@ -1674,8 +1779,12 @@ mod tests {
         let pool = memory_pool().await;
         insert_item(&pool, &sample_item("a")).await.unwrap();
 
-        // 文本行删除：无图片文件名返回。
-        assert_eq!(delete_item(&pool, "a").await.unwrap(), None);
+        // 文本行删除：返回删除结果且无图片文件名。
+        let outcome = delete_item(&pool, "a")
+            .await
+            .unwrap()
+            .expect("item was deleted");
+        assert_eq!(outcome.image_file_name, None);
         assert!(find_item_by_id(&pool, "a").await.unwrap().is_none());
 
         // 记录不存在：同样返回 None，不报错。
@@ -1693,8 +1802,11 @@ mod tests {
 
         // 图片行删除：返回落盘文件名供调用方删图。
         assert_eq!(
-            delete_item(&pool, "img").await.unwrap().as_deref(),
-            Some("deadbeef.png")
+            delete_item(&pool, "img")
+                .await
+                .unwrap()
+                .and_then(|o| o.image_file_name),
+            Some("deadbeef.png".to_owned())
         );
         assert!(find_item_by_id(&pool, "img").await.unwrap().is_none());
     }

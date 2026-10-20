@@ -13,18 +13,18 @@ use chacha20poly1305::{
     },
     XChaCha20Poly1305, XNonce,
 };
-use ecopaste_sync_protocol::EncryptedEvent;
+use ecopaste_sync_protocol::{EncryptedEvent, SyncEventKind};
 use rand::RngCore;
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-use super::model::{ClipboardEnvelope, StoredBlob};
+use super::model::{ClipboardEnvelope, DecryptedSyncEvent, StoredBlob, SyncedItemStatePatch};
 
 const BLOB_MAGIC: &[u8; 8] = b"ECOSBL01";
 const STREAM_NONCE_LEN: usize = 19;
 const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
-const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA01";
+const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
 
 struct TemporaryFileCleanup {
     armed: bool,
@@ -59,25 +59,31 @@ impl Drop for TemporaryFileCleanup {
     }
 }
 
-pub fn encrypt_event(
+fn encrypt_raw_event(
     key: &[u8; 32],
     event_id: String,
     origin_device_id: String,
     origin_sequence: u64,
     created_at_ms: i64,
-    envelope: &ClipboardEnvelope,
+    kind: SyncEventKind,
+    plaintext: &[u8],
 ) -> Result<EncryptedEvent> {
-    let plaintext = minicbor::to_vec(envelope).context("failed to encode sync event")?;
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
     let mut nonce = [0_u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let aad = event_aad(&event_id, &origin_device_id, origin_sequence, created_at_ms);
+    let aad = event_aad(
+        &event_id,
+        &origin_device_id,
+        origin_sequence,
+        created_at_ms,
+        kind,
+    );
     let encrypted = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: plaintext.as_slice(),
+                msg: plaintext,
                 aad: &aad,
             },
         )
@@ -92,38 +98,101 @@ pub fn encrypt_event(
         created_at_ms,
         nonce: nonce.to_vec(),
         ciphertext,
+        kind,
     })
 }
 
-pub fn decrypt_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<ClipboardEnvelope> {
+pub fn encrypt_event(
+    key: &[u8; 32],
+    event_id: String,
+    origin_device_id: String,
+    origin_sequence: u64,
+    created_at_ms: i64,
+    envelope: &ClipboardEnvelope,
+) -> Result<EncryptedEvent> {
+    let plaintext = minicbor::to_vec(envelope).context("failed to encode sync event")?;
+    encrypt_raw_event(
+        key,
+        event_id,
+        origin_device_id,
+        origin_sequence,
+        created_at_ms,
+        SyncEventKind::Content,
+        &plaintext,
+    )
+}
+
+pub fn encrypt_item_state(
+    key: &[u8; 32],
+    event_id: String,
+    origin_device_id: String,
+    origin_sequence: u64,
+    created_at_ms: i64,
+    patch: &SyncedItemStatePatch,
+) -> Result<EncryptedEvent> {
+    let plaintext = minicbor::to_vec(patch).context("failed to encode synchronized item state")?;
+    encrypt_raw_event(
+        key,
+        event_id,
+        origin_device_id,
+        origin_sequence,
+        created_at_ms,
+        SyncEventKind::ItemState,
+        &plaintext,
+    )
+}
+
+fn decrypt_event_plaintext(key: &[u8; 32], event: &EncryptedEvent) -> Result<Vec<u8>> {
     if event.nonce.len() != 24 {
         bail!("invalid sync event nonce");
     }
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
-    let plaintext = if let Some(ciphertext) = event.ciphertext.strip_prefix(EVENT_AAD_MAGIC) {
-        let aad = event_aad(
-            &event.event_id,
-            &event.origin_device_id,
-            event.origin_sequence,
-            event.created_at_ms,
-        );
-        cipher.decrypt(
+    let ciphertext = event
+        .ciphertext
+        .strip_prefix(EVENT_AAD_MAGIC)
+        .context("invalid synchronized event format")?;
+    let aad = event_aad(
+        &event.event_id,
+        &event.origin_device_id,
+        event.origin_sequence,
+        event.created_at_ms,
+        event.kind,
+    );
+    let plaintext = cipher
+        .decrypt(
             XNonce::from_slice(&event.nonce),
             Payload {
                 msg: ciphertext,
                 aad: &aad,
             },
         )
-    } else {
-        // 已生成的测试数据没有 AAD 标记，继续支持解密；新事件无法降级到此分支。
-        cipher.decrypt(
-            XNonce::from_slice(&event.nonce),
-            event.ciphertext.as_slice(),
-        )
+        .map_err(|_| anyhow::anyhow!("sync event authentication failed"))?;
+    Ok(plaintext)
+}
+
+pub fn decrypt_sync_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<DecryptedSyncEvent> {
+    let plaintext = decrypt_event_plaintext(key, event)?;
+    match event.kind {
+        SyncEventKind::Content => {
+            let envelope = minicbor::decode(&plaintext).context("failed to decode sync event")?;
+            Ok(DecryptedSyncEvent::Clipboard(Box::new(envelope)))
+        }
+        SyncEventKind::ItemState => {
+            let patch =
+                minicbor::decode(&plaintext).context("failed to decode synchronized item state")?;
+            Ok(DecryptedSyncEvent::ItemState(patch))
+        }
     }
-    .map_err(|_| anyhow::anyhow!("sync event authentication failed"))?;
-    minicbor::decode(&plaintext).context("failed to decode sync event")
+}
+
+pub fn decrypt_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<ClipboardEnvelope> {
+    match decrypt_sync_event(key, event)? {
+        DecryptedSyncEvent::Clipboard(envelope) => Ok(*envelope),
+        DecryptedSyncEvent::ItemState(_) => {
+            bail!("expected clipboard envelope, got synchronized item state")
+        }
+    }
 }
 
 fn event_aad(
@@ -131,14 +200,16 @@ fn event_aad(
     origin_device_id: &str,
     origin_sequence: u64,
     created_at_ms: i64,
+    kind: SyncEventKind,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(event_id.len() + origin_device_id.len() + 24);
+    let mut aad = Vec::with_capacity(event_id.len() + origin_device_id.len() + 25);
     aad.extend_from_slice(&(event_id.len() as u32).to_be_bytes());
     aad.extend_from_slice(event_id.as_bytes());
     aad.extend_from_slice(&(origin_device_id.len() as u32).to_be_bytes());
     aad.extend_from_slice(origin_device_id.as_bytes());
     aad.extend_from_slice(&origin_sequence.to_be_bytes());
     aad.extend_from_slice(&created_at_ms.to_be_bytes());
+    aad.push(kind.as_i64() as u8);
     aad
 }
 
@@ -717,7 +788,7 @@ mod tests {
                 is_sensitive: false,
                 source_platform: "macos".into(),
                 created_at_ms: 1,
-                content_hash: "hash".into(),
+                sync_key: "hash".into(),
                 updated_at_ms: Some(2),
                 source_revision: Some("revision".into()),
             },
@@ -739,23 +810,44 @@ mod tests {
         tampered.origin_sequence = 2;
         assert!(decrypt_event(&key, &tampered).is_err());
 
-        let nonce = [3_u8; 24];
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        let legacy_ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                minicbor::to_vec(&envelope).unwrap().as_slice(),
-            )
-            .unwrap();
-        let legacy = EncryptedEvent {
-            event_id: "legacy-event".into(),
-            origin_device_id: "legacy-device".into(),
-            origin_sequence: 1,
-            created_at_ms: 2,
-            nonce: nonce.to_vec(),
-            ciphertext: legacy_ciphertext,
+        let mut tampered = encrypt_event(
+            &key,
+            "event-kind".into(),
+            "device-123".into(),
+            2,
+            3,
+            &envelope,
+        )
+        .unwrap();
+        tampered.kind = SyncEventKind::ItemState;
+        assert!(decrypt_sync_event(&key, &tampered).is_err());
+    }
+
+    #[test]
+    fn item_state_round_trips_polymorphically() {
+        let key = [7_u8; 32];
+        let patch = SyncedItemStatePatch {
+            sync_key: "hash-patch".into(),
+            is_favorite: Some(true),
+            is_pinned: Some(false),
+            note: Some("note text".into()),
+            note_changed: true,
+            is_present: Some(false),
         };
-        assert_eq!(decrypt_event(&key, &legacy).unwrap(), envelope);
+        let event = encrypt_item_state(
+            &key,
+            "patch-event".into(),
+            "device-patch".into(),
+            1,
+            12345,
+            &patch,
+        )
+        .unwrap();
+        match decrypt_sync_event(&key, &event).unwrap() {
+            DecryptedSyncEvent::ItemState(decoded) => assert_eq!(decoded, patch),
+            _ => panic!("expected synchronized item state"),
+        }
+        assert!(decrypt_event(&key, &event).is_err());
     }
 
     #[test]

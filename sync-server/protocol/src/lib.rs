@@ -15,7 +15,8 @@ pub const SYNC_V2_PROTOCOL_VERSION: u16 = 5;
 pub const ASYNC_SOURCE_ICON_PROTOCOL_VERSION: u16 = 6;
 pub const REDUNDANT_WATCH_PROTOCOL_VERSION: u16 = 7;
 pub const BYTE_LIMITED_SYNC_PROTOCOL_VERSION: u16 = 8;
-pub const PROTOCOL_VERSION: u16 = BYTE_LIMITED_SYNC_PROTOCOL_VERSION;
+pub const TYPED_EVENTS_PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = TYPED_EVENTS_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -80,6 +81,32 @@ impl RemovedDevice {
     }
 }
 
+/// Identifies the encrypted payload without exposing clipboard content to transport services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum SyncEventKind {
+    #[n(0)]
+    Content,
+    #[n(1)]
+    ItemState,
+}
+
+impl SyncEventKind {
+    pub const fn as_i64(self) -> i64 {
+        match self {
+            Self::Content => 0,
+            Self::ItemState => 1,
+        }
+    }
+
+    pub fn from_i64(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Content),
+            1 => Some(Self::ItemState),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 pub struct EncryptedEvent {
@@ -95,6 +122,8 @@ pub struct EncryptedEvent {
     pub nonce: Vec<u8>,
     #[n(5)]
     pub ciphertext: Vec<u8>,
+    #[n(6)]
+    pub kind: SyncEventKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -147,6 +176,9 @@ pub enum Request {
         /// Opts into byte-limited responses and the explicit continuation flag.
         #[n(6)]
         byte_limited: Option<bool>,
+        /// Confirms that this request contains the end of the sender's current event outbox.
+        #[n(7)]
+        events_complete: Option<bool>,
     },
     #[n(3)]
     PutBlob {
@@ -253,6 +285,9 @@ pub enum Request {
         limit: u16,
         #[n(7)]
         byte_limited: Option<bool>,
+        /// Confirms that this request contains the end of the sender's current event outbox.
+        #[n(8)]
+        events_complete: Option<bool>,
     },
     /// Stores an optional source application icon and wakes group watchers after a new upload.
     #[n(13)]
@@ -619,6 +654,7 @@ mod tests {
             events: Vec::new(),
             limit: 100,
             byte_limited: None,
+            events_complete: Some(true),
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement, RemovedDevice,
+    CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement, RemovedDevice, SyncEventKind,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -301,8 +301,8 @@ impl Repository {
                 r#"
                 INSERT OR IGNORE INTO events (
                     group_id, event_id, origin_device_id, origin_sequence,
-                    created_at_ms, nonce, ciphertext
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    created_at_ms, nonce, ciphertext, event_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(group_id)
@@ -312,6 +312,7 @@ impl Repository {
             .bind(event.created_at_ms)
             .bind(&event.nonce)
             .bind(&event.ciphertext)
+            .bind(event.kind.as_i64())
             .execute(&mut *transaction)
             .await
             .context("insert encrypted event")?;
@@ -336,7 +337,7 @@ impl Repository {
         let rows = sqlx::query(
             r#"
             SELECT cursor, event_id, origin_device_id, origin_sequence,
-                   created_at_ms, nonce, ciphertext
+                   created_at_ms, nonce, ciphertext, event_kind
             FROM events
             WHERE group_id = ? AND cursor > ?
             ORDER BY cursor ASC
@@ -364,6 +365,7 @@ impl Repository {
                         created_at_ms: row.try_get("created_at_ms")?,
                         nonce: row.try_get("nonce")?,
                         ciphertext: row.try_get("ciphertext")?,
+                        kind: event_kind_from_row(&row)?,
                     },
                 })
             })
@@ -413,14 +415,15 @@ impl Repository {
             sqlx::query(
                 r#"
                 SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext
+                       created_at_ms, nonce, ciphertext, event_kind
                 FROM events
-                WHERE group_id = ? AND cursor < ?
+                WHERE group_id = ? AND event_kind = ? AND cursor < ?
                 ORDER BY cursor DESC
                 LIMIT ?
                 "#,
             )
             .bind(group_id)
+            .bind(SyncEventKind::Content.as_i64())
             .bind(i64::try_from(before_cursor).unwrap_or(i64::MAX))
             .bind(fetch_limit)
             .fetch_all(&self.pool)
@@ -429,14 +432,15 @@ impl Repository {
             sqlx::query(
                 r#"
                 SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext
+                       created_at_ms, nonce, ciphertext, event_kind
                 FROM events
-                WHERE group_id = ?
+                WHERE group_id = ? AND event_kind = ?
                 ORDER BY cursor DESC
                 LIMIT ?
                 "#,
             )
             .bind(group_id)
+            .bind(SyncEventKind::Content.as_i64())
             .bind(fetch_limit)
             .fetch_all(&self.pool)
             .await
@@ -459,11 +463,13 @@ impl Repository {
     }
 
     pub async fn event_count(&self, group_id: &str) -> Result<u64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE group_id = ?")
-            .bind(group_id)
-            .fetch_one(&self.pool)
-            .await
-            .context("count encrypted events")?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE group_id = ? AND event_kind = ?")
+                .bind(group_id)
+                .bind(SyncEventKind::Content.as_i64())
+                .fetch_one(&self.pool)
+                .await
+                .context("count encrypted events")?;
         u64::try_from(count).context("negative event count")
     }
 
@@ -587,8 +593,14 @@ fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
             created_at_ms: row.try_get("created_at_ms")?,
             nonce: row.try_get("nonce")?,
             ciphertext: row.try_get("ciphertext")?,
+            kind: event_kind_from_row(&row)?,
         },
     })
+}
+
+fn event_kind_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SyncEventKind> {
+    let value: i64 = row.try_get("event_kind")?;
+    SyncEventKind::from_i64(value).context("invalid synchronized event kind")
 }
 
 #[cfg(test)]
@@ -615,6 +627,7 @@ mod tests {
             created_at_ms: 1,
             nonce: vec![1; 24],
             ciphertext: vec![1],
+            kind: SyncEventKind::Content,
         };
         repository
             .insert_events("group_123", &[event])
@@ -687,10 +700,26 @@ mod tests {
                 created_at_ms: sequence as i64,
                 nonce: vec![sequence as u8; 24],
                 ciphertext: vec![sequence as u8],
+                kind: SyncEventKind::Content,
             })
             .collect::<Vec<_>>();
         repository
             .insert_events("group_123", &events)
+            .await
+            .unwrap();
+        repository
+            .insert_events(
+                "group_123",
+                &[EncryptedEvent {
+                    event_id: "state_004".into(),
+                    origin_device_id: "device_123".into(),
+                    origin_sequence: 4,
+                    created_at_ms: 4,
+                    nonce: vec![4; 24],
+                    ciphertext: vec![4],
+                    kind: SyncEventKind::ItemState,
+                }],
+            )
             .await
             .unwrap();
 

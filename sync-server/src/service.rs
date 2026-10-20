@@ -274,6 +274,7 @@ impl HubService {
                 events,
                 limit,
                 byte_limited,
+                events_complete: _,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();
@@ -365,6 +366,7 @@ impl HubService {
                 removed_devices,
                 limit,
                 byte_limited,
+                events_complete: _,
             } => {
                 let started_at = Instant::now();
                 let submitted_event_count = events.len();

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement, RemovedDevice};
+use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement, RemovedDevice, SyncEventKind};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::{
@@ -64,22 +64,47 @@ pub async fn insert_event(
     applied: bool,
     blobs: &[StoredBlob],
 ) -> Result<InsertEventResult> {
+    insert_event_with_content_presence(pool, event, applied, blobs, None).await
+}
+
+/// Stores a local content event and its implied presence version atomically.
+pub async fn insert_content_event(
+    pool: &SqlitePool,
+    event: &EncryptedEvent,
+    blobs: &[StoredBlob],
+    sync_key: &str,
+    is_sensitive: bool,
+) -> Result<InsertEventResult> {
+    insert_event_with_content_presence(pool, event, true, blobs, Some((sync_key, is_sensitive)))
+        .await
+}
+
+async fn insert_event_with_content_presence(
+    pool: &SqlitePool,
+    event: &EncryptedEvent,
+    applied: bool,
+    blobs: &[StoredBlob],
+    content_presence: Option<(&str, bool)>,
+) -> Result<InsertEventResult> {
     let now = Utc::now();
     let mut transaction = pool.begin().await.context("begin sync event transaction")?;
+    let origin_sequence =
+        i64::try_from(event.origin_sequence).context("sync origin sequence too large")?;
     let result = sqlx::query(
         r#"
         INSERT OR IGNORE INTO sync_events (
             event_id, origin_device_id, origin_sequence, event_created_at_ms,
-            nonce, ciphertext, is_applied, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            nonce, ciphertext, event_kind, is_applied, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&event.event_id)
     .bind(&event.origin_device_id)
-    .bind(i64::try_from(event.origin_sequence).context("sync origin sequence too large")?)
+    .bind(origin_sequence)
     .bind(event.created_at_ms)
     .bind(&event.nonce)
     .bind(&event.ciphertext)
+    .bind(event.kind.as_i64())
     .bind(applied)
     .bind(now)
     .bind(now)
@@ -90,13 +115,51 @@ pub async fn insert_event(
     let stored = if inserted {
         true
     } else {
-        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM sync_events WHERE event_id = ?)")
-            .bind(&event.event_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .context("check existing sync event")?
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM sync_events
+                WHERE event_id = ?
+                  AND origin_device_id = ?
+                  AND origin_sequence = ?
+                  AND event_created_at_ms = ?
+                  AND nonce = ?
+                  AND ciphertext = ?
+                  AND event_kind = ?
+            )
+            "#,
+        )
+        .bind(&event.event_id)
+        .bind(&event.origin_device_id)
+        .bind(origin_sequence)
+        .bind(event.created_at_ms)
+        .bind(&event.nonce)
+        .bind(&event.ciphertext)
+        .bind(event.kind.as_i64())
+        .fetch_one(&mut *transaction)
+        .await
+        .context("check existing sync event")?
             != 0
     };
+    if stored {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (key, value, created_at, updated_at)
+            VALUES ('origin_sequence', ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = MAX(CAST(sync_state.value AS INTEGER), CAST(excluded.value AS INTEGER)),
+                updated_at = excluded.updated_at
+            WHERE sync_state.value <> ''
+              AND sync_state.value NOT GLOB '*[^0-9]*'
+            "#,
+        )
+        .bind(origin_sequence.to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("observe synchronized event sequence")?;
+    }
     if inserted {
         for blob in blobs {
             sqlx::query(
@@ -115,6 +178,21 @@ pub async fn insert_event(
             .execute(&mut *transaction)
             .await
             .context("insert sync event blob")?;
+        }
+    }
+    if stored {
+        if let Some((sync_key, is_sensitive)) = content_presence {
+            crate::db::sync_item_state::record_content_presence(
+                &mut transaction,
+                sync_key,
+                is_sensitive,
+                &crate::db::sync_item_state::SyncEventVersion {
+                    origin_sequence: event.origin_sequence,
+                    origin_device_id: event.origin_device_id.clone(),
+                },
+            )
+            .await
+            .context("record synchronized content presence")?;
         }
     }
     transaction.commit().await.context("commit sync event")?;
@@ -149,9 +227,11 @@ pub async fn link_event_to_item(
 
 pub async fn event_for_item(pool: &SqlitePool, item_id: &str) -> Result<Option<String>> {
     sqlx::query_scalar(
-        "SELECT event_id FROM sync_item_events WHERE item_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT i.event_id FROM sync_item_events i JOIN sync_events e ON e.event_id = i.event_id \
+         WHERE i.item_id = ? AND e.event_kind = ? ORDER BY i.created_at DESC LIMIT 1",
     )
     .bind(item_id)
+    .bind(SyncEventKind::Content.as_i64())
     .fetch_optional(pool)
     .await
     .context("find sync event for clipboard item")
@@ -165,15 +245,16 @@ pub async fn latest_local_event_for_item(
     let row = sqlx::query(
         r#"
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext
+               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_item_events i
         JOIN sync_events e ON e.event_id = i.event_id
-        WHERE i.item_id = ? AND i.direction = 'local'
+        WHERE i.item_id = ? AND i.direction = 'local' AND e.event_kind = ?
         ORDER BY e.cursor DESC
         LIMIT 1
         "#,
     )
     .bind(item_id)
+    .bind(SyncEventKind::Content.as_i64())
     .fetch_optional(pool)
     .await
     .context("find latest local sync event for clipboard item")?;
@@ -189,7 +270,7 @@ pub async fn linked_events_for_item(
     let rows = sqlx::query(
         r#"
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext
+               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_item_events i
         JOIN sync_events e ON e.event_id = i.event_id
         WHERE i.item_id = ?
@@ -209,7 +290,7 @@ pub async fn linked_item_events(pool: &SqlitePool) -> Result<Vec<LinkedSyncEvent
     let rows = sqlx::query(
         r#"
         SELECT i.item_id, e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext
+               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_item_events i
         JOIN sync_events e ON e.event_id = i.event_id
         ORDER BY e.cursor ASC
@@ -265,11 +346,12 @@ pub async fn attach_event_blobs(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn unapplied_events(pool: &SqlitePool, limit: u16) -> Result<Vec<StoredSyncEvent>> {
     let rows = sqlx::query(
         r#"
         SELECT cursor, event_id, origin_device_id, origin_sequence,
-               event_created_at_ms, nonce, ciphertext
+               event_created_at_ms, nonce, ciphertext, event_kind
         FROM sync_events
         WHERE is_applied = 0
         ORDER BY cursor ASC
@@ -283,6 +365,41 @@ pub async fn unapplied_events(pool: &SqlitePool, limit: u16) -> Result<Vec<Store
     rows.into_iter().map(event_from_row).collect()
 }
 
+/// Lists unapplied events of one semantic kind without letting earlier content hide later state.
+pub async fn unapplied_events_by_kind(
+    pool: &SqlitePool,
+    kind: SyncEventKind,
+    limit: u16,
+) -> Result<Vec<StoredSyncEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT cursor, event_id, origin_device_id, origin_sequence,
+               event_created_at_ms, nonce, ciphertext, event_kind
+        FROM sync_events
+        WHERE is_applied = 0 AND event_kind = ?
+        ORDER BY cursor ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(kind.as_i64())
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .context("list unapplied sync events by kind")?;
+    rows.into_iter().map(event_from_row).collect()
+}
+
+pub async fn has_unapplied_events_by_kind(pool: &SqlitePool, kind: SyncEventKind) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM sync_events WHERE is_applied = 0 AND event_kind = ?)",
+    )
+    .bind(kind.as_i64())
+    .fetch_one(pool)
+    .await
+    .context("check unapplied sync events by kind")?
+        != 0)
+}
+
 pub async fn pending_events_for_target(
     pool: &SqlitePool,
     target_id: &str,
@@ -291,7 +408,7 @@ pub async fn pending_events_for_target(
     let rows = sqlx::query(
         r#"
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext
+               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_events e
         LEFT JOIN sync_deliveries d
           ON d.event_id = e.event_id AND d.target_id = ?
@@ -319,7 +436,7 @@ pub async fn pending_origin_events_for_target(
     let rows = sqlx::query(
         r#"
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext
+               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_events e
         LEFT JOIN sync_deliveries d
           ON d.event_id = e.event_id AND d.target_id = ?
@@ -345,7 +462,7 @@ pub async fn events_after_cursor(
     let rows = sqlx::query(
         r#"
         SELECT cursor, event_id, origin_device_id, origin_sequence,
-               event_created_at_ms, nonce, ciphertext
+               event_created_at_ms, nonce, ciphertext, event_kind
         FROM sync_events
         WHERE cursor > ?
         ORDER BY cursor ASC
@@ -1378,6 +1495,7 @@ pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
         "DELETE FROM sync_deliveries",
         "DELETE FROM sync_event_blobs",
         "DELETE FROM sync_events",
+        "DELETE FROM sync_item_states",
         "DELETE FROM sync_peers",
         "DELETE FROM sync_removed_peers",
         "DELETE FROM sync_state WHERE key <> 'origin_sequence'",
@@ -1407,8 +1525,14 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSyncEvent> {
             created_at_ms: row.try_get("event_created_at_ms")?,
             nonce: row.try_get("nonce")?,
             ciphertext: row.try_get("ciphertext")?,
+            kind: event_kind_from_row(&row)?,
         },
     })
+}
+
+fn event_kind_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SyncEventKind> {
+    let value: i64 = row.try_get("event_kind")?;
+    SyncEventKind::from_i64(value).context("invalid synchronized event kind")
 }
 
 async fn state_value(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
@@ -1441,19 +1565,24 @@ async fn set_state_value(pool: &SqlitePool, key: &str, value: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use crate::db::test_support::memory_pool;
+    use ecopaste_sync_protocol::MAX_EVENTS_PER_BATCH;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     use super::*;
 
     #[tokio::test]
-    async fn origin_index_upgrade_preserves_per_target_outbox_and_cursor_order() {
+    async fn origin_index_preserves_per_target_outbox_and_cursor_order() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         let migrator = sqlx::migrate!("./migrations");
-        migrator.run_to(10, &pool).await.unwrap();
+        migrator.run(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_sync_events_origin_cursor")
+            .execute(&pool)
+            .await
+            .unwrap();
         for (id, sequence, origin) in [
             ("first", 8, "local"),
             ("remote", 4, "other"),
@@ -1477,7 +1606,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        migrator.run(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_sync_events_origin_cursor \
+             ON sync_events(origin_device_id, cursor)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             ids(
                 pending_origin_events_for_target(&pool, "cloud", "local", 10)
@@ -1506,14 +1641,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unapplied_index_upgrade_preserves_order_limits_and_applied_state() {
+    async fn unapplied_index_preserves_order_limits_and_applied_state() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         let migrator = sqlx::migrate!("./migrations");
-        migrator.run_to(8, &pool).await.unwrap();
+        migrator.run(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_sync_events_unapplied_cursor")
+            .execute(&pool)
+            .await
+            .unwrap();
         for (id, sequence, applied) in [
             ("already-applied", 1, true),
             ("pending-z", 4, false),
@@ -1533,7 +1672,13 @@ mod tests {
             ["pending-z", "pending-a", "pending-m"]
         );
 
-        migrator.run(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_sync_events_unapplied_cursor \
+             ON sync_events(cursor) WHERE is_applied = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         for limit in [0, 1, 2, 10] {
             let after = unapplied_events(&pool, limit).await.unwrap();
@@ -1582,6 +1727,68 @@ mod tests {
             mark_applied(&pool, &stored.event.event_id).await.unwrap();
         }
         assert!(unapplied_events(&pool, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_events_are_not_hidden_behind_a_full_content_batch() {
+        let pool = memory_pool().await;
+        for sequence in 1..=MAX_EVENTS_PER_BATCH {
+            let event_id = format!("content-{sequence}");
+            insert_event(
+                &pool,
+                &test_event(&event_id, u64::from(sequence)),
+                false,
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        let mut state = test_event("state", u64::from(MAX_EVENTS_PER_BATCH) + 1);
+        state.kind = SyncEventKind::ItemState;
+        insert_event(&pool, &state, false, &[]).await.unwrap();
+
+        assert_eq!(
+            unapplied_events(&pool, MAX_EVENTS_PER_BATCH)
+                .await
+                .unwrap()
+                .len(),
+            usize::from(MAX_EVENTS_PER_BATCH)
+        );
+        let states = unapplied_events_by_kind(&pool, SyncEventKind::ItemState, 1)
+            .await
+            .unwrap();
+        assert_eq!(states[0].event.event_id, "state");
+    }
+
+    #[tokio::test]
+    async fn item_content_lookup_ignores_newer_state_events() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        let content = test_event("content", 1);
+        insert_event(&pool, &content, true, &[]).await.unwrap();
+        link_event_to_item(&pool, "item", "content", "local")
+            .await
+            .unwrap();
+        let mut state = test_event("state", 2);
+        state.kind = SyncEventKind::ItemState;
+        insert_event(&pool, &state, true, &[]).await.unwrap();
+        link_event_to_item(&pool, "item", "state", "local")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            event_for_item(&pool, "item").await.unwrap().as_deref(),
+            Some("content")
+        );
+        assert_eq!(
+            latest_local_event_for_item(&pool, "item")
+                .await
+                .unwrap()
+                .unwrap()
+                .event
+                .event_id,
+            "content"
+        );
     }
 
     #[tokio::test]
@@ -1674,14 +1881,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_state_clear_preserves_the_device_sequence() {
+    async fn group_state_clear_preserves_sequence_and_drops_item_state() {
         let pool = memory_pool().await;
         let first = next_origin_sequence(&pool).await.unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sync_item_states (sync_key, created_at, updated_at) VALUES ('hash', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         clear_group_state(&pool).await.unwrap();
         let second = next_origin_sequence(&pool).await.unwrap();
+        let state_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_item_states")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         assert!(second > first);
+        assert_eq!(state_count, 0);
     }
 
     #[tokio::test]
@@ -1766,6 +1987,62 @@ mod tests {
                 stored: false
             }
         );
+    }
+
+    #[tokio::test]
+    async fn content_event_and_presence_version_are_stored_together() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        sqlx::query("UPDATE clipboard_items SET sync_key = 'stable-key' WHERE id = 'item'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO sync_item_states (
+                sync_key, is_present, presence_origin_sequence,
+                presence_origin_device_id, dirty_mask, local_revision,
+                created_at, updated_at
+            ) VALUES ('stable-key', 0, 0, 'mac', 8, 1, '2026-01-01', '2026-01-01')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result =
+            insert_content_event(&pool, &test_event("event-1", 1), &[], "stable-key", false)
+                .await
+                .unwrap();
+
+        assert!(result.stored);
+        let state: (Option<i64>, Option<i64>, Option<String>, i64) = sqlx::query_as(
+            r#"
+            SELECT is_present, presence_origin_sequence,
+                   presence_origin_device_id, dirty_mask
+            FROM sync_item_states
+            WHERE sync_key = 'stable-key'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (Some(1), Some(1), Some("mac".into()), 0));
+    }
+
+    #[tokio::test]
+    async fn rejected_event_identity_conflict_does_not_exhaust_local_sequence() {
+        let pool = memory_pool().await;
+        insert_event(&pool, &test_event("event-1", 1), false, &[])
+            .await
+            .unwrap();
+
+        let conflict = insert_event(&pool, &test_event("event-1", i64::MAX as u64), false, &[])
+            .await
+            .unwrap();
+
+        assert!(!conflict.stored);
+        assert!(next_origin_sequence(&pool).await.is_ok());
     }
 
     #[tokio::test]
@@ -1945,6 +2222,7 @@ mod tests {
             created_at_ms: 100,
             nonce: vec![1; 24],
             ciphertext: vec![2; 32],
+            kind: SyncEventKind::Content,
         }
     }
 }

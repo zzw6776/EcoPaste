@@ -427,9 +427,11 @@ pub fn build_item_with_settings(
     }
 
     let now = Utc::now();
+    let item_content_hash = content_hash(draft.kind, &draft.content);
     Ok(Some(ClipboardItem {
         id: uuid::Uuid::new_v4().to_string(),
-        content_hash: content_hash(draft.kind, &draft.content),
+        content_hash: item_content_hash.clone(),
+        sync_key: item_content_hash,
         kind: draft.kind,
         sub_kind: draft.sub_kind,
         group_id: None,
