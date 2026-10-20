@@ -90,6 +90,12 @@ pub enum SyncEventKind {
     ItemState,
 }
 
+impl Default for SyncEventKind {
+    fn default() -> Self {
+        Self::Content
+    }
+}
+
 impl SyncEventKind {
     pub const fn as_i64(self) -> i64 {
         match self {
@@ -123,6 +129,7 @@ pub struct EncryptedEvent {
     #[n(5)]
     pub ciphertext: Vec<u8>,
     #[n(6)]
+    #[cbor(default)]
     pub kind: SyncEventKind,
 }
 

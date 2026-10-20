@@ -279,19 +279,28 @@ const List: FC<ListProps> = (props) => {
   useWindowReady(active && loadedInitial);
 
   const syncStatusItemsRef = useRef(loadedItems);
+  const syncStatusActiveRef = useRef(active);
   const syncStatusPendingRef = useRef(false);
   const syncStatusInFlightRef = useRef(false);
   const syncStatusMountedRef = useRef(true);
   syncStatusItemsRef.current = loadedItems;
+  syncStatusActiveRef.current = active;
 
   /** 查询期间只记录一次补刷，结果过期时直接读取最新列表。 */
   async function refreshSyncStatuses() {
     syncStatusPendingRef.current = true;
+    if (!syncStatusActiveRef.current || !clipboardWindowVisibleRef.current)
+      return;
     if (syncStatusInFlightRef.current) return;
 
     syncStatusInFlightRef.current = true;
     try {
-      while (syncStatusPendingRef.current && syncStatusMountedRef.current) {
+      while (
+        syncStatusPendingRef.current &&
+        syncStatusMountedRef.current &&
+        syncStatusActiveRef.current &&
+        clipboardWindowVisibleRef.current
+      ) {
         syncStatusPendingRef.current = false;
         const items = syncStatusItemsRef.current;
         const itemIds = [...items.values()].map((item) => {
@@ -300,6 +309,13 @@ const List: FC<ListProps> = (props) => {
         try {
           const statuses = await getSyncItemStatusesShared(itemIds);
           if (!syncStatusMountedRef.current) return;
+          if (
+            !syncStatusActiveRef.current ||
+            !clipboardWindowVisibleRef.current
+          ) {
+            syncStatusPendingRef.current = true;
+            return;
+          }
           if (items !== syncStatusItemsRef.current) {
             syncStatusPendingRef.current = true;
             continue;
@@ -323,11 +339,11 @@ const List: FC<ListProps> = (props) => {
   // biome-ignore lint/correctness/useExhaustiveDependencies: 列表更新触发状态读取，ref 提供最新快照。
   useEffect(() => {
     syncStatusMountedRef.current = true;
-    void refreshSyncStatuses();
+    if (active) void refreshSyncStatuses();
     return () => {
       syncStatusMountedRef.current = false;
     };
-  }, [loadedItems]);
+  }, [active, loadedItems]);
 
   useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
     void refreshSyncStatuses();
@@ -525,6 +541,7 @@ const List: FC<ListProps> = (props) => {
       return;
     }
 
+    if (active) void refreshSyncStatuses();
     void flushHiddenRangeRefresh();
 
     if (!active) return;

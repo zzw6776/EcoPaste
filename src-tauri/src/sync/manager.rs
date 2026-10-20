@@ -6095,6 +6095,9 @@ async fn dispatch_peer(
             events_complete,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
+            if events_complete.is_none() {
+                bail!("对端设备版本过低，请先升级后再同步");
+            }
             let remote_endpoint_id = connection.remote_id().to_string();
             if device.endpoint_id != remote_endpoint_id {
                 bail!("device endpoint identity does not match the connection");
