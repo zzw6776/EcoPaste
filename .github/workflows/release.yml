@@ -145,8 +145,6 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      # tauri-action merges latest.json by reading and replacing the shared asset.
-      max-parallel: 1
       matrix:
         include:
           - label: macOS Apple Silicon
@@ -273,8 +271,7 @@ jobs:
           releaseId: ${{ needs.release-metadata.outputs.release_id }}
           retryAttempts: 3
           tagName: ${{ needs.release-metadata.outputs.tag_name }}
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+          uploadUpdaterJson: false
 
       - name: Verify macOS app signatures and DMG contents before publishing
         if: runner.os == 'macOS'
@@ -399,34 +396,20 @@ jobs:
         with:
           ref: ${{ needs.release-metadata.outputs.tag_name }}
 
-      - name: Validate updater manifest
+      - name: Create updater manifest
         shell: bash
         env:
+          GITHUB_API_URL: ${{ github.api_url }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.release-metadata.outputs.release_id }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
           RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
           UPDATER_MANIFEST_PATH: ${{ runner.temp }}/ecopaste-updater/latest.json
         run: |
           set -euo pipefail
-          gh release download "${TAG_NAME}" --pattern latest.json --dir "$(dirname "${UPDATER_MANIFEST_PATH}")" --clobber
-          node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs';
-          const manifest = JSON.parse(readFileSync(process.env.UPDATER_MANIFEST_PATH, 'utf8'));
-          if (manifest.version !== process.env.RELEASE_VERSION) throw new Error('Updater version mismatch');
-          const repository = process.env.GH_REPO;
-          for (const platform of ['darwin-aarch64', 'darwin-x86_64', 'windows-x86_64']) {
-            const entry = manifest.platforms?.[platform];
-            if (!entry?.signature?.trim()) throw new Error(`Missing updater signature for ${platform}`);
-            const url = new URL(entry.url);
-            const apiAsset = url.origin === 'https://api.github.com' &&
-              url.pathname.startsWith(`/repos/${repository}/releases/assets/`);
-            const releaseAsset = url.origin === 'https://github.com' &&
-              url.pathname.startsWith(`/${repository}/releases/download/${process.env.TAG_NAME}/`);
-            if (!apiAsset && !releaseAsset) throw new Error(`Unexpected updater asset for ${platform}`);
-          }
-          console.log(`Validated updater ${manifest.version} for macOS ARM64, macOS Intel and Windows x64`);
-          NODE
+          node scripts/createUpdaterManifest.mjs
+          gh release upload "${TAG_NAME}" "${UPDATER_MANIFEST_PATH}#latest.json" --clobber
 
       - name: Publish completed release
         shell: bash
