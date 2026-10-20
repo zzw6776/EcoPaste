@@ -1243,7 +1243,7 @@ async fn merge_items(
     backup: &SqlitePool,
 ) -> Result<MergeOutcome> {
     let mut rows = sqlx::query_as::<_, BackupItemRow>(
-        "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, search_text, \
+        "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, sync_key, search_text, \
          summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
          created_at, updated_at FROM clipboard_items ORDER BY created_at ASC",
     )
@@ -1254,8 +1254,10 @@ async fn merge_items(
     while let Some(row) = rows.next().await {
         let row = row.context("failed to read backup items")?;
         let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM clipboard_items WHERE kind = ? AND content_hash = ? LIMIT 1",
+            "SELECT 1 FROM clipboard_items \
+             WHERE sync_key = ? OR (kind = ? AND content_hash = ?) LIMIT 1",
         )
+        .bind(row.sync_key.as_str())
         .bind(row.kind.as_str())
         .bind(row.content_hash.as_str())
         .fetch_optional(&mut **tx)
@@ -1268,10 +1270,10 @@ async fn merge_items(
 
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_items \
-             (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, search_text, \
+             (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
               summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(row.kind)
@@ -1281,7 +1283,8 @@ async fn merge_items(
         .bind(&row.id)
         .bind(row.updated_at)
         .bind(row.content)
-        .bind(row.content_hash)
+        .bind(&row.content_hash)
+        .bind(row.sync_key)
         .bind(row.search_text)
         .bind(row.summary)
         .bind(row.file_types)
@@ -1317,6 +1320,7 @@ struct BackupItemRow {
     source_app_id: Option<String>,
     content: String,
     content_hash: String,
+    sync_key: String,
     search_text: Option<String>,
     summary: Option<String>,
     file_types: Option<String>,
@@ -1702,7 +1706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_preserves_is_sensitive_flag() {
+    async fn merge_preserves_sensitive_flag_and_sync_key() {
         use crate::db::items::{content_hash, insert_item};
         use crate::db::models::{ClipboardItem, ClipboardKind, Platform};
         use crate::db::test_support::memory_pool;
@@ -1724,6 +1728,7 @@ mod tests {
             source_app_id: None,
             source_revision: uuid::Uuid::new_v4().simple().to_string(),
             content_hash: content_hash(ClipboardKind::Text, &content),
+            sync_key: "f".repeat(64),
             content,
             search_text: None,
             summary: None,
@@ -1773,5 +1778,12 @@ mod tests {
             imported,
             "merged sensitive item must keep is_sensitive = true"
         );
+        let imported_sync_key: String =
+            sqlx::query_scalar("SELECT sync_key FROM clipboard_items WHERE id = ?")
+                .bind("secret-1")
+                .fetch_one(&current)
+                .await
+                .unwrap();
+        assert_eq!(imported_sync_key, item.sync_key);
     }
 }

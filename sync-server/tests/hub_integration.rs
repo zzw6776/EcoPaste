@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::{
     ALPN, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice, Request, Response,
-    read_frame, write_frame,
+    SyncEventKind, read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -80,6 +80,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         created_at_ms: 100,
         nonce: vec![1; 24],
         ciphertext: vec![2; 128],
+        kind: SyncEventKind::Content,
     };
     let first = sync_request(
         &group_id,
@@ -135,6 +136,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         created_at_ms: 200,
         nonce: vec![3; 24],
         ciphertext: vec![4; 128],
+        kind: SyncEventKind::Content,
     };
     let removed_device = RemovedDevice {
         device_id: "device_removed".into(),
@@ -151,6 +153,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         removed_devices: vec![removed_device.clone()],
         limit: 100,
         byte_limited: None,
+        events_complete: Some(true),
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -298,6 +301,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         created_at_ms: 400,
         nonce: vec![5; 24],
         ciphertext: vec![6; 128],
+        kind: SyncEventKind::Content,
     };
     let remove_self = Request::SyncV2 {
         group_id: group_id.clone(),
@@ -313,6 +317,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         }],
         limit: 100,
         byte_limited: None,
+        events_complete: Some(true),
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -361,6 +366,7 @@ fn sync_request(
         events,
         limit: 100,
         byte_limited: None,
+        events_complete: Some(true),
     }
 }
 

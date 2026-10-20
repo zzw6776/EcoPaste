@@ -10,7 +10,7 @@ pub use identity::PairingCode;
 pub use manager::SyncManager;
 pub use model::{
     CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace, SyncItemStatus,
-    SyncPairingPreview, SyncStatus, SyncTarget,
+    SyncPairingPreview, SyncStatus, SyncTarget, SyncedItemStatePatch,
 };
 
 use std::sync::Arc;
@@ -42,6 +42,11 @@ pub fn enqueue_local_item(
             log::warn!("enqueue clipboard sync event failed: {error:#}");
         }
     });
+}
+
+/// Wakes the synchronization worker after a durable local item-state mutation.
+pub fn notify_local_state_changed(app: &AppHandle) {
+    wake_manager(app);
 }
 
 pub fn notify_settings_changed(app: &AppHandle) {

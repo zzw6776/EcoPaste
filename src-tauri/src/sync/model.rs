@@ -46,12 +46,50 @@ pub struct SyncedClipboardItem {
     #[n(11)]
     pub created_at_ms: i64,
     #[n(12)]
-    pub content_hash: String,
+    pub sync_key: String,
     #[n(13)]
     pub updated_at_ms: Option<i64>,
     #[n(14)]
     #[cbor(default)]
     pub source_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct SyncedItemStatePatch {
+    #[n(0)]
+    pub sync_key: String,
+    #[n(1)]
+    #[cbor(default)]
+    pub is_favorite: Option<bool>,
+    #[n(2)]
+    #[cbor(default)]
+    pub is_pinned: Option<bool>,
+    #[n(3)]
+    #[cbor(default)]
+    pub note: Option<String>,
+    #[n(4)]
+    #[cbor(default)]
+    pub note_changed: bool,
+    #[n(5)]
+    #[cbor(default)]
+    pub is_present: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecryptedSyncEvent {
+    Clipboard(Box<ClipboardEnvelope>),
+    ItemState(SyncedItemStatePatch),
+}
+
+impl DecryptedSyncEvent {
+    #[allow(dead_code)]
+    pub fn sync_key(&self) -> &str {
+        match self {
+            Self::Clipboard(envelope) => &envelope.item.sync_key,
+            Self::ItemState(patch) => &patch.sync_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -359,7 +397,7 @@ mod tests {
             is_sensitive: false,
             source_platform: "macos".into(),
             created_at_ms: 123,
-            content_hash: "hash".into(),
+            sync_key: "hash".into(),
             updated_at_ms: Some(456),
             source_revision: Some("revision".into()),
         };
@@ -403,7 +441,7 @@ mod tests {
                 is_sensitive: false,
                 source_platform: "macos".into(),
                 created_at_ms: 123,
-                content_hash: "hash".into(),
+                sync_key: "hash".into(),
                 updated_at_ms: Some(456),
                 source_revision: Some("revision".into()),
             },

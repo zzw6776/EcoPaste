@@ -1609,40 +1609,50 @@ pub async fn import_clipboard_group_svg(path: String) -> Result<String> {
     Ok(icon)
 }
 
-/// 翻转收藏状态（薄封装）。前端在调用前/后做乐观更新；这里不返回新状态，
+/// 翻转收藏状态（薄封装）。前端在调用前/后做乐观更新；
 /// 失败时前端按需回滚 / 重拉单条。
 #[tauri::command]
 pub async fn toggle_clipboard_item_favorite(
+    app: AppHandle,
     db: State<'_, DatabaseState>,
     id: String,
 ) -> Result<bool> {
     let pool = db.pool().await;
-    crate::db::items::toggle_item_favorite(&pool, &id).await
+    let outcome = crate::db::items::toggle_item_favorite(&pool, &id).await?;
+    crate::sync::notify_local_state_changed(&app);
+    Ok(outcome.is_favorite)
 }
 
 /// 翻转置顶状态（薄封装）。不更新 `updated_at`，避免污染最近使用排序。
 #[tauri::command]
 pub async fn toggle_clipboard_item_pinned(
+    app: AppHandle,
     db: State<'_, DatabaseState>,
     id: String,
 ) -> Result<bool> {
     let pool = db.pool().await;
-    crate::db::items::toggle_item_pinned(&pool, &id).await
+    let outcome = crate::db::items::toggle_item_pinned(&pool, &id).await?;
+    crate::sync::notify_local_state_changed(&app);
+    Ok(outcome.is_pinned)
 }
 
 /// 删除单条记录（薄封装）。若删的是图片记录，连带删除其落盘文件（原图 + 缩略图）。
 /// 行已删成功，删文件失败仅记日志、不回滚——残留文件最坏占用磁盘，不影响功能。
 #[tauri::command]
 pub async fn delete_clipboard_item(
+    app: AppHandle,
     db: State<'_, DatabaseState>,
     store: State<'_, ImageStore>,
     id: String,
 ) -> Result<()> {
     let pool = db.pool().await;
-    if let Some(file_name) = crate::db::items::delete_item(&pool, &id).await? {
-        if let Err(err) = store.remove(&file_name) {
-            log::warn!("remove deleted image {file_name} failed: {err}");
+    if let Some(outcome) = crate::db::items::delete_item(&pool, &id).await? {
+        if let Some(file_name) = outcome.image_file_name {
+            if let Err(err) = store.remove(&file_name) {
+                log::warn!("remove deleted image {file_name} failed: {err}");
+            }
         }
+        crate::sync::notify_local_state_changed(&app);
     }
     Ok(())
 }
@@ -1673,6 +1683,7 @@ pub async fn clear_clipboard_items(
     ) {
         log::warn!("emit {CLIPBOARD_UPDATED_EVENT} after clear failed: {err}");
     }
+    crate::sync::notify_local_state_changed(&app);
 
     Ok(outcome.removed)
 }
@@ -1716,11 +1727,17 @@ pub async fn update_clipboard_item_note(
             .try_state::<crate::settings::SettingsStore>()
             .map(|s| s.snapshot().clipboard.content.auto_favorite)
             .unwrap_or(false);
-        if auto_favorite {
-            crate::db::items::mark_item_favorite(&pool, &id).await?;
+        if auto_favorite
+            && crate::db::items::mark_item_favorite(&pool, &id)
+                .await?
+                .is_some()
+        {
             auto_favorited = true;
         }
     }
+
+    crate::sync::notify_local_state_changed(&app);
+
     Ok(UpdateNoteResult {
         note: normalized.map(str::to_owned),
         auto_favorited,
@@ -1848,6 +1865,7 @@ mod tests {
             source_app_id: None,
             source_revision: uuid::Uuid::new_v4().simple().to_string(),
             content_hash: content_hash(ClipboardKind::Text, &content),
+            sync_key: content_hash(ClipboardKind::Text, &content),
             content,
             search_text: None,
             summary: None,

@@ -674,6 +674,7 @@ mod tests {
             source_revision: "revision".to_owned(),
             content: content.to_owned(),
             content_hash: String::new(),
+            sync_key: String::new(),
             search_text: search_text.map(str::to_owned),
             summary: None,
             text_char_count: None,
