@@ -307,26 +307,82 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
 
+      - name: Create required desktop readiness marker
+        if: matrix.publish_release
+        shell: bash
+        env:
+          DESKTOP_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p .release-ready
+          printf '%s\n' "${DESKTOP_TARGET}" > ".release-ready/${DESKTOP_TARGET}.txt"
+
+      - name: Upload required desktop readiness marker
+        if: matrix.publish_release
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: desktop-ready-${{ matrix.target }}
+          path: .release-ready/${{ matrix.target }}.txt
+          retention-days: 1
+
   upload-macos-apple:
     name: Upload macOS Apple Silicon
-    needs:
-      - release-metadata
-      - build-desktop
-    if: ${{ always() && needs.release-metadata.result == 'success' }}
+    needs: release-metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 65
     permissions:
       actions: read
       contents: write
     steps:
-      - name: Download successful candidates
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/macos-aarch64
-          pattern: macos-aarch64-*
-
-      - name: Upload preferred candidate
+      - name: Wait for the first complete desktop release set
+        id: release_set
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          deadline=$((SECONDS + 3600))
+          while (( SECONDS < deadline )); do
+            artifact_names="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+                --jq '.artifacts[] | select(.expired == false) | .name'
+            )"
+            has_artifact() {
+              grep -Fqx "$1" <<< "${artifact_names}"
+            }
+
+            candidate=''
+            if has_artifact 'macos-aarch64-native'; then
+              candidate='macos-aarch64-native'
+            elif has_artifact 'macos-aarch64-cross'; then
+              candidate='macos-aarch64-cross'
+            fi
+
+            if [[ -n "${candidate}" ]] \
+              && has_artifact 'desktop-ready-x86_64-apple-darwin' \
+              && has_artifact 'desktop-ready-x86_64-pc-windows-msvc'; then
+              echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo '::error::No complete desktop release set became ready within 60 minutes.'
+          exit 1
+
+      - name: Download first successful Apple Silicon candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.release_set.outputs.candidate }}
+          path: ${{ runner.temp }}/macos-aarch64/${{ steps.release_set.outputs.candidate }}
+
+      - name: Upload successful candidate
+        shell: bash
+        env:
+          APPLE_CANDIDATE: ${{ steps.release_set.outputs.candidate }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
@@ -334,14 +390,7 @@ jobs:
           set -euo pipefail
 
           artifact_root="${RUNNER_TEMP}/macos-aarch64"
-          if [[ -d "${artifact_root}/macos-aarch64-native" ]]; then
-            selected="${artifact_root}/macos-aarch64-native"
-          elif [[ -d "${artifact_root}/macos-aarch64-cross" ]]; then
-            selected="${artifact_root}/macos-aarch64-cross"
-          else
-            echo "::error::Both Apple Silicon builds failed."
-            exit 1
-          fi
+          selected="${artifact_root}/${APPLE_CANDIDATE}"
 
           source_assets=(
             "${selected}/dmg/EcoPaste_${RELEASE_VERSION}_aarch64.dmg"

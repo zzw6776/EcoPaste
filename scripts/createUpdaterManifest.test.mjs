@@ -65,6 +65,24 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
     /name: macos-aarch64-\$\{\{ matrix\.apple_candidate }}/,
   );
   assert.match(workflow, /name: Upload macOS Apple Silicon/);
+  assert.match(workflow, /name: desktop-ready-\$\{\{ matrix\.target }}/);
+  assert.match(
+    workflow,
+    /name: Wait for the first complete desktop release set/,
+  );
+  assert.match(
+    workflow,
+    /actions\/runs\/\$\{GITHUB_RUN_ID\}\/artifacts\?per_page=100/,
+  );
+  assert.match(
+    workflow,
+    /name: \$\{\{ steps\.release_set\.outputs\.candidate }}/,
+  );
+  const appleUploadJob = workflow.slice(
+    workflow.indexOf("  upload-macos-apple:"),
+    workflow.indexOf("  build-android:"),
+  );
+  assert.doesNotMatch(appleUploadJob, /build-desktop/);
   assert.match(workflow, /EcoPaste_\$\{RELEASE_VERSION}_aarch64\.app\.tar\.gz/);
   assert.match(
     workflow,
