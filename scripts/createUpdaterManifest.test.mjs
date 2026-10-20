@@ -83,6 +83,7 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
     workflow.indexOf("  build-android:"),
   );
   assert.doesNotMatch(appleUploadJob, /build-desktop/);
+  assert.match(appleUploadJob, /GH_REPO: \$\{\{ github\.repository }}/);
   assert.match(workflow, /EcoPaste_\$\{RELEASE_VERSION}_aarch64\.app\.tar\.gz/);
   assert.match(
     workflow,

@@ -383,6 +383,7 @@ jobs:
         shell: bash
         env:
           APPLE_CANDIDATE: ${{ steps.release_set.outputs.candidate }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
