@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, RwLock, Weak,
+        Arc, Mutex as StdMutex, RwLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -118,6 +118,7 @@ pub struct SyncManager {
     cloud_transfer_wake: Notify,
     watch_wake: Notify,
     source_asset_wake: Notify,
+    local_outbox_wake: Notify,
     nearby_wake: Notify,
     lan_cycle_lock: AsyncRwLock<()>,
     cloud_cycle_lock: Mutex<()>,
@@ -129,6 +130,7 @@ pub struct SyncManager {
     apply_lock: Mutex<()>,
     /// 串行化本地事件入队，保证序号分配与写入之间不被并发打断。
     enqueue_lock: Mutex<()>,
+    pending_observations: StdMutex<HashMap<(String, String), ClipboardObservation>>,
     blob_download_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     inbound_stream_admission: Arc<Semaphore>,
     inbound_blob_concurrency: Arc<Semaphore>,
@@ -191,6 +193,44 @@ struct CloudSessionState {
     group_id: String,
     protocol_version: u16,
     sync_v2_supported: bool,
+}
+
+#[derive(Debug, Clone)]
+enum SyncConnectionTarget {
+    Cloud,
+    Peer {
+        device_id: String,
+        delivery_target: String,
+    },
+}
+
+impl SyncConnectionTarget {
+    fn peer(device_id: String) -> Self {
+        Self::Peer {
+            delivery_target: format!("peer:{device_id}"),
+            device_id,
+        }
+    }
+
+    fn is_cloud(&self) -> bool {
+        matches!(self, Self::Cloud)
+    }
+
+    fn delivery_target(&self) -> &str {
+        match self {
+            Self::Cloud => CLOUD_TARGET,
+            Self::Peer {
+                delivery_target, ..
+            } => delivery_target,
+        }
+    }
+
+    fn remote_batch_source(&self) -> repository::RemoteBatchSource<'_> {
+        match self {
+            Self::Cloud => repository::RemoteBatchSource::Cloud,
+            Self::Peer { device_id, .. } => repository::RemoteBatchSource::Peer { device_id },
+        }
+    }
 }
 
 /// Coalesces optional source icons already acknowledged or queued on the current Hub connection.
@@ -292,7 +332,6 @@ enum LanPeerSyncOutcome {
 }
 
 struct SyncConnectionOutcome {
-    cursor: u64,
     has_more: bool,
 }
 
@@ -409,6 +448,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         cloud_transfer_wake: Notify::new(),
         watch_wake: Notify::new(),
         source_asset_wake: Notify::new(),
+        local_outbox_wake: Notify::new(),
         nearby_wake: Notify::new(),
         lan_cycle_lock: AsyncRwLock::new(()),
         cloud_cycle_lock: Mutex::new(()),
@@ -419,6 +459,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         maintenance_lock: Mutex::new(()),
         apply_lock: Mutex::new(()),
         enqueue_lock: Mutex::new(()),
+        pending_observations: StdMutex::new(HashMap::new()),
         blob_download_locks: Mutex::new(HashMap::new()),
         inbound_stream_admission: Arc::new(Semaphore::new(128)),
         inbound_blob_concurrency: Arc::new(Semaphore::new(4)),
@@ -448,6 +489,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
     tauri::async_runtime::spawn(source_asset_worker(manager.clone()));
+    tauri::async_runtime::spawn(local_outbox_worker(manager.clone()));
     manager.wake();
     Ok(())
 }
@@ -458,6 +500,7 @@ impl SyncManager {
         self.wake_transfer();
         self.watch_wake.notify_one();
         self.source_asset_wake.notify_one();
+        self.local_outbox_wake.notify_one();
     }
 
     /// Reconnects LAN peers after an endpoint address or mDNS presence change.
@@ -691,6 +734,17 @@ impl SyncManager {
         self.cloud_transfer_wake.notify_one();
     }
 
+    fn schedule_transfer_wake(&self, delay: chrono::Duration) {
+        let delay = delay.to_std().unwrap_or(Duration::ZERO);
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
+                manager.wake_transfer();
+            }
+        });
+    }
+
     fn wake_lan_transfer(&self) {
         self.lan_transfer_wake.notify_one();
     }
@@ -748,7 +802,12 @@ impl SyncManager {
         if current_group.as_ref() != Some(code.group()) {
             self.stop_runtime().await?;
             let pool = self.pool().await;
+            let _enqueue_guard = self.enqueue_lock.lock().await;
             repository::clear_group_state(&pool).await?;
+            self.pending_observations
+                .lock()
+                .expect("pending clipboard observations poisoned")
+                .clear();
             self.identity.set_group(Some(code.group().clone()))?;
         }
         let pool = self.pool().await;
@@ -801,9 +860,14 @@ impl SyncManager {
         let _cloud_guard = self.cloud_cycle_lock.lock().await;
         let _lan_guard = self.lan_cycle_lock.write().await;
         self.stop_runtime().await?;
-        self.identity.set_group(None)?;
         let pool = self.pool().await;
+        let _enqueue_guard = self.enqueue_lock.lock().await;
+        self.identity.set_group(None)?;
         repository::clear_group_state(&pool).await?;
+        self.pending_observations
+            .lock()
+            .expect("pending clipboard observations poisoned")
+            .clear();
         self.lan_suspended_peers
             .write()
             .expect("LAN suspended peers poisoned")
@@ -1258,22 +1322,27 @@ impl SyncManager {
         let _ = tokio::time::timeout(Duration::from_secs(2), self.nearby_wake.notified()).await;
     }
 
-    pub async fn enqueue_item(&self, item: ClipboardItem, force_files: bool) -> Result<()> {
-        self.enqueue_item_inner(item, force_files, true, false, None)
-            .await?;
-        Ok(())
+    /// Attaches ephemeral watcher context to an already durable content operation and wakes its
+    /// materializer. Losing this context on process exit is safe because the outbox is persistent.
+    pub fn notify_content_staged(
+        &self,
+        item: &ClipboardItem,
+        observation: Option<ClipboardObservation>,
+        ready: bool,
+    ) {
+        if let Some(observation) = observation {
+            self.pending_observations
+                .lock()
+                .expect("pending clipboard observations poisoned")
+                .insert((item.id.clone(), item.source_revision.clone()), observation);
+        }
+        if ready {
+            self.local_outbox_wake.notify_one();
+        }
     }
 
-    /// Enqueues a clipboard event with watcher context for delayed file fingerprints and image
-    /// echo tracking.
-    pub async fn enqueue_observed_item(
-        &self,
-        item: ClipboardItem,
-        observation: ClipboardObservation,
-    ) -> Result<()> {
-        self.enqueue_item_inner(item, false, true, false, Some(observation))
-            .await?;
-        Ok(())
+    pub fn wake_local_outbox(&self) {
+        self.local_outbox_wake.notify_one();
     }
 
     pub async fn sync_item_now(
@@ -1281,26 +1350,48 @@ impl SyncManager {
         item: ClipboardItem,
         target: SyncTarget,
     ) -> Result<SyncItemStatus> {
-        if target == SyncTarget::Lan
-            && !self
-                .app
-                .state::<SettingsStore>()
-                .snapshot()
-                .sync
-                .lan_enabled
-        {
-            bail!("局域网同步已关闭");
+        use crate::i18n::commands::Key;
+
+        let lang = crate::i18n::current_language(&self.app);
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled {
+            bail!(crate::i18n::commands::label(lang, Key::SyncDisabled));
         }
-        self.enqueue_item_inner(item.clone(), true, false, false, None)
-            .await?
-            .context("此记录未满足当前同步策略")?;
+        if self.identity.snapshot().group.is_none() {
+            bail!(crate::i18n::commands::label(lang, Key::SyncGroupRequired));
+        }
+        if item.is_sensitive && !settings.sync_sensitive {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::SyncSensitiveDisabled
+            ));
+        }
+        if target == SyncTarget::Lan && !settings.lan_enabled {
+            bail!(crate::i18n::commands::label(lang, Key::SyncLanDisabled));
+        }
+        let pool = self.pool().await;
+        let operation_order = db::sync_queue::stage_existing_content(
+            &pool,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            true,
+            false,
+        )
+        .await?;
+        self.materialize_local_operations().await?;
+        if db::sync_queue::content_operation_exists(&pool, operation_order).await? {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::SyncOperationPending
+            ));
+        }
         if target == SyncTarget::Cloud {
             self.request_cloud_connection(Duration::from_secs(8))
                 .await?;
         }
         self.run_cycle(Some(target), None, Duration::from_secs(8))
             .await?;
-        let pool = self.pool().await;
         repository::item_statuses(&pool, &[item.id])
             .await?
             .into_iter()
@@ -1443,71 +1534,142 @@ impl SyncManager {
         unreachable!("cloud records retry loop always returns")
     }
 
-    async fn enqueue_item_inner(
-        &self,
-        item: ClipboardItem,
-        force_files: bool,
-        should_wake: bool,
-        history_backfill: bool,
-        observation: Option<ClipboardObservation>,
-    ) -> Result<Option<String>> {
+    /// Materializes durable local content/state operations in their per-item causal order.
+    async fn materialize_local_operations(&self) -> Result<usize> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
-        let identity = self.identity.snapshot();
-        if !settings.enabled && !force_files {
-            return Ok(None);
-        }
-        let Some(group) = identity.group else {
-            if force_files {
-                bail!("请先在偏好设置中启用同步或连接已有设备");
-            }
-            return Ok(None);
-        };
-        if item.is_sensitive && !settings.sync_sensitive {
-            return Ok(None);
+        if !settings.enabled {
+            return Ok(0);
         }
         let pool = self.pool().await;
-        if let Some(stored) = repository::latest_local_event_for_item(&pool, &item.id).await? {
-            if event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item) {
-                repository::clear_pending_item(&pool, &item.id).await?;
-                if should_wake {
-                    self.wake_transfer();
+        let _enqueue_guard = self.enqueue_lock.lock().await;
+        let identity = self.identity.snapshot();
+        let Some(group) = identity.group else {
+            return Ok(0);
+        };
+        let mut processed = 0;
+        let mut stored_any = false;
+        let max_operations = usize::from(MAX_EVENTS_PER_BATCH) * MAX_SYNC_BATCHES_PER_CONNECTION;
+
+        let materialize_result: Result<()> = async {
+            for _ in 0..max_operations {
+                let content =
+                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive).await?;
+                let state = db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
+                    .await?
+                    .into_iter()
+                    .next();
+                let materialize_content = match (&content, &state) {
+                    (Some(content), Some(state)) => content.operation_order <= state.pending_order,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+
+                if materialize_content {
+                    let operation = content.expect("content operation selected above");
+                    match self
+                        .materialize_content_operation(
+                            &pool,
+                            &settings,
+                            &identity.device_id,
+                            &group,
+                            &operation,
+                        )
+                        .await
+                    {
+                        Ok(stored) => stored_any |= stored,
+                        Err(error) => {
+                            db::sync_queue::fail_content(
+                                &pool,
+                                operation.operation_order,
+                                &error.to_string(),
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    let state = state.expect("item-state operation selected above");
+                    let sequence = repository::next_origin_sequence(&pool).await?;
+                    let event = crypto::encrypt_item_state(
+                        &group.content_key_bytes()?,
+                        Uuid::new_v4().simple().to_string(),
+                        identity.device_id.clone(),
+                        sequence,
+                        Utc::now().timestamp_millis(),
+                        &state.patch(),
+                    )?;
+                    repository::commit_item_state_event(&pool, &event, &state).await?;
+                    stored_any = true;
                 }
-                return Ok(Some(stored.event.event_id));
+                processed += 1;
             }
-        } else if history_backfill {
-            if let Some(event_id) = repository::event_for_item(&pool, &item.id).await? {
-                repository::clear_pending_item(&pool, &item.id).await?;
-                return Ok(Some(event_id));
+            Ok(())
+        }
+        .await;
+
+        if stored_any {
+            self.wake_transfer();
+            self.emit_updated();
+        }
+        materialize_result?;
+        Ok(processed)
+    }
+
+    async fn materialize_content_operation(
+        &self,
+        pool: &SqlitePool,
+        settings: &SyncSettings,
+        device_id: &str,
+        group: &GroupSecrets,
+        operation: &db::sync_queue::ContentOutboxOperation,
+    ) -> Result<bool> {
+        let Some(item) = db::items::find_item_by_id(pool, &operation.item_id).await? else {
+            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+            return Ok(false);
+        };
+        if item.source_revision != operation.source_revision || item.sync_key != operation.sync_key
+        {
+            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+            return Ok(false);
+        }
+        if let Some(stored) = repository::latest_local_event_for_item(pool, &item.id).await? {
+            if event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item) {
+                repository::clear_pending_item(pool, &item.id).await?;
+                db::sync_queue::complete_content(pool, operation.operation_order).await?;
+                self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+                return Ok(false);
             }
+        } else if operation.history_backfill
+            && repository::event_for_item(pool, &item.id).await?.is_some()
+        {
+            repository::clear_pending_item(pool, &item.id).await?;
+            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+            return Ok(false);
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
         let (envelope, blobs, fingerprint) = match self
-            .build_envelope(&event_id, &item, &settings, &group, force_files)
+            .build_envelope(&event_id, &item, settings, group, operation.force_files)
             .await?
         {
             Some(value) => value,
             None => {
-                repository::mark_pending_item(&pool, &item.id, "文件卡片总大小超过自动同步阈值")
+                repository::mark_pending_item(pool, &item.id, "文件卡片总大小超过自动同步阈值")
                     .await?;
+                db::sync_queue::complete_content(pool, operation.operation_order).await?;
+                self.discard_pending_observation(&operation.item_id, &operation.source_revision);
                 self.emit_updated();
-                return Ok(None);
+                return Ok(false);
             }
         };
-        if let (Some(observation), Some(fingerprint)) = (observation.as_ref(), fingerprint) {
-            self.app
-                .state::<Arc<ClipboardFingerprintState>>()
-                .commit_observation(observation, fingerprint);
-        }
         if item.kind == ClipboardKind::Files {
             if let Some(size) = envelope.item.size {
                 if item.size != Some(size)
-                    && db::items::update_file_item_size(
-                        &pool,
-                        &item.id,
-                        &item.source_revision,
-                        size,
-                    )
-                    .await?
+                    && db::items::update_file_item_size(pool, &item.id, &item.source_revision, size)
+                        .await?
                 {
                     if let Err(error) = self.app.emit(
                         crate::clipboard::CLIPBOARD_UPDATED_EVENT,
@@ -1524,31 +1686,37 @@ impl SyncManager {
                 }
             }
         }
-        let _enqueue_guard = self.enqueue_lock.lock().await;
-        let sequence = repository::next_origin_sequence(&pool).await?;
+        let sequence = repository::next_origin_sequence(pool).await?;
         let created_at_ms = Utc::now().timestamp_millis();
         let key = group.content_key_bytes()?;
         let event = crypto::encrypt_event(
             &key,
             event_id,
-            identity.device_id.clone(),
+            device_id.to_owned(),
             sequence,
             created_at_ms,
             &envelope,
         )?;
-        let stored = repository::insert_content_event(
-            &pool,
+        repository::commit_content_outbox_event(
+            pool,
+            operation.operation_order,
+            &item.id,
             &event,
             &blobs,
             &item.sync_key,
             item.is_sensitive,
         )
         .await?;
-        if !stored.stored {
-            bail!("同步事件序号冲突，请重新复制内容");
+        let observation = self
+            .pending_observations
+            .lock()
+            .expect("pending clipboard observations poisoned")
+            .remove(&(operation.item_id.clone(), operation.source_revision.clone()));
+        if let (Some(observation), Some(fingerprint)) = (observation.as_ref(), fingerprint) {
+            self.app
+                .state::<Arc<ClipboardFingerprintState>>()
+                .commit_observation(observation, fingerprint);
         }
-        repository::link_event_to_item(&pool, &item.id, &event.event_id, "local").await?;
-        repository::clear_pending_item(&pool, &item.id).await?;
         if let Some(fingerprint) = observation
             .as_ref()
             .and_then(ClipboardObservation::outbound_image)
@@ -1557,11 +1725,14 @@ impl SyncManager {
                 .state::<Arc<ClipboardFingerprintState>>()
                 .remember_synced_image(fingerprint);
         }
-        if should_wake {
-            self.wake_transfer();
-        }
-        self.emit_updated();
-        Ok(Some(event.event_id))
+        Ok(true)
+    }
+
+    fn discard_pending_observation(&self, item_id: &str, source_revision: &str) {
+        self.pending_observations
+            .lock()
+            .expect("pending clipboard observations poisoned")
+            .remove(&(item_id.to_owned(), source_revision.to_owned()));
     }
 
     async fn build_envelope(
@@ -1628,12 +1799,7 @@ impl SyncManager {
                             u64::try_from(size).context("invalid clipboard file size")?
                         }
                         Ok(None) => return Ok(None),
-                        Err(error) => {
-                            log::debug!(
-                                "defer automatic file sync because size is unavailable: {error:#}"
-                            );
-                            return Ok(None);
-                        }
+                        Err(error) => return Err(error),
                     };
                     if !permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
                         return Ok(None);
@@ -1820,82 +1986,33 @@ impl SyncManager {
             return Ok(());
         }
 
-        let item_ids = db::items::recent_item_ids_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
-        for item_id in item_ids.into_iter().rev() {
-            let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
-                continue;
-            };
-            if let Err(error) = self
-                .enqueue_item_inner(item, false, false, true, None)
-                .await
-            {
-                log::warn!("backfill clipboard item {item_id} failed: {error}");
-                repository::mark_pending_item(pool, &item_id, "历史记录无法自动同步，请手动重试")
-                    .await?;
-            }
-        }
-        repository::mark_history_backfill_completed(pool, &group.group_id).await?;
-        self.emit_updated();
-        Ok(())
-    }
-
-    /// Converts durable local item-state mutations into encrypted events. Rows remain dirty until
-    /// their exact local revision has been stored, so disabling sync or exiting the app cannot
-    /// lose a favorite, pin, note, or delete mutation.
-    async fn flush_dirty_item_states(&self, pool: &SqlitePool, group: &GroupSecrets) -> Result<()> {
-        let identity = self.identity.snapshot();
-        let key = group.content_key_bytes()?;
-        let _enqueue_guard = self.enqueue_lock.lock().await;
-        let mut stored_any = false;
         let sync_sensitive = self
             .app
             .state::<SettingsStore>()
             .snapshot()
             .sync
             .sync_sensitive;
-
-        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
-            let states =
-                db::sync_item_state::dirty_states(pool, MAX_EVENTS_PER_BATCH, sync_sensitive)
-                    .await?;
-            if states.is_empty() {
-                break;
+        let item_ids = db::items::recent_item_ids_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
+        for item_id in item_ids.into_iter().rev() {
+            let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
+                continue;
+            };
+            if item.is_sensitive && !sync_sensitive {
+                continue;
             }
-
-            for state in states {
-                let sequence = repository::next_origin_sequence(pool).await?;
-                let event = crypto::encrypt_item_state(
-                    &key,
-                    Uuid::new_v4().simple().to_string(),
-                    identity.device_id.clone(),
-                    sequence,
-                    Utc::now().timestamp_millis(),
-                    &state.patch(),
-                )?;
-                let stored = repository::insert_event(pool, &event, true, &[]).await?;
-                if !stored.stored {
-                    bail!("同步状态事件序号冲突");
-                }
-                if let Some(item) = db::items::find_item_by_sync_key(pool, &state.sync_key).await? {
-                    repository::link_event_to_item(pool, &item.id, &event.event_id, "local")
-                        .await?;
-                }
-                db::sync_item_state::mark_state_sent(
-                    pool,
-                    &state,
-                    &db::sync_item_state::SyncEventVersion {
-                        origin_sequence: sequence,
-                        origin_device_id: identity.device_id.clone(),
-                    },
-                )
-                .await?;
-                stored_any = true;
-            }
+            db::sync_queue::stage_existing_content(
+                pool,
+                &item.id,
+                &item.sync_key,
+                &item.source_revision,
+                false,
+                true,
+            )
+            .await?;
         }
-
-        if stored_any {
-            self.emit_updated();
-        }
+        repository::mark_history_backfill_completed(pool, &group.group_id).await?;
+        self.local_outbox_wake.notify_one();
+        self.emit_updated();
         Ok(())
     }
 
@@ -2044,8 +2161,8 @@ impl SyncManager {
         let pool = self.pool().await;
         {
             let _maintenance_guard = self.maintenance_lock.lock().await;
-            self.flush_dirty_item_states(&pool, &group).await?;
             self.backfill_recent_history(&pool, &group).await?;
+            self.materialize_local_operations().await?;
             self.repair_history_timestamps(&pool, &group).await?;
         }
         let mut lan_succeeded = false;
@@ -2141,9 +2258,14 @@ impl SyncManager {
                         let transfer_started_at = Instant::now();
                         let cursor = repository::cloud_cursor(&pool).await?;
                         let latest = self
-                            .sync_connection(&connection, CLOUD_TARGET, cursor, &group, &endpoint)
+                            .sync_connection(
+                                &connection,
+                                &SyncConnectionTarget::Cloud,
+                                cursor,
+                                &group,
+                                &endpoint,
+                            )
                             .await?;
-                        repository::set_cloud_cursor(&pool, latest.cursor).await?;
                         if latest.has_more {
                             self.wake_cloud_transfer();
                         }
@@ -2268,7 +2390,7 @@ impl SyncManager {
         let device_id = peer.announcement.device_id.clone();
         let peer_lock = self.lan_peer_lock(&device_id);
         let _peer_guard = peer_lock.lock().await;
-        let target_id = format!("peer:{device_id}");
+        let target = SyncConnectionTarget::peer(device_id.clone());
         let preferred = repository::preferred_peer_address(&pool, &device_id).await?;
         let address =
             match peer_endpoint_addr_with_preferred(&peer.announcement, preferred.as_deref()) {
@@ -2299,11 +2421,10 @@ impl SyncManager {
             }
         };
         match self
-            .sync_connection(&connection, &target_id, peer.pull_cursor, &group, &endpoint)
+            .sync_connection(&connection, &target, peer.pull_cursor, &group, &endpoint)
             .await
         {
             Ok(latest) => {
-                repository::set_peer_cursor(&pool, &device_id, latest.cursor).await?;
                 let (connected_address, transport) = connection_path(&connection);
                 repository::mark_peer_online(
                     &pool,
@@ -2676,13 +2797,15 @@ impl SyncManager {
     async fn sync_connection(
         self: &Arc<Self>,
         connection: &Connection,
-        target_id: &str,
+        target: &SyncConnectionTarget,
         after_cursor: u64,
         group: &GroupSecrets,
         endpoint: &Endpoint,
     ) -> Result<SyncConnectionOutcome> {
         let _sync_activity = SyncActivityGuard::acquire();
-        if target_id != CLOUD_TARGET {
+        let target_id = target.delivery_target();
+        let is_cloud = target.is_cloud();
+        if !is_cloud {
             match call(connection, Request::Health).await? {
                 Response::Health {
                     protocol_version, ..
@@ -2694,14 +2817,13 @@ impl SyncManager {
         }
         let pool = self.pool().await;
         let identity = self.identity.snapshot();
-        let use_sync_v2 =
-            target_id == CLOUD_TARGET && self.cloud_sync_v2_supported(connection, &group.group_id);
-        let publish_source_icons_after_event = target_id == CLOUD_TARGET
-            && self.cloud_async_source_icons_supported(connection, &group.group_id);
+        let use_sync_v2 = is_cloud && self.cloud_sync_v2_supported(connection, &group.group_id);
+        let publish_source_icons_after_event =
+            is_cloud && self.cloud_async_source_icons_supported(connection, &group.group_id);
         let removed_devices = if use_sync_v2 {
             repository::removed_devices(&pool).await?
         } else {
-            self.sync_removed_devices(connection, group, target_id == CLOUD_TARGET)
+            self.sync_removed_devices(connection, group, is_cloud)
                 .await?;
             Vec::new()
         };
@@ -2709,7 +2831,7 @@ impl SyncManager {
         let mut has_more = false;
         for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
             let batch_started_at = Instant::now();
-            let mut pending = if target_id == CLOUD_TARGET {
+            let mut pending = if is_cloud {
                 repository::pending_origin_events_for_target(
                     &pool,
                     target_id,
@@ -2788,7 +2910,7 @@ impl SyncManager {
                 split_source_icon_blobs(blobs, &source_icon_blob_ids);
             let required_blob_count = required_blobs.len();
             let source_icon_blob_count = source_icon_blobs.len();
-            let (source_icon_blobs, source_icon_cache_hits) = if target_id == CLOUD_TARGET {
+            let (source_icon_blobs, source_icon_cache_hits) = if is_cloud {
                 self.confirmed_cloud_source_icons
                     .write()
                     .expect("confirmed cloud source icons poisoned")
@@ -2823,7 +2945,7 @@ impl SyncManager {
                 )
                 .await
                 {
-                    Ok(()) if target_id == CLOUD_TARGET => {
+                    Ok(()) if is_cloud => {
                         self.confirmed_cloud_source_icons
                             .write()
                             .expect("confirmed cloud source icons poisoned")
@@ -2843,7 +2965,7 @@ impl SyncManager {
                 let protocol = if use_sync_v2 { "v2" } else { "legacy" };
                 let response = if use_sync_v2 {
                     call_cloud_hedged(connection, request).await?
-                } else if target_id == CLOUD_TARGET {
+                } else if is_cloud {
                     call_cloud(connection, request).await?
                 } else {
                     call_lan(connection, request).await?
@@ -2929,7 +3051,8 @@ impl SyncManager {
                     connection,
                     response.events,
                     group,
-                    target_id,
+                    target,
+                    response.latest_cursor,
                     !incoming_has_more,
                 )
                 .await?;
@@ -2942,7 +3065,7 @@ impl SyncManager {
                 }
             }
             cursor = response.latest_cursor;
-            if target_id == CLOUD_TARGET {
+            if is_cloud {
                 log::info!(
                     "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} eventFirstSourceIcons={publish_source_icons_after_event} queuedSourceIcons={queued_source_icon_count} blobMs={} requestMs={} applyMs={} sourceIconMs={} totalMs={}",
                     blob_elapsed.as_millis(),
@@ -2957,7 +3080,7 @@ impl SyncManager {
             }
         }
         self.source_asset_wake.notify_one();
-        Ok(SyncConnectionOutcome { cursor, has_more })
+        Ok(SyncConnectionOutcome { has_more })
     }
 
     /// Exchanges group-wide removal tombstones before normal events so a removed device leaves
@@ -3027,8 +3150,13 @@ impl SyncManager {
 
     /// Clears only synchronization state when another group member removes this device.
     async fn leave_after_removal(&self, pool: &SqlitePool) -> Result<()> {
+        let _enqueue_guard = self.enqueue_lock.lock().await;
         self.identity.set_group(None)?;
         repository::clear_group_state(pool).await?;
+        self.pending_observations
+            .lock()
+            .expect("pending clipboard observations poisoned")
+            .clear();
         let settings = self
             .app
             .state::<SettingsStore>()
@@ -3044,51 +3172,37 @@ impl SyncManager {
         connection: &Connection,
         events: Vec<CloudEvent>,
         group: &GroupSecrets,
-        source_target: &str,
+        source: &SyncConnectionTarget,
+        latest_cursor: u64,
         allow_content: bool,
     ) -> Result<bool> {
         let _sync_activity = SyncActivityGuard::acquire();
         let pool = self.pool().await;
         let removed_peers = repository::removed_peer_ids(&pool).await?;
-        let mut received_event_ids = Vec::new();
-        let mut remote_event_ids = Vec::new();
-        let mut received_new_events = false;
-        for cloud_event in events {
-            let event = cloud_event.event;
-            if removed_peers.contains(&event.origin_device_id) {
-                continue;
-            }
-            let result = repository::insert_event(
-                &pool,
-                &event,
-                event.origin_device_id == self.identity.snapshot().device_id,
-                &[],
-            )
-            .await?;
-            if !result.stored {
-                log::warn!(
-                    "ignore sync event {} with a reused origin sequence from {}",
-                    event.event_id,
-                    event.origin_device_id
-                );
-                continue;
-            }
-            received_event_ids.push(event.event_id.clone());
-            if event.origin_device_id == self.identity.snapshot().device_id {
-                continue;
-            }
-            remote_event_ids.push(event.event_id.clone());
-            received_new_events |= result.inserted;
-        }
-        repository::mark_delivered(&pool, source_target, &received_event_ids).await?;
-        if source_target != CLOUD_TARGET {
-            repository::mark_delivered(&pool, CLOUD_TARGET, &remote_event_ids).await?;
+        let events = events
+            .into_iter()
+            .map(|cloud_event| cloud_event.event)
+            .filter(|event| !removed_peers.contains(&event.origin_device_id))
+            .collect::<Vec<_>>();
+        let identity = self.identity.snapshot();
+        let stored = repository::store_remote_batch(
+            &pool,
+            source.remote_batch_source(),
+            latest_cursor,
+            &events,
+            &identity.device_id,
+        )
+        .await?;
+        for (event_id, origin_device_id) in stored.conflicts {
+            log::warn!(
+                "ignore sync event {event_id} with a reused origin sequence from {origin_device_id}"
+            );
         }
 
         let content_has_more = self
             .apply_pending_events(connection, &pool, group, allow_content)
             .await?;
-        if received_new_events && source_target == CLOUD_TARGET {
+        if stored.received_new_events && source.is_cloud() {
             self.wake_lan_transfer();
         }
         Ok(content_has_more)
@@ -3129,10 +3243,26 @@ impl SyncManager {
                 });
                 match decrypted {
                     Ok(DecryptedSyncEvent::ItemState(patch)) => {
-                        self.apply_item_state_event(pool, &event, patch).await?;
-                        #[cfg(target_os = "android")]
-                        {
-                            applied_any = true;
+                        match self.apply_item_state_event(pool, &event, patch).await {
+                            Ok(()) => {
+                                #[cfg(target_os = "android")]
+                                {
+                                    applied_any = true;
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "defer synchronized state event {}: {error:#}",
+                                    event.event_id
+                                );
+                                let delay = repository::mark_apply_failed(
+                                    pool,
+                                    &event.event_id,
+                                    &error.to_string(),
+                                )
+                                .await?;
+                                self.schedule_transfer_wake(delay);
+                            }
                         }
                     }
                     Ok(DecryptedSyncEvent::Clipboard(_)) => {
@@ -3140,11 +3270,17 @@ impl SyncManager {
                             "discard synchronized state event {} with content payload",
                             event.event_id
                         );
-                        repository::mark_applied(pool, &event.event_id).await?;
+                        repository::mark_rejected(
+                            pool,
+                            &event.event_id,
+                            "状态事件包含剪贴板内容载荷",
+                        )
+                        .await?;
                     }
                     Err(error) => {
                         log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                        repository::mark_applied(pool, &event.event_id).await?;
+                        repository::mark_rejected(pool, &event.event_id, &error.to_string())
+                            .await?;
                     }
                 }
             }
@@ -3184,12 +3320,13 @@ impl SyncManager {
                         "discard synchronized content event {} with state payload",
                         event.event_id
                     );
-                    repository::mark_applied(pool, &event.event_id).await?;
+                    repository::mark_rejected(pool, &event.event_id, "内容事件包含状态载荷")
+                        .await?;
                     made_content_progress = true;
                 }
                 Err(error) => {
                     log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                    repository::mark_applied(pool, &event.event_id).await?;
+                    repository::mark_rejected(pool, &event.event_id, &error.to_string()).await?;
                     made_content_progress = true;
                 }
             }
@@ -3219,7 +3356,7 @@ impl SyncManager {
                     .await?;
                     let should_apply = outcome.canonical_presence != Some(false);
                     let mut stored_blobs = Vec::new();
-                    let mut all_blobs_available = true;
+                    let mut blob_error = None;
                     if should_apply {
                         for manifest in &envelope.blobs {
                             match self.ensure_blob(connection, group, manifest).await {
@@ -3234,7 +3371,10 @@ impl SyncManager {
                                         event.event_id,
                                         manifest.blob_id
                                     );
-                                    all_blobs_available = false;
+                                    blob_error = Some(format!(
+                                        "同步 Blob {} 暂时不可用: {error}",
+                                        manifest.blob_id
+                                    ));
                                     break;
                                 }
                             }
@@ -3244,7 +3384,7 @@ impl SyncManager {
                         event,
                         envelope,
                         stored_blobs,
-                        all_blobs_available,
+                        blob_error,
                         should_apply,
                         outcome.image_files,
                     ))
@@ -3253,8 +3393,7 @@ impl SyncManager {
             .buffered_ordered(2);
         let mut preparations = std::pin::pin!(preparations);
         while let Some(prepared) = preparations.next().await {
-            let (event, envelope, stored_blobs, all_blobs_available, should_apply, image_files) =
-                prepared?;
+            let (event, envelope, stored_blobs, blob_error, should_apply, image_files) = prepared?;
             if !image_files.is_empty() {
                 let store = self.app.state::<ImageStore>();
                 for file_name in image_files {
@@ -3268,43 +3407,75 @@ impl SyncManager {
                 made_content_progress = true;
                 continue;
             }
-            if !all_blobs_available {
+            if let Some(error) = blob_error {
+                let delay = repository::mark_apply_failed(pool, &event.event_id, &error).await?;
+                self.schedule_transfer_wake(delay);
                 continue;
             }
             repository::attach_event_blobs(pool, &event.event_id, &stored_blobs).await?;
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let (item_id, item, fingerprint) = self.apply_envelope(&event, envelope, group).await?;
-            if !item_id.is_empty() {
-                repository::link_event_to_item(pool, &item_id, &event.event_id, "remote").await?;
-                self.reconcile_item_timestamps(pool, group, &item_id)
-                    .await?;
-                latest_clipboard_item = Some((item, fingerprint));
-            }
-            repository::mark_applied(pool, &event.event_id).await?;
-            made_content_progress = true;
-            if let Some(icon) = source_icon {
-                match self.source_icon_blob_record(&icon) {
-                    Ok(blob) => {
-                        if let Err(error) =
-                            repository::attach_event_blobs(pool, &event.event_id, &[blob]).await
-                        {
-                            log::warn!("attach optional source app icon blob failed: {error}");
-                        } else {
-                            source_assets_pending = true;
+            match self.apply_envelope(&event, envelope, group).await {
+                Ok((item_id, item, fingerprint)) => {
+                    if !item_id.is_empty() {
+                        repository::link_event_to_item(pool, &item_id, &event.event_id, "remote")
+                            .await?;
+                        self.reconcile_item_timestamps(pool, group, &item_id)
+                            .await?;
+                        latest_clipboard_item = Some((item, fingerprint));
+                    }
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    made_content_progress = true;
+                    if let Some(icon) = source_icon {
+                        match self.source_icon_blob_record(&icon) {
+                            Ok(blob) => {
+                                if let Err(error) =
+                                    repository::attach_event_blobs(pool, &event.event_id, &[blob])
+                                        .await
+                                {
+                                    log::warn!(
+                                        "attach optional source app icon blob failed: {error}"
+                                    );
+                                } else {
+                                    source_assets_pending = true;
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("prepare optional source app icon failed: {error}")
+                            }
                         }
                     }
-                    Err(error) => {
-                        log::warn!("prepare optional source app icon failed: {error}")
+                    #[cfg(target_os = "android")]
+                    {
+                        applied_any = true;
                     }
                 }
-            }
-            #[cfg(target_os = "android")]
-            {
-                applied_any = true;
+                Err(error) => {
+                    log::warn!(
+                        "defer unapplyable sync content event {}: {error:#}",
+                        event.event_id
+                    );
+                    let delay =
+                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
+                            .await?;
+                    self.schedule_transfer_wake(delay);
+                }
             }
         }
         if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
             self.write_latest_synced_item_to_clipboard(item, fingerprint.as_ref());
+            if let Err(error) = self.app.emit(
+                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                serde_json::json!({
+                    "id": item.id,
+                    "kind": item.kind,
+                    "reconciled": true,
+                }),
+            ) {
+                log::warn!(
+                    "emit {} failed: {error}",
+                    crate::clipboard::CLIPBOARD_UPDATED_EVENT
+                );
+            }
         }
         drop(_apply_guard);
         #[cfg(target_os = "android")]
@@ -3590,7 +3761,6 @@ impl SyncManager {
         if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
             item = materialized;
         }
-        self.app.emit(crate::clipboard::CLIPBOARD_UPDATED_EVENT, serde_json::json!({"id": result.id, "kind": item.kind, "deduplicated": result.deduplicated}))?;
         let fingerprint = files_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
         Ok((result.id, item, fingerprint))
     }
@@ -4613,6 +4783,49 @@ fn cloud_relay_mode(settings: &SyncSettings, token: Option<&str>) -> Result<Rela
         .map(|value| relay_map.clone().with_auth_token(value))
         .unwrap_or(relay_map);
     Ok(RelayMode::Custom(relay_map))
+}
+
+async fn local_outbox_worker(manager: Arc<SyncManager>) {
+    loop {
+        manager.local_outbox_wake.notified().await;
+        loop {
+            match manager.materialize_local_operations().await {
+                Ok(0) => {
+                    let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                    if !settings.enabled || manager.identity.snapshot().group.is_none() {
+                        break;
+                    }
+                    let pool = manager.pool().await;
+                    let retry_at =
+                        match db::sync_queue::next_content_retry_at(&pool, settings.sync_sensitive)
+                            .await
+                        {
+                            Ok(retry_at) => retry_at,
+                            Err(error) => {
+                                log::warn!("read local sync outbox retry failed: {error:#}");
+                                None
+                            }
+                        };
+                    let Some(retry_at) = retry_at else {
+                        break;
+                    };
+                    let delay = (retry_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+                    tokio::select! {
+                        _ = manager.local_outbox_wake.notified() => {}
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                Ok(_) => continue,
+                Err(error) => {
+                    log::warn!("materialize local sync outbox failed: {error:#}");
+                    tokio::select! {
+                        _ = manager.local_outbox_wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn cloud_transfer_worker(manager: Arc<SyncManager>) {

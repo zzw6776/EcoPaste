@@ -1,7 +1,7 @@
 use anyhow::Context;
 use blake3::Hasher;
 use chrono::Utc;
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::core::Result;
 use crate::db::models::{
@@ -84,20 +84,57 @@ pub fn content_hash(kind: ClipboardKind, content: &str) -> String {
 /// 入库主入口：按 `item.content_hash` 去重。
 /// 命中已有记录 → 复用 [`increment_item_use_count`] 累加并刷新 `updated_at`，不插入新行；
 /// 未命中 → 调用 [`insert_item`] 插入。返回生效行 id 与是否去重。
+#[cfg(test)]
 pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
-    if let Some(existing) = find_item_by_content_hash(pool, &item.content_hash).await? {
-        merge_local_reuse(pool, &existing.id, item).await?;
-        return Ok(UpsertResult {
-            id: existing.id,
-            deduplicated: true,
-        });
+    upsert_item_with_sync_outbox(pool, item, false).await
+}
+
+/// Persists one local capture and its synchronization intent in the same SQLite transaction.
+pub async fn upsert_item_with_sync_outbox(
+    pool: &SqlitePool,
+    item: &ClipboardItem,
+    stage_sync: bool,
+) -> Result<UpsertResult> {
+    let mut transaction = pool.begin().await.context("begin local clipboard upsert")?;
+    let existing_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM clipboard_items WHERE content_hash = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&item.content_hash)
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("find local clipboard item by content hash")?;
+
+    let (id, deduplicated) = if let Some(existing_id) = existing_id {
+        merge_local_reuse_on(&mut transaction, &existing_id, item).await?;
+        (existing_id, true)
+    } else {
+        insert_item_on(&mut transaction, item).await?;
+        (item.id.clone(), false)
+    };
+
+    if stage_sync {
+        let (source_revision, sync_key): (String, String) =
+            sqlx::query_as("SELECT source_revision, sync_key FROM clipboard_items WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&mut *transaction)
+                .await
+                .context("load staged clipboard item revision")?;
+        crate::db::sync_queue::stage_content(
+            &mut transaction,
+            &id,
+            &sync_key,
+            &source_revision,
+            false,
+            false,
+        )
+        .await?;
     }
 
-    insert_item(pool, item).await?;
-    Ok(UpsertResult {
-        id: item.id.clone(),
-        deduplicated: false,
-    })
+    transaction
+        .commit()
+        .await
+        .context("commit local clipboard upsert")?;
+    Ok(UpsertResult { id, deduplicated })
 }
 
 /// Merges a synchronized record without turning network receipt into local reuse time.
@@ -170,24 +207,6 @@ pub async fn set_synced_item_timestamps(
     Ok(())
 }
 
-/// 按 `content_hash` 查最近一条同内容记录（命中 `idx_clipboard_items_content_hash` 索引）。
-pub async fn find_item_by_content_hash(
-    pool: &SqlitePool,
-    hash: &str,
-) -> Result<Option<ClipboardItem>> {
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
-    qb.push(" WHERE clipboard_items.content_hash = ")
-        .push_bind(hash.to_owned())
-        .push(" ORDER BY clipboard_items.created_at DESC LIMIT 1");
-
-    let item = qb
-        .build_query_as::<ClipboardItem>()
-        .fetch_optional(pool)
-        .await
-        .context("failed to find clipboard item by content_hash")?;
-    Ok(item)
-}
-
 /// Finds the newest local row associated with a stable cross-device item key.
 pub async fn find_item_by_sync_key(
     pool: &SqlitePool,
@@ -205,47 +224,21 @@ pub async fn find_item_by_sync_key(
         .context("failed to find clipboard item by sync key")?)
 }
 
-/// 插入一条剪贴板记录（不做去重；去重请走 [`upsert_item`]）。
+/// 插入一条剪贴板记录（不做去重；本地捕获去重请走 [`upsert_item_with_sync_outbox`]）。
 pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO clipboard_items \
-         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
-          summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
-          created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(item.id.as_str())
-    .bind(item.kind)
-    .bind(item.sub_kind)
-    .bind(item.group_id.as_deref())
-    .bind(item.source_app_id.as_deref())
-    .bind(&item.source_revision)
-    .bind(item.updated_at)
-    .bind(item.content.as_str())
-    .bind(item.content_hash.as_str())
-    .bind(item.sync_key.as_str())
-    .bind(item.search_text.as_deref())
-    .bind(item.summary.as_deref())
-    .bind(item.file_types.as_deref())
-    .bind(item.size)
-    .bind(item.width)
-    .bind(item.height)
-    .bind(item.use_count)
-    .bind(item.is_favorite)
-    .bind(item.is_pinned)
-    .bind(item.is_sensitive)
-    .bind(item.platform)
-    .bind(item.note.as_deref())
-    .bind(item.created_at)
-    .bind(item.updated_at)
-    .execute(pool)
-    .await
-    .context("failed to insert clipboard item")?;
-    Ok(())
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("acquire clipboard item connection")?;
+    insert_item_on(&mut connection, item).await
 }
 
 /// 合并一次本机重新使用，并用捕获时刻与稳定 revision 决定最新来源应用。
-async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) -> Result<()> {
+async fn merge_local_reuse_on(
+    connection: &mut SqliteConnection,
+    id: &str,
+    item: &ClipboardItem,
+) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -280,9 +273,47 @@ async fn merge_local_reuse(pool: &SqlitePool, id: &str, item: &ClipboardItem) ->
     .bind(&item.source_revision)
     .bind(item.updated_at)
     .bind(id)
-    .execute(pool)
+    .execute(connection)
     .await
     .context("merge local clipboard reuse")?;
+    Ok(())
+}
+
+async fn insert_item_on(connection: &mut SqliteConnection, item: &ClipboardItem) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO clipboard_items \
+         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
+          summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
+          created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(item.id.as_str())
+    .bind(item.kind)
+    .bind(item.sub_kind)
+    .bind(item.group_id.as_deref())
+    .bind(item.source_app_id.as_deref())
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(item.content.as_str())
+    .bind(item.content_hash.as_str())
+    .bind(item.sync_key.as_str())
+    .bind(item.search_text.as_deref())
+    .bind(item.summary.as_deref())
+    .bind(item.file_types.as_deref())
+    .bind(item.size)
+    .bind(item.width)
+    .bind(item.height)
+    .bind(item.use_count)
+    .bind(item.is_favorite)
+    .bind(item.is_pinned)
+    .bind(item.is_sensitive)
+    .bind(item.platform)
+    .bind(item.note.as_deref())
+    .bind(item.created_at)
+    .bind(item.updated_at)
+    .execute(connection)
+    .await
+    .context("failed to insert clipboard item")?;
     Ok(())
 }
 

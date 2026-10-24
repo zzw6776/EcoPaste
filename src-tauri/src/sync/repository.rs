@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement, RemovedDevice, SyncEventKind};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -17,6 +17,7 @@ use super::{
 };
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
+const CLOUD_TARGET: &str = "cloud";
 const HISTORY_BACKFILL_GROUP_KEY: &str = "history_backfill_group_id";
 const HISTORY_BACKFILL_VERSION: u8 = 2;
 const HISTORY_TIMESTAMP_REPAIR_GROUP_KEY: &str = "history_timestamp_repair_group_id";
@@ -27,6 +28,27 @@ const LAST_SUCCESS_KEY: &str = "last_success_at";
 pub struct InsertEventResult {
     pub inserted: bool,
     pub stored: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteBatchSource<'a> {
+    Cloud,
+    Peer { device_id: &'a str },
+}
+
+impl RemoteBatchSource<'_> {
+    fn delivery_target(self) -> String {
+        match self {
+            Self::Cloud => CLOUD_TARGET.to_owned(),
+            Self::Peer { device_id } => format!("peer:{device_id}"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct StoreRemoteBatchResult {
+    pub received_new_events: bool,
+    pub conflicts: Vec<(String, String)>,
 }
 
 /// Allocates a monotonically increasing sequence for this device.
@@ -68,6 +90,7 @@ pub async fn insert_event(
 }
 
 /// Stores a local content event and its implied presence version atomically.
+#[cfg(test)]
 pub async fn insert_content_event(
     pool: &SqlitePool,
     event: &EncryptedEvent,
@@ -86,16 +109,35 @@ async fn insert_event_with_content_presence(
     blobs: &[StoredBlob],
     content_presence: Option<(&str, bool)>,
 ) -> Result<InsertEventResult> {
-    let now = Utc::now();
     let mut transaction = pool.begin().await.context("begin sync event transaction")?;
+    let result = insert_event_on(
+        &mut transaction,
+        event,
+        applied,
+        blobs,
+        content_presence.map(|(sync_key, is_sensitive)| (sync_key, is_sensitive, None)),
+    )
+    .await?;
+    transaction.commit().await.context("commit sync event")?;
+    Ok(result)
+}
+
+async fn insert_event_on(
+    connection: &mut SqliteConnection,
+    event: &EncryptedEvent,
+    applied: bool,
+    blobs: &[StoredBlob],
+    content_presence: Option<(&str, bool, Option<i64>)>,
+) -> Result<InsertEventResult> {
+    let now = Utc::now();
     let origin_sequence =
         i64::try_from(event.origin_sequence).context("sync origin sequence too large")?;
     let result = sqlx::query(
         r#"
         INSERT OR IGNORE INTO sync_events (
             event_id, origin_device_id, origin_sequence, event_created_at_ms,
-            nonce, ciphertext, event_kind, is_applied, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            nonce, ciphertext, event_kind, is_applied, apply_state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&event.event_id)
@@ -106,9 +148,10 @@ async fn insert_event_with_content_presence(
     .bind(&event.ciphertext)
     .bind(event.kind.as_i64())
     .bind(applied)
+    .bind(if applied { "applied" } else { "pending" })
     .bind(now)
     .bind(now)
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await
     .context("insert sync event")?;
     let inserted = result.rows_affected() == 1;
@@ -136,7 +179,7 @@ async fn insert_event_with_content_presence(
         .bind(&event.nonce)
         .bind(&event.ciphertext)
         .bind(event.kind.as_i64())
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut *connection)
         .await
         .context("check existing sync event")?
             != 0
@@ -156,7 +199,7 @@ async fn insert_event_with_content_presence(
         .bind(origin_sequence.to_string())
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await
         .context("observe synchronized event sequence")?;
     }
@@ -175,28 +218,135 @@ async fn insert_event_with_content_presence(
             .bind(i64::try_from(blob.size).context("encrypted sync blob is too large")?)
             .bind(now)
             .bind(now)
-            .execute(&mut *transaction)
+            .execute(&mut *connection)
             .await
             .context("insert sync event blob")?;
         }
     }
     if stored {
-        if let Some((sync_key, is_sensitive)) = content_presence {
-            crate::db::sync_item_state::record_content_presence(
-                &mut transaction,
+        if let Some((sync_key, is_sensitive, operation_order)) = content_presence {
+            crate::db::sync_item_state::record_content_presence_at_order(
+                connection,
                 sync_key,
                 is_sensitive,
                 &crate::db::sync_item_state::SyncEventVersion {
                     origin_sequence: event.origin_sequence,
                     origin_device_id: event.origin_device_id.clone(),
                 },
+                operation_order,
             )
             .await
             .context("record synchronized content presence")?;
         }
     }
-    transaction.commit().await.context("commit sync event")?;
     Ok(InsertEventResult { inserted, stored })
+}
+
+/// Atomically publishes one materialized content event and removes its durable outbox entry.
+pub async fn commit_content_outbox_event(
+    pool: &SqlitePool,
+    operation_order: i64,
+    item_id: &str,
+    event: &EncryptedEvent,
+    blobs: &[StoredBlob],
+    sync_key: &str,
+    is_sensitive: bool,
+) -> Result<InsertEventResult> {
+    let mut transaction = pool.begin().await.context("begin content outbox commit")?;
+    let result = insert_event_on(
+        &mut transaction,
+        event,
+        true,
+        blobs,
+        Some((sync_key, is_sensitive, Some(operation_order))),
+    )
+    .await?;
+    if !result.stored {
+        bail!("同步事件序号冲突，请重新复制内容");
+    }
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO sync_item_events (
+            item_id, event_id, direction, created_at, updated_at
+        )
+        SELECT ?, ?, 'local', ?, ?
+        WHERE EXISTS (SELECT 1 FROM clipboard_items WHERE id = ?)
+        "#,
+    )
+    .bind(item_id)
+    .bind(&event.event_id)
+    .bind(now)
+    .bind(now)
+    .bind(item_id)
+    .execute(&mut *transaction)
+    .await
+    .context("link content outbox event to clipboard item")?;
+    sqlx::query("DELETE FROM sync_pending_items WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .context("clear pending clipboard item after content commit")?;
+    sqlx::query("DELETE FROM sync_content_outbox WHERE operation_order = ?")
+        .bind(operation_order)
+        .execute(&mut *transaction)
+        .await
+        .context("complete content outbox entry")?;
+    transaction
+        .commit()
+        .await
+        .context("commit content outbox event")?;
+    Ok(result)
+}
+
+/// Atomically appends one local item-state event and clears only the serialized state revision.
+pub async fn commit_item_state_event(
+    pool: &SqlitePool,
+    event: &EncryptedEvent,
+    state: &crate::db::sync_item_state::DirtyItemState,
+) -> Result<InsertEventResult> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin item-state outbox commit")?;
+    let result = insert_event_on(&mut transaction, event, true, &[], None).await?;
+    if !result.stored {
+        bail!("同步状态事件序号冲突");
+    }
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO sync_item_events (
+            item_id, event_id, direction, created_at, updated_at
+        )
+        SELECT id, ?, 'local', ?, ?
+        FROM clipboard_items
+        WHERE sync_key = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&event.event_id)
+    .bind(now)
+    .bind(now)
+    .bind(&state.sync_key)
+    .execute(&mut *transaction)
+    .await
+    .context("link item-state outbox event")?;
+    crate::db::sync_item_state::mark_state_sent_on(
+        &mut transaction,
+        state,
+        &crate::db::sync_item_state::SyncEventVersion {
+            origin_sequence: event.origin_sequence,
+            origin_device_id: event.origin_device_id.clone(),
+        },
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .context("commit item-state outbox event")?;
+    Ok(result)
 }
 
 /// Associates a clipboard record with the encrypted event that carries it.
@@ -310,13 +460,91 @@ pub async fn linked_item_events(pool: &SqlitePool) -> Result<Vec<LinkedSyncEvent
 }
 
 pub async fn mark_applied(pool: &SqlitePool, event_id: &str) -> Result<()> {
-    sqlx::query("UPDATE sync_events SET is_applied = 1, updated_at = ? WHERE event_id = ?")
-        .bind(Utc::now())
-        .bind(event_id)
-        .execute(pool)
-        .await
-        .context("mark sync event applied")?;
+    sqlx::query(
+        r#"
+        UPDATE sync_events
+        SET is_applied = 1,
+            apply_state = 'applied',
+            apply_attempt_count = 0,
+            next_apply_at = NULL,
+            last_apply_error = NULL,
+            updated_at = ?
+        WHERE event_id = ?
+        "#,
+    )
+    .bind(Utc::now())
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .context("mark sync event applied")?;
     Ok(())
+}
+
+/// Permanently quarantines an authenticated event whose payload cannot be decoded or validated.
+pub async fn mark_rejected(pool: &SqlitePool, event_id: &str, error: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sync_events
+        SET is_applied = 1,
+            apply_state = 'rejected',
+            next_apply_at = NULL,
+            last_apply_error = ?,
+            updated_at = ?
+        WHERE event_id = ?
+        "#,
+    )
+    .bind(error)
+    .bind(Utc::now())
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .context("reject invalid sync event")?;
+    Ok(())
+}
+
+/// Defers a transient application failure without acknowledging the event as applied.
+pub async fn mark_apply_failed(
+    pool: &SqlitePool,
+    event_id: &str,
+    error: &str,
+) -> Result<chrono::Duration> {
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT apply_attempt_count FROM sync_events WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_optional(pool)
+            .await
+            .context("read sync event apply attempts")?
+            .unwrap_or(0_i64)
+            .saturating_add(1);
+    let seconds = match attempts {
+        i64::MIN..=1 => 2,
+        2 => 5,
+        3 => 15,
+        4 => 30,
+        5 => 60,
+        _ => 300,
+    };
+    sqlx::query(
+        r#"
+        UPDATE sync_events
+        SET is_applied = 0,
+            apply_state = 'pending',
+            apply_attempt_count = ?,
+            next_apply_at = ?,
+            last_apply_error = ?,
+            updated_at = ?
+        WHERE event_id = ?
+        "#,
+    )
+    .bind(attempts)
+    .bind(Utc::now() + chrono::Duration::seconds(seconds))
+    .bind(error)
+    .bind(Utc::now())
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .context("defer failed sync event application")?;
+    Ok(chrono::Duration::seconds(seconds))
 }
 
 pub async fn attach_event_blobs(
@@ -354,10 +582,13 @@ pub async fn unapplied_events(pool: &SqlitePool, limit: u16) -> Result<Vec<Store
                event_created_at_ms, nonce, ciphertext, event_kind
         FROM sync_events
         WHERE is_applied = 0
+          AND apply_state = 'pending'
+          AND (next_apply_at IS NULL OR next_apply_at <= ?)
         ORDER BY cursor ASC
         LIMIT ?
         "#,
     )
+    .bind(Utc::now())
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -376,12 +607,16 @@ pub async fn unapplied_events_by_kind(
         SELECT cursor, event_id, origin_device_id, origin_sequence,
                event_created_at_ms, nonce, ciphertext, event_kind
         FROM sync_events
-        WHERE is_applied = 0 AND event_kind = ?
+        WHERE is_applied = 0
+          AND apply_state = 'pending'
+          AND event_kind = ?
+          AND (next_apply_at IS NULL OR next_apply_at <= ?)
         ORDER BY cursor ASC
         LIMIT ?
         "#,
     )
     .bind(kind.as_i64())
+    .bind(Utc::now())
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -391,9 +626,18 @@ pub async fn unapplied_events_by_kind(
 
 pub async fn has_unapplied_events_by_kind(pool: &SqlitePool, kind: SyncEventKind) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(SELECT 1 FROM sync_events WHERE is_applied = 0 AND event_kind = ?)",
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM sync_events
+            WHERE is_applied = 0
+              AND apply_state = 'pending'
+              AND event_kind = ?
+              AND (next_apply_at IS NULL OR next_apply_at <= ?)
+        )
+        "#,
     )
     .bind(kind.as_i64())
+    .bind(Utc::now())
     .fetch_one(pool)
     .await
     .context("check unapplied sync events by kind")?
@@ -614,11 +858,24 @@ pub async fn mark_delivered(
     target_id: &str,
     event_ids: &[String],
 ) -> Result<()> {
-    let now = Utc::now();
     let mut transaction = pool
         .begin()
         .await
         .context("begin sync delivery transaction")?;
+    mark_delivered_on(&mut transaction, target_id, event_ids).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit sync deliveries")?;
+    Ok(())
+}
+
+async fn mark_delivered_on(
+    connection: &mut SqliteConnection,
+    target_id: &str,
+    event_ids: &[String],
+) -> Result<()> {
+    let now = Utc::now();
     for event_id in event_ids {
         sqlx::query(
             r#"
@@ -630,7 +887,7 @@ pub async fn mark_delivered(
         .bind(target_id)
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await
         .context("mark sync event delivered")?;
         sqlx::query(
@@ -653,15 +910,79 @@ pub async fn mark_delivered(
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await
         .context("record successful sync delivery")?;
     }
+    Ok(())
+}
+
+/// Stores a pulled batch, delivery acknowledgements, and its pull cursor in one transaction.
+/// A crash therefore either replays the whole batch or observes every event on the next cycle.
+pub async fn store_remote_batch(
+    pool: &SqlitePool,
+    source: RemoteBatchSource<'_>,
+    latest_cursor: u64,
+    events: &[EncryptedEvent],
+    local_device_id: &str,
+) -> Result<StoreRemoteBatchResult> {
+    let mut transaction = pool.begin().await.context("begin remote sync batch")?;
+    let target_id = source.delivery_target();
+    let mut result = StoreRemoteBatchResult::default();
+    let mut received_event_ids = Vec::new();
+    let mut remote_event_ids = Vec::new();
+
+    for event in events {
+        let inserted = insert_event_on(
+            &mut transaction,
+            event,
+            event.origin_device_id == local_device_id,
+            &[],
+            None,
+        )
+        .await?;
+        if !inserted.stored {
+            result
+                .conflicts
+                .push((event.event_id.clone(), event.origin_device_id.clone()));
+            continue;
+        }
+        received_event_ids.push(event.event_id.clone());
+        if event.origin_device_id != local_device_id {
+            remote_event_ids.push(event.event_id.clone());
+            result.received_new_events |= inserted.inserted;
+        }
+    }
+
+    mark_delivered_on(&mut transaction, &target_id, &received_event_ids).await?;
+    match source {
+        RemoteBatchSource::Cloud => {
+            set_state_value_on(
+                &mut transaction,
+                CLOUD_CURSOR_KEY,
+                &latest_cursor.to_string(),
+            )
+            .await?;
+        }
+        RemoteBatchSource::Peer { device_id } => {
+            mark_delivered_on(&mut transaction, CLOUD_TARGET, &remote_event_ids).await?;
+            sqlx::query(
+                "UPDATE sync_peers SET pull_cursor = ?, updated_at = ? WHERE device_id = ?",
+            )
+            .bind(i64::try_from(latest_cursor).unwrap_or(i64::MAX))
+            .bind(Utc::now())
+            .bind(device_id)
+            .execute(&mut *transaction)
+            .await
+            .context("update peer cursor with remote sync batch")?;
+        }
+    }
+
     transaction
         .commit()
         .await
-        .context("commit sync deliveries")?;
-    Ok(())
+        .context("commit remote sync batch")?;
+    Ok(result)
 }
 
 pub async fn mark_delivery_syncing(
@@ -1127,17 +1448,6 @@ pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
         .collect()
 }
 
-pub async fn set_peer_cursor(pool: &SqlitePool, device_id: &str, cursor: u64) -> Result<()> {
-    sqlx::query("UPDATE sync_peers SET pull_cursor = ?, updated_at = ? WHERE device_id = ?")
-        .bind(i64::try_from(cursor).unwrap_or(i64::MAX))
-        .bind(Utc::now())
-        .bind(device_id)
-        .execute(pool)
-        .await
-        .context("update peer sync cursor")?;
-    Ok(())
-}
-
 pub async fn mark_peer_connecting(pool: &SqlitePool, device_id: &str) -> Result<()> {
     set_peer_connection(pool, device_id, "connecting", None, None, None, false).await
 }
@@ -1289,10 +1599,6 @@ pub async fn cloud_cursor(pool: &SqlitePool) -> Result<u64> {
         .unwrap_or("0")
         .parse()
         .context("invalid cloud sync cursor")
-}
-
-pub async fn set_cloud_cursor(pool: &SqlitePool, cursor: u64) -> Result<()> {
-    set_state_value(pool, CLOUD_CURSOR_KEY, &cursor.to_string()).await
 }
 
 /// Returns whether this sync space has completed its one-time local history backfill.
@@ -1495,6 +1801,7 @@ pub async fn clear_group_state(pool: &SqlitePool) -> Result<()> {
         "DELETE FROM sync_deliveries",
         "DELETE FROM sync_event_blobs",
         "DELETE FROM sync_events",
+        "DELETE FROM sync_content_outbox",
         "DELETE FROM sync_item_states",
         "DELETE FROM sync_peers",
         "DELETE FROM sync_removed_peers",
@@ -1544,6 +1851,18 @@ async fn state_value(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
 }
 
 async fn set_state_value(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("acquire sync state connection")?;
+    set_state_value_on(&mut connection, key, value).await
+}
+
+async fn set_state_value_on(
+    connection: &mut SqliteConnection,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -1556,7 +1875,7 @@ async fn set_state_value(pool: &SqlitePool, key: &str, value: &str) -> Result<()
     .bind(value)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(connection)
     .await
     .context("update sync state")?;
     Ok(())
@@ -1893,6 +2212,23 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        insert_test_item(&pool, "item").await;
+        let (sync_key, source_revision): (String, String) = sqlx::query_as(
+            "SELECT sync_key, source_revision FROM clipboard_items WHERE id = 'item'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        crate::db::sync_queue::stage_existing_content(
+            &pool,
+            "item",
+            &sync_key,
+            &source_revision,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
 
         clear_group_state(&pool).await.unwrap();
         let second = next_origin_sequence(&pool).await.unwrap();
@@ -1900,9 +2236,14 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_content_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         assert!(second > first);
         assert_eq!(state_count, 0);
+        assert_eq!(outbox_count, 0);
     }
 
     #[tokio::test]
@@ -2028,6 +2369,140 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, (Some(1), Some(1), Some("mac".into()), 0));
+    }
+
+    #[tokio::test]
+    async fn content_event_commit_removes_its_outbox_entry_atomically() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        let (sync_key, source_revision): (String, String) = sqlx::query_as(
+            "SELECT sync_key, source_revision FROM clipboard_items WHERE id = 'item'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let operation_order = crate::db::sync_queue::stage_existing_content(
+            &pool,
+            "item",
+            &sync_key,
+            &source_revision,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        commit_content_outbox_event(
+            &pool,
+            operation_order,
+            "item",
+            &test_event("event-1", 1),
+            &[],
+            &sync_key,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_content_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_item_events WHERE item_id = 'item' AND event_id = 'event-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outbox_count, 0);
+        assert_eq!(event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn transient_apply_failure_is_retried_while_invalid_events_are_quarantined() {
+        let pool = memory_pool().await;
+        insert_event(&pool, &test_event("event-1", 1), false, &[])
+            .await
+            .unwrap();
+
+        let delay = mark_apply_failed(&pool, "event-1", "database busy")
+            .await
+            .unwrap();
+        assert_eq!(delay, chrono::Duration::seconds(2));
+        assert!(unapplied_events_by_kind(&pool, SyncEventKind::Content, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::query("UPDATE sync_events SET next_apply_at = ? WHERE event_id = 'event-1'")
+            .bind(Utc::now() - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            unapplied_events_by_kind(&pool, SyncEventKind::Content, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        mark_rejected(&pool, "event-1", "invalid payload")
+            .await
+            .unwrap();
+        let state: (bool, String, Option<String>) = sqlx::query_as(
+            "SELECT is_applied, apply_state, last_apply_error FROM sync_events WHERE event_id = 'event-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            (true, "rejected".into(), Some("invalid payload".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_batch_commits_events_deliveries_and_raw_device_cursor_together() {
+        let pool = memory_pool().await;
+        upsert_peer(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "android".into(),
+                device_name: "Pixel".into(),
+                platform: "android".into(),
+                endpoint_id: "endpoint".into(),
+                direct_addresses: vec!["192.168.1.2:35555".into()],
+                relay_urls: Vec::new(),
+                last_seen_ms: 100,
+            },
+        )
+        .await
+        .unwrap();
+        let mut event = test_event("remote-event", 1);
+        event.origin_device_id = "other".into();
+
+        let result = store_remote_batch(
+            &pool,
+            RemoteBatchSource::Peer {
+                device_id: "android",
+            },
+            17,
+            &[event],
+            "local",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.received_new_events);
+        assert!(result.conflicts.is_empty());
+        assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
+        let delivery_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_deliveries WHERE event_id = 'remote-event' AND target_id IN ('peer:android', 'cloud')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(delivery_count, 2);
     }
 
     #[tokio::test]
