@@ -35,7 +35,9 @@ use super::source;
 use super::source::FrontmostApp;
 use super::storage::ImageStore;
 use crate::db::apps::upsert_app;
-use crate::db::items::{file_items_missing_size, fill_file_item_size, upsert_item, UpsertResult};
+#[cfg(test)]
+use crate::db::items::upsert_item;
+use crate::db::items::{file_items_missing_size, fill_file_item_size, UpsertResult};
 use crate::db::models::{ClipboardApp, ClipboardItem, ClipboardKind};
 use crate::settings::SettingsStore;
 
@@ -253,13 +255,18 @@ pub async fn persist_and_notify(
             }
         }
     }
-    let result = upsert_item(pool, &item_to_write).await?;
+    let stage_sync = crate::sync::should_stage_local_item(app, &item_to_write);
+    let result =
+        crate::db::items::upsert_item_with_sync_outbox(pool, &item_to_write, stage_sync).await?;
     sound::maybe_play_copy(app);
     notify_clipboard_updated(app, &result.id, item_to_write.kind, result.deduplicated);
     item_to_write.id = result.id.clone();
     if item_to_write.kind == ClipboardKind::Files && item_to_write.size.is_none() {
-        resolve_file_size_and_enqueue(app, pool, item_to_write, observation);
-    } else {
+        if stage_sync {
+            crate::sync::enqueue_local_item(app, item_to_write.clone(), observation);
+        }
+        resolve_file_size_and_enqueue(app, pool, item_to_write, stage_sync);
+    } else if stage_sync {
         crate::sync::enqueue_local_item(app, item_to_write, observation);
     }
     Ok(result)
@@ -291,17 +298,24 @@ fn resolve_file_size_and_enqueue(
     app: &AppHandle,
     pool: &SqlitePool,
     mut item: ClipboardItem,
-    observation: Option<ClipboardObservation>,
+    staged_for_sync: bool,
 ) {
     let app = app.clone();
     let pool = pool.clone();
     tauri::async_runtime::spawn(async move {
         let size = match calculate_current_file_item_size(&pool, &item).await {
             Ok(Some(size)) => size,
-            Ok(None) => return,
+            Ok(None) => {
+                if staged_for_sync {
+                    crate::sync::notify_local_item_ready(&app);
+                }
+                return;
+            }
             Err(error) => {
                 log::warn!("calculate clipboard file size failed: {error:#}");
-                crate::sync::enqueue_local_item(&app, item, observation);
+                if staged_for_sync {
+                    crate::sync::notify_local_item_ready(&app);
+                }
                 return;
             }
         };
@@ -309,12 +323,20 @@ fn resolve_file_size_and_enqueue(
         match fill_file_item_size(&pool, &item.id, &item.source_revision, size).await {
             Ok(true) => {
                 notify_clipboard_updated(&app, &item.id, item.kind, true);
-                crate::sync::enqueue_local_item(&app, item, observation);
+                if staged_for_sync {
+                    crate::sync::notify_local_item_ready(&app);
+                }
             }
-            Ok(false) => {}
+            Ok(false) => {
+                if staged_for_sync {
+                    crate::sync::notify_local_item_ready(&app);
+                }
+            }
             Err(error) => {
                 log::warn!("persist clipboard file size failed: {error:#}");
-                crate::sync::enqueue_local_item(&app, item, observation);
+                if staged_for_sync {
+                    crate::sync::notify_local_item_ready(&app);
+                }
             }
         }
     });

@@ -26,5 +26,10 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(target_os = "macos")]
         Key::PasteTargetUnavailable => "无法恢复原输入窗口，请重新唤起后再试",
         Key::SaveImage => "保存图片",
+        Key::SyncDisabled => "请先启用多端同步",
+        Key::SyncGroupRequired => "请先创建或加入同步设备组",
+        Key::SyncLanDisabled => "局域网同步已关闭",
+        Key::SyncOperationPending => "此记录仍在等待前序同步操作，请稍后重试",
+        Key::SyncSensitiveDisabled => "敏感内容同步已关闭",
     }
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result as AnyResult};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -65,6 +67,7 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5))
         .disable_statement_logging();
 
     let pool = SqlitePoolOptions::new()

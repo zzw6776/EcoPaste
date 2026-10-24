@@ -24,6 +24,7 @@ pub struct DirtyItemState {
     pub is_present: Option<bool>,
     pub dirty_mask: i64,
     pub local_revision: i64,
+    pub pending_order: i64,
 }
 
 impl DirtyItemState {
@@ -97,17 +98,20 @@ async fn mark_local_bool(
     value: bool,
     dirty_bit: i64,
 ) -> Result<()> {
+    let pending_order = crate::db::sync_queue::next_operation_order(connection).await?;
     let now = Utc::now();
     let query = format!(
         r#"
         INSERT INTO sync_item_states (
-            sync_key, is_sensitive, {column}, dirty_mask, local_revision, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            sync_key, is_sensitive, {column}, dirty_mask, local_revision,
+            pending_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             is_sensitive = excluded.is_sensitive,
             {column} = excluded.{column},
             dirty_mask = sync_item_states.dirty_mask | excluded.dirty_mask,
             local_revision = sync_item_states.local_revision + 1,
+            pending_order = excluded.pending_order,
             updated_at = excluded.updated_at
         "#,
     );
@@ -116,6 +120,7 @@ async fn mark_local_bool(
         .bind(is_sensitive)
         .bind(value)
         .bind(dirty_bit)
+        .bind(pending_order)
         .bind(now)
         .bind(now)
         .execute(connection)
@@ -131,17 +136,20 @@ pub async fn mark_local_note(
     is_sensitive: bool,
     note: Option<&str>,
 ) -> Result<()> {
+    let pending_order = crate::db::sync_queue::next_operation_order(connection).await?;
     let now = Utc::now();
     sqlx::query(
         r#"
         INSERT INTO sync_item_states (
-            sync_key, is_sensitive, note, dirty_mask, local_revision, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            sync_key, is_sensitive, note, dirty_mask, local_revision,
+            pending_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             is_sensitive = excluded.is_sensitive,
             note = excluded.note,
             dirty_mask = sync_item_states.dirty_mask | excluded.dirty_mask,
             local_revision = sync_item_states.local_revision + 1,
+            pending_order = excluded.pending_order,
             updated_at = excluded.updated_at
         "#,
     )
@@ -149,6 +157,7 @@ pub async fn mark_local_note(
     .bind(is_sensitive)
     .bind(note)
     .bind(NOTE_DIRTY)
+    .bind(pending_order)
     .bind(now)
     .bind(now)
     .execute(connection)
@@ -163,17 +172,20 @@ pub async fn mark_local_deleted(
     sync_key: &str,
     is_sensitive: bool,
 ) -> Result<()> {
+    let pending_order = crate::db::sync_queue::next_operation_order(connection).await?;
     let now = Utc::now();
     sqlx::query(
         r#"
         INSERT INTO sync_item_states (
-            sync_key, is_sensitive, is_present, dirty_mask, local_revision, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            sync_key, is_sensitive, is_present, dirty_mask, local_revision,
+            pending_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             is_sensitive = excluded.is_sensitive,
             is_present = excluded.is_present,
             dirty_mask = sync_item_states.dirty_mask | excluded.dirty_mask,
             local_revision = sync_item_states.local_revision + 1,
+            pending_order = excluded.pending_order,
             updated_at = excluded.updated_at
         "#,
     )
@@ -181,6 +193,7 @@ pub async fn mark_local_deleted(
     .bind(is_sensitive)
     .bind(false)
     .bind(PRESENCE_DIRTY)
+    .bind(pending_order)
     .bind(now)
     .bind(now)
     .execute(connection)
@@ -201,14 +214,20 @@ pub async fn dirty_states(
                    WHEN ? OR is_sensitive = 0 THEN dirty_mask
                    ELSE dirty_mask & ?
                END AS dirty_mask,
-               local_revision
-        FROM sync_item_states
+               local_revision, pending_order
+        FROM sync_item_states state
         WHERE dirty_mask <> 0
+          AND pending_order IS NOT NULL
           AND (
               ? OR is_sensitive = 0
               OR ((dirty_mask & ?) <> 0 AND presence_origin_sequence IS NOT NULL)
           )
-        ORDER BY updated_at ASC
+          AND NOT EXISTS (
+              SELECT 1 FROM sync_content_outbox content
+              WHERE content.sync_key = state.sync_key
+                AND content.operation_order < state.pending_order
+          )
+        ORDER BY pending_order ASC
         LIMIT ?
         "#,
     )
@@ -224,6 +243,7 @@ pub async fn dirty_states(
 
 /// Records the version assigned to a durable local state event and clears only the exact revision
 /// that was serialized. A concurrent local mutation leaves the row dirty for the next pass.
+#[cfg(test)]
 pub async fn mark_state_sent(
     pool: &SqlitePool,
     state: &DirtyItemState,
@@ -233,13 +253,28 @@ pub async fn mark_state_sent(
         .begin()
         .await
         .context("begin synchronized state send")?;
+    mark_state_sent_on(&mut transaction, state, version).await?;
+
+    transaction
+        .commit()
+        .await
+        .context("commit synchronized state send")?;
+    Ok(())
+}
+
+/// Finalizes a local state revision inside the caller's event-log transaction.
+pub async fn mark_state_sent_on(
+    connection: &mut SqliteConnection,
+    state: &DirtyItemState,
+    version: &SyncEventVersion,
+) -> Result<()> {
     let sequence =
         i64::try_from(version.origin_sequence).context("sync state version too large")?;
     let now = Utc::now();
 
     if state.dirty_mask & FAVORITE_DIRTY != 0 {
         set_version(
-            &mut transaction,
+            connection,
             &state.sync_key,
             "favorite",
             sequence,
@@ -250,7 +285,7 @@ pub async fn mark_state_sent(
     }
     if state.dirty_mask & PINNED_DIRTY != 0 {
         set_version(
-            &mut transaction,
+            connection,
             &state.sync_key,
             "pinned",
             sequence,
@@ -261,7 +296,7 @@ pub async fn mark_state_sent(
     }
     if state.dirty_mask & NOTE_DIRTY != 0 {
         set_version(
-            &mut transaction,
+            connection,
             &state.sync_key,
             "note",
             sequence,
@@ -272,7 +307,7 @@ pub async fn mark_state_sent(
     }
     if state.dirty_mask & PRESENCE_DIRTY != 0 {
         set_version(
-            &mut transaction,
+            connection,
             &state.sync_key,
             "presence",
             sequence,
@@ -285,27 +320,29 @@ pub async fn mark_state_sent(
     sqlx::query(
         r#"
         UPDATE sync_item_states
-        SET dirty_mask = dirty_mask & ~?, updated_at = ?
+        SET dirty_mask = dirty_mask & ~?,
+            pending_order = CASE
+                WHEN (dirty_mask & ~?) = 0 THEN NULL
+                ELSE pending_order
+            END,
+            updated_at = ?
         WHERE sync_key = ? AND local_revision = ?
         "#,
     )
     .bind(state.dirty_mask)
+    .bind(state.dirty_mask)
     .bind(now)
     .bind(&state.sync_key)
     .bind(state.local_revision)
-    .execute(&mut *transaction)
+    .execute(connection)
     .await
     .context("clear sent synchronized item state")?;
 
-    transaction
-        .commit()
-        .await
-        .context("commit synchronized state send")?;
     Ok(())
 }
 
 async fn set_version(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    connection: &mut SqliteConnection,
     sync_key: &str,
     field: &str,
     sequence: i64,
@@ -320,7 +357,7 @@ async fn set_version(
         .bind(device_id)
         .bind(sync_key)
         .bind(local_revision)
-        .execute(&mut **transaction)
+        .execute(connection)
         .await
         .context("record synchronized item state version")?;
     Ok(())
@@ -585,12 +622,47 @@ async fn is_present(pool: &SqlitePool, sync_key: &str) -> Result<Option<bool>> {
 }
 
 /// Records the versioned presence implied by a locally originated content event.
+#[cfg(test)]
 pub async fn record_content_presence(
     connection: &mut SqliteConnection,
     sync_key: &str,
     is_sensitive: bool,
     version: &SyncEventVersion,
 ) -> Result<()> {
+    record_content_presence_at_order(connection, sync_key, is_sensitive, version, None).await
+}
+
+/// Records content presence without superseding a later local delete staged during materialization.
+pub async fn record_content_presence_at_order(
+    connection: &mut SqliteConnection,
+    sync_key: &str,
+    is_sensitive: bool,
+    version: &SyncEventVersion,
+    operation_order: Option<i64>,
+) -> Result<()> {
+    if let Some(operation_order) = operation_order {
+        let has_later_delete = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM sync_item_states
+                WHERE sync_key = ?
+                  AND (dirty_mask & ?) <> 0
+                  AND pending_order > ?
+            )
+            "#,
+        )
+        .bind(sync_key)
+        .bind(PRESENCE_DIRTY)
+        .bind(operation_order)
+        .fetch_one(&mut *connection)
+        .await
+        .context("check later synchronized presence mutation")?
+            != 0;
+        if has_later_delete {
+            return Ok(());
+        }
+    }
+
     let sequence =
         i64::try_from(version.origin_sequence).context("sync state version too large")?;
     let now = Utc::now();
@@ -608,6 +680,10 @@ pub async fn record_content_presence(
             presence_origin_sequence = excluded.presence_origin_sequence,
             presence_origin_device_id = excluded.presence_origin_device_id,
             dirty_mask = sync_item_states.dirty_mask & ~?,
+            pending_order = CASE
+                WHEN (sync_item_states.dirty_mask & ~?) = 0 THEN NULL
+                ELSE sync_item_states.pending_order
+            END,
             local_revision = sync_item_states.local_revision + 1,
             updated_at = excluded.updated_at
         WHERE EXISTS (SELECT 1 FROM clipboard_items WHERE sync_key = excluded.sync_key)
@@ -620,6 +696,7 @@ pub async fn record_content_presence(
     .bind(now)
     .bind(now)
     .bind(sync_key)
+    .bind(PRESENCE_DIRTY)
     .bind(PRESENCE_DIRTY)
     .execute(connection)
     .await
@@ -817,6 +894,129 @@ mod tests {
 
         assert_eq!(is_present(&pool, "stable-key").await.unwrap(), Some(true));
         assert!(dirty_states(&pool, 10, false).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn earlier_content_materialization_preserves_a_later_local_delete() {
+        let pool = memory_pool().await;
+        insert_item(&pool, &sample_item("item", "stable-key"))
+            .await
+            .unwrap();
+
+        let mut transaction = pool.begin().await.unwrap();
+        let content_order = crate::db::sync_queue::next_operation_order(&mut transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_deleted(&mut connection, "stable-key", false)
+            .await
+            .unwrap();
+        record_content_presence_at_order(
+            &mut connection,
+            "stable-key",
+            false,
+            &version(2, "device-a"),
+            Some(content_order),
+        )
+        .await
+        .unwrap();
+        drop(connection);
+
+        let state = dirty_states(&pool, 10, false).await.unwrap().pop().unwrap();
+        assert_eq!(state.patch().is_present, Some(false));
+        let stored_presence: Option<bool> =
+            sqlx::query_scalar("SELECT is_present FROM sync_item_states WHERE sync_key = ?")
+                .bind("stable-key")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_presence, Some(false));
+    }
+
+    #[tokio::test]
+    async fn local_queue_orders_content_before_a_later_delete_for_the_same_item() {
+        let pool = memory_pool().await;
+        let item = sample_item("item", "stable-key");
+        insert_item(&pool, &item).await.unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        let content_order = crate::db::sync_queue::stage_content(
+            &mut transaction,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_deleted(&mut connection, &item.sync_key, false)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let content = crate::db::sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(content.operation_order, content_order);
+        assert!(dirty_states(&pool, 1, false).await.unwrap().is_empty());
+
+        crate::db::sync_queue::complete_content(&pool, content_order)
+            .await
+            .unwrap();
+        assert_eq!(
+            dirty_states(&pool, 1, false)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .patch()
+                .is_present,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_queue_orders_delete_before_later_content_for_the_same_item() {
+        let pool = memory_pool().await;
+        let item = sample_item("item", "stable-key");
+        insert_item(&pool, &item).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_deleted(&mut connection, &item.sync_key, false)
+            .await
+            .unwrap();
+        drop(connection);
+        let mut transaction = pool.begin().await.unwrap();
+        crate::db::sync_queue::stage_content(
+            &mut transaction,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            dirty_states(&pool, 1, false)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .patch()
+                .is_present,
+            Some(false)
+        );
     }
 
     #[tokio::test]

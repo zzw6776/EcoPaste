@@ -26,5 +26,12 @@ pub fn label(key: Key) -> &'static str {
             "The original input window could not be restored. Open EcoPaste and try again"
         }
         Key::SaveImage => "Save Image",
+        Key::SyncDisabled => "Enable multi-device sync first",
+        Key::SyncGroupRequired => "Create or join a sync group first",
+        Key::SyncLanDisabled => "Local network sync is disabled",
+        Key::SyncOperationPending => {
+            "This item is still waiting for an earlier sync operation. Try again shortly"
+        }
+        Key::SyncSensitiveDisabled => "Sensitive content sync is disabled",
     }
 }

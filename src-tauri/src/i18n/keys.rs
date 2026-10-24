@@ -41,6 +41,11 @@ pub enum CommandKey {
     #[cfg(target_os = "macos")]
     PasteTargetUnavailable,
     SaveImage,
+    SyncDisabled,
+    SyncGroupRequired,
+    SyncLanDisabled,
+    SyncOperationPending,
+    SyncSensitiveDisabled,
 }
 
 #[cfg(not(target_os = "android"))]
