@@ -44,6 +44,7 @@
     "loadAutostart": "Load launch-at-login state",
     "loadClipboardGroups": "Load groups",
     "loadClipboardList": "Load list",
+    "loadCloudDevices": "Load cloud devices",
     "loadCloudRecords": "Load cloud records",
     "loadIncomingSyncJoinRequests": "Load incoming join requests",
     "loadNearbySyncJoinAttempt": "Load join request status",

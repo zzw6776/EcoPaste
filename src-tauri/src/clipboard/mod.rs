@@ -1,6 +1,6 @@
 mod app_store;
 mod apps_registry;
-mod cleanup;
+pub(crate) mod cleanup;
 mod detect;
 mod file_icon_store;
 mod file_thumbnail;

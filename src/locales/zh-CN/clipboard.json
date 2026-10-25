@@ -158,6 +158,26 @@
       "serverVersionUnknown": "服务端版本：未知",
       "title": "云端"
     },
+    "devices": {
+      "current": "本机",
+      "days": "{{count}} 天",
+      "empty": "云端暂无已配对设备",
+      "lastSeen": "最近在线：{{time}}",
+      "noRetainedEvents": "云端当前没有保留的同步事件",
+      "offline": "离线",
+      "oldestEvent": "最早保留事件：{{time}}",
+      "online": "在线",
+      "open": "查看云端设备",
+      "refresh": "刷新云端设备",
+      "retention": "保留周期：{{days}} · 事件：{{events}} / {{maxEvents}}",
+      "storage": "Hub 存储",
+      "storageUsage": "{{used}} / {{max}}",
+      "summary": "共 {{total}} 台，{{online}} 台在线",
+      "title": "云端设备",
+      "unlimited": "不限",
+      "version": "版本 v{{version}}",
+      "versionUnknown": "版本未知"
+    },
     "lan": {
       "connecting": "局域网正在连接",
       "degraded": "局域网部分连接异常",

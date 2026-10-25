@@ -24,7 +24,15 @@ async fn main() -> Result<()> {
         .with_context(|| format!("create blob directory {}", blob_root.display()))?;
     let secret_key = load_or_create_secret_key(&config.data_dir.join("iroh-secret.key")).await?;
     let repository = Repository::open(&config.data_dir.join("hub.sqlite3")).await?;
-    let service = HubService::new(repository, blob_root, config.max_blob_bytes);
+    let service = HubService::new(
+        repository,
+        blob_root,
+        config.max_blob_bytes,
+        config.max_group_bytes,
+        config.event_retention_days,
+        config.max_events_per_group,
+    );
+    service.spawn_cleanup_worker();
 
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)

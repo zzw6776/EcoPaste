@@ -17,6 +17,8 @@ use super::{
 };
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
+const CLOUD_BOOTSTRAP_GROUP_KEY: &str = "cloud_bootstrap_group_id";
+const CLOUD_BOOTSTRAP_TARGET_KEY: &str = "cloud_bootstrap_target_cursor";
 const CLOUD_TARGET: &str = "cloud";
 const HISTORY_BACKFILL_GROUP_KEY: &str = "history_backfill_group_id";
 const HISTORY_BACKFILL_VERSION: u8 = 2;
@@ -748,6 +750,42 @@ pub async fn blobs_for_events(pool: &SqlitePool, event_ids: &[String]) -> Result
             })
         })
         .collect()
+}
+
+/// Adds transport-only blob references to a batch without duplicating them in the event table.
+pub async fn attach_event_blob_ids(
+    pool: &SqlitePool,
+    events: &mut [StoredSyncEvent],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let event_indexes = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.event.event_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT event_id, blob_id FROM sync_event_blobs WHERE event_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for event in events.iter() {
+        separated.push_bind(&event.event.event_id);
+    }
+    query.push(") ORDER BY event_id, blob_id");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("list event blob references")?;
+    for row in rows {
+        let event_id: String = row.try_get("event_id")?;
+        let blob_id: String = row.try_get("blob_id")?;
+        if let Some(index) = event_indexes.get(&event_id) {
+            events[*index].event.blob_ids.push(blob_id);
+        }
+    }
+    Ok(())
 }
 
 /// Persists optional source icons until the Hub has acknowledged their storage.
@@ -1601,6 +1639,168 @@ pub async fn cloud_cursor(pool: &SqlitePool) -> Result<u64> {
         .context("invalid cloud sync cursor")
 }
 
+pub async fn cloud_bootstrap_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
+    let value = state_value(pool, CLOUD_BOOTSTRAP_GROUP_KEY).await?;
+    Ok(value.as_deref() == Some(group_id) || value == Some(format!("complete:{group_id}")))
+}
+
+pub async fn cloud_bootstrap_pending(pool: &SqlitePool, group_id: &str) -> Result<bool> {
+    Ok(state_value(pool, CLOUD_BOOTSTRAP_GROUP_KEY).await? == Some(format!("pending:{group_id}")))
+}
+
+pub async fn cloud_bootstrap_target(pool: &SqlitePool, group_id: &str) -> Result<Option<u64>> {
+    if !cloud_bootstrap_pending(pool, group_id).await? {
+        return Ok(None);
+    }
+    state_value(pool, CLOUD_BOOTSTRAP_TARGET_KEY)
+        .await?
+        .map(|value| {
+            value
+                .parse()
+                .context("invalid cloud bootstrap target cursor")
+        })
+        .transpose()
+}
+
+pub async fn cloud_bootstrap_in_progress(pool: &SqlitePool) -> Result<bool> {
+    Ok(state_value(pool, CLOUD_BOOTSTRAP_GROUP_KEY)
+        .await?
+        .is_some_and(|value| value.starts_with("pending:")))
+}
+
+/// Atomically persists the selected Hub floor and marks initial bootstrap in progress.
+pub async fn start_cloud_bootstrap(
+    pool: &SqlitePool,
+    group_id: &str,
+    start_cursor: u64,
+    target_cursor: u64,
+) -> Result<()> {
+    let mut transaction = pool.begin().await.context("begin cloud bootstrap")?;
+    let now = Utc::now();
+    for (key, value) in [
+        (CLOUD_CURSOR_KEY, start_cursor.to_string()),
+        (CLOUD_BOOTSTRAP_GROUP_KEY, format!("pending:{group_id}")),
+        (CLOUD_BOOTSTRAP_TARGET_KEY, target_cursor.to_string()),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (key, value, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("persist cloud bootstrap state")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit cloud bootstrap")?;
+    Ok(())
+}
+
+pub async fn mark_cloud_bootstrap_completed(pool: &SqlitePool, group_id: &str) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin completing cloud bootstrap")?;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_state (key, value, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(CLOUD_BOOTSTRAP_GROUP_KEY)
+    .bind(format!("complete:{group_id}"))
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .context("mark cloud bootstrap complete")?;
+    sqlx::query("DELETE FROM sync_state WHERE key = ?")
+        .bind(CLOUD_BOOTSTRAP_TARGET_KEY)
+        .execute(&mut *transaction)
+        .await
+        .context("clear cloud bootstrap target")?;
+    transaction
+        .commit()
+        .await
+        .context("commit completed cloud bootstrap")?;
+    Ok(())
+}
+
+/// Drops applied content events whose local clipboard record is gone. Item-state events stay
+/// available because they carry metadata and deletion ordering independently from content.
+pub async fn prune_released_content_events(pool: &SqlitePool, limit: u32) -> Result<u64> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin local sync event cleanup")?;
+    let event_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT e.event_id
+        FROM sync_events e
+        WHERE e.event_kind = ?
+          AND e.is_applied = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM sync_item_events i WHERE i.event_id = e.event_id
+          )
+        ORDER BY e.cursor ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(SyncEventKind::Content.as_i64())
+    .bind(i64::from(limit.max(1)))
+    .fetch_all(&mut *transaction)
+    .await
+    .context("list released local sync events")?;
+    if event_ids.is_empty() {
+        transaction
+            .commit()
+            .await
+            .context("commit empty local sync event cleanup")?;
+        return Ok(0);
+    }
+
+    let mut query = sqlx::QueryBuilder::new("DELETE FROM sync_events WHERE event_id IN (");
+    let mut separated = query.separated(", ");
+    for event_id in &event_ids {
+        separated.push_bind(event_id);
+    }
+    query.push(")");
+    query
+        .build()
+        .execute(&mut *transaction)
+        .await
+        .context("delete released local sync events")?;
+    transaction
+        .commit()
+        .await
+        .context("commit local sync event cleanup")?;
+    Ok(event_ids.len() as u64)
+}
+
+pub async fn live_sync_blob_ids(pool: &SqlitePool) -> Result<HashSet<String>> {
+    let ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT blob_id FROM sync_event_blobs
+        UNION
+        SELECT blob_id FROM sync_source_icon_uploads
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list live local sync blobs")?;
+    Ok(ids.into_iter().collect())
+}
+
 /// Returns whether this sync space has completed its one-time local history backfill.
 pub async fn history_backfill_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
     let expected = format!("{HISTORY_BACKFILL_VERSION}:{group_id}");
@@ -1833,6 +2033,7 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSyncEvent> {
             nonce: row.try_get("nonce")?,
             ciphertext: row.try_get("ciphertext")?,
             kind: event_kind_from_row(&row)?,
+            blob_ids: Vec::new(),
         },
     })
 }
@@ -2197,6 +2398,54 @@ mod tests {
             .unwrap();
         assert!(history_backfill_completed(&pool, "group-a").await.unwrap());
         assert!(!history_backfill_completed(&pool, "group-b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cloud_bootstrap_tracks_pending_and_completed_phases() {
+        let pool = memory_pool().await;
+
+        assert!(!cloud_bootstrap_pending(&pool, "group-a").await.unwrap());
+        start_cloud_bootstrap(&pool, "group-a", 42, 84)
+            .await
+            .unwrap();
+        assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
+        assert!(cloud_bootstrap_pending(&pool, "group-a").await.unwrap());
+        assert_eq!(
+            cloud_bootstrap_target(&pool, "group-a").await.unwrap(),
+            Some(84)
+        );
+        assert!(cloud_bootstrap_in_progress(&pool).await.unwrap());
+        assert!(!cloud_bootstrap_completed(&pool, "group-a").await.unwrap());
+
+        mark_cloud_bootstrap_completed(&pool, "group-a")
+            .await
+            .unwrap();
+        assert!(!cloud_bootstrap_pending(&pool, "group-a").await.unwrap());
+        assert_eq!(
+            cloud_bootstrap_target(&pool, "group-a").await.unwrap(),
+            None
+        );
+        assert!(!cloud_bootstrap_in_progress(&pool).await.unwrap());
+        assert!(cloud_bootstrap_completed(&pool, "group-a").await.unwrap());
+        assert!(!cloud_bootstrap_completed(&pool, "group-b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn released_content_event_is_pruned_only_after_its_item_is_gone() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item-1").await;
+        insert_test_event(&pool, "event-1").await;
+        link_event_to_item(&pool, "item-1", "event-1", "local")
+            .await
+            .unwrap();
+        assert_eq!(prune_released_content_events(&pool, 10).await.unwrap(), 0);
+        sqlx::query("DELETE FROM clipboard_items WHERE id = 'item-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(prune_released_content_events(&pool, 10).await.unwrap(), 1);
+        assert!(events_after_cursor(&pool, 0, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2698,6 +2947,7 @@ mod tests {
             nonce: vec![1; 24],
             ciphertext: vec![2; 32],
             kind: SyncEventKind::Content,
+            blob_ids: Vec::new(),
         }
     }
 }

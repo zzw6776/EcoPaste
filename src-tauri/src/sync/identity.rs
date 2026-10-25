@@ -15,12 +15,12 @@ use minicbor::{Decode, Encode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
+use uuid::Uuid;
 
 use crate::settings::{CloudRelayMode, SyncSettings};
 
 const IDENTITY_FILENAME: &str = "sync-identity.json";
-const PAIRING_PREFIX_V1: &str = "ecopaste-pair-v1:";
-const PAIRING_PREFIX_V2: &str = "ecopaste-pair-v2:";
+const PAIRING_PREFIX_V3: &str = "ecopaste-pair-v3:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "camelCase")]
@@ -82,24 +82,24 @@ pub struct PersistedIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "camelCase")]
-#[cbor(array)]
+#[cbor(map)]
 pub struct PairingCode {
     #[n(0)]
     pub version: u16,
     #[n(1)]
-    pub group: GroupSecrets,
+    pub invitation_id: String,
     #[n(2)]
-    pub server_endpoint_id: String,
+    pub invitation_secret: Vec<u8>,
     #[n(3)]
-    pub server_direct_addresses: Vec<String>,
+    pub expires_at_ms: i64,
     #[n(4)]
-    pub server_relay_urls: Vec<String>,
+    pub space_id: String,
     #[n(5)]
     pub inviter: ecopaste_sync_protocol::PeerAnnouncement,
     #[n(6)]
-    #[cbor(default)]
-    #[serde(default)]
     pub cloud_relay_mode: CloudRelayMode,
+    #[n(7)]
+    pub server_relay_urls: Vec<String>,
 }
 
 pub struct IdentityStore {
@@ -205,38 +205,34 @@ impl PairingCode {
     pub fn encode(&self) -> Result<String> {
         let cbor = minicbor::to_vec(self).context("failed to encode pairing code")?;
         Ok(format!(
-            "{PAIRING_PREFIX_V2}{}",
+            "{PAIRING_PREFIX_V3}{}",
             BASE64URL_NOPAD.encode(&cbor)
         ))
     }
 
     pub fn decode(value: &str) -> Result<Self> {
         let value = value.trim();
-        let (encoded, encoding_version) =
-            if let Some(encoded) = value.strip_prefix(PAIRING_PREFIX_V2) {
-                (encoded, 2)
-            } else if let Some(encoded) = value.strip_prefix(PAIRING_PREFIX_V1) {
-                (encoded, 1)
-            } else {
-                bail!("配对码格式无效");
-            };
+        let Some(encoded) = value.strip_prefix(PAIRING_PREFIX_V3) else {
+            if value.starts_with("ecopaste-pair-v1:") || value.starts_with("ecopaste-pair-v2:") {
+                bail!("旧版配对码已失效，请在已连接设备上重新生成");
+            }
+            bail!("配对码格式无效");
+        };
         let payload = BASE64URL_NOPAD
             .decode(encoded.as_bytes())
             .context("配对码格式无效")?;
-        let code: Self = if encoding_version == 2 {
-            minicbor::decode(&payload).context("配对码内容无效")?
-        } else {
-            serde_json::from_slice(&payload).context("配对码内容无效")?
-        };
-        if code.version != 1 {
+        let code: Self = minicbor::decode(&payload).context("配对码内容无效")?;
+        if code.version != 3 {
             bail!("配对码版本不受支持");
         }
-        validate_group(&code.group)?;
+        if Uuid::parse_str(&code.invitation_id).is_err()
+            || code.invitation_secret.len() != 32
+            || code.space_id.len() != 24
+            || code.inviter.endpoint_id.trim().is_empty()
+        {
+            bail!("配对码内容无效");
+        }
         Ok(code)
-    }
-
-    pub fn group(&self) -> &GroupSecrets {
-        &self.group
     }
 
     pub fn inviter_device_name(&self) -> &str {
@@ -556,30 +552,13 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[derive(Encode)]
-    #[cbor(array)]
-    struct LegacyCborPairingCode {
-        #[n(0)]
-        version: u16,
-        #[n(1)]
-        group: GroupSecrets,
-        #[n(2)]
-        server_endpoint_id: String,
-        #[n(3)]
-        server_direct_addresses: Vec<String>,
-        #[n(4)]
-        server_relay_urls: Vec<String>,
-        #[n(5)]
-        inviter: ecopaste_sync_protocol::PeerAnnouncement,
-    }
-
     fn pairing_code_fixture() -> PairingCode {
         PairingCode {
-            version: 1,
-            group: GroupSecrets::generate(),
-            server_endpoint_id: "endpoint-server".to_owned(),
-            server_direct_addresses: vec!["10.120.90.10:44820".to_owned()],
-            server_relay_urls: vec!["https://relay.example.com".to_owned()],
+            version: 3,
+            invitation_id: "db868bdc-030d-4874-a186-e8ff151516e1".to_owned(),
+            invitation_secret: vec![7; 32],
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+            space_id: "00112233445566778899aabb".to_owned(),
             inviter: ecopaste_sync_protocol::PeerAnnouncement {
                 device_id: "00112233445566778899aabbccddeeff".to_owned(),
                 device_name: "Work MacBook Pro".to_owned(),
@@ -590,6 +569,7 @@ mod tests {
                 last_seen_ms: 1_777_777_777_777,
             },
             cloud_relay_mode: CloudRelayMode::Custom,
+            server_relay_urls: vec!["https://relay.example.com".to_owned()],
         }
     }
 
@@ -597,48 +577,20 @@ mod tests {
     fn pairing_code_uses_compact_cbor_and_round_trips() {
         let code = pairing_code_fixture();
         let encoded = code.encode().unwrap();
-        let legacy_json = serde_json::to_vec(&code).unwrap();
-        let legacy = format!(
-            "{PAIRING_PREFIX_V1}{}",
-            BASE64URL_NOPAD.encode(&legacy_json)
-        );
-
-        assert!(encoded.starts_with(PAIRING_PREFIX_V2));
-        assert!(encoded.len() < legacy.len());
+        assert!(encoded.starts_with(PAIRING_PREFIX_V3));
         assert_eq!(PairingCode::decode(&encoded).unwrap(), code);
     }
 
     #[test]
-    fn legacy_pairing_code_remains_supported() {
-        let mut value = serde_json::to_value(pairing_code_fixture()).unwrap();
-        value.as_object_mut().unwrap().remove("cloudRelayMode");
-        let json = serde_json::to_vec(&value).unwrap();
-        let encoded = format!("{PAIRING_PREFIX_V1}{}", BASE64URL_NOPAD.encode(&json));
-
-        assert_eq!(
-            PairingCode::decode(&encoded).unwrap().cloud_relay_mode,
-            CloudRelayMode::Off
-        );
+    fn expiry_is_left_to_the_inviting_device_clock() {
+        let mut code = pairing_code_fixture();
+        code.expires_at_ms = chrono::Utc::now().timestamp_millis() - 1;
+        assert_eq!(PairingCode::decode(&code.encode().unwrap()).unwrap(), code);
     }
 
     #[test]
-    fn previous_cbor_pairing_code_defaults_relay_to_off() {
-        let code = pairing_code_fixture();
-        let legacy = LegacyCborPairingCode {
-            version: code.version,
-            group: code.group,
-            server_endpoint_id: code.server_endpoint_id,
-            server_direct_addresses: code.server_direct_addresses,
-            server_relay_urls: code.server_relay_urls,
-            inviter: code.inviter,
-        };
-        let payload = minicbor::to_vec(legacy).unwrap();
-        let encoded = format!("{PAIRING_PREFIX_V2}{}", BASE64URL_NOPAD.encode(&payload));
-
-        assert_eq!(
-            PairingCode::decode(&encoded).unwrap().cloud_relay_mode,
-            CloudRelayMode::Off
-        );
+    fn legacy_pairing_codes_are_rejected() {
+        assert!(PairingCode::decode("ecopaste-pair-v2:AAAA").is_err());
     }
 
     #[test]

@@ -14,7 +14,14 @@ use iroh::{
 async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let repository = Repository::open(&directory.path().join("hub.sqlite3")).await?;
-    let service = HubService::new(repository, directory.path().join("blobs"), 1024 * 1024);
+    let service = HubService::new(
+        repository,
+        directory.path().join("blobs"),
+        1024 * 1024,
+        10 * 1024 * 1024,
+        90,
+        100_000,
+    );
     let server = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
@@ -84,6 +91,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
             limit: 100,
             byte_limited: Some(true),
             events_complete: None,
+            bounded_hub: None,
         },
     )
     .await?
@@ -101,6 +109,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         nonce: vec![1; 24],
         ciphertext: vec![2; 128],
         kind: SyncEventKind::Content,
+        blob_ids: Vec::new(),
     };
     let first = sync_request(
         &group_id,
@@ -157,6 +166,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         nonce: vec![3; 24],
         ciphertext: vec![4; 128],
         kind: SyncEventKind::Content,
+        blob_ids: Vec::new(),
     };
     let removed_device = RemovedDevice {
         device_id: "device_removed".into(),
@@ -174,6 +184,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         limit: 100,
         byte_limited: None,
         events_complete: Some(true),
+        bounded_hub: Some(true),
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -192,6 +203,20 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         anyhow::bail!("expected duplicate combined sync response");
     };
     assert!(accepted_event_ids.is_empty());
+    assert_eq!(
+        call(
+            &connection,
+            Request::BootstrapPlan {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+            },
+        )
+        .await?,
+        Response::BootstrapPlan {
+            start_cursor: 0,
+            latest_cursor: 2,
+        }
+    );
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), watch)
             .await
@@ -277,6 +302,27 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
             ..
         }
     ));
+    let Response::Devices {
+        devices,
+        hub_status,
+    } = call(
+        &connection,
+        Request::ListDevices {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            device: device("device_654321", "Windows", &client_endpoint_id),
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected cloud device directory");
+    };
+    assert_eq!(devices.len(), 2);
+    assert!(devices.iter().all(|device| device.online));
+    assert!(devices.iter().all(|device| device.app_version == "1.1.154"));
+    let hub_status = hub_status.context("expected bounded Hub status")?;
+    assert_eq!(hub_status.event_count, 2);
+    assert_eq!(hub_status.max_bytes, 10 * 1024 * 1024);
     let source_icon = b"encrypted-source-icon";
     let source_icon_id = blake3::hash(source_icon).to_hex().to_string();
     upload_source_icon(
@@ -322,6 +368,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         nonce: vec![5; 24],
         ciphertext: vec![6; 128],
         kind: SyncEventKind::Content,
+        blob_ids: Vec::new(),
     };
     let remove_self = Request::SyncV2 {
         group_id: group_id.clone(),
@@ -338,6 +385,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         limit: 100,
         byte_limited: None,
         events_complete: Some(true),
+        bounded_hub: Some(true),
     };
     let Response::SyncedV2 {
         accepted_event_ids,
@@ -368,6 +416,7 @@ fn device(device_id: &str, name: &str, endpoint_id: &str) -> DeviceAnnouncement 
         endpoint_id: endpoint_id.into(),
         direct_addresses: vec!["127.0.0.1:44820".into()],
         relay_urls: Vec::new(),
+        app_version: "1.1.154".into(),
     }
 }
 
@@ -387,6 +436,7 @@ fn sync_request(
         limit: 100,
         byte_limited: None,
         events_complete: Some(true),
+        bounded_hub: Some(true),
     }
 }
 

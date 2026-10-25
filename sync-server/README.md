@@ -9,6 +9,8 @@ EcoPaste 的可独立部署密文同步 Hub，传输层使用 Iroh 1.0/QUIC。�
 
 服务端不会收到剪贴板明文或设备组内容密钥。局域网同步由客户端之间直接完成；Hub 不在线时，已经配对且能互相发现的设备仍可在局域网工作。
 
+Hub 是有界的加密同步缓冲，不是永久备份。默认每个同步空间保留 90 天、最多 100,000 条原始事件和 10 GiB 密文数据；后台按小批次裁剪事件，并在最后一个引用消失后回收对应密文文件。新设备首次同步会在 Hub 当前保留范围内继续应用本机的历史保留时长与最大条数设置，不会先下载完整云端历史再本地删除。
+
 ## 本机运行
 
 需要 Rust 1.98：
@@ -77,7 +79,12 @@ cargo test
 | `--data-dir` | `ECOPASTE_DATA_DIR` | `./data` | SQLite、Iroh 身份和密文文件目录 |
 | `--bind` | `ECOPASTE_BIND` | `0.0.0.0:44820` | Iroh QUIC UDP 监听地址 |
 | `--max-blob-bytes` | `ECOPASTE_MAX_BLOB_BYTES` | `2147483648` | 单个密文文件上限 |
+| `--max-group-bytes` | `ECOPASTE_MAX_GROUP_BYTES` | `10737418240` | 每个同步空间的密文事件与文件总配额；`0` 表示不限 |
+| `--event-retention-days` | `ECOPASTE_EVENT_RETENTION_DAYS` | `90` | 云端事件保留天数；`0` 表示不按时间裁剪 |
+| `--max-events-per-group` | `ECOPASTE_MAX_EVENTS_PER_GROUP` | `100000` | 每个同步空间保留的原始事件数；`0` 表示不限 |
 | `--no-relay` | `ECOPASTE_NO_RELAY` | `false` | 禁用公共 Iroh relay，只允许直连 |
+
+Hub 定时执行保留策略清理；上传因空间配额不足被拒绝时，还会按本次上传所需容量触发异步低水位回收。客户端保持本地操作可用，并按现有云端退避策略自动重试。
 
 ## 生产数据与备份
 

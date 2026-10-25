@@ -16,7 +16,9 @@ pub const ASYNC_SOURCE_ICON_PROTOCOL_VERSION: u16 = 6;
 pub const REDUNDANT_WATCH_PROTOCOL_VERSION: u16 = 7;
 pub const BYTE_LIMITED_SYNC_PROTOCOL_VERSION: u16 = 8;
 pub const TYPED_EVENTS_PROTOCOL_VERSION: u16 = 9;
-pub const PROTOCOL_VERSION: u16 = TYPED_EVENTS_PROTOCOL_VERSION;
+pub const CLOUD_DEVICE_DIRECTORY_PROTOCOL_VERSION: u16 = 10;
+pub const BOUNDED_HUB_PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = BOUNDED_HUB_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -36,6 +38,29 @@ pub struct DeviceAnnouncement {
     pub direct_addresses: Vec<String>,
     #[n(5)]
     pub relay_urls: Vec<String>,
+    #[n(6)]
+    #[cbor(default)]
+    pub app_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cbor(map)]
+pub struct CloudDevice {
+    #[n(0)]
+    pub device_id: String,
+    #[n(1)]
+    pub device_name: String,
+    #[n(2)]
+    pub platform: String,
+    #[n(3)]
+    pub endpoint_id: String,
+    #[n(4)]
+    pub app_version: String,
+    #[n(5)]
+    pub last_seen_ms: i64,
+    #[n(6)]
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
@@ -82,18 +107,13 @@ impl RemovedDevice {
 }
 
 /// Identifies the encrypted payload without exposing clipboard content to transport services.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
 pub enum SyncEventKind {
     #[n(0)]
+    #[default]
     Content,
     #[n(1)]
     ItemState,
-}
-
-impl Default for SyncEventKind {
-    fn default() -> Self {
-        Self::Content
-    }
 }
 
 impl SyncEventKind {
@@ -131,6 +151,31 @@ pub struct EncryptedEvent {
     #[n(6)]
     #[cbor(default)]
     pub kind: SyncEventKind,
+    /// Opaque encrypted blob identifiers referenced by this event.
+    /// The Hub uses only this authenticated-group metadata for reference counting.
+    #[n(7)]
+    #[cbor(default)]
+    pub blob_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cbor(map)]
+pub struct HubStatus {
+    #[n(0)]
+    pub used_bytes: u64,
+    #[n(1)]
+    pub max_bytes: u64,
+    #[n(2)]
+    pub event_count: u64,
+    #[n(3)]
+    pub blob_count: u64,
+    #[n(4)]
+    pub oldest_event_received_at_ms: Option<i64>,
+    #[n(5)]
+    pub retention_days: u32,
+    #[n(6)]
+    pub max_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -186,6 +231,9 @@ pub enum Request {
         /// Confirms that this request contains the end of the sender's current event outbox.
         #[n(7)]
         events_complete: Option<bool>,
+        /// Opts into explicit history-gap errors after bounded Hub pruning.
+        #[n(8)]
+        bounded_hub: Option<bool>,
     },
     #[n(3)]
     PutBlob {
@@ -295,6 +343,9 @@ pub enum Request {
         /// Confirms that this request contains the end of the sender's current event outbox.
         #[n(8)]
         events_complete: Option<bool>,
+        /// Opts into explicit history-gap errors after bounded Hub pruning.
+        #[n(9)]
+        bounded_hub: Option<bool>,
     },
     /// Stores an optional source application icon and wakes group watchers after a new upload.
     #[n(13)]
@@ -321,6 +372,48 @@ pub enum Request {
         after_removed_at_ms: i64,
         #[n(4)]
         watch_slot: u8,
+    },
+    /// Lists active group members and their current Hub presence.
+    #[n(15)]
+    ListDevices {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        device: DeviceAnnouncement,
+    },
+    /// Calculates the first retained cursor that a new or repaired client should consume.
+    #[n(16)]
+    BootstrapPlan {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+    },
+    /// Stores a blob that participates in bounded Hub reference reclamation.
+    #[n(17)]
+    PutManagedBlob {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blob_id: String,
+        #[n(3)]
+        size: u64,
+    },
+    /// Stores an optional source icon that participates in reference reclamation.
+    #[n(18)]
+    PutManagedSourceIcon {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blob_id: String,
+        #[n(3)]
+        size: u64,
     },
 }
 
@@ -422,6 +515,22 @@ pub enum Response {
         #[n(5)]
         has_more: Option<bool>,
     },
+    #[n(13)]
+    Devices {
+        #[n(0)]
+        devices: Vec<CloudDevice>,
+        #[n(1)]
+        #[cbor(default)]
+        hub_status: Option<HubStatus>,
+    },
+    #[n(14)]
+    BootstrapPlan {
+        /// Cursor to persist before requesting the first normal sync page.
+        #[n(0)]
+        start_cursor: u64,
+        #[n(1)]
+        latest_cursor: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -438,6 +547,10 @@ pub enum ErrorCode {
     TooLarge,
     #[n(5)]
     Internal,
+    #[n(6)]
+    HistoryGap,
+    #[n(7)]
+    QuotaExceeded,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -656,12 +769,14 @@ mod tests {
                 endpoint_id: "endpoint".into(),
                 direct_addresses: vec!["192.168.1.2:44820".into()],
                 relay_urls: Vec::new(),
+                app_version: "1.1.154".into(),
             },
             after_cursor: 7,
             events: Vec::new(),
             limit: 100,
             byte_limited: None,
             events_complete: Some(true),
+            bounded_hub: Some(true),
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
@@ -685,6 +800,71 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn cloud_device_directory_round_trip() {
+        let request = Request::ListDevices {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            device: DeviceAnnouncement {
+                device_id: "device_123".into(),
+                device_name: "Windows PC".into(),
+                platform: "windows".into(),
+                endpoint_id: "endpoint_123".into(),
+                direct_addresses: Vec::new(),
+                relay_urls: Vec::new(),
+                app_version: "1.1.154".into(),
+            },
+        };
+        let response = Response::Devices {
+            devices: vec![CloudDevice {
+                device_id: "device_123".into(),
+                device_name: "Windows PC".into(),
+                platform: "windows".into(),
+                endpoint_id: "endpoint_123".into(),
+                app_version: "1.1.154".into(),
+                last_seen_ms: 42,
+                online: true,
+            }],
+            hub_status: None,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Request>(&mut server).await.unwrap(),
+            request
+        );
+        write_frame(&mut server, &response).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Response>(&mut client).await.unwrap(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plan_round_trip() {
+        let request = Request::BootstrapPlan {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+        };
+        let response = Response::BootstrapPlan {
+            start_cursor: 21,
+            latest_cursor: 42,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Request>(&mut server).await.unwrap(),
+            request
+        );
+        write_frame(&mut server, &response).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Response>(&mut client).await.unwrap(),
+            response
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,1 @@
+ALTER TABLE devices ADD COLUMN app_version TEXT NOT NULL DEFAULT '';

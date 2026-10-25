@@ -82,6 +82,15 @@ enum LegacyResponse {
     },
 }
 
+#[derive(Debug, Encode, Decode)]
+enum LegacyDirectoryResponse {
+    #[n(13)]
+    Devices {
+        #[n(0)]
+        devices: Vec<CloudDevice>,
+    },
+}
+
 fn event(index: u64, size: usize) -> EncryptedEvent {
     EncryptedEvent {
         event_id: format!("event-{index}"),
@@ -91,6 +100,7 @@ fn event(index: u64, size: usize) -> EncryptedEvent {
         nonce: vec![255; 24],
         ciphertext: vec![255; size],
         kind: SyncEventKind::Content,
+        blob_ids: Vec::new(),
     }
 }
 
@@ -102,6 +112,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
         endpoint_id: "endpoint".into(),
         direct_addresses: Vec::new(),
         relay_urls: Vec::new(),
+        app_version: "1.1.154".into(),
     };
     if v2 {
         Request::SyncV2 {
@@ -114,6 +125,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             limit: MAX_EVENTS_PER_BATCH,
             byte_limited: Some(true),
             events_complete: Some(true),
+            bounded_hub: Some(true),
         }
     } else {
         Request::Sync {
@@ -125,6 +137,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             limit: MAX_EVENTS_PER_BATCH,
             byte_limited: Some(true),
             events_complete: Some(true),
+            bounded_hub: Some(true),
         }
     }
 }
@@ -165,15 +178,18 @@ fn optional_batch_fields_are_compatible_in_both_directions() {
             Request::Sync {
                 byte_limited,
                 events_complete,
+                bounded_hub,
                 ..
             }
             | Request::SyncV2 {
                 byte_limited,
                 events_complete,
+                bounded_hub,
                 ..
             } => {
                 *byte_limited = None;
                 *events_complete = None;
+                *bounded_hub = None;
             }
             _ => unreachable!(),
         }
@@ -210,6 +226,54 @@ fn legacy_event_without_kind_decodes_as_content() {
     let decoded: EncryptedEvent = minicbor::decode(&minicbor::to_vec(legacy).unwrap()).unwrap();
 
     assert_eq!(decoded.kind, SyncEventKind::Content);
+    assert!(decoded.blob_ids.is_empty());
+}
+
+#[test]
+fn legacy_event_decoder_ignores_blob_references() {
+    let mut current = event(1, 32);
+    current.blob_ids = vec!["a".repeat(64)];
+
+    let decoded: LegacyEncryptedEvent =
+        minicbor::decode(&minicbor::to_vec(current).unwrap()).unwrap();
+
+    assert_eq!(decoded.event_id, "event-1");
+}
+
+#[test]
+fn legacy_device_directory_decodes_without_hub_status() {
+    let legacy = LegacyDirectoryResponse::Devices {
+        devices: Vec::new(),
+    };
+
+    let decoded: Response = minicbor::decode(&minicbor::to_vec(legacy).unwrap()).unwrap();
+
+    assert_eq!(
+        decoded,
+        Response::Devices {
+            devices: Vec::new(),
+            hub_status: None,
+        }
+    );
+
+    let current = Response::Devices {
+        devices: Vec::new(),
+        hub_status: Some(HubStatus {
+            used_bytes: 1,
+            max_bytes: 2,
+            event_count: 3,
+            blob_count: 4,
+            oldest_event_received_at_ms: Some(5),
+            retention_days: 90,
+            max_events: 100_000,
+        }),
+    };
+    let legacy: LegacyDirectoryResponse =
+        minicbor::decode(&minicbor::to_vec(current).unwrap()).unwrap();
+    assert!(matches!(
+        legacy,
+        LegacyDirectoryResponse::Devices { devices } if devices.is_empty()
+    ));
 }
 
 #[test]
