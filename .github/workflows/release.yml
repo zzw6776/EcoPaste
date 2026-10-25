@@ -536,6 +536,7 @@ jobs:
         shell: bash
         env:
           GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_ID: ${{ needs.release-metadata.outputs.release_id }}

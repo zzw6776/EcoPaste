@@ -16,7 +16,7 @@ const bundles = [
 ];
 const assets = bundles.map((name, index) => {
   return {
-    browser_download_url: `https://github.com/example/EcoPaste/releases/download/v1.2.3/${name}`,
+    browser_download_url: `https://github.com/example/EcoPaste/releases/download/untagged-draft/${name}`,
     digest: name.endsWith(".apk") ? `sha256:${"a".repeat(64)}` : null,
     name,
     url: `https://api.github.com/repos/example/EcoPaste/releases/assets/${index + 1}`,
@@ -30,12 +30,11 @@ const signatures = Object.fromEntries(
 
 test("builds one updater manifest for every supported target", () => {
   const publishedAt = new Date("2026-10-20T12:00:00.000Z");
-  const manifest = buildUpdaterManifest(
-    version,
-    assets,
-    signatures,
+  const manifest = buildUpdaterManifest(version, assets, signatures, {
     publishedAt,
-  );
+    releaseDownloadBaseUrl:
+      "https://github.com/example/EcoPaste/releases/download/v1.2.3",
+  });
 
   assert.equal(manifest.version, version);
   assert.equal(manifest.pub_date, publishedAt.toISOString());
@@ -55,7 +54,7 @@ test("builds one updater manifest for every supported target", () => {
   assert.equal(manifest.platforms["windows-x86_64"].url, assets[2].url);
   assert.equal(
     manifest.platforms["android-aarch64"].url,
-    assets[3].browser_download_url,
+    "https://github.com/example/EcoPaste/releases/download/v1.2.3/EcoPaste_1.2.3_arm64.apk",
   );
   assert.equal(manifest.platforms["android-aarch64"].signature, "");
   assert.equal(manifest.platforms["android-aarch64"].sha256, "a".repeat(64));
@@ -63,7 +62,11 @@ test("builds one updater manifest for every supported target", () => {
 
 test("rejects incomplete updater assets", () => {
   assert.throws(
-    () => buildUpdaterManifest(version, assets.slice(1), signatures),
+    () =>
+      buildUpdaterManifest(version, assets.slice(1), signatures, {
+        releaseDownloadBaseUrl:
+          "https://github.com/example/EcoPaste/releases/download/v1.2.3",
+      }),
     /Missing updater asset: EcoPaste_1\.2\.3_aarch64\.app\.tar\.gz/,
   );
 });
@@ -76,7 +79,11 @@ test("rejects Android updater assets without a SHA-256 digest", () => {
   });
 
   assert.throws(
-    () => buildUpdaterManifest(version, assetsWithoutAndroidDigest, signatures),
+    () =>
+      buildUpdaterManifest(version, assetsWithoutAndroidDigest, signatures, {
+        releaseDownloadBaseUrl:
+          "https://github.com/example/EcoPaste/releases/download/v1.2.3",
+      }),
     /Missing APK SHA-256 digest: EcoPaste_1\.2\.3_arm64\.apk/,
   );
 });
@@ -119,6 +126,7 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
     /label: macOS Intel\n\s+os: macos-26-intel[\s\S]*?target: x86_64-apple-darwin/,
   );
   assert.match(workflow, /uploadUpdaterJson: false/);
+  assert.match(workflow, /GITHUB_SERVER_URL: \$\{\{ github\.server_url }}/);
   assert.equal(
     workflow.match(/node scripts\/createUpdaterManifest\.mjs/g)?.length,
     1,
