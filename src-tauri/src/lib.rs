@@ -320,7 +320,6 @@ pub fn run() {
                 }
             }
 
-            #[cfg(not(target_os = "android"))]
             update::schedule_auto_check(&handle);
 
             // Windows 冷启动文件关联：第一个实例从自身启动参数里取 `.ecopastebak` 路径。

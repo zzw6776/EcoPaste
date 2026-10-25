@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.154"
+version = "1.1.156"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -63,6 +63,9 @@ n0-future = "0.3"
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+semver = "1"
+sha2 = "0.10"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rodio = { version = "0.20", default-features = false, features = ["symphonia-mp3"] }

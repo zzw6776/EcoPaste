@@ -6,6 +6,7 @@
     "install": "安装并重新启动",
     "later": "稍后提醒我",
     "ok": "好",
+    "openInstaller": "重新打开安装器",
     "releaseNotes": "查看更新日志",
     "skip": "跳过这个版本"
   },
@@ -14,6 +15,7 @@
     "checkError": "无法检查可用更新，请稍后再试。",
     "checking": "正在连接更新服务器，请稍候。",
     "downloaded": "更新已经下载完成，可以安装并重新启动 EcoPaste。",
+    "downloadedAndroid": "更新包已经下载完成，Android 系统安装器已打开；请在系统界面中确认安装。",
     "downloading": "正在下载 EcoPaste {{version}}，请稍候。",
     "error": "检查或安装更新时遇到问题。",
     "idle": "检查 EcoPaste 是否有可用的新版本。",

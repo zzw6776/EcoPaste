@@ -30,9 +30,11 @@ import CustomIconButton from "@/components/CustomIconButton";
 import Modal from "@/components/Modal";
 import { GITHUB_URL } from "@/constants/urls";
 import { WINDOW_LABEL } from "@/constants/windows";
+import { router } from "@/router";
 import { resetSettings } from "@/stores/settings";
 import type { ClipboardGroupRecord } from "@/types/clipboard";
 import { getModalApi } from "@/utils/feedback";
+import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
 import type { PreferenceSetting } from "../../types/preferences";
 import { translatePreferenceControlLabel } from "../../utils/preferenceI18n";
@@ -323,6 +325,12 @@ const ActionControl: FC<ActionControlProps> = (props) => {
 
   const handleClick = async () => {
     if (setting.id === ABOUT_CHECK_UPDATES_SETTING_ID) {
+      if (isAndroid) {
+        await router.navigate("/update");
+        markActionComplete();
+        return;
+      }
+
       await runWithKeepalive("open-update-window", openUpdateWindow);
       markActionComplete();
       return;

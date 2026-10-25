@@ -487,6 +487,9 @@ mod native {
 pub fn init(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     native::init(app);
+
+    #[cfg(target_os = "windows")]
+    let _ = app;
 }
 
 /// 在当前光标处弹出列表项右键菜单。`available_actions` / `is_favorite` 由
@@ -566,4 +569,7 @@ pub async fn popup_clipboard_item_menu(
 pub fn handle_menu_event(app: &AppHandle, menu_id: &str) {
     #[cfg(target_os = "macos")]
     native::handle_event(app, menu_id);
+
+    #[cfg(target_os = "windows")]
+    let _ = (app, menu_id);
 }

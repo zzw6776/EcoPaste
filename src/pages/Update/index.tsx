@@ -21,6 +21,8 @@ import { UPDATE_RELEASES_URL } from "@/constants/urls";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { useWindowReady } from "@/hooks/useWindowReady";
+import { router } from "@/router";
+import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
 
 type UpdateViewState =
@@ -193,6 +195,11 @@ const Update: FC = () => {
   };
 
   const closeWindow = async () => {
+    if (isAndroid) {
+      await router.navigate(-1);
+      return;
+    }
+
     await hideWindow(getCurrentWebviewWindow().label);
   };
 
@@ -222,7 +229,12 @@ const Update: FC = () => {
       return;
     }
 
-    setUpdateState(status.update.downloaded ? "downloaded" : "available");
+    if (status.update.downloaded) {
+      setUpdateState("downloaded");
+      return;
+    }
+
+    setUpdateState(isAndroid ? "downloading" : "available");
   };
 
   useMount(async () => {
@@ -245,6 +257,16 @@ const Update: FC = () => {
       setProgress(event.payload);
     },
   );
+
+  useTauriListen<AppUpdateStatus>(TAURI_EVENT.UPDATE_STATUS, (event) => {
+    applyUpdateStatus(event.payload);
+  });
+
+  useTauriListen<string>(TAURI_EVENT.UPDATE_ERROR, (event) => {
+    setErrorPhase("updating");
+    setUpdateState("error");
+    setErrorMessage(event.payload);
+  });
 
   return (
     <div className="relative flex h-screen bg-ant-container text-ant-text">
@@ -355,7 +377,11 @@ const Update: FC = () => {
 
           {state === "downloaded" ? (
             <Button onClick={installCurrentUpdate} shape="round" type="primary">
-              {t("update:actions.install")}
+              {t(
+                isAndroid
+                  ? "update:actions.openInstaller"
+                  : "update:actions.install",
+              )}
             </Button>
           ) : null}
         </footer>
@@ -400,7 +426,13 @@ function resolveDescription(
       version: update?.version ?? "",
     });
   }
-  if (state === "downloaded") return t("update:description.downloaded");
+  if (state === "downloaded") {
+    return t(
+      isAndroid
+        ? "update:description.downloadedAndroid"
+        : "update:description.downloaded",
+    );
+  }
   if (state === "error") {
     return t(
       errorPhase === "checking"
