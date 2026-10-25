@@ -311,6 +311,47 @@ object EcoPasteBridge {
         return result.get()
     }
 
+    /** Opens the system package installer; Android still requires explicit user confirmation. */
+    @JvmStatic
+    fun openPackageInstaller(context: Context, path: String): String {
+        val file = File(path)
+        if (!file.isFile) return fileActionResult("missing", "update APK does not exist")
+
+        val result = AtomicReference(fileActionResult("failed"))
+        val completed = CountDownLatch(1)
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val uri = FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file,
+                )
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    clipData = ClipData.newRawUri(file.name, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                val targetContext = getCurrentActivity() ?: context
+                if (targetContext !is Activity) {
+                    installIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                targetContext.startActivity(installIntent)
+                result.set(fileActionResult("success"))
+            } catch (error: ActivityNotFoundException) {
+                result.set(fileActionResult("unavailable", error.message.orEmpty()))
+            } catch (error: Throwable) {
+                Log.e(TAG, "open package installer failed", error)
+                result.set(fileActionResult("failed", error.message.orEmpty()))
+            } finally {
+                completed.countDown()
+            }
+        }
+        if (!completed.await(10, TimeUnit.SECONDS)) {
+            return fileActionResult("failed", "package installer launch timed out")
+        }
+        return result.get()
+    }
+
     private fun mimeType(file: File): String {
         val extension = file.extension.lowercase()
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)

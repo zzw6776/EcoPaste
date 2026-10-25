@@ -72,7 +72,9 @@
   "plugins": {
     "updater": {
       "active": true,
-      "endpoints": ["https://github.com/zzw6776/EcoPaste/releases/latest/download/latest.json"],
+      "endpoints": [
+        "https://github.com/zzw6776/EcoPaste/releases/latest/download/latest.json"
+      ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzRDVDOEE5Qzk3NkNBNEEKUldSS3luYkpxY2pWOC9Eb0JvT3BkbTFzaUVRVW4wRGZqRVFyN1dtWVRWbVhoR0swb1phd3lNNFEK",
       "windows": {
         "installMode": "passive"

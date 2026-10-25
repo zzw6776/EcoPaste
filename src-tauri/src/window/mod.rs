@@ -279,7 +279,7 @@ pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
             request.layout_completed_at = Instant::now();
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = layout_timing;
+        let _ = (layout_timing.position_us, layout_timing.restore_us);
     } else if label == ONBOARDING_WINDOW_LABEL {
         if let Err(err) = position_window(app_handle, label, WindowPosition::Center) {
             log::warn!("center onboarding window failed: {err}");

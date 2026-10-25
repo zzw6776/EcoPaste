@@ -254,7 +254,7 @@ fn write_image_bytes(
 
     #[cfg(not(target_os = "macos"))]
     {
-        if let Err(error) = set_image_with_retry(ctx, &bytes) {
+        if let Err(error) = set_image_with_retry(ctx, bytes) {
             guard.cancel(&suppression);
             return Err(error);
         }

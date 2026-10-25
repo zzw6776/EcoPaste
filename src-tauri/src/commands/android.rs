@@ -1114,6 +1114,19 @@ mod jni_bridge {
         file_action("saveClipboardFile", path)
     }
 
+    pub fn open_package_installer(path: &std::path::Path) -> Result<()> {
+        let result = file_action("openPackageInstaller", path)?;
+        if result.status == "success" {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "Android package installer is unavailable: {}",
+            result.message
+        )
+        .into())
+    }
+
     pub fn apply_android_settings(settings: &crate::settings::AndroidSettings) -> Result<()> {
         let gesture = &settings.gesture;
         with_jni_env(|env, context, bridge_class| {
@@ -1239,6 +1252,12 @@ pub fn save_android_clipboard_file_path(path: &std::path::Path) -> Result<Androi
             message: String::new(),
         })
     }
+}
+
+/// Opens Android's package installer for an APK downloaded into app-private storage.
+#[cfg(target_os = "android")]
+pub fn open_android_package_installer(path: &std::path::Path) -> Result<()> {
+    jni_bridge::open_package_installer(path)
 }
 
 /// Writes one diagnostic stage to a stable Android logcat tag.

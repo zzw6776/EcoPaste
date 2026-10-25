@@ -18,8 +18,13 @@
   "files": {
     "includes": [
       "**",
+      "!**/.cache",
+      "!**/.gradle",
       "!**/node_modules",
+      "!**/coverage",
       "!**/dist",
+      "!artifacts",
+      "!.pnpm-store",
       "!src-tauri/target",
       "!src-tauri/vendor/**/target",
       "!src-tauri/.sqlx",

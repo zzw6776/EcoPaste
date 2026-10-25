@@ -2697,8 +2697,10 @@ impl SyncManager {
                             );
                         }
                         Err(error) => {
-                            self.invalidate_cloud_connection(connection.stable_id());
-                            self.watch_wake.notify_one();
+                            if should_invalidate_cloud_connection(&connection, &error) {
+                                self.invalidate_cloud_connection(connection.stable_id());
+                                self.watch_wake.notify_one();
+                            }
                             cloud_error = Some(error.to_string());
                         }
                     }
@@ -3825,81 +3827,90 @@ impl SyncManager {
             }
         }
 
-        // 状态事件已经全部合并；内容只有在没有被更新删除状态压制时才请求 Blob。
-        let preparations = n0_future::stream::iter(pending_content)
-            .map(|(event, envelope)| {
-                let pool = pool.clone();
-                async move {
-                    let presence = SyncedItemStatePatch {
-                        sync_key: envelope.item.sync_key.clone(),
-                        is_favorite: None,
-                        is_pinned: None,
-                        note: None,
-                        note_changed: false,
-                        is_present: Some(true),
-                    };
-                    let outcome = db::sync_item_state::apply_remote_patch(
-                        &pool,
-                        &presence,
-                        &db::sync_item_state::SyncEventVersion {
-                            origin_sequence: event.origin_sequence,
-                            origin_device_id: event.origin_device_id.clone(),
-                        },
-                    )
-                    .await?;
-                    let should_apply = outcome.canonical_presence != Some(false);
-                    let mut stored_blobs = Vec::new();
-                    let mut blob_error = None;
-                    if should_apply {
-                        for manifest in &envelope.blobs {
-                            match self.ensure_blob(connection, group, manifest).await {
-                                Ok(path) => stored_blobs.push(StoredBlob {
-                                    blob_id: manifest.blob_id.clone(),
-                                    encrypted_path: path.to_string_lossy().into_owned(),
-                                    size: manifest.encrypted_size,
-                                }),
-                                Err(error) => {
-                                    log::debug!(
-                                        "defer sync event {} until blob {} is available: {error}",
-                                        event.event_id,
-                                        manifest.blob_id
-                                    );
-                                    blob_error = Some(format!(
-                                        "同步 Blob {} 暂时不可用: {error}",
-                                        manifest.blob_id
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok::<_, anyhow::Error>((
-                        event,
-                        envelope,
-                        stored_blobs,
-                        blob_error,
-                        should_apply,
-                        outcome.image_files,
-                    ))
+        // SQLite 写入按游标顺序串行完成，避免并发事务互相触发 SQLITE_BUSY；
+        // 只有不持有数据库事务的 Blob 网络与文件 I/O 才并发执行。
+        let mut ready_content = Vec::new();
+        for (event, envelope) in pending_content {
+            let presence = SyncedItemStatePatch {
+                sync_key: envelope.item.sync_key.clone(),
+                is_favorite: None,
+                is_pinned: None,
+                note: None,
+                note_changed: false,
+                is_present: Some(true),
+            };
+            let outcome = match db::sync_item_state::apply_remote_patch(
+                pool,
+                &presence,
+                &db::sync_item_state::SyncEventVersion {
+                    origin_sequence: event.origin_sequence,
+                    origin_device_id: event.origin_device_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    log::warn!(
+                        "defer synchronized content presence {}: {error:#}",
+                        event.event_id
+                    );
+                    let delay =
+                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
+                            .await?;
+                    self.schedule_transfer_wake(delay);
+                    continue;
                 }
-            })
-            .buffered_ordered(2);
-        let mut preparations = std::pin::pin!(preparations);
-        while let Some(prepared) = preparations.next().await {
-            let (event, envelope, stored_blobs, blob_error, should_apply, image_files) = prepared?;
-            if !image_files.is_empty() {
+            };
+
+            if !outcome.image_files.is_empty() {
                 let store = self.app.state::<ImageStore>();
-                for file_name in image_files {
+                for file_name in outcome.image_files {
                     if let Err(error) = store.remove(&file_name) {
                         log::warn!("remove deleted synchronized image {file_name} failed: {error}");
                     }
                 }
             }
-            if !should_apply {
+            if outcome.canonical_presence == Some(false) {
                 repository::mark_applied(pool, &event.event_id).await?;
                 made_content_progress = true;
                 continue;
             }
+
+            ready_content.push((event, envelope));
+        }
+
+        let preparations = n0_future::stream::iter(ready_content)
+            .map(|(event, envelope)| async move {
+                let mut stored_blobs = Vec::new();
+                let mut blob_error = None;
+                for manifest in &envelope.blobs {
+                    match self.ensure_blob(connection, group, manifest).await {
+                        Ok(path) => stored_blobs.push(StoredBlob {
+                            blob_id: manifest.blob_id.clone(),
+                            encrypted_path: path.to_string_lossy().into_owned(),
+                            size: manifest.encrypted_size,
+                        }),
+                        Err(error) => {
+                            log::debug!(
+                                "defer sync event {} until blob {} is available: {error}",
+                                event.event_id,
+                                manifest.blob_id
+                            );
+                            blob_error = Some(format!(
+                                "同步 Blob {} 暂时不可用: {error}",
+                                manifest.blob_id
+                            ));
+                            break;
+                        }
+                    }
+                }
+                (event, envelope, stored_blobs, blob_error)
+            })
+            .buffered_ordered(2);
+        let mut preparations = std::pin::pin!(preparations);
+        while let Some(prepared) = preparations.next().await {
+            let (event, envelope, stored_blobs, blob_error) = prepared;
             if let Some(error) = blob_error {
                 let delay = repository::mark_apply_failed(pool, &event.event_id, &error).await?;
                 self.schedule_transfer_wake(delay);
@@ -7210,6 +7221,10 @@ async fn call_cloud_hedged(connection: &Connection, request: Request) -> Result<
 
 fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
+}
+
+fn should_invalidate_cloud_connection(connection: &Connection, error: &anyhow::Error) -> bool {
+    connection.close_reason().is_some() || is_cloud_attempt_timeout(error)
 }
 
 fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {

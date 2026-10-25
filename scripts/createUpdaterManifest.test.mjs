@@ -9,9 +9,15 @@ const bundles = [
   "EcoPaste_1.2.3_aarch64.app.tar.gz",
   "EcoPaste_1.2.3_x64.app.tar.gz",
   "EcoPaste_1.2.3_x64-setup.exe",
+  "EcoPaste_1.2.3_arm64.apk",
+  "EcoPaste_1.2.3_arm.apk",
+  "EcoPaste_1.2.3_x86.apk",
+  "EcoPaste_1.2.3_x86_64.apk",
 ];
 const assets = bundles.map((name, index) => {
   return {
+    browser_download_url: `https://github.com/example/EcoPaste/releases/download/v1.2.3/${name}`,
+    digest: name.endsWith(".apk") ? `sha256:${"a".repeat(64)}` : null,
     name,
     url: `https://api.github.com/repos/example/EcoPaste/releases/assets/${index + 1}`,
   };
@@ -22,7 +28,7 @@ const signatures = Object.fromEntries(
   }),
 );
 
-test("builds one updater manifest for every desktop target", () => {
+test("builds one updater manifest for every supported target", () => {
   const publishedAt = new Date("2026-10-20T12:00:00.000Z");
   const manifest = buildUpdaterManifest(
     version,
@@ -40,15 +46,38 @@ test("builds one updater manifest for every desktop target", () => {
     "darwin-x86_64-app",
     "windows-x86_64",
     "windows-x86_64-nsis",
+    "android-aarch64",
+    "android-armv7",
+    "android-i686",
+    "android-x86_64",
   ]);
   assert.equal(manifest.platforms["darwin-aarch64"].signature, "signature-1");
   assert.equal(manifest.platforms["windows-x86_64"].url, assets[2].url);
+  assert.equal(
+    manifest.platforms["android-aarch64"].url,
+    assets[3].browser_download_url,
+  );
+  assert.equal(manifest.platforms["android-aarch64"].signature, "");
+  assert.equal(manifest.platforms["android-aarch64"].sha256, "a".repeat(64));
 });
 
 test("rejects incomplete updater assets", () => {
   assert.throws(
     () => buildUpdaterManifest(version, assets.slice(1), signatures),
     /Missing updater asset: EcoPaste_1\.2\.3_aarch64\.app\.tar\.gz/,
+  );
+});
+
+test("rejects Android updater assets without a SHA-256 digest", () => {
+  const assetsWithoutAndroidDigest = assets.map((asset) => {
+    if (asset.name !== "EcoPaste_1.2.3_arm64.apk") return asset;
+
+    return { ...asset, digest: null };
+  });
+
+  assert.throws(
+    () => buildUpdaterManifest(version, assetsWithoutAndroidDigest, signatures),
+    /Missing APK SHA-256 digest: EcoPaste_1\.2\.3_arm64\.apk/,
   );
 });
 

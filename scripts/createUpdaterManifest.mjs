@@ -15,9 +15,13 @@ const updaterBundles = [
     platforms: ["windows-x86_64", "windows-x86_64-nsis"],
     suffix: "_x64-setup.exe",
   },
+  { platforms: ["android-aarch64"], signed: false, suffix: "_arm64.apk" },
+  { platforms: ["android-armv7"], signed: false, suffix: "_arm.apk" },
+  { platforms: ["android-i686"], signed: false, suffix: "_x86.apk" },
+  { platforms: ["android-x86_64"], signed: false, suffix: "_x86_64.apk" },
 ];
 
-/** Build and validate the desktop updater manifest from uploaded release assets. */
+/** Build and validate the cross-platform updater manifest from uploaded release assets. */
 export function buildUpdaterManifest(
   version,
   assets,
@@ -33,13 +37,25 @@ export function buildUpdaterManifest(
       throw new Error(`Missing updater asset: ${name}`);
     }
 
-    const signature = signatures[`${name}.sig`]?.trim();
-    if (!signature) {
+    const signature =
+      bundle.signed === false ? "" : (signatures[`${name}.sig`]?.trim() ?? "");
+    if (bundle.signed !== false && !signature) {
       throw new Error(`Missing updater signature: ${name}.sig`);
+    }
+    const digest = bundle.signed === false ? asset.digest?.trim() : "";
+    if (bundle.signed === false && !digest?.startsWith("sha256:")) {
+      throw new Error(`Missing APK SHA-256 digest: ${name}`);
     }
 
     for (const platform of bundle.platforms) {
-      platforms[platform] = { signature, url: asset.url };
+      platforms[platform] = {
+        signature,
+        url:
+          bundle.signed === false
+            ? (asset.browser_download_url ?? asset.url)
+            : asset.url,
+        ...(digest ? { sha256: digest.slice("sha256:".length) } : {}),
+      };
     }
   }
 
@@ -91,9 +107,9 @@ async function main() {
     { headers },
   );
   const assets = await assetsResponse.json();
-  const signatureNames = updaterBundles.map(
-    (bundle) => `EcoPaste_${version}${bundle.suffix}.sig`,
-  );
+  const signatureNames = updaterBundles
+    .filter((bundle) => bundle.signed !== false)
+    .map((bundle) => `EcoPaste_${version}${bundle.suffix}.sig`);
   const signatures = {};
 
   for (const name of signatureNames) {
