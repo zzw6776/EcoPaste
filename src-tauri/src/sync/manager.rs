@@ -2,7 +2,7 @@ use super::activity::SyncActivityGuard;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -19,9 +19,9 @@ use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
     DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
-    Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
-    TYPED_EVENTS_PROTOCOL_VERSION,
+    Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
+    BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -63,17 +63,17 @@ use super::{
         server_is_configured, GroupSecrets, IdentityStore, PairingCode,
     },
     model::{
-        BlobManifest, BlobRole, ClipboardEnvelope, CloudRecord, CloudRecordPage,
-        DecryptedSyncEvent, IncomingJoinRequest, LinkedSyncEvent, NearbyJoinAttempt,
-        NearbyJoinState, NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef,
-        StoredBlob, StoredSyncEvent, SyncChannelState, SyncChannelStatus, SyncItemStatus,
-        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
-        SyncedItemStatePatch,
+        BlobManifest, BlobRole, ClipboardEnvelope, CloudDeviceDirectory, CloudDeviceStatus,
+        CloudHubStatus, CloudRecord, CloudRecordPage, DecryptedSyncEvent, IncomingJoinRequest,
+        LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice, NearbySyncSpace,
+        SourceAppRef, SourceIconRef, StoredBlob, StoredSyncEvent, SyncChannelState,
+        SyncChannelStatus, SyncItemStatus, SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget,
+        SyncedClipboardItem, SyncedItemStatePatch,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
-        JoinCompletion, JoinRequest, JoinResponse, JOIN_ALPN, JOIN_PROTOCOL_VERSION,
-        JOIN_TIMEOUT_SECS,
+        JoinCompletion, JoinRequest, JoinResponse, PairingBootstrap, JOIN_ALPN,
+        JOIN_PROTOCOL_VERSION, JOIN_TIMEOUT_SECS, PAIRING_INVITATION_TTL_SECS,
     },
     repository,
 };
@@ -106,8 +106,42 @@ fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
 }
 
 const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
+const LOCAL_SYNC_GC_BATCH_SIZE: u32 = 500;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
+
+fn remove_unreferenced_sync_blobs(root: &Path, live_blob_ids: &HashSet<String>) -> Result<u64> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0_u64;
+    for entry in walkdir::WalkDir::new(root)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+    {
+        let entry = entry.context("walk local sync blob directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(blob_id) = entry.file_name().to_str() else {
+            continue;
+        };
+        if live_blob_ids.contains(blob_id)
+            || crypto::blob_path(root, blob_id).ok().as_deref() != Some(entry.path())
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).with_context(|| {
+            format!(
+                "remove unreferenced local sync blob {}",
+                entry.path().display()
+            )
+        })?;
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
+}
 
 pub struct SyncManager {
     update_notification_pending: Arc<AtomicBool>,
@@ -152,6 +186,7 @@ pub struct SyncManager {
     nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
     incoming_join_requests: Mutex<HashMap<String, PendingIncomingJoinRequest>>,
     outgoing_join_attempts: RwLock<HashMap<String, NearbyJoinAttempt>>,
+    pairing_invitations: Mutex<HashMap<String, PairingInvitation>>,
     join_rate_limits: RwLock<HashMap<String, Instant>>,
     pairing_sessions: AtomicUsize,
 }
@@ -177,6 +212,11 @@ enum PendingMdnsEvent {
 struct PendingIncomingJoinRequest {
     public: IncomingJoinRequest,
     responder: oneshot::Sender<JoinResponse>,
+}
+
+struct PairingInvitation {
+    secret_hash: [u8; 32],
+    expires_at_ms: i64,
 }
 
 struct EndpointRuntime {
@@ -355,6 +395,17 @@ impl std::fmt::Display for CloudAttemptTimeout {
 impl std::error::Error for CloudAttemptTimeout {}
 
 #[derive(Debug)]
+struct CloudHistoryGap;
+
+impl std::fmt::Display for CloudHistoryGap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("云端较早的同步事件已按保留策略清理")
+    }
+}
+
+impl std::error::Error for CloudHistoryGap {}
+
+#[derive(Debug)]
 struct LanAttemptTimeout;
 
 impl std::fmt::Display for LanAttemptTimeout {
@@ -481,6 +532,7 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         nearby_devices: RwLock::new(HashMap::new()),
         incoming_join_requests: Mutex::new(HashMap::new()),
         outgoing_join_attempts: RwLock::new(HashMap::new()),
+        pairing_invitations: Mutex::new(HashMap::new()),
         join_rate_limits: RwLock::new(HashMap::new()),
         pairing_sessions: AtomicUsize::new(0),
     });
@@ -781,26 +833,104 @@ impl SyncManager {
             .snapshot()
             .group
             .as_ref()
-            .is_some_and(|group| group == code.group());
+            .and_then(|group| discovery_space_id(group).ok())
+            .is_some_and(|space_id| space_id == code.space_id);
         SyncPairingPreview {
             inviter_device_name: code.inviter_device_name().to_owned(),
             same_group,
         }
     }
 
-    /// Joins the scanned device and clears routes encrypted for a previous sync space.
-    pub async fn join_group(&self, code: &PairingCode, replace_existing: bool) -> Result<()> {
+    /// Redeems a short-lived invitation over an encrypted Iroh connection.
+    pub async fn join_group(
+        self: &Arc<Self>,
+        code: &PairingCode,
+        replace_existing: bool,
+    ) -> Result<()> {
+        let current_group = self.identity.snapshot().group;
+        let same_group = current_group
+            .as_ref()
+            .and_then(|group| discovery_space_id(group).ok())
+            .is_some_and(|space_id| space_id == code.space_id);
+        if current_group.is_some() && !same_group && !replace_existing {
+            bail!("本机已连接到其他设备，请先确认是否加入二维码所属设备");
+        }
+
+        let current_settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let mut connection_settings = current_settings.clone();
+        connection_settings.cloud_enabled = code.cloud_relay_mode != CloudRelayMode::Off;
+        connection_settings.cloud_relay_mode = code.cloud_relay_mode;
+        connection_settings.server_relay_urls = code.server_relay_urls.clone();
+        self.pairing_sessions.fetch_add(1, Ordering::AcqRel);
+        let result = async {
+            let endpoint = self.ensure_endpoint(&connection_settings).await?;
+            let target = pairing_endpoint_addr(code)?;
+            let connection =
+                tokio::time::timeout(Duration::from_secs(8), endpoint.connect(target, JOIN_ALPN))
+                    .await
+                    .context("连接二维码设备超时")??;
+            let announcement = self.device_announcement(&endpoint);
+            let request_id = Uuid::new_v4().to_string();
+            let mut nonce = vec![0_u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let request = JoinRequest {
+                version: JOIN_PROTOCOL_VERSION,
+                request_id,
+                nonce,
+                device_id: announcement.device_id,
+                device_name: announcement.device_name,
+                platform: announcement.platform,
+                endpoint_id: announcement.endpoint_id,
+                direct_addresses: announcement.direct_addresses,
+                relay_urls: announcement.relay_urls,
+                invitation_id: Some(code.invitation_id.clone()),
+                invitation_secret: Some(code.invitation_secret.clone()),
+            };
+            let response = tokio::time::timeout(
+                Duration::from_secs(JOIN_TIMEOUT_SECS) + JOIN_HANDSHAKE_TIMEOUT * 2,
+                call_join(&connection, request, Some((self, replace_existing, true))),
+            )
+            .await
+            .context("二维码加入申请已超时")??;
+            match response {
+                JoinResponse::Approved { .. } => Ok(()),
+                JoinResponse::Rejected => bail!("二维码设备拒绝了加入申请"),
+                JoinResponse::Expired => bail!("配对码已过期，请重新生成"),
+                JoinResponse::Error { message } => bail!(message),
+            }
+        }
+        .await;
+        self.pairing_sessions.fetch_sub(1, Ordering::AcqRel);
+        if let Err(error) = self.stop_runtime().await {
+            log::debug!("reset pairing endpoint failed: {error}");
+        }
+        if self.app.state::<SettingsStore>().snapshot().sync.enabled {
+            self.wake();
+            self.emit_updated();
+        }
+        result
+    }
+
+    /// Applies approved group bootstrap data and clears routes from a previous sync space.
+    async fn apply_pairing_bootstrap(
+        &self,
+        bootstrap: &PairingBootstrap,
+        replace_existing: bool,
+        preserve_runtime: bool,
+    ) -> Result<()> {
         let _cloud_guard = self.cloud_cycle_lock.lock().await;
         let _lan_guard = self.lan_cycle_lock.write().await;
         let current_group = self.identity.snapshot().group;
         let switching_group = current_group
             .as_ref()
-            .is_some_and(|group| group != code.group());
+            .is_some_and(|group| group != &bootstrap.group);
         if switching_group && !replace_existing {
             bail!("本机已连接到其他设备，请先确认是否加入二维码所属设备");
         }
-        if current_group.as_ref() != Some(code.group()) {
-            self.stop_runtime().await?;
+        if current_group.as_ref() != Some(&bootstrap.group) {
+            if !preserve_runtime {
+                self.stop_runtime().await?;
+            }
             let pool = self.pool().await;
             let _enqueue_guard = self.enqueue_lock.lock().await;
             repository::clear_group_state(&pool).await?;
@@ -808,10 +938,25 @@ impl SyncManager {
                 .lock()
                 .expect("pending clipboard observations poisoned")
                 .clear();
-            self.identity.set_group(Some(code.group().clone()))?;
+            self.identity.set_group(Some(bootstrap.group.clone()))?;
         }
         let pool = self.pool().await;
-        repository::restore_and_upsert_peer(&pool, &code.inviter).await?;
+        repository::restore_and_upsert_peer(&pool, &bootstrap.inviter).await?;
+        let cloud_enabled = !bootstrap.server_endpoint_id.trim().is_empty();
+        let settings = self
+            .app
+            .state::<SettingsStore>()
+            .update(serde_json::json!({
+                "sync": {
+                    "enabled": true,
+                    "cloudEnabled": cloud_enabled,
+                    "cloudRelayMode": bootstrap.cloud_relay_mode,
+                    "serverEndpointId": bootstrap.server_endpoint_id,
+                    "serverDirectAddresses": bootstrap.server_direct_addresses,
+                    "serverRelayUrls": bootstrap.server_relay_urls,
+                }
+            }))?;
+        crate::commands::emit_settings_updated(&self.app, &settings);
         Ok(())
     }
 
@@ -903,8 +1048,59 @@ impl SyncManager {
         let group = identity.group.context("请先启用同步或连接已有设备")?;
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let endpoint = self.ensure_endpoint(&settings).await?;
+        let invitation_id = Uuid::new_v4().to_string();
+        let mut invitation_secret = vec![0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut invitation_secret);
+        let expires_at_ms = Utc::now().timestamp_millis()
+            + i64::try_from(PAIRING_INVITATION_TTL_SECS * 1_000).context("配对码有效期无效")?;
+        let mut invitations = self.pairing_invitations.lock().await;
+        invitations.clear();
+        invitations.insert(
+            invitation_id.clone(),
+            PairingInvitation {
+                secret_hash: *blake3::hash(&invitation_secret).as_bytes(),
+                expires_at_ms,
+            },
+        );
+        drop(invitations);
+        let mut inviter = self.announcement(&endpoint);
+        inviter.relay_urls = endpoint
+            .addr()
+            .relay_urls()
+            .map(ToString::to_string)
+            .collect();
         Ok(PairingCode {
-            version: 1,
+            version: JOIN_PROTOCOL_VERSION,
+            invitation_id,
+            invitation_secret,
+            expires_at_ms,
+            space_id: discovery_space_id(&group)?,
+            inviter,
+            cloud_relay_mode: if settings.cloud_enabled {
+                settings.cloud_relay_mode
+            } else {
+                CloudRelayMode::Off
+            },
+            server_relay_urls: if settings.cloud_enabled {
+                settings.server_relay_urls
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    async fn build_pairing_bootstrap(&self) -> Result<PairingBootstrap> {
+        let identity = self.identity.snapshot();
+        let group = identity.group.context("请先启用同步或连接已有设备")?;
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let endpoint = self
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.endpoint.clone())
+            .context("同步端点尚未就绪")?;
+        Ok(PairingBootstrap {
             group,
             server_endpoint_id: if settings.cloud_enabled {
                 settings.server_endpoint_id
@@ -928,6 +1124,23 @@ impl SyncManager {
                 CloudRelayMode::Off
             },
         })
+    }
+
+    async fn consume_pairing_invitation(&self, invitation_id: &str, secret: &[u8]) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let mut invitations = self.pairing_invitations.lock().await;
+        invitations.retain(|_, invitation| invitation.expires_at_ms > now);
+        let invitation = invitations
+            .get(invitation_id)
+            .context("配对码已过期或已使用，请重新生成")?;
+        if invitation.expires_at_ms <= now
+            || secret.len() != 32
+            || invitation.secret_hash != *blake3::hash(secret).as_bytes()
+        {
+            bail!("配对码无效，请重新生成");
+        }
+        invitations.remove(invitation_id);
+        Ok(())
     }
 
     /// Scans briefly and returns nearby sync spaces grouped by their anonymous identifier.
@@ -988,6 +1201,7 @@ impl SyncManager {
     pub async fn request_nearby_join(
         self: &Arc<Self>,
         endpoint_id: &str,
+        replace_existing: bool,
     ) -> Result<NearbyJoinAttempt> {
         let entry = self
             .nearby_devices
@@ -999,6 +1213,14 @@ impl SyncManager {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         if !settings.lan_enabled {
             bail!("请先开启局域网同步");
+        }
+        let current_group = self.identity.snapshot().group;
+        let same_group = current_group
+            .as_ref()
+            .and_then(|group| discovery_space_id(group).ok())
+            .is_some_and(|space_id| space_id == entry.metadata.space_id);
+        if current_group.is_some() && !same_group && !replace_existing {
+            bail!("本机已连接到其他设备，请先确认是否加入附近设备");
         }
         let join_address = EndpointAddr::from_parts(
             entry.address.id,
@@ -1031,7 +1253,6 @@ impl SyncManager {
             comparison_code,
             state: NearbyJoinState::Pending,
             expires_at: expires_at.to_rfc3339(),
-            pairing_code: None,
             last_error: None,
         };
         {
@@ -1056,6 +1277,8 @@ impl SyncManager {
             endpoint_id: announcement.endpoint_id,
             direct_addresses: announcement.direct_addresses,
             relay_urls: announcement.relay_urls,
+            invitation_id: None,
+            invitation_secret: None,
         };
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -1069,7 +1292,11 @@ impl SyncManager {
                 .context("连接附近设备超时")??;
                 tokio::time::timeout(
                     Duration::from_secs(JOIN_TIMEOUT_SECS) + JOIN_HANDSHAKE_TIMEOUT * 2,
-                    call_join(&connection, request),
+                    call_join(
+                        &connection,
+                        request,
+                        Some((manager.as_ref(), replace_existing, true)),
+                    ),
                 )
                 .await
                 .context("加入申请已超时")?
@@ -1077,11 +1304,13 @@ impl SyncManager {
             .await;
             manager.finish_outgoing_join(&request_id, response);
             manager.pairing_sessions.fetch_sub(1, Ordering::AcqRel);
+            if let Err(error) = manager.stop_runtime().await {
+                log::debug!("reset nearby pairing endpoint failed: {error}");
+            }
             let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-            if !settings.enabled {
-                if let Err(error) = manager.stop_runtime().await {
-                    log::debug!("stop temporary pairing endpoint failed: {error}");
-                }
+            if settings.enabled {
+                manager.wake();
+                manager.emit_updated();
             }
         });
         Ok(attempt)
@@ -1100,8 +1329,8 @@ impl SyncManager {
             return Ok(());
         }
 
-        let pairing_code = match async { self.build_pairing_code().await?.encode() }.await {
-            Ok(pairing_code) => pairing_code,
+        let bootstrap = match self.build_pairing_bootstrap().await {
+            Ok(bootstrap) => bootstrap,
             Err(error) => {
                 let _ = pending.responder.send(JoinResponse::Error {
                     message: error.to_string(),
@@ -1111,7 +1340,9 @@ impl SyncManager {
         };
         pending
             .responder
-            .send(JoinResponse::Approved { pairing_code })
+            .send(JoinResponse::Approved {
+                bootstrap: Box::new(bootstrap),
+            })
             .map_err(|_| anyhow::anyhow!("申请设备已断开"))?;
         Ok(())
     }
@@ -1268,6 +1499,82 @@ impl SyncManager {
         }
     }
 
+    /// Applies local history retention while transfers are paused, then reclaims encrypted content
+    /// that no current route can still need.
+    pub(crate) async fn run_local_retention_cleanup(&self, cloud_cycle_held: bool) -> bool {
+        if cloud_cycle_held {
+            let _lan_guard = self.lan_cycle_lock.write().await;
+            let _enqueue_guard = self.enqueue_lock.lock().await;
+            return self.run_local_retention_cleanup_locked().await;
+        }
+
+        let _cloud_guard = self.cloud_cycle_lock.lock().await;
+        let _lan_guard = self.lan_cycle_lock.write().await;
+        let _enqueue_guard = self.enqueue_lock.lock().await;
+        self.run_local_retention_cleanup_locked().await
+    }
+
+    async fn run_local_retention_cleanup_locked(&self) -> bool {
+        if !crate::clipboard::cleanup::apply_retention(&self.app).await {
+            return false;
+        }
+
+        let pool = self.pool().await;
+        let mut removed_events = 0_u64;
+        loop {
+            let removed =
+                match repository::prune_released_content_events(&pool, LOCAL_SYNC_GC_BATCH_SIZE)
+                    .await
+                {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        log::warn!("local sync event cleanup failed: {error}");
+                        return false;
+                    }
+                };
+            removed_events = removed_events.saturating_add(removed);
+            if removed < u64::from(LOCAL_SYNC_GC_BATCH_SIZE) {
+                break;
+            }
+        }
+
+        let live_blob_ids = match repository::live_sync_blob_ids(&pool).await {
+            Ok(ids) => ids,
+            Err(error) => {
+                log::warn!("list live local sync blobs failed: {error}");
+                return false;
+            }
+        };
+        let blob_root = match crate::core::paths::resources_dir(&self.app) {
+            Ok(root) => root.join("sync-blobs"),
+            Err(error) => {
+                log::warn!("resolve local sync blob directory failed: {error}");
+                return false;
+            }
+        };
+        let removed_blobs = match tauri::async_runtime::spawn_blocking(move || {
+            remove_unreferenced_sync_blobs(&blob_root, &live_blob_ids)
+        })
+        .await
+        {
+            Ok(Ok(removed)) => removed,
+            Ok(Err(error)) => {
+                log::warn!("local sync blob cleanup failed: {error}");
+                return false;
+            }
+            Err(error) => {
+                log::warn!("local sync blob cleanup task failed: {error}");
+                return false;
+            }
+        };
+        if removed_events > 0 || removed_blobs > 0 {
+            log::info!(
+                "local sync cleanup removed {removed_events} event(s) and {removed_blobs} blob(s)"
+            );
+        }
+        true
+    }
+
     /// Immediately reconnects all paired devices or one selected device.
     pub async fn reconnect_peer(self: &Arc<Self>, device_id: Option<String>) -> Result<()> {
         if !self
@@ -1403,6 +1710,93 @@ impl SyncManager {
         repository::item_statuses(&self.pool().await, item_ids).await
     }
 
+    /// Reads the Hub member directory without affecting synchronization cursors.
+    pub async fn cloud_devices(self: &Arc<Self>) -> Result<CloudDeviceDirectory> {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !settings.cloud_enabled {
+            bail!("请先启用多端同步和云端同步");
+        }
+        let identity = self.identity.snapshot();
+        let group = identity
+            .group
+            .as_ref()
+            .context("请先创建或加入同步设备组")?;
+        let endpoint = self.ensure_endpoint(&settings).await?;
+        let connection = self
+            .request_cloud_connection(Duration::from_secs(8))
+            .await?;
+        let request = Request::ListDevices {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            device: self.device_announcement(&endpoint),
+        };
+        let (_, response) = self
+            .request_cloud_query(connection, group, &request)
+            .await?;
+        let Response::Devices {
+            devices,
+            hub_status,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("云端返回了无效的设备响应");
+        };
+        let mut devices = devices
+            .into_iter()
+            .map(|device| {
+                let last_seen_at = Utc
+                    .timestamp_millis_opt(device.last_seen_ms)
+                    .single()
+                    .context("云端设备时间无效")?
+                    .to_rfc3339();
+                Ok(CloudDeviceStatus {
+                    current: device.device_id == identity.device_id,
+                    device_id: device.device_id,
+                    device_name: device.device_name,
+                    platform: device.platform,
+                    app_version: device.app_version,
+                    online: device.online,
+                    last_seen_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        devices.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| right.online.cmp(&left.online))
+                .then_with(|| left.device_name.cmp(&right.device_name))
+        });
+        let hub_status = hub_status
+            .map(|status| {
+                let oldest_event_at = status
+                    .oldest_event_received_at_ms
+                    .map(|timestamp| {
+                        Utc.timestamp_millis_opt(timestamp)
+                            .single()
+                            .context("云端保留时间无效")
+                            .map(|value| value.to_rfc3339())
+                    })
+                    .transpose()?;
+                Ok::<_, anyhow::Error>(CloudHubStatus {
+                    used_bytes: status.used_bytes,
+                    max_bytes: status.max_bytes,
+                    event_count: status.event_count,
+                    blob_count: status.blob_count,
+                    oldest_event_at,
+                    retention_days: status.retention_days,
+                    max_events: status.max_events,
+                })
+            })
+            .transpose()?;
+        Ok(CloudDeviceDirectory {
+            devices,
+            hub_status,
+        })
+    }
+
     /// Reads encrypted Hub history without advancing the normal synchronization cursor.
     pub async fn cloud_records(
         self: &Arc<Self>,
@@ -1428,7 +1822,7 @@ impl SyncManager {
             limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
         };
         let (connection, response) = self
-            .request_cloud_records_page(connection, &group, &request)
+            .request_cloud_query(connection, &group, &request)
             .await?;
         let Response::EventsPage {
             events,
@@ -1496,8 +1890,8 @@ impl SyncManager {
         })
     }
 
-    /// Retries one idempotent history read after evicting a stale shared cloud connection.
-    async fn request_cloud_records_page(
+    /// Retries one idempotent Hub query after evicting a stale shared cloud connection.
+    async fn request_cloud_query(
         self: &Arc<Self>,
         mut connection: Connection,
         group: &GroupSecrets,
@@ -1511,14 +1905,14 @@ impl SyncManager {
                     call(&connection, request.clone()),
                 )
                 .await
-                .context("读取云端记录超时")?
+                .context("读取云端数据超时")?
             }
             .await;
             match result {
                 Ok(response) => return Ok((connection, response)),
                 Err(error) if attempt == 0 => {
                     self.invalidate_cloud_connection(connection.stable_id());
-                    log::debug!("retry cloud records on a fresh connection: {error}");
+                    log::debug!("retry cloud query on a fresh connection: {error}");
                     connection = self
                         .request_cloud_connection(Duration::from_secs(8))
                         .await?;
@@ -1531,7 +1925,7 @@ impl SyncManager {
             }
         }
 
-        unreachable!("cloud records retry loop always returns")
+        unreachable!("cloud query retry loop always returns")
     }
 
     /// Materializes durable local content/state operations in their per-item causal order.
@@ -2256,7 +2650,9 @@ impl SyncManager {
                             self.ensure_cloud_group(&connection, &group).await?;
                         let group_elapsed = group_started_at.elapsed();
                         let transfer_started_at = Instant::now();
-                        let cursor = repository::cloud_cursor(&pool).await?;
+                        let (cursor, bootstrap_target) = self
+                            .prepare_cloud_cursor(&connection, &group, &pool, false)
+                            .await?;
                         let latest = self
                             .sync_connection(
                                 &connection,
@@ -2266,6 +2662,19 @@ impl SyncManager {
                                 &endpoint,
                             )
                             .await?;
+                        let bootstrap_reached = if let Some(target) = bootstrap_target {
+                            repository::cloud_cursor(&pool).await? >= target
+                        } else {
+                            false
+                        };
+                        if bootstrap_reached {
+                            let local_cleanup_succeeded =
+                                self.run_local_retention_cleanup(true).await;
+                            if local_cleanup_succeeded {
+                                repository::mark_cloud_bootstrap_completed(&pool, &group.group_id)
+                                    .await?;
+                            }
+                        }
                         if latest.has_more {
                             self.wake_cloud_transfer();
                         }
@@ -2794,6 +3203,65 @@ impl SyncManager {
             .is_some_and(|session| session.protocol_version >= REDUNDANT_WATCH_PROTOCOL_VERSION)
     }
 
+    fn bounded_hub_supported(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .filter(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+            .is_some_and(|session| session.protocol_version >= BOUNDED_HUB_PROTOCOL_VERSION)
+    }
+
+    async fn prepare_cloud_cursor(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        pool: &SqlitePool,
+        force: bool,
+    ) -> Result<(u64, Option<u64>)> {
+        let current = repository::cloud_cursor(pool).await?;
+        if !self.bounded_hub_supported(connection, &group.group_id) {
+            return Ok((current, None));
+        }
+        if !force && repository::cloud_bootstrap_completed(pool, &group.group_id).await? {
+            return Ok((current, None));
+        }
+        if !force && repository::cloud_bootstrap_pending(pool, &group.group_id).await? {
+            let target = repository::cloud_bootstrap_target(pool, &group.group_id)
+                .await?
+                .context("missing cloud bootstrap target cursor")?;
+            return Ok((current, Some(target)));
+        }
+        if !force && current > 0 {
+            repository::mark_cloud_bootstrap_completed(pool, &group.group_id).await?;
+            return Ok((current, None));
+        }
+
+        let response = call_cloud(
+            connection,
+            Request::BootstrapPlan {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+            },
+        )
+        .await?;
+        let Response::BootstrapPlan {
+            start_cursor,
+            latest_cursor,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("云端返回了无效的初始同步范围");
+        };
+        repository::start_cloud_bootstrap(pool, &group.group_id, start_cursor, latest_cursor)
+            .await?;
+        Ok((start_cursor, Some(latest_cursor)))
+    }
+
     async fn sync_connection(
         self: &Arc<Self>,
         connection: &Connection,
@@ -2843,6 +3311,11 @@ impl SyncManager {
                 repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
                     .await?
             };
+            let managed_hub_blobs =
+                is_cloud && self.bounded_hub_supported(connection, &group.group_id);
+            if managed_hub_blobs {
+                repository::attach_event_blob_ids(&pool, &mut pending).await?;
+            }
             let available_count = pending.len();
             let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
             // Keep the field present while byte-limiting so the final continuation value cannot
@@ -2858,6 +3331,7 @@ impl SyncManager {
                     limit: MAX_EVENTS_PER_BATCH,
                     byte_limited: Some(true),
                     events_complete: Some(false),
+                    bounded_hub: managed_hub_blobs.then_some(true),
                 }
             } else {
                 Request::Sync {
@@ -2869,6 +3343,7 @@ impl SyncManager {
                     limit: MAX_EVENTS_PER_BATCH,
                     byte_limited: Some(true),
                     events_complete: Some(false),
+                    bounded_hub: managed_hub_blobs.then_some(true),
                 }
             };
             let pending_count = limit_sync_request(&mut request)?;
@@ -2923,8 +3398,14 @@ impl SyncManager {
                 .iter()
                 .map(|blob| blob.blob_id.clone())
                 .collect::<Vec<_>>();
-            if let Err(error) =
-                upload_blobs(connection, group, required_blobs, BlobUploadKind::Content).await
+            if let Err(error) = upload_blobs(
+                connection,
+                group,
+                required_blobs,
+                BlobUploadKind::Content,
+                managed_hub_blobs,
+            )
+            .await
             {
                 repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
                     .await?;
@@ -2942,6 +3423,7 @@ impl SyncManager {
                     group,
                     std::mem::take(&mut deferred_source_icon_blobs),
                     BlobUploadKind::SourceIcon,
+                    managed_hub_blobs,
                 )
                 .await
                 {
@@ -2998,6 +3480,10 @@ impl SyncManager {
                         removed_devices,
                         has_more,
                     },
+                    Response::Error {
+                        code: ErrorCode::HistoryGap,
+                        ..
+                    } if is_cloud => return Err(anyhow::Error::new(CloudHistoryGap)),
                     Response::Error { message, .. } => bail!(message),
                     _ => bail!("同步端返回了无效响应"),
                 };
@@ -3007,6 +3493,13 @@ impl SyncManager {
             let (response, protocol) = match result {
                 Ok(response) => response,
                 Err(error) => {
+                    if is_cloud && error.downcast_ref::<CloudHistoryGap>().is_some() {
+                        let (reset_cursor, _) = self
+                            .prepare_cloud_cursor(connection, group, &pool, true)
+                            .await?;
+                        log::info!("cloud history gap recovered: bootstrapCursor={reset_cursor}");
+                        return Ok(SyncConnectionOutcome { has_more: true });
+                    }
                     if !is_cloud_attempt_timeout(&error) {
                         repository::mark_delivery_error(
                             &pool,
@@ -3944,6 +4437,7 @@ impl SyncManager {
             group,
             blobs,
             BlobUploadKind::PublishedSourceIcon,
+            self.bounded_hub_supported(connection, &group.group_id),
         )
         .await?;
         repository::complete_source_icon_uploads(&pool, &group.group_id, &blob_ids).await?;
@@ -4107,6 +4601,7 @@ impl SyncManager {
                 .map(ToString::to_string)
                 .collect(),
             relay_urls: Vec::new(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
 
@@ -4194,9 +4689,8 @@ impl SyncManager {
             return;
         };
         match result {
-            Ok(JoinResponse::Approved { pairing_code }) => {
+            Ok(JoinResponse::Approved { .. }) => {
                 attempt.state = NearbyJoinState::Approved;
-                attempt.pairing_code = Some(pairing_code);
                 attempt.last_error = None;
             }
             Ok(JoinResponse::Rejected) => attempt.state = NearbyJoinState::Rejected,
@@ -4731,6 +5225,32 @@ fn earliest_timestamp(left: Option<&String>, right: Option<&String>) -> Option<S
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
         (None, None) => None,
     }
+}
+
+/// Builds the one-time invitation route; unlike LAN synchronization it may use a configured Relay.
+fn pairing_endpoint_addr(code: &PairingCode) -> Result<EndpointAddr> {
+    let endpoint_id: EndpointId = code
+        .inviter
+        .endpoint_id
+        .trim()
+        .parse()
+        .context("配对码中的设备身份无效")?;
+    let mut addresses = Vec::new();
+    for direct in &code.inviter.direct_addresses {
+        let address: SocketAddr = direct.parse().context("配对码中的直连地址无效")?;
+        if address.is_ipv4() {
+            addresses.push(TransportAddr::Ip(address));
+        }
+    }
+    for relay in &code.inviter.relay_urls {
+        addresses.push(TransportAddr::Relay(
+            relay.parse().context("配对码中的 Relay 地址无效")?,
+        ));
+    }
+    if addresses.is_empty() {
+        bail!("配对码中的设备当前没有可用连接地址");
+    }
+    Ok(EndpointAddr::from_parts(endpoint_id, addresses))
 }
 
 fn endpoint_runtime_config(
@@ -5983,12 +6503,8 @@ impl ProtocolHandler for JoinService {
         let Some(manager) = self.manager.upgrade() else {
             return Ok(());
         };
-        if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
-            log::warn!("rejected non-LAN join connection: {error}");
-            return Ok(());
-        }
         if let Err(error) = handle_join_connection(manager, connection).await {
-            log::warn!("LAN join request failed: {error}");
+            log::warn!("join request failed: {error}");
         }
         Ok(())
     }
@@ -6024,7 +6540,12 @@ async fn handle_join_connection(manager: Arc<SyncManager>, connection: Connectio
         bail!("加入申请确认无效");
     }
 
-    let commit_result = if let Some(peer) = approved_peer.as_ref() {
+    let commit_result = if !acknowledgement.accepted {
+        Err(anyhow::anyhow!(
+            "申请设备未能保存配对结果：{}",
+            acknowledgement.error.as_deref().unwrap_or("未知错误")
+        ))
+    } else if let Some(peer) = approved_peer.as_ref() {
         let pool = manager.pool().await;
         repository::restore_and_upsert_peer(&pool, peer).await
     } else {
@@ -6065,8 +6586,8 @@ async fn process_join_request(
     request: JoinRequest,
 ) -> Result<(JoinResponse, Option<PeerAnnouncement>)> {
     let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-    if !settings.enabled || !settings.lan_enabled || manager.identity.snapshot().group.is_none() {
-        bail!("该设备当前不接受局域网加入申请");
+    if !settings.enabled || manager.identity.snapshot().group.is_none() {
+        bail!("该设备当前不接受加入申请");
     }
     if request.version != JOIN_PROTOCOL_VERSION {
         bail!("加入协议版本不兼容");
@@ -6086,6 +6607,24 @@ async fn process_join_request(
         || request.relay_urls.len() > 16
     {
         bail!("加入申请内容无效");
+    }
+    let invitation = match (&request.invitation_id, &request.invitation_secret) {
+        (Some(invitation_id), Some(invitation_secret)) => {
+            Some((invitation_id.as_str(), invitation_secret.as_slice()))
+        }
+        (None, None) => None,
+        _ => bail!("加入申请中的配对凭证无效"),
+    };
+    let is_invitation = invitation.is_some();
+    if let Some((invitation_id, invitation_secret)) = invitation {
+        manager
+            .consume_pairing_invitation(invitation_id, invitation_secret)
+            .await?;
+    } else {
+        if !settings.lan_enabled {
+            bail!("该设备当前不接受局域网加入申请");
+        }
+        ensure_lan_connection(connection, LAN_PATH_SELECTION_TIMEOUT).await?;
     }
     let own_identity = manager.identity.snapshot();
     if request.device_id == own_identity.device_id {
@@ -6135,7 +6674,9 @@ async fn process_join_request(
         relay_urls: request.relay_urls,
         last_seen_ms: Utc::now().timestamp_millis(),
     };
-    peer_endpoint_addr(&announcement).context("加入申请包含无效的连接地址")?;
+    if !is_invitation {
+        peer_endpoint_addr(&announcement).context("加入申请包含无效的连接地址")?;
+    }
     let approved_peer = announcement;
     let (sender, receiver) = oneshot::channel();
     {
@@ -6306,6 +6847,7 @@ async fn dispatch_peer(
             limit,
             byte_limited,
             events_complete,
+            bounded_hub: _,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             if events_complete.is_none() {
@@ -6504,7 +7046,11 @@ async fn dispatch_peer(
         | Request::WatchGroupStream { .. }
         | Request::WatchGroupStreamV2 { .. }
         | Request::WatchGroupStreamV3 { .. }
-        | Request::ListEvents { .. } => {
+        | Request::ListEvents { .. }
+        | Request::ListDevices { .. }
+        | Request::BootstrapPlan { .. }
+        | Request::PutManagedBlob { .. }
+        | Request::PutManagedSourceIcon { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
     }
@@ -6671,16 +7217,33 @@ fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {
 }
 
 /// Confirms both the approval response and its durable commit before returning it to the UI.
-async fn call_join(connection: &Connection, request: JoinRequest) -> Result<JoinResponse> {
+async fn call_join(
+    connection: &Connection,
+    request: JoinRequest,
+    apply: Option<(&SyncManager, bool, bool)>,
+) -> Result<JoinResponse> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let request_id = request.request_id.clone();
     write_frame(&mut send, &request).await?;
-    let response = read_frame(&mut recv).await.context("读取加入申请结果")?;
+    let response: JoinResponse = read_frame(&mut recv).await.context("读取加入申请结果")?;
+    let apply_error = match (&response, apply) {
+        (
+            JoinResponse::Approved { bootstrap },
+            Some((manager, replace_existing, preserve_runtime)),
+        ) => manager
+            .apply_pairing_bootstrap(bootstrap, replace_existing, preserve_runtime)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        _ => None,
+    };
     write_frame(
         &mut send,
         &JoinAcknowledgement {
             version: JOIN_PROTOCOL_VERSION,
             request_id,
+            accepted: apply_error.is_none(),
+            error: apply_error.clone(),
         },
     )
     .await?;
@@ -6695,6 +7258,9 @@ async fn call_join(connection: &Connection, request: JoinRequest) -> Result<Join
         .context("等待批准设备接收确认超时")??;
     if stopped.is_some() {
         bail!("批准设备中止了加入确认");
+    }
+    if let Some(message) = apply_error {
+        bail!(message);
     }
     match completion {
         JoinCompletion::Committed => Ok(response),
@@ -6733,6 +7299,7 @@ async fn upload_blob(
     group: &GroupSecrets,
     blob: &StoredBlob,
     kind: BlobUploadKind,
+    managed_hub_blob: bool,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
     let total_started_at = Instant::now();
@@ -6742,14 +7309,26 @@ async fn upload_blob(
         .context("open blob upload stream timeout")??;
     let open_elapsed = open_started_at.elapsed();
     let write_started_at = Instant::now();
-    let request = match kind {
-        BlobUploadKind::PublishedSourceIcon => Request::PutSourceIcon {
+    let request = match (kind, managed_hub_blob) {
+        (BlobUploadKind::PublishedSourceIcon, true) => Request::PutManagedSourceIcon {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
             blob_id: blob.blob_id.clone(),
             size: blob.size,
         },
-        BlobUploadKind::Content | BlobUploadKind::SourceIcon => Request::PutBlob {
+        (BlobUploadKind::PublishedSourceIcon, false) => Request::PutSourceIcon {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            blob_id: blob.blob_id.clone(),
+            size: blob.size,
+        },
+        (BlobUploadKind::Content | BlobUploadKind::SourceIcon, true) => Request::PutManagedBlob {
+            group_id: group.group_id.clone(),
+            access_token: group.access_token_bytes()?,
+            blob_id: blob.blob_id.clone(),
+            size: blob.size,
+        },
+        (BlobUploadKind::Content | BlobUploadKind::SourceIcon, false) => Request::PutBlob {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
             blob_id: blob.blob_id.clone(),
@@ -6881,6 +7460,7 @@ async fn upload_blobs(
     group: &GroupSecrets,
     blobs: Vec<StoredBlob>,
     kind: BlobUploadKind,
+    managed_hub_blobs: bool,
 ) -> Result<()> {
     for batch in blobs.chunks(MAX_CONCURRENT_BLOB_TRANSFERS) {
         let mut tasks = tokio::task::JoinSet::new();
@@ -6888,7 +7468,9 @@ async fn upload_blobs(
             let connection = connection.clone();
             let group = group.clone();
             let blob = blob.clone();
-            tasks.spawn(async move { upload_blob(&connection, &group, &blob, kind).await });
+            tasks.spawn(async move {
+                upload_blob(&connection, &group, &blob, kind, managed_hub_blobs).await
+            });
         }
         while let Some(result) = tasks.join_next().await {
             result.context("blob upload task failed")??;
@@ -7409,6 +7991,28 @@ mod tests {
     }
 
     #[test]
+    fn local_sync_blob_cleanup_keeps_only_live_managed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let live_id = "a".repeat(64);
+        let stale_id = "b".repeat(64);
+        let live_path = crypto::blob_path(directory.path(), &live_id).unwrap();
+        let stale_path = crypto::blob_path(directory.path(), &stale_id).unwrap();
+        fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        fs::write(&live_path, b"live").unwrap();
+        fs::write(&stale_path, b"stale").unwrap();
+        fs::write(directory.path().join("unmanaged"), b"keep").unwrap();
+
+        let removed =
+            remove_unreferenced_sync_blobs(directory.path(), &HashSet::from([live_id])).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(live_path.is_file());
+        assert!(!stale_path.exists());
+        assert!(directory.path().join("unmanaged").is_file());
+    }
+
+    #[test]
     fn synchronized_files_keep_their_logical_basename() {
         let root = Path::new("sync-files/event");
         let first = synced_file_destination(root, 0, "report.txt");
@@ -7759,6 +8363,7 @@ mod tests {
             nonce: vec![0; 24],
             ciphertext: vec![1],
             kind: ecopaste_sync_protocol::SyncEventKind::Content,
+            blob_ids: Vec::new(),
         };
         let envelope = ClipboardEnvelope {
             version: 1,

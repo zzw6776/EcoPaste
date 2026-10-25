@@ -158,6 +158,26 @@
       "serverVersionUnknown": "Server version: Unknown",
       "title": "Cloud"
     },
+    "devices": {
+      "current": "This device",
+      "days": "{{count}} days",
+      "empty": "No paired devices are registered in the cloud",
+      "lastSeen": "Last online: {{time}}",
+      "noRetainedEvents": "No sync events are currently retained in the cloud",
+      "offline": "Offline",
+      "oldestEvent": "Oldest retained event: {{time}}",
+      "online": "Online",
+      "open": "View cloud devices",
+      "refresh": "Refresh cloud devices",
+      "retention": "Retention: {{days}} · Events: {{events}} / {{maxEvents}}",
+      "storage": "Hub storage",
+      "storageUsage": "{{used}} / {{max}}",
+      "summary": "{{total}} total, {{online}} online",
+      "title": "Cloud devices",
+      "unlimited": "Unlimited",
+      "version": "Version v{{version}}",
+      "versionUnknown": "Version unknown"
+    },
     "lan": {
       "connecting": "LAN is connecting",
       "degraded": "Some LAN connections are degraded",

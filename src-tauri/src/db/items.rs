@@ -1111,6 +1111,7 @@ mod tests {
                 nonce: vec![0; 24],
                 ciphertext: vec![1],
                 kind: ecopaste_sync_protocol::SyncEventKind::Content,
+                blob_ids: Vec::new(),
             };
             crate::sync::repository::insert_event(&pool, &event, true, &[])
                 .await

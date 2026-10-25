@@ -203,6 +203,31 @@ export interface CloudRecordPage {
   total: number;
 }
 
+export interface CloudDeviceStatus {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  appVersion: string;
+  online: boolean;
+  current: boolean;
+  lastSeenAt: string;
+}
+
+export interface CloudHubStatus {
+  usedBytes: number;
+  maxBytes: number;
+  eventCount: number;
+  blobCount: number;
+  oldestEventAt: string | null;
+  retentionDays: number;
+  maxEvents: number;
+}
+
+export interface CloudDeviceDirectory {
+  devices: CloudDeviceStatus[];
+  hubStatus: CloudHubStatus | null;
+}
+
 export type SyncChannelState =
   | "disabled"
   | "idle"
@@ -285,7 +310,6 @@ export interface NearbyJoinAttempt {
   comparisonCode: string;
   state: NearbyJoinState;
   expiresAt: string;
-  pairingCode: string | null;
   lastError: string | null;
 }
 
@@ -320,6 +344,13 @@ export const listCloudRecords = async (beforeCursor?: number, limit = 30) => {
     TAURI_COMMAND.LIST_CLOUD_RECORDS,
     "commands:labels.loadCloudRecords",
     { beforeCursor, limit },
+  );
+};
+
+export const listCloudDevices = async () => {
+  return call<CloudDeviceDirectory>(
+    TAURI_COMMAND.LIST_CLOUD_DEVICES,
+    "commands:labels.loadCloudDevices",
   );
 };
 
@@ -405,11 +436,14 @@ export const discoverNearbySyncSpaces = async () => {
   );
 };
 
-export const requestNearbySyncJoin = async (endpointId: string) => {
+export const requestNearbySyncJoin = async (
+  endpointId: string,
+  replaceExisting = false,
+) => {
   return call<NearbyJoinAttempt>(
     TAURI_COMMAND.REQUEST_NEARBY_SYNC_JOIN,
     "commands:labels.requestNearbySyncJoin",
-    { endpointId },
+    { endpointId, replaceExisting },
   );
 };
 

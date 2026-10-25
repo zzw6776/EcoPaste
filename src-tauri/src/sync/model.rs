@@ -307,6 +307,37 @@ pub struct CloudRecordPage {
     pub total: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudDeviceStatus {
+    pub device_id: String,
+    pub device_name: String,
+    pub platform: String,
+    pub app_version: String,
+    pub online: bool,
+    pub current: bool,
+    pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudHubStatus {
+    pub used_bytes: u64,
+    pub max_bytes: u64,
+    pub event_count: u64,
+    pub blob_count: u64,
+    pub oldest_event_at: Option<String>,
+    pub retention_days: u32,
+    pub max_events: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudDeviceDirectory {
+    pub devices: Vec<CloudDeviceStatus>,
+    pub hub_status: Option<CloudHubStatus>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,7 +556,6 @@ pub struct NearbyJoinAttempt {
     pub comparison_code: String,
     pub state: NearbyJoinState,
     pub expires_at: String,
-    pub pairing_code: Option<String>,
     pub last_error: Option<String>,
 }
 

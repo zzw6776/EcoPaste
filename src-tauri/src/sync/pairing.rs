@@ -3,11 +3,14 @@ use data_encoding::BASE64URL_NOPAD;
 use iroh::address_lookup::UserData;
 use minicbor::{Decode, Encode};
 
+use crate::settings::CloudRelayMode;
+
 use super::identity::GroupSecrets;
 
 pub const JOIN_ALPN: &[u8] = b"ecopaste/pair/2";
-pub const JOIN_PROTOCOL_VERSION: u16 = 2;
+pub const JOIN_PROTOCOL_VERSION: u16 = 3;
 pub const JOIN_TIMEOUT_SECS: u64 = 60;
+pub const PAIRING_INVITATION_TTL_SECS: u64 = 5 * 60;
 const DISCOVERY_PREFIX: &str = "ecopaste-discovery-v1:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -91,6 +94,29 @@ pub struct JoinRequest {
     pub direct_addresses: Vec<String>,
     #[n(8)]
     pub relay_urls: Vec<String>,
+    #[n(9)]
+    #[cbor(default)]
+    pub invitation_id: Option<String>,
+    #[n(10)]
+    #[cbor(default)]
+    pub invitation_secret: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct PairingBootstrap {
+    #[n(0)]
+    pub group: GroupSecrets,
+    #[n(1)]
+    pub server_endpoint_id: String,
+    #[n(2)]
+    pub server_direct_addresses: Vec<String>,
+    #[n(3)]
+    pub server_relay_urls: Vec<String>,
+    #[n(4)]
+    pub inviter: ecopaste_sync_protocol::PeerAnnouncement,
+    #[n(5)]
+    pub cloud_relay_mode: CloudRelayMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -98,7 +124,7 @@ pub enum JoinResponse {
     #[n(0)]
     Approved {
         #[n(0)]
-        pairing_code: String,
+        bootstrap: Box<PairingBootstrap>,
     },
     #[n(1)]
     Rejected,
@@ -118,6 +144,11 @@ pub struct JoinAcknowledgement {
     pub version: u16,
     #[n(1)]
     pub request_id: String,
+    #[n(2)]
+    pub accepted: bool,
+    #[n(3)]
+    #[cbor(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -265,9 +296,33 @@ mod tests {
 
     #[test]
     fn join_handshake_messages_round_trip() {
+        let response = JoinResponse::Approved {
+            bootstrap: Box::new(PairingBootstrap {
+                group: GroupSecrets::generate(),
+                server_endpoint_id: "server-endpoint".into(),
+                server_direct_addresses: vec!["192.168.1.2:443".into()],
+                server_relay_urls: Vec::new(),
+                inviter: ecopaste_sync_protocol::PeerAnnouncement {
+                    device_id: "device".into(),
+                    device_name: "Windows PC".into(),
+                    platform: "windows".into(),
+                    endpoint_id: "device-endpoint".into(),
+                    direct_addresses: vec!["192.168.1.3:443".into()],
+                    relay_urls: Vec::new(),
+                    last_seen_ms: 42,
+                },
+                cloud_relay_mode: CloudRelayMode::Off,
+            }),
+        };
+        let encoded = minicbor::to_vec(&response).unwrap();
+        let decoded: JoinResponse = minicbor::decode(&encoded).unwrap();
+        assert_eq!(decoded, response);
+
         let acknowledgement = JoinAcknowledgement {
             version: JOIN_PROTOCOL_VERSION,
             request_id: "request".into(),
+            accepted: true,
+            error: None,
         };
         let encoded = minicbor::to_vec(&acknowledgement).unwrap();
         let decoded: JoinAcknowledgement = minicbor::decode(&encoded).unwrap();

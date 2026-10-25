@@ -111,7 +111,11 @@ async fn mark_local_bool(
             {column} = excluded.{column},
             dirty_mask = sync_item_states.dirty_mask | excluded.dirty_mask,
             local_revision = sync_item_states.local_revision + 1,
-            pending_order = excluded.pending_order,
+            pending_order = CASE
+                WHEN (sync_item_states.dirty_mask & {PRESENCE_DIRTY}) <> 0
+                    THEN sync_item_states.pending_order
+                ELSE excluded.pending_order
+            END,
             updated_at = excluded.updated_at
         "#,
     );
@@ -149,7 +153,11 @@ pub async fn mark_local_note(
             note = excluded.note,
             dirty_mask = sync_item_states.dirty_mask | excluded.dirty_mask,
             local_revision = sync_item_states.local_revision + 1,
-            pending_order = excluded.pending_order,
+            pending_order = CASE
+                WHEN (sync_item_states.dirty_mask & ?) <> 0
+                    THEN sync_item_states.pending_order
+                ELSE excluded.pending_order
+            END,
             updated_at = excluded.updated_at
         "#,
     )
@@ -160,6 +168,7 @@ pub async fn mark_local_note(
     .bind(pending_order)
     .bind(now)
     .bind(now)
+    .bind(PRESENCE_DIRTY)
     .execute(connection)
     .await
     .context("record local synchronized note state")?;
@@ -1017,6 +1026,73 @@ mod tests {
                 .is_present,
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_after_delete_does_not_move_delete_behind_later_content() {
+        let pool = memory_pool().await;
+        let item = sample_item("item", "stable-key");
+        insert_item(&pool, &item).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_deleted(&mut connection, &item.sync_key, false)
+            .await
+            .unwrap();
+        drop(connection);
+        let mut transaction = pool.begin().await.unwrap();
+        crate::db::sync_queue::stage_content(
+            &mut transaction,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_favorite(&mut connection, &item.sync_key, false, true)
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .is_none());
+        let state = dirty_states(&pool, 1, false).await.unwrap().pop().unwrap();
+        let patch = state.patch();
+        assert_eq!(patch.is_present, Some(false));
+        assert_eq!(patch.is_favorite, Some(true));
+    }
+
+    #[tokio::test]
+    async fn delete_after_metadata_becomes_the_combined_state_order() {
+        let pool = memory_pool().await;
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_favorite(&mut connection, "stable-key", false, true)
+            .await
+            .unwrap();
+        let metadata_order: i64 =
+            sqlx::query_scalar("SELECT pending_order FROM sync_item_states WHERE sync_key = ?")
+                .bind("stable-key")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        mark_local_deleted(&mut connection, "stable-key", false)
+            .await
+            .unwrap();
+        mark_local_note(&mut connection, "stable-key", false, Some("keep"))
+            .await
+            .unwrap();
+        drop(connection);
+        let state = dirty_states(&pool, 1, false).await.unwrap().pop().unwrap();
+
+        assert!(state.pending_order > metadata_order);
+        let patch = state.patch();
+        assert_eq!(patch.is_present, Some(false));
+        assert_eq!(patch.is_favorite, Some(true));
+        assert_eq!(patch.note.as_deref(), Some("keep"));
     }
 
     #[tokio::test]

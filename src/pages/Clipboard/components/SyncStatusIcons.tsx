@@ -22,6 +22,7 @@ import { useTauriListen } from "@/hooks/useTauriListen";
 import { cn } from "@/utils/cn";
 import { isAndroid, isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
+import CloudDevicesDrawer from "./CloudDevicesDrawer";
 import CloudRecordsDrawer from "./CloudRecordsDrawer";
 import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
 
@@ -38,6 +39,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const { compact = false } = props;
   const { t } = useTranslation("clipboard");
   const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [devicesOpen, setDevicesOpen] = useState(false);
   const [recordsOpen, setRecordsOpen] = useState(false);
   const [detailsTarget, setDetailsTarget] = useState<"lan" | "cloud" | null>(
     null,
@@ -137,6 +139,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
     cancelDeferredRefresh();
     setDetailsTarget(null);
+    setDevicesOpen(false);
     setRecordsOpen(false);
   }
 
@@ -172,6 +175,17 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
       setDetailsTarget(null);
     }
     setRecordsOpen(true);
+  }
+
+  function handleOpenDevices() {
+    if (!isAndroid) {
+      setDetailsTarget(null);
+    }
+    setDevicesOpen(true);
+  }
+
+  function handleCloseDevices() {
+    setDevicesOpen(false);
   }
 
   function handleCloseRecords() {
@@ -219,6 +233,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     <CloudDetails
       addresses={[...(status?.cloudDirectAddresses ?? [])]}
       endpointId={status?.cloudEndpointId ?? ""}
+      onOpenDevices={handleOpenDevices}
       onOpenRecords={handleOpenRecords}
       onReconnect={handleReconnectCloud}
       reconnecting={reconnectingKey === "cloud"}
@@ -331,6 +346,7 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
         </Drawer>
       ) : null}
 
+      <CloudDevicesDrawer onClose={handleCloseDevices} open={devicesOpen} />
       <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
     </>
   );
@@ -562,6 +578,7 @@ const LanPeerDetails: FC<LanPeerDetailsProps> = (props) => {
 interface CloudDetailsProps {
   addresses: readonly string[];
   endpointId: string;
+  onOpenDevices: () => void;
   onOpenRecords: () => void;
   onReconnect: () => void;
   reconnecting: boolean;
@@ -573,6 +590,7 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
   const {
     addresses,
     endpointId,
+    onOpenDevices,
     onOpenRecords,
     onReconnect,
     reconnecting,
@@ -667,6 +685,15 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
         size="small"
       >
         {t("syncStatus.cloud.reconnect")}
+      </Button>
+      <Button
+        block
+        disabled={!status?.enabled || !status.cloudEnabled || !status.paired}
+        icon={<i className="i-lucide:monitor-smartphone size-4" />}
+        onClick={onOpenDevices}
+        size="small"
+      >
+        {t("syncStatus.devices.open")}
       </Button>
       <Button
         block

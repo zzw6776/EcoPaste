@@ -9,8 +9,8 @@ pub(crate) mod repository;
 pub use identity::PairingCode;
 pub use manager::SyncManager;
 pub use model::{
-    CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace, SyncItemStatus,
-    SyncPairingPreview, SyncStatus, SyncTarget, SyncedItemStatePatch,
+    CloudDeviceDirectory, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace,
+    SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget, SyncedItemStatePatch,
 };
 
 use std::sync::Arc;

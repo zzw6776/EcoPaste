@@ -425,30 +425,45 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
     }
   }
 
-  async function handleRequestNearbyJoin(endpointId: string) {
+  async function handleRequestNearbyJoin(
+    endpointId: string,
+    replaceExisting: boolean,
+  ) {
     try {
-      setJoinAttempt(await requestNearbySyncJoin(endpointId));
+      setJoinAttempt(await requestNearbySyncJoin(endpointId, replaceExisting));
     } catch {
       // 命令层已统一记录并显示错误。
     }
   }
 
-  function requestNearbyJoin(endpointId: string) {
-    void handleRequestNearbyJoin(endpointId);
+  function requestNearbyJoin(device: NearbySyncDevice, currentSpace: boolean) {
+    if (!status?.paired || currentSpace) {
+      void handleRequestNearbyJoin(device.endpointId, false);
+      return;
+    }
+
+    getModalApi().confirm({
+      cancelText: t("sync.conflict.keepLocal"),
+      centered: true,
+      content: t("sync.conflict.warning", {
+        device: device.deviceName,
+      }),
+      okText: t("sync.conflict.joinRemote", {
+        device: device.deviceName,
+      }),
+      onCancel: async () => {
+        await handleExport();
+        setJoinAttempt(null);
+      },
+      onOk: async () => {
+        await handleRequestNearbyJoin(device.endpointId, true);
+      },
+      title: t("sync.conflict.title"),
+    });
   }
 
   function handleRefreshNearby() {
     void scanNearby();
-  }
-
-  async function handleUseApprovedJoin() {
-    if (!joinAttempt?.pairingCode) return;
-
-    await processPairingCode(joinAttempt.pairingCode);
-  }
-
-  function handleApprovedJoin() {
-    void handleUseApprovedJoin();
   }
 
   function handleOpenJoin() {
@@ -1030,15 +1045,6 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
                   {joinAttempt.lastError}
                 </div>
               ) : null}
-              {joinAttempt.state === "approved" && joinAttempt.pairingCode ? (
-                <Button
-                  className="mt-3"
-                  onClick={handleApprovedJoin}
-                  type="primary"
-                >
-                  {t("sync.nearby.joinApproved")}
-                </Button>
-              ) : null}
             </div>
           ) : null}
 
@@ -1080,7 +1086,7 @@ interface NearbyDeviceSettingProps {
   currentSpace: boolean;
   device: NearbySyncDevice;
   disabled: boolean;
-  onRequest: (endpointId: string) => void;
+  onRequest: (device: NearbySyncDevice, currentSpace: boolean) => void;
 }
 
 const NearbyDeviceSetting: FC<NearbyDeviceSettingProps> = (props) => {
@@ -1088,7 +1094,7 @@ const NearbyDeviceSetting: FC<NearbyDeviceSettingProps> = (props) => {
   const { t } = useTranslation("preferences");
 
   function handleRequest() {
-    onRequest(device.endpointId);
+    onRequest(device, currentSpace);
   }
 
   return (

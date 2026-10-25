@@ -6,8 +6,9 @@ use crate::{
     core::Result,
     settings::SettingsStore,
     sync::{
-        CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace, PairingCode,
-        SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus, SyncTarget,
+        CloudDeviceDirectory, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt,
+        NearbySyncSpace, PairingCode, SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus,
+        SyncTarget,
     },
 };
 
@@ -26,6 +27,18 @@ pub async fn list_cloud_records(
         .inner()
         .clone()
         .cloud_records(before_cursor, limit)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_cloud_devices(
+    manager: State<'_, Arc<SyncManager>>,
+) -> Result<CloudDeviceDirectory> {
+    manager
+        .inner()
+        .clone()
+        .cloud_devices()
         .await
         .map_err(Into::into)
 }
@@ -60,26 +73,16 @@ pub async fn inspect_sync_pairing_code(
 
 #[tauri::command]
 pub async fn join_sync_group(
-    app: AppHandle,
     manager: State<'_, Arc<SyncManager>>,
     pairing_code: String,
     replace_existing: bool,
 ) -> Result<SyncStatus> {
     let code = PairingCode::decode(&pairing_code)?;
-    let cloud_enabled = !code.server_endpoint_id.trim().is_empty();
-    manager.join_group(&code, replace_existing).await?;
-    let settings = app.state::<SettingsStore>().update(serde_json::json!({
-        "sync": {
-            "enabled": true,
-            "cloudEnabled": cloud_enabled,
-            "cloudRelayMode": code.cloud_relay_mode,
-            "serverEndpointId": code.server_endpoint_id,
-            "serverDirectAddresses": code.server_direct_addresses,
-            "serverRelayUrls": code.server_relay_urls,
-        }
-    }))?;
-    crate::commands::settings::emit_settings_updated(&app, &settings);
-    manager.wake();
+    manager
+        .inner()
+        .clone()
+        .join_group(&code, replace_existing)
+        .await?;
     Ok(manager.status().await?)
 }
 
@@ -160,11 +163,12 @@ pub async fn discover_nearby_sync_spaces(
 pub async fn request_nearby_sync_join(
     manager: State<'_, Arc<SyncManager>>,
     endpoint_id: String,
+    replace_existing: bool,
 ) -> Result<NearbyJoinAttempt> {
     manager
         .inner()
         .clone()
-        .request_nearby_join(endpoint_id.trim())
+        .request_nearby_join(endpoint_id.trim(), replace_existing)
         .await
         .map_err(Into::into)
 }

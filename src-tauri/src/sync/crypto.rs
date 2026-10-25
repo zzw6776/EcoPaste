@@ -99,6 +99,7 @@ fn encrypt_raw_event(
         nonce: nonce.to_vec(),
         ciphertext,
         kind,
+        blob_ids: Vec::new(),
     })
 }
 

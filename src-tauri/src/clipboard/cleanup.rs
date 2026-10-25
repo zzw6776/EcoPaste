@@ -22,7 +22,7 @@ pub fn spawn(app: AppHandle) {
         };
         let mut settings_changes = store.subscribe_changes();
 
-        run_once(&app).await;
+        run_now(&app).await;
         let mut last_cleanup_at = Instant::now();
 
         loop {
@@ -35,14 +35,14 @@ pub fn spawn(app: AppHandle) {
 
             let remaining = interval.saturating_sub(last_cleanup_at.elapsed());
             if remaining.is_zero() {
-                run_once(&app).await;
+                run_now(&app).await;
                 last_cleanup_at = Instant::now();
                 continue;
             }
 
             tokio::select! {
                 _ = tokio::time::sleep(remaining) => {
-                    run_once(&app).await;
+                    run_now(&app).await;
                     last_cleanup_at = Instant::now();
                 }
                 changed = settings_changes.changed() => {
@@ -55,22 +55,39 @@ pub fn spawn(app: AppHandle) {
     });
 }
 
-async fn run_once(app: &AppHandle) {
+/// Applies the current local retention policy immediately and reports whether database cleanup succeeded.
+pub(crate) async fn run_now(app: &AppHandle) -> bool {
+    let pool = app.state::<crate::db::DatabaseState>().pool().await;
+    match crate::sync::repository::cloud_bootstrap_in_progress(&pool).await {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(err) => {
+            log::warn!("read cloud bootstrap state before history cleanup failed: {err}");
+            return false;
+        }
+    }
+    let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() else {
+        return apply_retention(app).await;
+    };
+    manager.run_local_retention_cleanup(false).await
+}
+
+pub(crate) async fn apply_retention(app: &AppHandle) -> bool {
     let history = match app.try_state::<SettingsStore>() {
         Some(store) => store.snapshot().clipboard.history,
-        None => return,
+        None => return true,
     };
 
     let cutoff = retention_cutoff(&history.retention, Utc::now());
     let max = (history.max_count > 0).then_some(history.max_count);
 
     if cutoff.is_none() && max.is_none() {
-        return;
+        return true;
     }
 
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
     match cleanup_history(&pool, cutoff, max).await {
-        Ok(outcome) if outcome.removed == 0 => {}
+        Ok(outcome) if outcome.removed == 0 => true,
         Ok(outcome) => {
             remove_images(app, &outcome.image_files);
             log::info!("history cleanup removed {} item(s)", outcome.removed);
@@ -80,8 +97,12 @@ async fn run_once(app: &AppHandle) {
             ) {
                 log::warn!("emit cleanup event failed: {err}");
             }
+            true
         }
-        Err(err) => log::warn!("history cleanup failed: {err}"),
+        Err(err) => {
+            log::warn!("history cleanup failed: {err}");
+            false
+        }
     }
 }
 
