@@ -26,8 +26,13 @@ export function buildUpdaterManifest(
   version,
   assets,
   signatures,
-  publishedAt = new Date(),
+  options = {},
 ) {
+  const { publishedAt = new Date(), releaseDownloadBaseUrl } = options;
+  if (!releaseDownloadBaseUrl) {
+    throw new Error("Release download base URL is missing");
+  }
+
   const platforms = {};
 
   for (const bundle of updaterBundles) {
@@ -52,7 +57,7 @@ export function buildUpdaterManifest(
         signature,
         url:
           bundle.signed === false
-            ? (asset.browser_download_url ?? asset.url)
+            ? `${releaseDownloadBaseUrl.replace(/\/$/, "")}/${encodeURIComponent(name)}`
             : asset.url,
         ...(digest ? { sha256: digest.slice("sha256:".length) } : {}),
       };
@@ -83,6 +88,8 @@ async function main() {
     GH_TOKEN: token,
     RELEASE_ID: releaseId,
     RELEASE_VERSION: version,
+    GITHUB_SERVER_URL: serverUrl,
+    TAG_NAME: tagName,
     UPDATER_MANIFEST_PATH: outputPath,
   } = process.env;
   if (
@@ -91,6 +98,8 @@ async function main() {
     !token ||
     !releaseId ||
     !version ||
+    !serverUrl ||
+    !tagName ||
     !outputPath
   ) {
     throw new Error("Updater manifest environment is incomplete");
@@ -124,7 +133,10 @@ async function main() {
     signatures[name] = await response.text();
   }
 
-  const manifest = buildUpdaterManifest(version, assets, signatures);
+  const releaseDownloadBaseUrl = `${serverUrl}/${repository}/releases/download/${encodeURIComponent(tagName)}`;
+  const manifest = buildUpdaterManifest(version, assets, signatures, {
+    releaseDownloadBaseUrl,
+  });
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
