@@ -3,7 +3,7 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-image_name="zzw6776/ecopaste-sync-server:${ECOPASTE_SYNC_IMAGE_TAG:-latest}"
+image_name="ghcr.io/zzw6776/ecopaste-sync-server:${ECOPASTE_SYNC_IMAGE_TAG:-latest}"
 legacy_container_name="ecopaste-sync-persistent"
 data_volume_name="ecopaste-sync-data"
 service_name="ecopaste-sync"
