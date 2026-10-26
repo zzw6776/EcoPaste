@@ -1,6 +1,6 @@
 services:
   ecopaste-sync:
-    image: zzw6776/ecopaste-sync-server:${ECOPASTE_SYNC_IMAGE_TAG:-latest}
+    image: ghcr.io/zzw6776/ecopaste-sync-server:${ECOPASTE_SYNC_IMAGE_TAG:-latest}
     restart: unless-stopped
     ports:
       - "4443:4443/udp"
