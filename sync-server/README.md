@@ -51,13 +51,13 @@ cd sync-server
 docker compose logs -f ecopaste-sync
 ```
 
-`docker-up.sh` 不在本机编译服务，而是从 Docker Hub 拉取 `zzw6776/ecopaste-sync-server:latest`，因此本地不再保留 Rust Buildx 编译缓存。同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；升级该版本并推送到 `master` 时，GitHub Docker Image CI 自动构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。稳定版同时更新版本标签和 `latest`，预发布版只更新版本标签。需要固定版本时可在启动前设置 `ECOPASTE_SYNC_IMAGE_TAG`，例如 `ECOPASTE_SYNC_IMAGE_TAG=0.1.1 ./docker-up.sh`。
+`docker-up.sh` 不在本机编译服务，而是从 GitHub Container Registry 拉取公开镜像 `ghcr.io/zzw6776/ecopaste-sync-server:latest`，因此本地不再保留 Rust Buildx 编译缓存。同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；升级该版本并推送到 `master` 时，GitHub Docker Image CI 自动构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。稳定版同时更新版本标签和 `latest`，预发布版只更新版本标签。需要固定版本时可在启动前设置 `ECOPASTE_SYNC_IMAGE_TAG`，例如 `ECOPASTE_SYNC_IMAGE_TAG=0.1.1 ./docker-up.sh`。
 
 新镜像成功启动后，脚本会删除被替换的旧镜像，并清理该服务遗留的悬空镜像。本机容器的 `/data` 固定挂载外部 Docker volume `ecopaste-sync-data`，停止、重建容器或清理旧镜像都不会删除 Hub 数据和服务端身份；首次运行时脚本会自动创建该卷。如果拉取或启动失败，旧镜像会保留，避免失去回退基础。
 
 Compose 使用 `4443:4443/udp` 发布 Hub 端口。Linux 上客户端可通过宿主机地址访问；macOS 虚拟化 Docker 运行时还需要正确转发 UDP/QUIC，不能只根据容器启动成功判断 `127.0.0.1:4443` 或 Mac 局域网地址已经可达。部署后应分别完成 Mac 和 Android 的 Iroh 握手验证；运行时无法转发 UDP 时启用云端公共 Relay，或把服务原生运行在宿主机。
 
-Docker Hub 发布需要在 GitHub 仓库中配置值为 Docker Hub 用户名的 `DOCKERHUB_USERNAME` Variable，以及 `DOCKERHUB_TOKEN` Secret。Token 应使用 Docker Hub 专门为 CI 创建且具备 Read/Write 权限的 Access Token，不要把密码或 Token 直接写入 workflow。GitHub Actions 使用独立远端缓存，本机无需创建 Buildx builder；也不要为了清理该服务而执行无过滤条件的全局 `docker image prune` 或 `docker builder prune`。
+GHCR 发布使用工作流自带的 `GITHUB_TOKEN` 和仓库 `packages: write` 权限，不需要配置长期仓库密钥。公开镜像可匿名拉取；若将来改为私有镜像，服务器应使用只有 `read:packages` 的拉取令牌。GitHub Actions 使用独立远端缓存，本机无需创建 Buildx builder；也不要为了清理该服务而执行无过滤条件的全局 `docker image prune` 或 `docker builder prune`。
 
 如需完全不依赖公共 Iroh relay，可增加环境变量 `ECOPASTE_NO_RELAY=true`；这时只保留 UDP 直连，公网部署必须保证客户端能够访问服务端 UDP 端口。
 
