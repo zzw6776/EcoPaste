@@ -152,7 +152,7 @@ fn handle_msg(buf: &[u8], service_name: &Name, addr: IpAddr) -> Option<MdnsMsg> 
             continue;
         }
         tracing::trace!("received mDNS additional for {}", name);
-        let ip: IpAddr = match &additional.data {
+        let advertised_ip: IpAddr = match &additional.data {
             RData::A(a) => a.0.into(),
             RData::AAAA(a) => a.0.into(),
             _ => {
@@ -163,11 +163,27 @@ fn handle_msg(buf: &[u8], service_name: &Name, addr: IpAddr) -> Option<MdnsMsg> 
                 continue;
             }
         };
+        // An IPv4 mDNS response can advertise every IPv4 address owned by the sender. Only the
+        // packet source proves which one is reachable through the network where we received it.
+        // Keep cross-family records because the generic crate supports IPv6 services announced
+        // over IPv4; EcoPaste's address filter already limits its own routes to IPv4.
+        let mismatched_ipv4 = matches!(
+            (advertised_ip, addr),
+            (IpAddr::V4(advertised), IpAddr::V4(source)) if advertised != source
+        );
+        if mismatched_ipv4 {
+            tracing::trace!(
+                %advertised_ip,
+                source_ip = %addr,
+                "ignoring mDNS address advertised from another interface"
+            );
+            continue;
+        }
         for (port, peer_id) in peer_ports.get(name).map(|x| &**x).unwrap_or(&[]) {
             peer_addrs
                 .entry(peer_id.clone())
                 .or_default()
-                .push((ip, *port));
+                .push((advertised_ip, *port));
         }
     }
     let mut ret = BTreeMap::new();
@@ -180,8 +196,51 @@ fn handle_msg(buf: &[u8], service_name: &Name, addr: IpAddr) -> Option<MdnsMsg> 
             addrs,
             last_seen,
             txt,
+            source: Some(addr),
         };
         ret.insert(peer_id, peer);
     }
     Some(MdnsMsg::Response(ret))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::{
+        op::{MessageType, OpCode},
+        rr::{Record, rdata},
+    };
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn response_ignores_other_ipv4_addresses_advertised_by_the_sender() {
+        let service_name = Name::from_str("_ecopaste-v1._udp.local.").unwrap();
+        let peer_name = Name::from_str("peer._ecopaste-v1._udp.local.").unwrap();
+        let target = Name::from_str("peer-38466.local.").unwrap();
+        let source_ip: IpAddr = "192.168.50.187".parse().unwrap();
+        let mut packet = Message::new(0, MessageType::Response, OpCode::Query);
+        packet.add_answer(Record::from_rdata(
+            peer_name,
+            0,
+            RData::SRV(rdata::SRV::new(0, 0, 38466, target.clone())),
+        ));
+        packet.add_additional(Record::from_rdata(
+            target.clone(),
+            0,
+            RData::A(rdata::A::from("172.19.0.1".parse::<Ipv4Addr>().unwrap())),
+        ));
+        packet.add_additional(Record::from_rdata(
+            target,
+            0,
+            RData::A(rdata::A::from("192.168.50.187".parse::<Ipv4Addr>().unwrap())),
+        ));
+
+        let Some(MdnsMsg::Response(peers)) =
+            handle_msg(&packet.to_vec().unwrap(), &service_name, source_ip)
+        else {
+            panic!("expected an mDNS response");
+        };
+
+        assert_eq!(peers["peer"].addrs(), &[(source_ip, 38466)]);
+    }
 }
