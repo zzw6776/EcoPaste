@@ -1112,6 +1112,7 @@ mod tests {
                 ciphertext: vec![1],
                 kind: ecopaste_sync_protocol::SyncEventKind::Content,
                 blob_ids: Vec::new(),
+                optional_blob_ids: Vec::new(),
             };
             crate::sync::repository::insert_event(&pool, &event, true, &[])
                 .await

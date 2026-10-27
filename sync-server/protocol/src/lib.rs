@@ -18,7 +18,8 @@ pub const BYTE_LIMITED_SYNC_PROTOCOL_VERSION: u16 = 8;
 pub const TYPED_EVENTS_PROTOCOL_VERSION: u16 = 9;
 pub const CLOUD_DEVICE_DIRECTORY_PROTOCOL_VERSION: u16 = 10;
 pub const BOUNDED_HUB_PROTOCOL_VERSION: u16 = 11;
-pub const PROTOCOL_VERSION: u16 = BOUNDED_HUB_PROTOCOL_VERSION;
+pub const OPTIONAL_BLOB_REFS_PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = OPTIONAL_BLOB_REFS_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -156,6 +157,11 @@ pub struct EncryptedEvent {
     #[n(7)]
     #[cbor(default)]
     pub blob_ids: Vec<String>,
+    /// Upload-time subset of `blob_ids` that may arrive after the event (source icons).
+    /// These references retain the same lifetime as required blobs. Omitted by older clients.
+    #[n(8)]
+    #[cbor(default)]
+    pub optional_blob_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]

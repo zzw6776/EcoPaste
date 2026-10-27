@@ -100,6 +100,7 @@ fn encrypt_raw_event(
         ciphertext,
         kind,
         blob_ids: Vec::new(),
+        optional_blob_ids: Vec::new(),
     })
 }
 

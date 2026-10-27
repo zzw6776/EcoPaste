@@ -2120,6 +2120,7 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSyncEvent> {
             ciphertext: row.try_get("ciphertext")?,
             kind: event_kind_from_row(&row)?,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         },
     })
 }
@@ -3105,6 +3106,7 @@ mod tests {
             ciphertext: vec![2; 32],
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         }
     }
 }

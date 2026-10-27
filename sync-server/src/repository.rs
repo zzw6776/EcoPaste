@@ -389,7 +389,12 @@ impl Repository {
         let mut transaction = self.pool.begin().await.context("begin event transaction")?;
         let referenced_blob_ids = events
             .iter()
-            .flat_map(|event| event.blob_ids.iter())
+            .flat_map(|event| {
+                event
+                    .blob_ids
+                    .iter()
+                    .filter(|blob_id| !event.optional_blob_ids.contains(blob_id))
+            })
             .collect::<HashSet<_>>();
         if !referenced_blob_ids.is_empty() {
             let mut query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM blobs WHERE group_id = ");
@@ -438,6 +443,13 @@ impl Repository {
             }
             for blob_id in &blob_ids {
                 validate_blob_id(blob_id)?;
+            }
+            if event
+                .optional_blob_ids
+                .iter()
+                .any(|blob_id| !blob_ids.contains(blob_id))
+            {
+                bail!("optional blob reference is not listed in event blob references");
             }
             let result = sqlx::query(
                 r#"
@@ -1247,6 +1259,7 @@ fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
             ciphertext: row.try_get("ciphertext")?,
             kind: event_kind_from_row(&row)?,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         },
     })
 }
@@ -1282,6 +1295,7 @@ mod tests {
             ciphertext: vec![1],
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         };
         repository
             .insert_events("group_123", &[event], None)
@@ -1356,6 +1370,7 @@ mod tests {
                 ciphertext: vec![sequence as u8],
                 kind: SyncEventKind::Content,
                 blob_ids: Vec::new(),
+                optional_blob_ids: Vec::new(),
             })
             .collect::<Vec<_>>();
         repository
@@ -1374,6 +1389,7 @@ mod tests {
                     ciphertext: vec![4],
                     kind: SyncEventKind::ItemState,
                     blob_ids: Vec::new(),
+                    optional_blob_ids: Vec::new(),
                 }],
                 None,
             )
@@ -1675,7 +1691,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_with_missing_blob_reference_is_rejected() {
+    async fn optional_blob_can_arrive_later_and_is_retained_until_its_event_is_pruned() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let blob_id = "d".repeat(64);
+        let mut event = test_event(1);
+        event.blob_ids.push(blob_id.clone());
+        event.optional_blob_ids.push(blob_id.clone());
+
+        repository
+            .insert_events("group_123", &[event], None)
+            .await
+            .unwrap();
+        let mut policy = CleanupPolicy {
+            retention_cutoff_ms: None,
+            legacy_blob_cutoff_ms: None,
+            max_events: None,
+            target_bytes: None,
+            orphan_cutoff_ms: i64::MAX,
+            batch_size: 10,
+        };
+        let result = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(result.deleted_events, 0);
+        assert!(result.deleted_blob_ids.is_empty());
+        assert_eq!(
+            repository
+                .group_usage("group_123")
+                .await
+                .unwrap()
+                .blob_count,
+            0
+        );
+
+        repository
+            .record_blob("group_123", &blob_id, 128, true)
+            .await
+            .unwrap();
+        let result = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert!(result.deleted_blob_ids.is_empty());
+        let events = repository.list_events("group_123", 0, 10).await.unwrap();
+        assert_eq!(events[0].event.blob_ids, vec![blob_id.clone()]);
+
+        policy.max_events = Some(0);
+        let result = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(result.deleted_events, 1);
+        assert_eq!(result.deleted_blob_ids, vec![blob_id]);
+        let usage = repository.group_usage("group_123").await.unwrap();
+        assert_eq!(usage.blob_count, 0);
+        assert_eq!(usage.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn optional_blob_must_be_listed_in_the_event_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let mut event = test_event(1);
+        event.optional_blob_ids.push("d".repeat(64));
+
+        assert!(
+            repository
+                .insert_events("group_123", &[event], None)
+                .await
+                .is_err()
+        );
+        assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn optional_blob_does_not_bypass_another_events_required_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let blob_id = "d".repeat(64);
+        let mut optional = test_event(1);
+        optional.blob_ids.push(blob_id.clone());
+        optional.optional_blob_ids.push(blob_id.clone());
+        let mut required = test_event(2);
+        required.blob_ids.push(blob_id);
+
+        assert!(
+            repository
+                .insert_events("group_123", &[optional, required], None)
+                .await
+                .is_err()
+        );
+        assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn required_blob_reference_is_rejected_until_the_blob_is_uploaded() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
@@ -1689,11 +1810,22 @@ mod tests {
 
         assert!(
             repository
-                .insert_events("group_123", &[event], None)
+                .insert_events("group_123", std::slice::from_ref(&event), None)
                 .await
                 .is_err()
         );
         assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
+
+        repository
+            .record_blob("group_123", &event.blob_ids[0], 128, true)
+            .await
+            .unwrap();
+        let accepted = repository
+            .insert_events("group_123", &[event], None)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(repository.event_count("group_123").await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1733,6 +1865,7 @@ mod tests {
             ciphertext: vec![sequence as u8; 16],
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         }
     }
 }
