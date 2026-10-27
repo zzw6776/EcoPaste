@@ -101,6 +101,7 @@ fn event(index: u64, size: usize) -> EncryptedEvent {
         ciphertext: vec![255; size],
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
+        optional_blob_ids: Vec::new(),
     }
 }
 
@@ -227,17 +228,30 @@ fn legacy_event_without_kind_decodes_as_content() {
 
     assert_eq!(decoded.kind, SyncEventKind::Content);
     assert!(decoded.blob_ids.is_empty());
+    assert!(decoded.optional_blob_ids.is_empty());
 }
 
 #[test]
 fn legacy_event_decoder_ignores_blob_references() {
     let mut current = event(1, 32);
     current.blob_ids = vec!["a".repeat(64)];
+    current.optional_blob_ids = current.blob_ids.clone();
 
     let decoded: LegacyEncryptedEvent =
         minicbor::decode(&minicbor::to_vec(current).unwrap()).unwrap();
 
     assert_eq!(decoded.event_id, "event-1");
+}
+
+#[test]
+fn optional_blob_references_round_trip() {
+    let mut current = event(1, 32);
+    current.blob_ids = vec!["a".repeat(64), "b".repeat(64)];
+    current.optional_blob_ids = vec!["b".repeat(64)];
+
+    let decoded: EncryptedEvent = minicbor::decode(&minicbor::to_vec(&current).unwrap()).unwrap();
+
+    assert_eq!(decoded, current);
 }
 
 #[test]

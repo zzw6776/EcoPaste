@@ -101,6 +101,8 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     assert_eq!(code, ErrorCode::InvalidRequest);
     assert!(message.contains("版本过低"));
 
+    let source_icon = b"encrypted-source-icon";
+    let source_icon_id = blake3::hash(source_icon).to_hex().to_string();
     let event = EncryptedEvent {
         event_id: "event_123456".into(),
         origin_device_id: "device_123456".into(),
@@ -109,7 +111,8 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         nonce: vec![1; 24],
         ciphertext: vec![2; 128],
         kind: SyncEventKind::Content,
-        blob_ids: Vec::new(),
+        blob_ids: vec![source_icon_id.clone()],
+        optional_blob_ids: vec![source_icon_id.clone()],
     };
     let first = sync_request(
         &group_id,
@@ -167,6 +170,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         ciphertext: vec![4; 128],
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
+        optional_blob_ids: Vec::new(),
     };
     let removed_device = RemovedDevice {
         device_id: "device_removed".into(),
@@ -235,7 +239,9 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         anyhow::bail!("expected second sync response");
     };
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event, event);
+    let mut expected_event = event;
+    expected_event.optional_blob_ids.clear();
+    assert_eq!(events[0].event, expected_event);
     assert_eq!(events[1].event, next_event);
     assert_eq!(peers[0].device_id, "device_123456");
 
@@ -323,8 +329,6 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let hub_status = hub_status.context("expected bounded Hub status")?;
     assert_eq!(hub_status.event_count, 2);
     assert_eq!(hub_status.max_bytes, 10 * 1024 * 1024);
-    let source_icon = b"encrypted-source-icon";
-    let source_icon_id = blake3::hash(source_icon).to_hex().to_string();
     upload_source_icon(
         &connection,
         &group_id,
@@ -333,6 +337,10 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         source_icon,
     )
     .await?;
+    assert_eq!(
+        download_blob(&connection, &group_id, &access_token, &source_icon_id).await?,
+        source_icon
+    );
     assert!(matches!(
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -369,6 +377,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         ciphertext: vec![6; 128],
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
+        optional_blob_ids: Vec::new(),
     };
     let remove_self = Request::SyncV2 {
         group_id: group_id.clone(),
@@ -488,7 +497,7 @@ async fn upload_source_icon(
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
-        &Request::PutSourceIcon {
+        &Request::PutManagedSourceIcon {
             group_id: group_id.into(),
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),

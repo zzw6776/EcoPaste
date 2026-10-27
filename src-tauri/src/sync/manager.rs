@@ -20,8 +20,9 @@ use ecopaste_sync_protocol::{
     limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
     DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
     Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
-    BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
+    BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES,
+    OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
+    SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -3216,6 +3217,17 @@ impl SyncManager {
             .is_some_and(|session| session.protocol_version >= BOUNDED_HUB_PROTOCOL_VERSION)
     }
 
+    fn cloud_optional_blob_refs_supported(&self, connection: &Connection, group_id: &str) -> bool {
+        self.cloud_session
+            .read()
+            .expect("cloud session state poisoned")
+            .as_ref()
+            .filter(|session| {
+                session.connection_id == connection.stable_id() && session.group_id == group_id
+            })
+            .is_some_and(|session| session.protocol_version >= OPTIONAL_BLOB_REFS_PROTOCOL_VERSION)
+    }
+
     async fn prepare_cloud_cursor(
         &self,
         connection: &Connection,
@@ -3288,8 +3300,12 @@ impl SyncManager {
         let pool = self.pool().await;
         let identity = self.identity.snapshot();
         let use_sync_v2 = is_cloud && self.cloud_sync_v2_supported(connection, &group.group_id);
-        let publish_source_icons_after_event =
-            is_cloud && self.cloud_async_source_icons_supported(connection, &group.group_id);
+        let managed_hub_blobs = is_cloud && self.bounded_hub_supported(connection, &group.group_id);
+        let optional_blob_refs =
+            is_cloud && self.cloud_optional_blob_refs_supported(connection, &group.group_id);
+        let publish_source_icons_after_event = is_cloud
+            && self.cloud_async_source_icons_supported(connection, &group.group_id)
+            && (!managed_hub_blobs || optional_blob_refs);
         let removed_devices = if use_sync_v2 {
             repository::removed_devices(&pool).await?
         } else {
@@ -3313,10 +3329,11 @@ impl SyncManager {
                 repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
                     .await?
             };
-            let managed_hub_blobs =
-                is_cloud && self.bounded_hub_supported(connection, &group.group_id);
             if managed_hub_blobs {
                 repository::attach_event_blob_ids(&pool, &mut pending).await?;
+                if optional_blob_refs {
+                    mark_optional_source_icon_refs(&mut pending, &group.content_key_bytes()?);
+                }
             }
             let available_count = pending.len();
             let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
@@ -3391,7 +3408,8 @@ impl SyncManager {
                 split_source_icon_blobs(blobs, &source_icon_blob_ids);
             let required_blob_count = required_blobs.len();
             let source_icon_blob_count = source_icon_blobs.len();
-            let (source_icon_blobs, source_icon_cache_hits) = if is_cloud {
+            // A bounded Hub can reclaim an icon while this QUIC connection is still alive.
+            let (source_icon_blobs, source_icon_cache_hits) = if is_cloud && !managed_hub_blobs {
                 self.confirmed_cloud_source_icons
                     .write()
                     .expect("confirmed cloud source icons poisoned")
@@ -3444,6 +3462,17 @@ impl SyncManager {
                             );
                     }
                     Ok(()) => {}
+                    Err(error) if managed_hub_blobs => {
+                        repository::mark_delivery_error(
+                            &pool,
+                            target_id,
+                            &event_ids,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        self.emit_updated();
+                        return Err(error);
+                    }
                     Err(error) => log::warn!("publish optional source app icons failed: {error}"),
                 }
                 source_icon_elapsed = source_icon_started_at.elapsed();
@@ -7485,6 +7514,26 @@ fn source_icon_blob_ids(events: &[StoredSyncEvent], key: &[u8; 32]) -> HashSet<S
         .collect()
 }
 
+/// Marks only source icons as deferrable; content manifests always require stored blobs.
+fn mark_optional_source_icon_refs(events: &mut [StoredSyncEvent], key: &[u8; 32]) {
+    for stored in events {
+        let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
+            continue;
+        };
+        let Some(icon) = envelope.source_app.as_ref().and_then(valid_source_icon) else {
+            continue;
+        };
+        if stored.event.blob_ids.contains(&icon.blob_id)
+            && !envelope
+                .blobs
+                .iter()
+                .any(|blob| blob.blob_id == icon.blob_id)
+        {
+            stored.event.optional_blob_ids.push(icon.blob_id);
+        }
+    }
+}
+
 /// Uploads independent encrypted blobs over a small number of parallel QUIC streams.
 async fn upload_blobs(
     connection: &Connection,
@@ -8360,6 +8409,113 @@ mod tests {
     }
 
     #[test]
+    fn only_source_icons_are_marked_optional_on_existing_encrypted_events() {
+        let key = [7; 32];
+        let content_id = "a".repeat(64);
+        let icon_id = "b".repeat(64);
+        let mut envelope = ClipboardEnvelope {
+            version: 1,
+            item: SyncedClipboardItem {
+                kind: "image".into(),
+                sub_kind: None,
+                content: String::new(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: Some(128),
+                width: Some(1),
+                height: Some(1),
+                is_sensitive: false,
+                source_platform: "windows".into(),
+                created_at_ms: 100,
+                sync_key: "c".repeat(64),
+                updated_at_ms: Some(100),
+                source_revision: Some("revision".into()),
+            },
+            blobs: vec![BlobManifest {
+                blob_id: content_id.clone(),
+                name: "image.png".into(),
+                original_size: 128,
+                encrypted_size: 192,
+                role: BlobRole::Image,
+                file_index: None,
+                is_directory_archive: false,
+            }],
+            source_app: Some(SourceAppRef {
+                version: 1,
+                source_key: "d".repeat(64),
+                platform: "windows".into(),
+                display_name: "Example".into(),
+                icon: Some(SourceIconRef {
+                    icon_hash: "e".repeat(64),
+                    blob_id: icon_id.clone(),
+                    original_size: 128,
+                    encrypted_size: 192,
+                }),
+                accent_start: None,
+                accent_end: None,
+            }),
+        };
+        let mut manifest = envelope.blobs[0].clone();
+        for (index, kind) in ["text", "image", "files"].into_iter().enumerate() {
+            envelope.item.kind = kind.into();
+            manifest.role = if kind == "files" {
+                BlobRole::File
+            } else {
+                BlobRole::Image
+            };
+            manifest.file_index = (kind == "files").then_some(0);
+            envelope.blobs = if kind == "text" {
+                Vec::new()
+            } else {
+                vec![manifest.clone()]
+            };
+            let expected_blob_ids = envelope
+                .blobs
+                .iter()
+                .map(|blob| blob.blob_id.clone())
+                .chain(std::iter::once(icon_id.clone()))
+                .collect::<Vec<_>>();
+            let mut event = crypto::encrypt_event(
+                &key,
+                "event".into(),
+                "device".into(),
+                index as u64 + 1,
+                100,
+                &envelope,
+            )
+            .unwrap();
+            event.blob_ids = expected_blob_ids.clone();
+            let ciphertext = event.ciphertext.clone();
+            let mut pending = vec![StoredSyncEvent { cursor: 1, event }];
+
+            mark_optional_source_icon_refs(&mut pending, &key);
+
+            assert_eq!(pending[0].event.optional_blob_ids, vec![icon_id.clone()]);
+            assert_eq!(pending[0].event.blob_ids, expected_blob_ids);
+            assert_eq!(pending[0].event.ciphertext, ciphertext);
+        }
+
+        envelope
+            .source_app
+            .as_mut()
+            .unwrap()
+            .icon
+            .as_mut()
+            .unwrap()
+            .blob_id = content_id.clone();
+        let mut event =
+            crypto::encrypt_event(&key, "event".into(), "device".into(), 4, 100, &envelope)
+                .unwrap();
+        event.blob_ids = vec![content_id];
+        let mut pending = vec![StoredSyncEvent { cursor: 1, event }];
+
+        mark_optional_source_icon_refs(&mut pending, &key);
+
+        assert!(pending[0].event.optional_blob_ids.is_empty());
+    }
+
+    #[test]
     fn source_icon_confirmation_cache_is_scoped_to_cloud_connection_and_group() {
         let source_icon = StoredBlob {
             blob_id: "source-icon".into(),
@@ -8395,6 +8551,7 @@ mod tests {
             ciphertext: vec![1],
             kind: ecopaste_sync_protocol::SyncEventKind::Content,
             blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
         };
         let envelope = ClipboardEnvelope {
             version: 1,

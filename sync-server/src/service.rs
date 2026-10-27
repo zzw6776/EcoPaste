@@ -1509,6 +1509,7 @@ mod tests {
                     ciphertext: vec![2; 16],
                     kind: SyncEventKind::Content,
                     blob_ids: Vec::new(),
+                    optional_blob_ids: Vec::new(),
                 }],
                 None,
             )
@@ -1568,6 +1569,7 @@ mod tests {
                     ciphertext: vec![2; 16],
                     kind: SyncEventKind::Content,
                     blob_ids: vec![blob_id],
+                    optional_blob_ids: Vec::new(),
                 }],
                 None,
             )
