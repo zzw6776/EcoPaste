@@ -113,6 +113,7 @@ pub struct Peer {
     addrs: Vec<(IpAddr, u16)>,
     last_seen: Instant,
     txt: TxtData,
+    source: Option<IpAddr>,
 }
 
 impl Peer {
@@ -124,6 +125,7 @@ impl Peer {
             addrs: Default::default(),
             last_seen: Instant::now(),
             txt: Default::default(),
+            source: None,
         }
     }
 
