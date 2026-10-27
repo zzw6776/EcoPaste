@@ -1728,7 +1728,7 @@ impl SyncManager {
         let request = Request::ListDevices {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
-            device: self.device_announcement(&endpoint),
+            device: self.cloud_device_announcement(&endpoint),
         };
         let (_, response) = self
             .request_cloud_query(connection, group, &request)
@@ -3326,7 +3326,7 @@ impl SyncManager {
                 Request::SyncV2 {
                     group_id: group.group_id.clone(),
                     access_token: group.access_token_bytes()?,
-                    device: self.device_announcement(endpoint),
+                    device: self.cloud_device_announcement(endpoint),
                     after_cursor: cursor,
                     events: outgoing_events,
                     removed_devices: removed_devices.clone(),
@@ -3339,7 +3339,11 @@ impl SyncManager {
                 Request::Sync {
                     group_id: group.group_id.clone(),
                     access_token: group.access_token_bytes()?,
-                    device: self.device_announcement(endpoint),
+                    device: if is_cloud {
+                        self.cloud_device_announcement(endpoint)
+                    } else {
+                        self.device_announcement(endpoint)
+                    },
                     after_cursor: cursor,
                     events: outgoing_events,
                     limit: MAX_EVENTS_PER_BATCH,
@@ -3537,7 +3541,11 @@ impl SyncManager {
             repository::mark_delivered(&pool, target_id, &event_ids).await?;
             for peer in response.peers {
                 if peer.device_id != identity.device_id {
-                    repository::upsert_peer(&pool, &peer).await?;
+                    if is_cloud {
+                        repository::upsert_cloud_peer_identity(&pool, &peer).await?;
+                    } else {
+                        repository::upsert_peer(&pool, &peer).await?;
+                    }
                 }
             }
             let apply_started_at = Instant::now();
@@ -4614,6 +4622,14 @@ impl SyncManager {
             relay_urls: Vec::new(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
+    }
+
+    /// Announces cloud membership without exporting volatile LAN transport routes.
+    fn cloud_device_announcement(&self, endpoint: &Endpoint) -> DeviceAnnouncement {
+        let mut device = self.device_announcement(endpoint);
+        device.direct_addresses.clear();
+        device.relay_urls.clear();
+        device
     }
 
     fn update_discovery_metadata(&self, endpoint: &Endpoint, lan_enabled: bool) -> Result<()> {

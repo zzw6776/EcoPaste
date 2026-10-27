@@ -37,6 +37,7 @@ import {
 import Modal from "@/components/Modal";
 import { TAURI_EVENT } from "@/constants/events";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
+import CloudDevicesDrawer from "@/pages/Clipboard/components/CloudDevicesDrawer";
 import CloudRecordsDrawer from "@/pages/Clipboard/components/CloudRecordsDrawer";
 import { updateSettings } from "@/stores/settings";
 import type { CloudRelayMode } from "@/types/settings";
@@ -68,6 +69,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   const [cloudRelayUrls, setCloudRelayUrls] = useState("");
   const [cloudRelayMode, setCloudRelayMode] = useState<CloudRelayMode>("off");
   const [cloudRelayToken, setCloudRelayToken] = useState("");
+  const [devicesOpen, setDevicesOpen] = useState(false);
   const [recordsOpen, setRecordsOpen] = useState(false);
   const [nearbySpaces, setNearbySpaces] = useState<NearbySyncSpace[]>([]);
   const [nearbyLoading, setNearbyLoading] = useState(false);
@@ -402,6 +404,14 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
     setRecordsOpen(false);
   }
 
+  function handleOpenDevices() {
+    setDevicesOpen(true);
+  }
+
+  function handleCloseDevices() {
+    setDevicesOpen(false);
+  }
+
   function handleCloudConfigToggle() {
     setCloudConfigOpen((open) => {
       return !open;
@@ -699,6 +709,16 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
                 size="small"
               >
                 {t("sync.actions.reconnectCloud")}
+              </Button>
+              <Button
+                disabled={
+                  disabled || busy || !status.paired || !status.cloudEndpointId
+                }
+                icon={<i className="i-lucide:monitor-smartphone size-4" />}
+                onClick={handleOpenDevices}
+                size="small"
+              >
+                {t("sync.cloud.devices")}
               </Button>
               <Button
                 disabled={
@@ -1075,6 +1095,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
           )}
         </div>
       </Modal>
+      <CloudDevicesDrawer onClose={handleCloseDevices} open={devicesOpen} />
       <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
     </div>
   );
