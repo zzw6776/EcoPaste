@@ -131,7 +131,7 @@ impl Repository {
         Ok(())
     }
 
-    /// Updates the peer route cache advertised to the rest of the group.
+    /// Updates cloud-visible device identity without retaining LAN transport routes.
     pub async fn upsert_device(&self, group_id: &str, device: &DeviceAnnouncement) -> Result<()> {
         validate_identifier("device_id", &device.device_id)?;
         validate_identifier("endpoint_id", &device.endpoint_id)?;
@@ -150,8 +150,6 @@ impl Repository {
         if device.direct_addresses.len() > 16 || device.relay_urls.len() > 8 {
             bail!("too many device addresses");
         }
-        let direct_addresses = encode_lines(&device.direct_addresses)?;
-        let relay_urls = encode_lines(&device.relay_urls)?;
         sqlx::query(
             r#"
             INSERT INTO devices (
@@ -173,8 +171,8 @@ impl Repository {
         .bind(&device.device_name)
         .bind(&device.platform)
         .bind(&device.endpoint_id)
-        .bind(direct_addresses)
-        .bind(relay_urls)
+        .bind(Vec::<u8>::new())
+        .bind(Vec::<u8>::new())
         .bind(&device.app_version)
         .bind(now_ms())
         .execute(&self.pool)
@@ -656,7 +654,7 @@ impl Repository {
         u64::try_from(count).context("negative event count")
     }
 
-    /// Returns recently seen peers. Stale entries remain useful as an offline LAN route cache.
+    /// Returns recently seen group members without exposing LAN transport routes.
     pub async fn list_peers(
         &self,
         group_id: &str,
@@ -664,8 +662,7 @@ impl Repository {
     ) -> Result<Vec<PeerAnnouncement>> {
         let rows = sqlx::query(
             r#"
-            SELECT device_id, device_name, platform, endpoint_id,
-                   direct_addresses, relay_urls, last_seen_ms
+            SELECT device_id, device_name, platform, endpoint_id, last_seen_ms
             FROM devices
             WHERE group_id = ? AND device_id != ?
             ORDER BY last_seen_ms DESC
@@ -680,15 +677,13 @@ impl Repository {
 
         rows.into_iter()
             .map(|row| {
-                let direct: Vec<u8> = row.try_get("direct_addresses")?;
-                let relays: Vec<u8> = row.try_get("relay_urls")?;
                 Ok(PeerAnnouncement {
                     device_id: row.try_get("device_id")?,
                     device_name: row.try_get("device_name")?,
                     platform: row.try_get("platform")?,
                     endpoint_id: row.try_get("endpoint_id")?,
-                    direct_addresses: decode_lines(&direct)?,
-                    relay_urls: decode_lines(&relays)?,
+                    direct_addresses: Vec::new(),
+                    relay_urls: Vec::new(),
                     last_seen_ms: row.try_get("last_seen_ms")?,
                 })
             })
@@ -1229,21 +1224,6 @@ fn validate_access_token(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn encode_lines(values: &[String]) -> Result<Vec<u8>> {
-    if values.iter().any(|value| value.contains(['\n', '\r'])) {
-        bail!("invalid address");
-    }
-    Ok(values.join("\n").into_bytes())
-}
-
-fn decode_lines(value: &[u8]) -> Result<Vec<String>> {
-    let value = std::str::from_utf8(value).context("invalid address encoding")?;
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(value.lines().map(str::to_owned).collect())
-}
-
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1503,6 +1483,49 @@ mod tests {
             repository.latest_removed_at_ms("group_123").await.unwrap(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn device_directory_does_not_store_or_return_lan_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        repository
+            .upsert_device(
+                "group_123",
+                &DeviceAnnouncement {
+                    device_id: "device_123".into(),
+                    device_name: "Android".into(),
+                    platform: "android".into(),
+                    endpoint_id: "endpoint_123".into(),
+                    direct_addresses: vec!["172.19.0.1:35555".into()],
+                    relay_urls: vec!["https://relay.example".into()],
+                    app_version: "1.1.160".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let stored_lengths: (i64, i64) = sqlx::query_as(
+            "SELECT length(direct_addresses), length(relay_urls) FROM devices WHERE group_id = 'group_123' AND device_id = 'device_123'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_lengths, (0, 0));
+
+        let peer = repository
+            .list_peers("group_123", "another_device")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(peer.direct_addresses.is_empty());
+        assert!(peer.relay_urls.is_empty());
     }
 
     #[tokio::test]

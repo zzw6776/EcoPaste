@@ -787,6 +787,7 @@
     "cloud": {
       "activeRoute": "Last successful route ({{transport}}): {{address}}",
       "description": "The Hub stores end-to-end encrypted data only; authentication and decryption stay on this device.",
+      "devices": "View cloud devices",
       "directAddresses": "Hub direct addresses",
       "disabledHint": "Enable the Hub to use cloud sync automatically when LAN is unavailable.",
       "domainHint": "Direct routes accept IP:port or domain:port and resolve domains again on every reconnect.",

@@ -1092,6 +1092,92 @@ pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<(
     upsert_peer_on(&mut connection, peer).await
 }
 
+/// Updates cloud-visible peer identity without importing Hub-cached network routes.
+pub async fn upsert_cloud_peer_identity(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin cloud sync peer identity transaction")?;
+    let previous_endpoint: Option<String> =
+        sqlx::query_scalar("SELECT endpoint_id FROM sync_peers WHERE device_id = ?")
+            .bind(&peer.device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .context("read existing cloud sync peer identity")?;
+    let endpoint_changed = previous_endpoint
+        .as_deref()
+        .is_some_and(|endpoint_id| endpoint_id != peer.endpoint_id);
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_peers (
+            device_id, device_name, platform, endpoint_id, direct_addresses,
+            relay_urls, pull_cursor, last_seen_ms, created_at, updated_at
+        )
+        SELECT ?, ?, ?, ?, '[]', '[]', 0, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sync_removed_peers
+            WHERE (device_id = ? OR endpoint_id = ?)
+              AND (restored_at_ms IS NULL OR removed_at_ms > restored_at_ms)
+        )
+        ON CONFLICT(device_id) DO UPDATE SET
+            device_name = excluded.device_name,
+            platform = excluded.platform,
+            endpoint_id = excluded.endpoint_id,
+            direct_addresses = CASE
+                WHEN sync_peers.endpoint_id = excluded.endpoint_id
+                THEN sync_peers.direct_addresses
+                ELSE excluded.direct_addresses
+            END,
+            relay_urls = CASE
+                WHEN sync_peers.endpoint_id = excluded.endpoint_id
+                THEN sync_peers.relay_urls
+                ELSE excluded.relay_urls
+            END,
+            last_seen_ms = CASE
+                WHEN sync_peers.endpoint_id = excluded.endpoint_id
+                THEN sync_peers.last_seen_ms
+                ELSE excluded.last_seen_ms
+            END,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&peer.device_id)
+    .bind(&peer.device_name)
+    .bind(&peer.platform)
+    .bind(&peer.endpoint_id)
+    .bind(peer.last_seen_ms)
+    .bind(now)
+    .bind(now)
+    .bind(&peer.device_id)
+    .bind(&peer.endpoint_id)
+    .execute(&mut *transaction)
+    .await
+    .context("upsert cloud sync peer identity")?;
+
+    if endpoint_changed {
+        sqlx::query(
+            r#"
+            UPDATE sync_peer_connections
+            SET state = 'offline', connected_address = NULL, transport = NULL,
+                last_error = NULL, updated_at = ?
+            WHERE device_id = ?
+            "#,
+        )
+        .bind(now)
+        .bind(&peer.device_id)
+        .execute(&mut *transaction)
+        .await
+        .context("invalidate routes for changed cloud peer identity")?;
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("commit cloud sync peer identity")?;
+    Ok(())
+}
+
 async fn upsert_peer_on(connection: &mut SqliteConnection, peer: &PeerAnnouncement) -> Result<()> {
     let now = Utc::now();
     let direct_addresses = lan_direct_addresses(&peer.direct_addresses);
@@ -2752,6 +2838,77 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(delivery_count, 2);
+    }
+
+    #[tokio::test]
+    async fn cloud_peer_identity_preserves_current_lan_routes() {
+        let pool = memory_pool().await;
+        upsert_peer(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "android".into(),
+                device_name: "Old name".into(),
+                platform: "android".into(),
+                endpoint_id: "endpoint-1".into(),
+                direct_addresses: vec!["192.168.1.2:35555".into()],
+                relay_urls: Vec::new(),
+                last_seen_ms: 100,
+            },
+        )
+        .await
+        .unwrap();
+        mark_peer_online(&pool, "android", Some("192.168.1.2:35555"), Some("direct"))
+            .await
+            .unwrap();
+
+        upsert_cloud_peer_identity(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "android".into(),
+                device_name: "New name".into(),
+                platform: "android".into(),
+                endpoint_id: "endpoint-1".into(),
+                direct_addresses: vec!["172.19.0.1:35555".into()],
+                relay_urls: vec!["https://relay.example".into()],
+                last_seen_ms: 200,
+            },
+        )
+        .await
+        .unwrap();
+
+        let peer = list_peers(&pool).await.unwrap().remove(0).announcement;
+        assert_eq!(peer.device_name, "New name");
+        assert_eq!(peer.direct_addresses, ["192.168.1.2:35555"]);
+        assert!(peer.relay_urls.is_empty());
+        assert_eq!(peer.last_seen_ms, 100);
+        assert_eq!(
+            preferred_peer_address(&pool, "android").await.unwrap(),
+            Some("192.168.1.2:35555".into())
+        );
+
+        upsert_cloud_peer_identity(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "android".into(),
+                device_name: "New identity".into(),
+                platform: "android".into(),
+                endpoint_id: "endpoint-2".into(),
+                direct_addresses: vec!["10.45.180.213:35555".into()],
+                relay_urls: Vec::new(),
+                last_seen_ms: 300,
+            },
+        )
+        .await
+        .unwrap();
+
+        let peer = list_peers(&pool).await.unwrap().remove(0).announcement;
+        assert_eq!(peer.endpoint_id, "endpoint-2");
+        assert!(peer.direct_addresses.is_empty());
+        assert_eq!(peer.last_seen_ms, 300);
+        assert_eq!(
+            preferred_peer_address(&pool, "android").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
