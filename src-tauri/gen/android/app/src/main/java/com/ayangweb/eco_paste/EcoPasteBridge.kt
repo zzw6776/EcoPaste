@@ -37,6 +37,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.lang.ref.WeakReference
 import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -73,7 +74,11 @@ object EcoPasteBridge {
     private var pendingDefaultNetworkNotification: PendingNetworkNotification? = null
     private var lanNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var lanNetwork: Network? = null
-    private var lanNetworkFingerprint: String? = null
+    private var wifiLanFingerprint: String? = null
+    private var wifiLanAddresses = emptySet<String>()
+    private var tetheredInterfaceNames: Set<String>? = null
+    private var tetheringEventCallback: Any? = null
+    private var publishedLanFingerprint: String? = null
     private var pendingLanNetworkNotification: PendingNetworkNotification? = null
     private var rootClipboardMonitor: RootClipboardMonitor? = null
     private var foregroundCaptureActive = false
@@ -376,6 +381,7 @@ object EcoPasteBridge {
         }
         refreshClipboardListener()
         registerSyncNetworkCallbacks(context.applicationContext)
+        refreshLanInterfaceNotification("initialize")
         replayPendingSyncNetworkNotifications()
     }
 
@@ -396,6 +402,12 @@ object EcoPasteBridge {
         }
         if (lanNetworkCallback == null) {
             registerLanNetworkCallback(connectivityManager)
+        }
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA &&
+            tetheringEventCallback == null
+        ) {
+            registerTetheringEventCallback(context)
         }
     }
 
@@ -485,11 +497,9 @@ object EcoPasteBridge {
                 synchronized(this@EcoPasteBridge) {
                     if (lanNetwork != network) return
                     lanNetwork = null
-                    lanNetworkFingerprint = null
-                    queueLanNetworkNotification(
-                        PendingNetworkNotification(NetworkNotificationKind.LOST),
-                        "lost:$network",
-                    )
+                    wifiLanFingerprint = null
+                    wifiLanAddresses = emptySet()
+                    publishLanInterfaceNotification("wifi-lost:$network")
                 }
             }
         }
@@ -501,6 +511,20 @@ object EcoPasteBridge {
             lanNetworkCallback = callback
         } catch (error: RuntimeException) {
             Log.w(TAG, "register LAN sync network callback failed: ${error.message}")
+        }
+    }
+
+    /** Tracks hotspot interfaces that Android does not expose as Wi-Fi Network objects. */
+    private fun registerTetheringEventCallback(context: Context) {
+        try {
+            tetheringEventCallback = TetheringMonitorApi36.register(context) { interfaceNames ->
+                synchronized(this@EcoPasteBridge) {
+                    tetheredInterfaceNames = interfaceNames
+                    publishLanInterfaceNotification("tethering-changed")
+                }
+            }
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "register tethering callback failed: ${error.message}")
         }
     }
 
@@ -554,9 +578,54 @@ object EcoPasteBridge {
             currentProperties.interfaceName.orEmpty(),
             multicastInterfaces.joinToString(","),
         ).joinToString(":")
-        if (lanNetwork != network || lanNetworkFingerprint == fingerprint) return
-        lanNetworkFingerprint = fingerprint
-        Log.i(TAG, "LAN sync network changed ($reason): $fingerprint")
+        if (lanNetwork != network) return
+        if (wifiLanFingerprint != fingerprint) {
+            wifiLanFingerprint = fingerprint
+            wifiLanAddresses = multicastInterfaces.toSet()
+        }
+        publishLanInterfaceNotification("wifi-$reason")
+    }
+
+    /** Publishes the union of client Wi-Fi and hotspot interfaces without background polling. */
+    @Synchronized
+    private fun refreshLanInterfaceNotification(reason: String) {
+        val connectivityManager = applicationContext
+            ?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val network = lanNetwork
+        if (connectivityManager != null && network != null) {
+            val properties = connectivityManager.getLinkProperties(network)
+            if (properties != null) {
+                notifyLanNetworkChanged(connectivityManager, network, reason, properties)
+                return
+            }
+        }
+        publishLanInterfaceNotification(reason)
+    }
+
+    /** Sends only meaningful interface-set changes to the Rust synchronization runtime. */
+    @Synchronized
+    private fun publishLanInterfaceNotification(reason: String) {
+        val hotspotAddresses = collectHotspotInterfaceAddresses(tetheredInterfaceNames)
+        val multicastInterfaces = (wifiLanAddresses + hotspotAddresses).sorted()
+        if (multicastInterfaces.isEmpty()) {
+            if (publishedLanFingerprint == null) return
+            publishedLanFingerprint = null
+            Log.i(TAG, "LAN sync network lost ($reason)")
+            queueLanNetworkNotification(
+                PendingNetworkNotification(NetworkNotificationKind.LOST),
+                reason,
+            )
+            return
+        }
+
+        val fingerprint = listOf(
+            wifiLanFingerprint.orEmpty(),
+            tetheredInterfaceNames.orEmpty().sorted().joinToString(","),
+            multicastInterfaces.joinToString(","),
+        ).joinToString(":")
+        if (publishedLanFingerprint == fingerprint) return
+        publishedLanFingerprint = fingerprint
+        Log.i(TAG, "LAN sync interfaces changed ($reason): $fingerprint")
         queueLanNetworkNotification(
             PendingNetworkNotification(
                 kind = NetworkNotificationKind.CHANGED,
@@ -565,6 +634,30 @@ object EcoPasteBridge {
             ),
             "$reason:$fingerprint",
         )
+    }
+
+    /** Resolves private IPv4 addresses from exact tethering names or conservative legacy names. */
+    private fun collectHotspotInterfaceAddresses(
+        exactInterfaceNames: Set<String>?,
+    ): Set<String> {
+        return try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+            interfaces
+                .filter { networkInterface ->
+                    val selected = exactInterfaceNames?.contains(networkInterface.name)
+                        ?: isLikelyHotspotInterfaceName(networkInterface.name)
+                    selected && networkInterface.isUp && !networkInterface.isLoopback &&
+                        !networkInterface.isVirtual && networkInterface.supportsMulticast()
+                }
+                .flatMap { it.inetAddresses.toList() }
+                .filterIsInstance<Inet4Address>()
+                .filter { !it.isLoopbackAddress && (it.isSiteLocalAddress || it.isLinkLocalAddress) }
+                .mapNotNull { it.hostAddress }
+                .toSet()
+        } catch (error: Exception) {
+            Log.d(TAG, "read hotspot interfaces failed: ${error.message}")
+            emptySet()
+        }
     }
 
     /** Includes only properties that change the effective outbound QUIC path. */
@@ -716,6 +809,7 @@ object EcoPasteBridge {
             lanDiscoveryLock = null
             return
         }
+        refreshLanInterfaceNotification("discovery-enabled")
         lanDiscoveryLeaseCount += 1
         if (lanDiscoveryLock?.isHeld == true) return
 

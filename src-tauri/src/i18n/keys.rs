@@ -48,6 +48,14 @@ pub enum CommandKey {
     SyncSensitiveDisabled,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SyncKey {
+    OpenStream,
+    SendRequest,
+    WaitForResponse,
+    ReadResponse,
+}
+
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy)]
 pub enum TrayKey {

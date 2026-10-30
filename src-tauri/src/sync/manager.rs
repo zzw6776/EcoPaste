@@ -54,7 +54,7 @@ use crate::{
         self,
         models::{ClipboardApp, ClipboardItem, ClipboardKind, ClipboardSubKind, Platform},
     },
-    settings::{CloudRelayMode, SettingsStore, SyncSettings},
+    settings::{CloudRelayMode, Language, SettingsStore, SyncSettings},
 };
 
 use super::{
@@ -89,7 +89,7 @@ const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const LAN_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-const CLOUD_SYNC_HEDGE_DELAY: Duration = Duration::from_millis(300);
+const CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_WATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 const PRIMARY_CLOUD_WATCH_SLOT: u8 = 0;
@@ -384,12 +384,37 @@ struct SyncBatchResponse {
     has_more: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CloudAttemptPhase {
+    OpenStream,
+    WriteRequest,
+    ReadResponseHeader,
+    ReadResponseBody,
+}
+
+impl CloudAttemptPhase {
+    fn label(self, language: Language) -> &'static str {
+        use crate::i18n::sync::Key;
+
+        let key = match self {
+            Self::OpenStream => Key::OpenStream,
+            Self::WriteRequest => Key::SendRequest,
+            Self::ReadResponseHeader => Key::WaitForResponse,
+            Self::ReadResponseBody => Key::ReadResponse,
+        };
+        crate::i18n::sync::label(language, key)
+    }
+}
+
 #[derive(Debug)]
-struct CloudAttemptTimeout;
+struct CloudAttemptTimeout {
+    phase: CloudAttemptPhase,
+    language: Language,
+}
 
 impl std::fmt::Display for CloudAttemptTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("cloud attempt timed out")
+        formatter.write_str(self.phase.label(self.language))
     }
 }
 
@@ -3112,14 +3137,16 @@ impl SyncManager {
             return Ok(false);
         }
 
+        let language = crate::i18n::current_language(&self.app);
         let create_group = call_cloud(
             connection,
             Request::CreateGroup {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
             },
+            language,
         );
-        let read_metadata = call_cloud(connection, Request::HealthV2);
+        let read_metadata = call_cloud(connection, Request::HealthV2, language);
         let (group_response, metadata_response) = tokio::join!(create_group, read_metadata);
         match group_response? {
             Response::GroupCreated => {}
@@ -3141,6 +3168,11 @@ impl SyncManager {
             Ok(_) => {
                 log::debug!("cloud Hub returned an invalid health response; using legacy sync");
                 0
+            }
+            Err(error)
+                if is_cloud_attempt_timeout(&error) || connection.close_reason().is_some() =>
+            {
+                return Err(error);
             }
             Err(error) => {
                 log::debug!("query cloud Hub metadata failed; using legacy sync: {error}");
@@ -3259,6 +3291,7 @@ impl SyncManager {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
             },
+            crate::i18n::current_language(&self.app),
         )
         .await?;
         let Response::BootstrapPlan {
@@ -3287,6 +3320,7 @@ impl SyncManager {
         let _sync_activity = SyncActivityGuard::acquire();
         let target_id = target.delivery_target();
         let is_cloud = target.is_cloud();
+        let language = crate::i18n::current_language(&self.app);
         if !is_cloud {
             match call(connection, Request::Health).await? {
                 Response::Health {
@@ -3480,10 +3514,8 @@ impl SyncManager {
             let request_started_at = Instant::now();
             let result = async {
                 let protocol = if use_sync_v2 { "v2" } else { "legacy" };
-                let response = if use_sync_v2 {
-                    call_cloud_hedged(connection, request).await?
-                } else if is_cloud {
-                    call_cloud(connection, request).await?
+                let response = if is_cloud {
+                    call_cloud(connection, request, language).await?
                 } else {
                     call_lan(connection, request).await?
                 };
@@ -3631,7 +3663,12 @@ impl SyncManager {
             devices: local,
         };
         let result = if cloud {
-            call_cloud(connection, request).await
+            call_cloud(
+                connection,
+                request,
+                crate::i18n::current_language(&self.app),
+            )
+            .await
         } else {
             call_lan(connection, request).await
         };
@@ -7163,105 +7200,161 @@ async fn call_lan(connection: &Connection, request: Request) -> Result<Response>
     minicbor::decode(&encoded).context("decode LAN sync response")
 }
 
-/// Bounds short cloud control requests without constraining LAN or long-lived watch streams.
-async fn call_cloud(connection: &Connection, request: Request) -> Result<Response> {
-    let (mut send, mut recv) = connection.open_bi().await?;
-    write_frame(&mut send, &request).await?;
-    send.finish()?;
-    let length = match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, recv.read_u32()).await {
-        Ok(length) => length.context("read cloud response frame length")? as usize,
+fn cloud_attempt_timeout(phase: CloudAttemptPhase, language: Language) -> anyhow::Error {
+    anyhow::Error::new(CloudAttemptTimeout { phase, language })
+}
+
+/// Writes every byte while resetting the timeout whenever the transport makes progress.
+async fn write_all_with_cloud_idle_timeout<W>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    idle_timeout: Duration,
+    language: Language,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !bytes.is_empty() {
+        let written = match tokio::time::timeout(idle_timeout, writer.write(bytes)).await {
+            Ok(result) => result.context("write cloud sync request")?,
+            Err(_) => {
+                return Err(cloud_attempt_timeout(
+                    CloudAttemptPhase::WriteRequest,
+                    language,
+                ));
+            }
+        };
+        if written == 0 {
+            return Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "cloud sync request writer made no progress",
+            )));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// Encodes one cloud control request and bounds only periods without write progress.
+async fn write_cloud_request<W>(
+    writer: &mut W,
+    request: &Request,
+    idle_timeout: Duration,
+    language: Language,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let encoded = minicbor::to_vec(request).context("encode cloud sync request")?;
+    if encoded.len() > MAX_FRAME_BYTES {
+        bail!("cloud request frame is too large: {} bytes", encoded.len());
+    }
+    let length = u32::try_from(encoded.len())?.to_be_bytes();
+    write_all_with_cloud_idle_timeout(writer, &length, idle_timeout, language).await?;
+    write_all_with_cloud_idle_timeout(writer, &encoded, idle_timeout, language).await?;
+    match tokio::time::timeout(idle_timeout, writer.flush()).await {
+        Ok(result) => result.context("flush cloud sync request")?,
         Err(_) => {
-            return Err(anyhow::Error::new(CloudAttemptTimeout).context("等待云端同步响应超时"));
+            return Err(cloud_attempt_timeout(
+                CloudAttemptPhase::WriteRequest,
+                language,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reads every byte while resetting the timeout whenever the transport makes progress.
+async fn read_exact_with_cloud_idle_timeout<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    idle_timeout: Duration,
+    language: Language,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let read =
+            match tokio::time::timeout(idle_timeout, reader.read(&mut buffer[offset..])).await {
+                Ok(result) => result.context("read cloud sync response")?,
+                Err(_) => {
+                    return Err(cloud_attempt_timeout(
+                        CloudAttemptPhase::ReadResponseBody,
+                        language,
+                    ));
+                }
+            };
+        if read == 0 {
+            return Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "cloud sync response ended early",
+            )));
+        }
+        offset += read;
+    }
+    Ok(())
+}
+
+/// Reads one cloud response with separate header and body-progress deadlines.
+async fn read_cloud_response<R>(
+    reader: &mut R,
+    header_timeout: Duration,
+    body_idle_timeout: Duration,
+    language: Language,
+) -> Result<Response>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = match tokio::time::timeout(header_timeout, reader.read_u32()).await {
+        Ok(result) => result.context("read cloud response frame length")? as usize,
+        Err(_) => {
+            return Err(cloud_attempt_timeout(
+                CloudAttemptPhase::ReadResponseHeader,
+                language,
+            ));
         }
     };
-    if length > ecopaste_sync_protocol::MAX_FRAME_BYTES {
+    if length > MAX_FRAME_BYTES {
         bail!("cloud response frame is too large: {length} bytes");
     }
     let mut encoded = vec![0; length];
-    tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read_exact(&mut encoded))
-        .await
-        .context("读取云端同步响应超时")??;
+    read_exact_with_cloud_idle_timeout(reader, &mut encoded, body_idle_timeout, language).await?;
     minicbor::decode(&encoded).context("decode cloud sync response")
 }
 
-/// Starts a duplicate idempotent sync request only when the primary exceeds the normal tail.
-async fn call_cloud_hedged(connection: &Connection, request: Request) -> Result<Response> {
-    #[derive(Clone, Copy)]
-    enum HedgeRole {
-        Primary,
-        Backup,
-    }
-
-    impl HedgeRole {
-        fn as_str(self) -> &'static str {
-            match self {
-                Self::Primary => "primary",
-                Self::Backup => "backup",
+/// Bounds every cloud control phase without limiting a response that keeps making progress.
+async fn call_cloud(
+    connection: &Connection,
+    request: Request,
+    language: Language,
+) -> Result<Response> {
+    let (mut send, mut recv) =
+        match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, connection.open_bi()).await {
+            Ok(result) => result.context("open cloud sync stream")?,
+            Err(_) => {
+                return Err(cloud_attempt_timeout(
+                    CloudAttemptPhase::OpenStream,
+                    language,
+                ));
             }
-        }
-    }
-
-    let started_at = Instant::now();
-    let stats_before = connection.stats();
-    let mut primary = Box::pin(call_cloud(connection, request.clone()));
-    match tokio::time::timeout(CLOUD_SYNC_HEDGE_DELAY, &mut primary).await {
-        Ok(result) => return result,
-        Err(_) => log::info!(
-            "cloud sync hedge started: connectionId={} delayMs={} lostPackets={}",
-            connection.stable_id(),
-            CLOUD_SYNC_HEDGE_DELAY.as_millis(),
-            stats_before.lost_packets,
-        ),
-    }
-
-    let mut backup = Box::pin(call_cloud(connection, request));
-    let (first_role, first_result) = tokio::select! {
-        result = &mut primary => (HedgeRole::Primary, result),
-        result = &mut backup => (HedgeRole::Backup, result),
-    };
-    let (winner, first_failed, result) = match first_result {
-        Ok(response) => (first_role, false, Ok(response)),
-        Err(first_error) => {
-            log::debug!(
-                "cloud sync hedge first attempt failed: role={} error={first_error}",
-                first_role.as_str()
-            );
-            let (second_role, second_result) = match first_role {
-                HedgeRole::Primary => (HedgeRole::Backup, backup.await),
-                HedgeRole::Backup => (HedgeRole::Primary, primary.await),
-            };
-            (
-                second_role,
-                true,
-                second_result.with_context(|| {
-                    format!(
-                        "cloud sync hedge failed after {} attempt: {first_error}",
-                        first_role.as_str()
-                    )
-                }),
-            )
-        }
-    };
-    let stats_after = connection.stats();
-    log::info!(
-        "cloud sync hedge completed: connectionId={} winner={} firstFailed={} elapsedMs={} lostPacketsDelta={} sentDatagramsDelta={} receivedDatagramsDelta={}",
-        connection.stable_id(),
-        winner.as_str(),
-        first_failed,
-        started_at.elapsed().as_millis(),
-        stats_after
-            .lost_packets
-            .saturating_sub(stats_before.lost_packets),
-        stats_after
-            .udp_tx
-            .datagrams
-            .saturating_sub(stats_before.udp_tx.datagrams),
-        stats_after
-            .udp_rx
-            .datagrams
-            .saturating_sub(stats_before.udp_rx.datagrams),
-    );
-    result
+        };
+    write_cloud_request(
+        &mut send,
+        &request,
+        CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT,
+        language,
+    )
+    .await?;
+    send.finish()?;
+    read_cloud_response(
+        &mut recv,
+        CLOUD_CONTROL_REQUEST_TIMEOUT,
+        BLOB_IDLE_TIMEOUT,
+        language,
+    )
+    .await
 }
 
 fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
@@ -8062,6 +8155,116 @@ fn parse_platform(value: &str) -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_attempt_timeout_uses_the_selected_language() {
+        let zh = CloudAttemptTimeout {
+            phase: CloudAttemptPhase::OpenStream,
+            language: Language::ZhCN,
+        };
+        let en = CloudAttemptTimeout {
+            phase: CloudAttemptPhase::ReadResponseBody,
+            language: Language::EnUS,
+        };
+
+        assert_eq!(zh.to_string(), "打开云端同步流超时");
+        assert_eq!(en.to_string(), "Timed out reading the cloud sync response");
+    }
+
+    #[tokio::test]
+    async fn cloud_request_write_times_out_without_progress() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = write_cloud_request(
+            &mut writer,
+            &Request::HealthV2,
+            Duration::from_millis(20),
+            Language::ZhCN,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(is_cloud_attempt_timeout(&error), "{error:#}");
+        assert_eq!(error.to_string(), "发送云端同步请求超时");
+    }
+
+    #[tokio::test]
+    async fn cloud_request_writer_preserves_the_protocol_frame() {
+        let request = Request::CreateGroup {
+            group_id: "group".into(),
+            access_token: vec![7; 32],
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+
+        write_cloud_request(
+            &mut writer,
+            &request,
+            Duration::from_millis(50),
+            Language::ZhCN,
+        )
+        .await
+        .unwrap();
+        let decoded = read_frame(&mut reader).await.unwrap();
+
+        assert_eq!(request, decoded);
+    }
+
+    #[tokio::test]
+    async fn cloud_request_write_resets_timeout_after_progress() {
+        let bytes = vec![7_u8; 20];
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let reader_task = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            for _ in 0..20 {
+                reader.read_exact(&mut byte).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        write_all_with_cloud_idle_timeout(
+            &mut writer,
+            &bytes,
+            Duration::from_millis(50),
+            Language::ZhCN,
+        )
+        .await
+        .unwrap();
+        reader_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_response_header_times_out_without_progress() {
+        let (_writer, mut reader) = tokio::io::duplex(8);
+        let error = read_cloud_response(
+            &mut reader,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Language::ZhCN,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(is_cloud_attempt_timeout(&error), "{error:#}");
+        assert_eq!(error.to_string(), "等待云端同步响应超时");
+    }
+
+    #[tokio::test]
+    async fn cloud_response_body_times_out_after_partial_progress() {
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        writer.write_all(&4_u32.to_be_bytes()).await.unwrap();
+        writer.write_all(&[0_u8]).await.unwrap();
+
+        let error = read_cloud_response(
+            &mut reader,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Language::ZhCN,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(is_cloud_attempt_timeout(&error), "{error:#}");
+        assert_eq!(error.to_string(), "读取云端同步响应超时");
+    }
 
     #[test]
     fn automatic_file_upload_uses_the_whole_card_size() {
