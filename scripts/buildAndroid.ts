@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -6,7 +6,7 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { parse, resolve } from "node:path";
+import { delimiter, parse, resolve } from "node:path";
 import { acquireAndroidBuildLock } from "./androidBuildLock";
 import { normalizeAndroidManifestFile } from "./androidManifest";
 import { cleanAndroidCacheIfNeeded } from "./buildCache";
@@ -91,6 +91,28 @@ function resolveWindowsAndroidCargoHome() {
   return resolve(projectRoot, ".cache", "windows-android-cargo-home");
 }
 
+/** Uses the project-required JDK without changing the user's global Java selection. */
+function resolveMacAndroidJavaHome() {
+  if (process.platform !== "darwin") {
+    return void 0;
+  }
+
+  try {
+    const javaHome = execFileSync("/usr/libexec/java_home", ["-v", "17"], {
+      encoding: "utf8",
+    }).trim();
+    if (javaHome && existsSync(resolve(javaHome, "bin", "java"))) {
+      return javaHome;
+    }
+  } catch {
+    // The actionable project error below is clearer than java_home's stderr.
+  }
+
+  throw new Error(
+    "Android builds on macOS require JDK 17. Install it without changing the system default Java.",
+  );
+}
+
 /** 运行 pnpm 子命令，并保留终端中的原始构建输出。 */
 async function runPnpm(
   args: string[],
@@ -158,6 +180,12 @@ const buildEnv: NodeJS.ProcessEnv = {
   ...process.env,
   [SKIP_GRADLE_RUST_BUILD_ENV]: "1",
 };
+const macAndroidJavaHome = resolveMacAndroidJavaHome();
+if (macAndroidJavaHome) {
+  buildEnv.JAVA_HOME = macAndroidJavaHome;
+  buildEnv.PATH = `${resolve(macAndroidJavaHome, "bin")}${delimiter}${process.env.PATH ?? ""}`;
+  process.stdout.write(`Android JDK: ${macAndroidJavaHome}\n`);
+}
 const windowsAndroidCargoHome = resolveWindowsAndroidCargoHome();
 if (windowsAndroidCargoHome) {
   mkdirSync(windowsAndroidCargoHome, { recursive: true });
