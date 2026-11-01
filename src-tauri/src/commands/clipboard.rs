@@ -1652,6 +1652,7 @@ pub async fn delete_clipboard_item(
                 log::warn!("remove deleted image {file_name} failed: {err}");
             }
         }
+        crate::clipboard::shared_files::cleanup_after_delete(&app).await;
         crate::sync::notify_local_state_changed(&app);
     }
     Ok(())
@@ -1674,6 +1675,7 @@ pub async fn clear_clipboard_items(
             log::warn!("remove cleared image {file_name} failed: {err}");
         }
     }
+    crate::clipboard::shared_files::cleanup_after_delete(&app).await;
 
     if let Err(err) = app.emit(
         CLIPBOARD_UPDATED_EVENT,

@@ -41,6 +41,15 @@ class MainActivity : TauriActivity() {
         }
         EcoPasteBridge.setCurrentActivity(this)
         EcoPasteBridge.initialize(applicationContext)
+        if (savedInstanceState == null) {
+            EcoPasteShareReceiver.receive(this, intent)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        EcoPasteShareReceiver.receive(this, intent)
     }
 
     override fun onResume() {

@@ -3,6 +3,12 @@ use crate::i18n::keys::CommandKey as Key;
 /// 返回美式英文 Tauri 命令错误根因文案。
 pub fn label(key: Key) -> &'static str {
     match key {
+        #[cfg(any(target_os = "android", test))]
+        Key::AndroidShareEmpty => "The share is empty or contains no readable content",
+        #[cfg(target_os = "android")]
+        Key::AndroidShareFailed => "Unable to receive shared content. Please share again",
+        #[cfg(any(target_os = "android", test))]
+        Key::AndroidShareResult => "Added {saved} records, skipped {skipped}, failed {failed} items",
         Key::AndroidDirectoryUnsupported => "Folders cannot be opened or saved as a copy yet",
         Key::AndroidFileMissing => "The file no longer exists",
         Key::AndroidFileOpenFailed => "The file could not be opened",

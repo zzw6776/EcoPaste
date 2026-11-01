@@ -3,34 +3,48 @@
 //! 数据库 `content_hash` 负责历史去重；这里的指纹只用于判断同步内容是否已经是当前
 //! 系统剪贴板内容，从而避免远程桌面与 EcoPaste 双向同步形成反馈循环。
 
+use std::sync::Mutex;
+
+#[cfg(any(not(target_os = "android"), test))]
 use std::{
     collections::VecDeque,
-    sync::{LazyLock, Mutex},
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
+#[cfg(any(not(target_os = "android"), test))]
 use image::{imageops::FilterType, ImageReader, Rgba, RgbaImage};
 
 use crate::db::models::{ClipboardItem, ClipboardKind, ClipboardSubKind};
 
 const TEXT_DOMAIN: &[u8] = b"ecopaste-clipboard-text-v1\0";
+#[cfg(any(not(target_os = "android"), test))]
 const IMAGE_DOMAIN: &[u8] = b"ecopaste-clipboard-image-v1\0";
 const FILES_DOMAIN: &[u8] = b"ecopaste-clipboard-files-v1\0";
+#[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_HASH_COLUMNS: u32 = 16;
+#[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_HASH_ROWS: u32 = 16;
+#[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_SAMPLE_COUNT: usize =
     ((PERCEPTUAL_HASH_COLUMNS + 1) * PERCEPTUAL_HASH_ROWS) as usize;
+#[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_HASH_DISTANCE_LIMIT: u32 = 32;
+#[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_LUMA_MAE_LIMIT: u32 = 2;
+#[cfg(any(not(target_os = "android"), test))]
 const RECENT_SYNCED_IMAGE_LIMIT: usize = 8;
+#[cfg(any(not(target_os = "android"), test))]
 const RECENT_SYNCED_IMAGE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardFingerprint {
     exact: String,
+    #[cfg(any(not(target_os = "android"), test))]
     perceptual_image: Option<PerceptualImageFingerprint>,
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PerceptualImageFingerprint {
     width: u32,
@@ -59,6 +73,7 @@ impl ClipboardFingerprint {
 
     /// 图片使用 RGBA 语义指纹；最多缓存 64 个字节摘要到指纹的映射，不保留原图或像素。
     /// 编码字节变化时重新解码，PNG/TIFF/DIB 重新编码仍按像素判等。
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn from_image_bytes(bytes: &[u8]) -> Option<Self> {
         static CACHE: LazyLock<Mutex<VecDeque<(blake3::Hash, ClipboardFingerprint)>>> =
             LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -118,6 +133,7 @@ impl ClipboardFingerprint {
     }
 
     /// 写回保护继续使用与监听端一致的字符串形式。
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn as_str(&self) -> &str {
         &self.exact
     }
@@ -125,11 +141,13 @@ impl ClipboardFingerprint {
     fn exact(value: String) -> Self {
         Self {
             exact: value,
+            #[cfg(any(not(target_os = "android"), test))]
             perceptual_image: None,
         }
     }
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 impl PerceptualImageFingerprint {
     /// 将完整 RGBA 图缩成 17×16，再比较相邻灰度像素形成 256 位差异哈希。
     fn from_rgba(image: &RgbaImage) -> Self {
@@ -187,6 +205,7 @@ impl PerceptualImageFingerprint {
     }
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 fn composited_luma(pixel: &Rgba<u8>) -> u8 {
     let [red, green, blue, alpha] = pixel.0;
     let alpha = u32::from(alpha);
@@ -228,9 +247,11 @@ struct FingerprintState {
     generation: u64,
     current: Option<ClipboardFingerprint>,
     write_pending: bool,
+    #[cfg(any(not(target_os = "android"), test))]
     recent_synced_images: VecDeque<RecentSyncedImage>,
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 struct RecentSyncedImage {
     fingerprint: ClipboardFingerprint,
     recorded_at: Instant,
@@ -240,8 +261,11 @@ struct RecentSyncedImage {
 #[derive(Clone)]
 pub struct ClipboardObservation {
     generation: u64,
+    #[cfg(any(not(target_os = "android"), test))]
     previous: Option<ClipboardFingerprint>,
+    #[cfg(any(not(target_os = "android"), test))]
     restore_previous: bool,
+    #[cfg(any(not(target_os = "android"), test))]
     outbound_image: Option<ClipboardFingerprint>,
 }
 
@@ -263,14 +287,18 @@ impl ClipboardFingerprintState {
             .lock()
             .expect("clipboard fingerprint state poisoned");
         state.generation = state.generation.wrapping_add(1);
-        let restore_previous = state.write_pending;
-        state.write_pending = false;
-        ClipboardObservation {
+        let observation = ClipboardObservation {
             generation: state.generation,
+            #[cfg(any(not(target_os = "android"), test))]
             previous: state.current.take(),
-            restore_previous,
+            #[cfg(any(not(target_os = "android"), test))]
+            restore_previous: state.write_pending,
+            #[cfg(any(not(target_os = "android"), test))]
             outbound_image: None,
-        }
+        };
+        state.current = None;
+        state.write_pending = false;
+        observation
     }
 
     /// 仅在观察期间没有更新的剪贴板事件时提交结果，防止慢速文件任务覆盖新内容。
@@ -292,6 +320,7 @@ impl ClipboardFingerprintState {
     }
 
     /// 仅恢复同步写回前预发布的目标；普通写回不能把变化前的旧指纹重新标成当前内容。
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn restore_observation(&self, observation: ClipboardObservation) {
         let mut state = self
             .inner
@@ -315,6 +344,7 @@ impl ClipboardFingerprintState {
     }
 
     /// 只与最近真正进入同步队列或由同步自动写入的图片比较，避免影响普通历史去重。
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn matches_recent_synced_image(&self, fingerprint: &ClipboardFingerprint) -> bool {
         if fingerprint.perceptual_image.is_none() {
             return false;
@@ -323,6 +353,7 @@ impl ClipboardFingerprintState {
     }
 
     /// 同步事件成功落入本地事件队列后，短期记录其感知指纹以识别远程桌面反射。
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn remember_synced_image(&self, fingerprint: &ClipboardFingerprint) {
         if fingerprint.perceptual_image.is_none() {
             return;
@@ -342,6 +373,7 @@ impl ClipboardFingerprintState {
             .expect("clipboard fingerprint state poisoned");
         state.generation = state.generation.wrapping_add(1);
         let generation = state.generation;
+        #[cfg(any(not(target_os = "android"), test))]
         let recent_image = fingerprint
             .perceptual_image
             .as_ref()
@@ -349,6 +381,7 @@ impl ClipboardFingerprintState {
         let previous = state.current.replace(fingerprint);
         let previous_write_pending = state.write_pending;
         state.write_pending = true;
+        #[cfg(any(not(target_os = "android"), test))]
         if let Some(recent_image) = recent_image {
             remember_synced_image_at(&mut state, recent_image, Instant::now(), Some(generation));
         }
@@ -364,6 +397,7 @@ impl ClipboardFingerprintState {
             .inner
             .lock()
             .expect("clipboard fingerprint state poisoned");
+        #[cfg(any(not(target_os = "android"), test))]
         state
             .recent_synced_images
             .retain(|recent| recent.write_generation != Some(write.generation));
@@ -373,6 +407,7 @@ impl ClipboardFingerprintState {
         }
     }
 
+    #[cfg(any(not(target_os = "android"), test))]
     fn matches_recent_synced_image_at(
         &self,
         fingerprint: &ClipboardFingerprint,
@@ -397,6 +432,7 @@ impl ClipboardFingerprintState {
     }
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 impl ClipboardObservation {
     /// 把监听阶段已完成的图片指纹带到异步同步入队阶段，不重新读取或解码图片。
     pub fn with_outbound_image(mut self, fingerprint: ClipboardFingerprint) -> Self {
@@ -409,6 +445,7 @@ impl ClipboardObservation {
     }
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 fn remember_synced_image_at(
     state: &mut FingerprintState,
     fingerprint: ClipboardFingerprint,
@@ -426,6 +463,7 @@ fn remember_synced_image_at(
     });
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 fn prune_recent_synced_images(state: &mut FingerprintState, now: Instant) {
     state.recent_synced_images.retain(|recent| {
         now.checked_duration_since(recent.recorded_at)

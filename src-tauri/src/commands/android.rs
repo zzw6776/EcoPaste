@@ -751,6 +751,62 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_captureClip
     0
 }
 
+/// Completes the two-sided readiness handshake if Rust setup preceded native bridge initialization.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_isShareRuntimeReady(
+    _env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jboolean {
+    APP_HANDLE.get().is_some().into()
+}
+
+/// Runs from the native share worker after runtime readiness; all persistence stays in Rust.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_receiveShare(
+    raw_env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+    payload: jni::sys::jstring,
+) -> jni::sys::jstring {
+    let Ok(mut env) = jni::JNIEnv::from_raw(raw_env) else {
+        return std::ptr::null_mut();
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let app = APP_HANDLE
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Android runtime is not ready"))?;
+        let payload = jni::objects::JString::from_raw(payload);
+        let payload: String = env.get_string(&payload)?.into();
+        let delivery = serde_json::from_str(&payload)?;
+        let outcome = tauri::async_runtime::block_on(crate::clipboard::android_share::receive(
+            app, delivery,
+        ))?;
+        Ok::<_, anyhow::Error>(crate::i18n::commands::share_result(
+            crate::i18n::current_language(app),
+            outcome.saved,
+            outcome.skipped,
+            outcome.failed,
+        ))
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("Android share worker panicked")));
+    let message = match result {
+        Ok(message) => message,
+        Err(error) => {
+            log::error!("receive Android share failed: {error:#}");
+            let language = APP_HANDLE
+                .get()
+                .map(crate::i18n::current_language)
+                .unwrap_or_default();
+            crate::i18n::commands::label(language, crate::i18n::commands::Key::AndroidShareFailed)
+                .to_owned()
+        }
+    };
+    env.new_string(message)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_pasteOverlayItem(

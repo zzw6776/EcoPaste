@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod android_share;
 mod app_store;
 mod apps_registry;
 pub(crate) mod cleanup;
@@ -11,6 +13,7 @@ mod ingest;
 mod payload;
 mod read;
 mod secrets;
+pub(crate) mod shared_files;
 mod sound;
 mod source;
 mod storage;

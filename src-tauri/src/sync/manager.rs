@@ -2137,6 +2137,7 @@ impl SyncManager {
                 .state::<Arc<ClipboardFingerprintState>>()
                 .commit_observation(observation, fingerprint);
         }
+        #[cfg(not(target_os = "android"))]
         if let Some(fingerprint) = observation
             .as_ref()
             .and_then(ClipboardObservation::outbound_image)
@@ -3946,6 +3947,7 @@ impl SyncManager {
                 }
             }
             if outcome.canonical_presence == Some(false) {
+                crate::clipboard::shared_files::cleanup_after_delete(&self.app).await;
                 repository::mark_applied(pool, &event.event_id).await?;
                 made_content_progress = true;
                 continue;
@@ -4107,6 +4109,9 @@ impl SyncManager {
             }
         }
 
+        if outcome.canonical_presence == Some(false) {
+            crate::clipboard::shared_files::cleanup_after_delete(&self.app).await;
+        }
         repository::mark_applied(pool, &event.event_id).await?;
         Ok(())
     }
@@ -4348,7 +4353,7 @@ impl SyncManager {
     fn write_latest_synced_item_to_clipboard(
         &self,
         item: &ClipboardItem,
-        fingerprint: Option<&ClipboardFingerprint>,
+        _fingerprint: Option<&ClipboardFingerprint>,
     ) {
         if !self
             .app
@@ -4379,7 +4384,7 @@ impl SyncManager {
             &guard,
             &fingerprints,
             item,
-            fingerprint,
+            _fingerprint,
         );
 
         if let Err(error) = result {

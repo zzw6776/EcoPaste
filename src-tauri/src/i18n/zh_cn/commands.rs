@@ -8,6 +8,12 @@ pub fn label(key: Key) -> &'static str {
         Key::AndroidFileOpenFailed => "无法打开文件",
         Key::AndroidFileOpenUnavailable => "没有可用于打开该文件的应用",
         Key::AndroidFileSaveFailed => "无法保存文件",
+        #[cfg(any(target_os = "android", test))]
+        Key::AndroidShareEmpty => "分享内容为空或不包含可读取的内容",
+        #[cfg(target_os = "android")]
+        Key::AndroidShareFailed => "无法接收分享内容，请重新分享",
+        #[cfg(any(target_os = "android", test))]
+        Key::AndroidShareResult => "已加入 {saved} 条记录，跳过 {skipped} 条，失败 {failed} 项",
         #[cfg(not(target_os = "android"))]
         Key::DragSourceFilesMissing => "拖拽源文件已不存在",
         #[cfg(not(target_os = "android"))]

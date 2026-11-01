@@ -112,6 +112,9 @@ pub async fn clean_resource_cache(
     let file_icon_files = referenced_file_icon_files(&pool).await?;
 
     let mut removed = CleanCacheStats::default();
+    let shared = crate::clipboard::shared_files::cleanup(&app).await?;
+    removed.files += shared.files;
+    removed.bytes += shared.bytes;
     clean_sharded_files(
         &resources_dir.join("clipboard-images").join("origin"),
         &image_files,
@@ -171,6 +174,7 @@ async fn switch_storage_location(
     db: &DatabaseState,
     target: PathBuf,
 ) -> Result<ChangeStorageLocationResult> {
+    let _shared_files_guard = crate::clipboard::shared_files::lock().await;
     let current = crate::core::paths::app_data_dir(&app)?;
     if current == target {
         return Ok(ChangeStorageLocationResult {
@@ -190,6 +194,16 @@ async fn switch_storage_location(
     let app_for_db = app.clone();
     let current_for_db = current.clone();
     let target_for_db = target.clone();
+    let shared_files_relocation = crate::clipboard::shared_files::Relocation::new(
+        current
+            .join("resources")
+            .join(crate::clipboard::shared_files::DIRECTORY)
+            .to_string_lossy()
+            .into_owned(),
+        target
+            .join("resources")
+            .join(crate::clipboard::shared_files::DIRECTORY),
+    );
 
     db.close_and_replace(|| async move {
         let switch_result = (|| -> Result<()> {
@@ -206,7 +220,13 @@ async fn switch_storage_location(
             return crate::db::init(&app_for_db).await;
         }
 
-        match crate::db::init(&app_for_db).await {
+        let initialized = async {
+            let pool = crate::db::init(&app_for_db).await?;
+            shared_files_relocation.apply(&pool).await?;
+            Ok::<_, crate::core::AppError>(pool)
+        }
+        .await;
+        match initialized {
             Ok(pool) => Ok(pool),
             Err(err) => {
                 *switch_error_for_task

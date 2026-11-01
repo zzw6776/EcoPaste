@@ -383,13 +383,21 @@ object EcoPasteBridge {
         registerSyncNetworkCallbacks(context.applicationContext)
         refreshLanInterfaceNotification("initialize")
         replayPendingSyncNetworkNotifications()
+        if (isShareRuntimeReady()) EcoPasteShareReceiver.onRuntimeReady()
     }
 
     /** Replays callbacks that raced with creation of the native synchronization manager. */
     @JvmStatic
     fun onSyncRuntimeReady() {
+        EcoPasteShareReceiver.onRuntimeReady()
         replayPendingSyncNetworkNotifications()
     }
+
+    @JvmStatic
+    external fun receiveShare(payload: String): String
+
+    @JvmStatic
+    external fun isShareRuntimeReady(): Boolean
 
     /** Separates the app's cloud default route from Wi-Fi-only LAN discovery lifecycle. */
     @Synchronized

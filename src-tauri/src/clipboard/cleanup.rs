@@ -87,9 +87,13 @@ pub(crate) async fn apply_retention(app: &AppHandle) -> bool {
 
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
     match cleanup_history(&pool, cutoff, max).await {
-        Ok(outcome) if outcome.removed == 0 => true,
+        Ok(outcome) if outcome.removed == 0 => {
+            super::shared_files::cleanup_after_delete(app).await;
+            true
+        }
         Ok(outcome) => {
             remove_images(app, &outcome.image_files);
+            super::shared_files::cleanup_after_delete(app).await;
             log::info!("history cleanup removed {} item(s)", outcome.removed);
             if let Err(err) = app.emit(
                 CLIPBOARD_UPDATED_EVENT,
