@@ -47,3 +47,20 @@ test("declares the Root overlay service without an Accessibility service", () =>
   assert.doesNotMatch(manifest, /BIND_ACCESSIBILITY_SERVICE/);
   assert.doesNotMatch(manifest, /EcoPasteAccessibilityService/);
 });
+
+test("accepts single and multiple shares of every MIME type outside the generated association block", () => {
+  const manifest = readFileSync(
+    "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+    "utf8",
+  );
+  const manualManifest = manifest.split(MARKER)[0];
+  const shareFilter = manualManifest.match(
+    /<intent-filter>\s*<action android:name="android.intent.action.SEND"[\s\S]*?<\/intent-filter>/,
+  )?.[0];
+
+  assert.ok(shareFilter);
+  assert.match(shareFilter, /android.intent.action.SEND_MULTIPLE/);
+  assert.match(shareFilter, /android.intent.category.DEFAULT/);
+  assert.match(shareFilter, /android:mimeType="\*\/\*"/);
+  assert.doesNotMatch(shareFilter, /android.intent.action.VIEW/);
+});

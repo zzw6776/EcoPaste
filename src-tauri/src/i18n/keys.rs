@@ -27,6 +27,12 @@ pub enum CommandKey {
     AndroidFileOpenFailed,
     AndroidFileOpenUnavailable,
     AndroidFileSaveFailed,
+    #[cfg(any(target_os = "android", test))]
+    AndroidShareEmpty,
+    #[cfg(target_os = "android")]
+    AndroidShareFailed,
+    #[cfg(any(target_os = "android", test))]
+    AndroidShareResult,
     #[cfg(not(target_os = "android"))]
     DragSourceFilesMissing,
     #[cfg(not(target_os = "android"))]

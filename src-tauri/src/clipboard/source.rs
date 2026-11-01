@@ -8,7 +8,9 @@
 //! 平台 API：macOS 走 `NSWorkspace.frontmostApplication`，Windows 走 `GetForegroundWindow`
 //! + `QueryFullProcessImageNameW`。图标统一交给 `crate::clipboard::icon` 跨平台抽取。
 
-use crate::db::models::{ClipboardApp, Platform};
+#[cfg(any(not(target_os = "android"), test))]
+use crate::db::models::ClipboardApp;
+use crate::db::models::Platform;
 
 use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
@@ -47,6 +49,7 @@ pub fn detect_frontmost(
 
 /// 只有图标文件、同步哈希与强调色都完整，且文件仍是当前规范尺寸时才跳过平台图标提取。
 /// 名称不参与判断：每次仍捕获最新名称，由 `materialize_source` 更新缓存。
+#[cfg(not(target_os = "android"))]
 fn has_complete_cached_icon(
     icon_store: &AppIconStore,
     registry: &AppsRegistry,
@@ -59,6 +62,7 @@ fn has_complete_cached_icon(
     cached_icon_is_complete(icon_store, &cached)
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 fn cached_icon_is_complete(icon_store: &AppIconStore, cached: &ClipboardApp) -> bool {
     cached.icon_hash.is_some()
         && cached.accent_start.is_some()
