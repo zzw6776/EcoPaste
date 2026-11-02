@@ -26,6 +26,9 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
 const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
 
+/// Advance only when the event decoder gains support for previously deferred formats.
+pub const RETENTION_DECODER_REVISION: u32 = 1;
+
 struct TemporaryFileCleanup {
     armed: bool,
     path: PathBuf,

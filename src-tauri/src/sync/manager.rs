@@ -18,11 +18,11 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
-    DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
-    Response, SyncEventKind, ALL_EVENTS_HISTORY_PROTOCOL_VERSION, ALPN,
-    ASYNC_SOURCE_ICON_PROTOCOL_VERSION, BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH,
-    MAX_FRAME_BYTES, OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
+    DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement,
+    RemovedDevice, Request, Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
+    BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES,
+    OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
+    RETENTION_PROGRESS_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -3224,7 +3224,7 @@ impl SyncManager {
                 0
             }
         };
-        if protocol_version < ALL_EVENTS_HISTORY_PROTOCOL_VERSION {
+        if protocol_version < RETENTION_PROGRESS_PROTOCOL_VERSION {
             bail!("同步服务版本过低，请升级到支持新版同步协议的版本");
         }
         *self
@@ -3597,6 +3597,7 @@ impl SyncManager {
                 Request::RetentionPlan {
                     group_id: group.group_id.clone(),
                     access_token: group.access_token_bytes()?,
+                    decoder_revision: Some(crypto::RETENTION_DECODER_REVISION),
                 },
                 language,
             )
@@ -3613,6 +3614,8 @@ impl SyncManager {
                 bail!("invalid cloud retention plan");
             };
             let mut mappings = Vec::with_capacity(events.len());
+            let mut deferred_event_ids = Vec::new();
+            let mut first_decode_error = None;
             for stored in &events {
                 match crypto::retention_mapping(&key, &stored.event) {
                     Ok(mapping) => {
@@ -3640,10 +3643,14 @@ impl SyncManager {
                         .await?;
                         mappings.push(mapping);
                     }
-                    Err(error) => log::warn!("keep invalid legacy cloud event protected: {error}"),
+                    Err(error) => {
+                        deferred_event_ids.push(stored.event.event_id.clone());
+                        first_decode_error.get_or_insert_with(|| error.to_string());
+                    }
                 }
             }
-            let made_progress = !mappings.is_empty();
+            let made_progress = !mappings.is_empty() || !deferred_event_ids.is_empty();
+            let deferred_count = deferred_event_ids.len();
             let mut protected_keys = repository::protected_sync_keys(&pool)
                 .await?
                 .iter()
@@ -3662,7 +3669,7 @@ impl SyncManager {
                 .await?
                 .as_deref()
                 != Some(fingerprint.as_str());
-            if changed || !mappings.is_empty() {
+            if changed || made_progress {
                 let generation = if changed {
                     repository::next_origin_sequence(&pool).await?
                 } else {
@@ -3677,12 +3684,21 @@ impl SyncManager {
                         generation,
                         protected_keys: changed.then_some(protected_keys),
                         mappings,
+                        deferred: (!deferred_event_ids.is_empty()).then_some(
+                            DeferredRetentionEvents {
+                                decoder_revision: crypto::RETENTION_DECODER_REVISION,
+                                event_ids: deferred_event_ids,
+                            },
+                        ),
                     },
                     language,
                 )
                 .await?;
                 match response {
                     Response::RetentionUpdated => {
+                        if let Some(error) = first_decode_error {
+                            log::warn!("deferred unsupported cloud history: count={deferred_count} decoderRevision={} firstError={error}", crypto::RETENTION_DECODER_REVISION);
+                        }
                         if changed {
                             repository::set_cloud_retention_snapshot(&pool, &fingerprint).await?;
                         }

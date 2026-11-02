@@ -583,13 +583,17 @@ impl HubService {
             Request::RetentionPlan {
                 group_id,
                 access_token,
+                decoder_revision,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
-                let events = self.repository.retention_candidates(&group_id).await?;
+                let events = self
+                    .repository
+                    .retention_candidates(&group_id, remote_endpoint_id, decoder_revision)
+                    .await?;
                 let mut response = Response::RetentionPlan {
                     epoch: self.repository.retention_epoch(&group_id).await?,
                     has_more: events.len() == usize::from(MAX_EVENTS_PER_BATCH),
@@ -605,6 +609,7 @@ impl HubService {
                 generation,
                 protected_keys,
                 mappings,
+                deferred,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
@@ -622,6 +627,7 @@ impl HubService {
                         generation,
                         protected_keys.as_deref(),
                         &mappings,
+                        deferred.as_ref(),
                     )
                     .await?;
                 drop(guard);
@@ -1751,7 +1757,10 @@ mod tests {
 
         let mut pages = 0;
         loop {
-            let candidates = repository.retention_candidates("group_123").await.unwrap();
+            let candidates = repository
+                .retention_candidates("group_123", "endpoint_123", None)
+                .await
+                .unwrap();
             if candidates.is_empty() {
                 break;
             }
@@ -1764,7 +1773,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             repository
-                .set_retention("group_123", "device_123", 1, Some(&[]), &mappings)
+                .set_retention("group_123", "device_123", 1, Some(&[]), &mappings, None)
                 .await
                 .unwrap();
             pages += 1;

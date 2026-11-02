@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::{
-    ALPN, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice, Request, Response,
-    RetentionMapping, SyncEventKind, read_frame, write_frame,
+    ALPN, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice,
+    Request, Response, RetentionMapping, SyncEventKind, read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -446,6 +446,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         Request::RetentionPlan {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
+            decoder_revision: None,
         },
     )
     .await?
@@ -455,6 +456,43 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     assert!(!epoch.is_empty());
     assert!(!has_more);
     assert_eq!(legacy_events.len(), 2);
+    assert_eq!(
+        call(
+            &connection,
+            Request::SetRetention {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                device: device("device_123456", "Mac", &client_endpoint_id),
+                generation: 0,
+                protected_keys: None,
+                mappings: Vec::new(),
+                deferred: Some(DeferredRetentionEvents {
+                    decoder_revision: 1,
+                    event_ids: vec![legacy_events[0].event.event_id.clone()],
+                }),
+            }
+        )
+        .await?,
+        Response::RetentionUpdated
+    );
+    for (revision, expected) in [(Some(1), 1), (Some(2), 2), (None, 2)] {
+        let Response::RetentionPlan { events, .. } = call(
+            &connection,
+            Request::RetentionPlan {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                decoder_revision: revision,
+            },
+        )
+        .await?
+        else {
+            anyhow::bail!("expected retention plan")
+        };
+        assert_eq!(events.len(), expected);
+        if revision == Some(1) {
+            assert_eq!(events[0].event.event_id, legacy_events[1].event.event_id);
+        }
+    }
     let item_key = "a".repeat(64);
     assert_eq!(
         call(
@@ -473,6 +511,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
                         blob_ids: stored.event.blob_ids.clone(),
                     })
                     .collect(),
+                deferred: None,
             }
         )
         .await?,
@@ -480,7 +519,8 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     );
     assert!(matches!(call(&connection, Request::RetentionPlan {
         group_id: group_id.clone(), access_token: access_token.clone(),
-    }).await?, Response::RetentionPlan { events, has_more: false, .. } if events.is_empty()));
+    decoder_revision: None,
+}).await?, Response::RetentionPlan { events, has_more: false, .. } if events.is_empty()));
     assert!(matches!(
         call(
             &connection,
@@ -491,6 +531,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
                 generation: 11,
                 protected_keys: Some(Vec::new()),
                 mappings: Vec::new(),
+                deferred: None,
             }
         )
         .await?,
@@ -566,6 +607,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         Request::RetentionPlan {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
+            decoder_revision: None,
         },
     ] {
         assert!(matches!(
@@ -596,6 +638,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
                 generation: 11,
                 protected_keys: Some(vec![item_key]),
                 mappings: Vec::new(),
+                deferred: None,
             },
         )
         .await?,

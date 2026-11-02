@@ -21,7 +21,8 @@ pub const BOUNDED_HUB_PROTOCOL_VERSION: u16 = 11;
 pub const OPTIONAL_BLOB_REFS_PROTOCOL_VERSION: u16 = 12;
 pub const RETENTION_PROTECTION_PROTOCOL_VERSION: u16 = 13;
 pub const ALL_EVENTS_HISTORY_PROTOCOL_VERSION: u16 = 14;
-pub const PROTOCOL_VERSION: u16 = ALL_EVENTS_HISTORY_PROTOCOL_VERSION;
+pub const RETENTION_PROGRESS_PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = RETENTION_PROGRESS_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -179,6 +180,16 @@ pub struct RetentionMapping {
     pub item_key: String,
     #[n(2)]
     pub blob_ids: Vec<String>,
+}
+
+/// Records unparseable history for one device/decoder without changing its retention protection.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct DeferredRetentionEvents {
+    #[n(0)]
+    pub decoder_revision: u32,
+    #[n(1)]
+    pub event_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
@@ -437,6 +448,8 @@ pub enum Request {
         group_id: String,
         #[n(1)]
         access_token: Vec<u8>,
+        #[n(2)]
+        decoder_revision: Option<u32>,
     },
     /// Replaces a device's protection snapshot and registers identities without revealing content.
     #[n(20)]
@@ -453,6 +466,8 @@ pub enum Request {
         protected_keys: Option<Vec<String>>,
         #[n(5)]
         mappings: Vec<RetentionMapping>,
+        #[n(6)]
+        deferred: Option<DeferredRetentionEvents>,
     },
     /// Stores an optional source icon that participates in reference reclamation.
     #[n(18)]
