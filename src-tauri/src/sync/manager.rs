@@ -4138,7 +4138,7 @@ impl SyncManager {
         let stored = repository::store_remote_batch(
             &pool,
             source.remote_batch_source(),
-            latest_cursor,
+            Some(latest_cursor),
             &events,
             &identity.device_id,
         )
@@ -7376,35 +7376,23 @@ async fn dispatch_peer(
             manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
-            let mut incoming_event_ids = Vec::new();
-            let mut remote_event_ids = Vec::new();
-            let mut accepted = Vec::new();
-            for event in events {
-                let result = repository::insert_event(&pool, &event, false, &[]).await?;
-                if !result.stored {
-                    log::warn!(
-                        "ignore LAN sync event {} with a reused origin sequence from {}",
-                        event.event_id,
-                        event.origin_device_id
-                    );
-                    continue;
-                }
-                incoming_event_ids.push(event.event_id.clone());
-                if event.origin_device_id != manager.identity.snapshot().device_id {
-                    remote_event_ids.push(event.event_id.clone());
-                }
-                if result.inserted {
-                    accepted.push(event.event_id.clone());
-                }
-            }
-            let received_new_events = !accepted.is_empty();
-            repository::mark_delivered(
+            let stored = repository::store_remote_batch(
                 &pool,
-                &format!("peer:{}", device.device_id),
-                &incoming_event_ids,
+                repository::RemoteBatchSource::Peer {
+                    device_id: &device.device_id,
+                },
+                None,
+                &events,
+                &manager.identity.snapshot().device_id,
             )
             .await?;
-            repository::mark_delivered(&pool, CLOUD_TARGET, &remote_event_ids).await?;
+            for (event_id, origin_device_id) in stored.conflicts {
+                log::warn!(
+                    "ignore LAN sync event {event_id} with a reused origin sequence from {origin_device_id}"
+                );
+            }
+            let accepted = stored.inserted_event_ids;
+            let received_new_events = !accepted.is_empty();
             let outgoing = repository::events_after_cursor(
                 &pool,
                 after_cursor,
