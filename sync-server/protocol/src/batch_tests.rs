@@ -149,6 +149,79 @@ fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
 }
 
 #[test]
+fn retention_progress_fields_are_backward_compatible() {
+    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+    enum LegacyRetentionRequest {
+        #[n(19)]
+        RetentionPlan {
+            #[n(0)]
+            group_id: String,
+            #[n(1)]
+            access_token: Vec<u8>,
+        },
+        #[n(20)]
+        SetRetention {
+            #[n(0)]
+            group_id: String,
+            #[n(1)]
+            access_token: Vec<u8>,
+            #[n(2)]
+            device: Box<DeviceAnnouncement>,
+            #[n(3)]
+            generation: u64,
+            #[n(4)]
+            protected_keys: Option<Vec<String>>,
+            #[n(5)]
+            mappings: Vec<RetentionMapping>,
+        },
+    }
+
+    let legacy_plan = LegacyRetentionRequest::RetentionPlan {
+        group_id: "group".into(),
+        access_token: vec![7; 32],
+    };
+    let mut plan: Request = minicbor::decode(&minicbor::to_vec(&legacy_plan).unwrap()).unwrap();
+    let Request::RetentionPlan {
+        decoder_revision, ..
+    } = &mut plan
+    else {
+        panic!("expected retention plan")
+    };
+    assert_eq!(*decoder_revision, None);
+    *decoder_revision = Some(1);
+    let decoded: LegacyRetentionRequest =
+        minicbor::decode(&minicbor::to_vec(&plan).unwrap()).unwrap();
+    assert_eq!(decoded, legacy_plan);
+
+    let Request::Sync { device, .. } = request(false, Vec::new()) else {
+        panic!("expected sync request")
+    };
+    let legacy_update = LegacyRetentionRequest::SetRetention {
+        group_id: "group".into(),
+        access_token: vec![7; 32],
+        device: Box::new(device),
+        generation: 1,
+        protected_keys: None,
+        mappings: Vec::new(),
+    };
+    let mut update: Request = minicbor::decode(&minicbor::to_vec(&legacy_update).unwrap()).unwrap();
+    let Request::SetRetention { deferred, .. } = &mut update else {
+        panic!("expected retention update")
+    };
+    assert!(deferred.is_none());
+    *deferred = Some(DeferredRetentionEvents {
+        decoder_revision: 1,
+        event_ids: vec!["event_123".into()],
+    });
+    let encoded = minicbor::to_vec(&update).unwrap();
+    assert_eq!(minicbor::decode::<Request>(&encoded).unwrap(), update);
+    assert_eq!(
+        minicbor::decode::<LegacyRetentionRequest>(&encoded).unwrap(),
+        legacy_update
+    );
+}
+
+#[test]
 fn history_state_filter_is_opt_in_and_backward_compatible() {
     #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
     enum LegacyHistoryRequest {

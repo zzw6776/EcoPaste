@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    CloudDevice, CloudEvent, DeviceAnnouncement, EncryptedEvent, MAX_EVENTS_PER_BATCH,
-    PeerAnnouncement, RemovedDevice, RetentionMapping, SyncEventKind,
+    CloudDevice, CloudEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent,
+    MAX_EVENTS_PER_BATCH, PeerAnnouncement, RemovedDevice, RetentionMapping, SyncEventKind,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -544,17 +544,34 @@ impl Repository {
             .context("read retention epoch")
     }
 
-    /// Unknown legacy identities remain protected until a client decrypts and registers them.
-    pub async fn retention_candidates(&self, group_id: &str) -> Result<Vec<CloudEvent>> {
+    /// Resumes pending registration, excluding only this endpoint's acknowledged decoder failures.
+    /// Unknown identities remain protected even after every current decoder has deferred them.
+    pub async fn retention_candidates(
+        &self,
+        group_id: &str,
+        endpoint_id: &str,
+        decoder_revision: Option<u32>,
+    ) -> Result<Vec<CloudEvent>> {
+        if decoder_revision == Some(0) {
+            bail!("invalid retention decoder revision");
+        }
         let rows = sqlx::query(
             r#"
-            SELECT cursor, event_id, origin_device_id, origin_sequence,
-                   created_at_ms, nonce, ciphertext, event_kind, retention_key
-            FROM events WHERE group_id = ? AND retention_key IS NULL
-            ORDER BY cursor ASC LIMIT ?
+            SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+                   e.created_at_ms, e.nonce, e.ciphertext, e.event_kind, e.retention_key
+            FROM events e WHERE e.group_id = ? AND e.retention_key IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM retention_deferred_events d
+                  JOIN devices device ON device.group_id = d.group_id AND device.device_id = d.device_id
+                  WHERE d.group_id = e.group_id AND d.event_id = e.event_id
+                    AND device.endpoint_id = ? AND d.decoder_revision = ?
+              )
+            ORDER BY e.cursor ASC LIMIT ?
             "#,
         )
         .bind(group_id)
+        .bind(endpoint_id)
+        .bind(decoder_revision.map(i64::from))
         .bind(i64::from(MAX_EVENTS_PER_BATCH))
         .fetch_all(&self.pool)
         .await
@@ -571,9 +588,14 @@ impl Repository {
         generation: u64,
         protected_keys: Option<&[String]>,
         mappings: &[RetentionMapping],
+        deferred: Option<&DeferredRetentionEvents>,
     ) -> Result<()> {
-        if mappings.len() > usize::from(MAX_EVENTS_PER_BATCH) {
-            bail!("too many retention mappings");
+        let deferred_count = deferred.map_or(0, |value| value.event_ids.len());
+        if mappings.len().saturating_add(deferred_count) > usize::from(MAX_EVENTS_PER_BATCH) {
+            bail!("too many retention registration results");
+        }
+        if deferred.is_some_and(|value| value.decoder_revision == 0) {
+            bail!("invalid retention decoder revision");
         }
         let mut transaction = self
             .pool
@@ -638,6 +660,27 @@ impl Repository {
                 sqlx::query("INSERT OR IGNORE INTO event_blob_refs(group_id,event_id,blob_id,created_at_ms) VALUES (?,?,?,?)")
                     .bind(group_id).bind(&mapping.event_id).bind(blob_id).bind(now_ms())
                     .execute(&mut *transaction).await?;
+            }
+        }
+        if let Some(deferred) = deferred {
+            for event_id in &deferred.event_ids {
+                validate_identifier("event_id", event_id)?;
+                sqlx::query(
+                    "INSERT INTO retention_deferred_events(group_id,event_id,device_id,decoder_revision,created_at,updated_at) \
+                     SELECT group_id,event_id,?,?,?,? FROM events WHERE group_id = ? AND event_id = ? AND retention_key IS NULL \
+                     ON CONFLICT(group_id,event_id,device_id) DO UPDATE SET \
+                         decoder_revision = excluded.decoder_revision, updated_at = excluded.updated_at \
+                     WHERE retention_deferred_events.decoder_revision <> excluded.decoder_revision",
+                )
+                .bind(device_id)
+                .bind(i64::from(deferred.decoder_revision))
+                .bind(&now)
+                .bind(&now)
+                .bind(group_id)
+                .bind(event_id)
+                .execute(&mut *transaction)
+                .await
+                .context("defer unsupported retention event")?;
             }
         }
         // A legacy blob can be shared with an event whose references are not registered yet.
@@ -2100,6 +2143,7 @@ mod tests {
                 1,
                 Some(&[protected_key]),
                 &[],
+                None,
             )
             .await
             .unwrap();
@@ -2149,7 +2193,7 @@ mod tests {
         assert!(!idle.has_more);
 
         repository
-            .set_retention("group_123", &device.device_id, 2, Some(&[]), &[])
+            .set_retention("group_123", &device.device_id, 2, Some(&[]), &[], None)
             .await
             .unwrap();
         let released = repository.cleanup_group("group_123", policy).await.unwrap();
@@ -2187,16 +2231,16 @@ mod tests {
                 .await
                 .unwrap();
             repository
-                .set_retention("group_123", id, 10, Some(&keys), &[])
+                .set_retention("group_123", id, 10, Some(&keys), &[], None)
                 .await
                 .unwrap();
         }
         repository
-            .set_retention("group_123", "device_123", 11, Some(&[]), &[])
+            .set_retention("group_123", "device_123", 11, Some(&[]), &[], None)
             .await
             .unwrap();
         repository
-            .set_retention("group_123", "device_123", 10, Some(&keys), &[])
+            .set_retention("group_123", "device_123", 10, Some(&keys), &[], None)
             .await
             .unwrap();
         let mut policy = retention_test_policy();
@@ -2276,7 +2320,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .retention_candidates("group_123")
+                .retention_candidates("group_123", "endpoint_123", None)
                 .await
                 .unwrap()
                 .len(),
@@ -2289,7 +2333,7 @@ mod tests {
             blob_ids: vec![blob.clone()],
         };
         repository
-            .set_retention("group_123", &device.device_id, 1, Some(&[]), &[first])
+            .set_retention("group_123", &device.device_id, 1, Some(&[]), &[first], None)
             .await
             .unwrap();
         let partially_registered = repository.cleanup_group("group_123", policy).await.unwrap();
@@ -2316,12 +2360,13 @@ mod tests {
                 2,
                 Some(std::slice::from_ref(&second.item_key)),
                 std::slice::from_ref(&second),
+                None,
             )
             .await
             .unwrap();
         assert!(
             repository
-                .retention_candidates("group_123")
+                .retention_candidates("group_123", "endpoint_123", None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2335,7 +2380,7 @@ mod tests {
             1
         );
         repository
-            .set_retention("group_123", &device.device_id, 3, Some(&[]), &[])
+            .set_retention("group_123", &device.device_id, 3, Some(&[]), &[], None)
             .await
             .unwrap();
         let released = repository.cleanup_group("group_123", policy).await.unwrap();
@@ -2373,7 +2418,14 @@ mod tests {
             .await
             .unwrap();
         repository
-            .set_retention("group_123", &device.device_id, 1, Some(&[protected]), &[])
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                1,
+                Some(&[protected]),
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let mut policy = retention_test_policy();
@@ -2411,6 +2463,324 @@ mod tests {
             rest.iter().map(|stored| stored.cursor).collect::<Vec<_>>(),
             [257, 258, 260]
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_retention_resumes_after_restart_and_is_scoped_to_device_and_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite3");
+        let repository = Repository::open(&path).await.unwrap();
+        let device = retention_test_device("device_123");
+        let other_device = retention_test_device("device_456");
+        for group in ["group_123", "group_456"] {
+            repository.create_group(group, &[7; 32]).await.unwrap();
+            repository.upsert_device(group, &device).await.unwrap();
+        }
+        repository
+            .upsert_device("group_123", &other_device)
+            .await
+            .unwrap();
+        let mut events = (1..=u64::from(MAX_EVENTS_PER_BATCH) + 2)
+            .map(test_event)
+            .collect::<Vec<_>>();
+        for event in &mut events {
+            event.retention_key = None;
+        }
+        repository
+            .insert_events("group_123", &events, None)
+            .await
+            .unwrap();
+        repository
+            .insert_events("group_456", &events[..1], None)
+            .await
+            .unwrap();
+        let blob = "c".repeat(64);
+        repository
+            .record_blob("group_123", &blob, 200, false)
+            .await
+            .unwrap();
+        let first_page = repository
+            .retention_candidates("group_123", &device.endpoint_id, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(first_page.len(), usize::from(MAX_EVENTS_PER_BATCH));
+        let deferred = DeferredRetentionEvents {
+            decoder_revision: 1,
+            event_ids: first_page
+                .iter()
+                .map(|stored| stored.event.event_id.clone())
+                .collect(),
+        };
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                1,
+                Some(&[]),
+                &[],
+                Some(&deferred),
+            )
+            .await
+            .unwrap();
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                1,
+                None,
+                &[],
+                Some(&deferred),
+            )
+            .await
+            .unwrap();
+        repository.pool.close().await;
+
+        let repository = Repository::open(&path).await.unwrap();
+        let next_page = repository
+            .retention_candidates("group_123", &device.endpoint_id, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(next_page.len(), 2);
+        assert_eq!(
+            next_page[0].event,
+            events[usize::from(MAX_EVENTS_PER_BATCH)]
+        );
+        for (group, endpoint, revision, expected) in [
+            (
+                "group_123",
+                device.endpoint_id.as_str(),
+                Some(2),
+                usize::from(MAX_EVENTS_PER_BATCH),
+            ),
+            (
+                "group_123",
+                other_device.endpoint_id.as_str(),
+                Some(1),
+                usize::from(MAX_EVENTS_PER_BATCH),
+            ),
+            (
+                "group_123",
+                device.endpoint_id.as_str(),
+                None,
+                usize::from(MAX_EVENTS_PER_BATCH),
+            ),
+            ("group_456", device.endpoint_id.as_str(), Some(1), 1),
+        ] {
+            assert_eq!(
+                repository
+                    .retention_candidates(group, endpoint, revision)
+                    .await
+                    .unwrap()
+                    .len(),
+                expected
+            );
+        }
+        let mapping = RetentionMapping {
+            event_id: next_page[0].event.event_id.clone(),
+            item_key: "a".repeat(64),
+            blob_ids: Vec::new(),
+        };
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                0,
+                None,
+                &[mapping],
+                Some(&DeferredRetentionEvents {
+                    decoder_revision: 1,
+                    event_ids: vec![next_page[1].event.event_id.clone()],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .retention_candidates("group_123", &device.endpoint_id, Some(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut policy = retention_test_policy();
+        policy.target_bytes = Some(0);
+        policy.retention_cutoff_ms = Some(i64::MAX);
+        policy.legacy_blob_cutoff_ms = Some(i64::MAX);
+        let cleanup = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(cleanup.deleted_events, 0);
+        assert!(cleanup.deleted_blob_ids.is_empty());
+        assert_eq!(
+            repository
+                .group_usage("group_123")
+                .await
+                .unwrap()
+                .blob_count,
+            1
+        );
+        let original = repository.list_events("group_123", 0, 1).await.unwrap();
+        assert_eq!(original[0].event, events[0]);
+
+        let mut new_event = test_event(999);
+        new_event.retention_key = None;
+        repository
+            .insert_events("group_123", std::slice::from_ref(&new_event), None)
+            .await
+            .unwrap();
+        let next_page = repository
+            .retention_candidates("group_123", &device.endpoint_id, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(next_page.len(), 1);
+        assert_eq!(next_page[0].event, new_event);
+
+        // New decoder results replace the previous revision's deferral instead of accumulating rows.
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                0,
+                None,
+                &[],
+                Some(&DeferredRetentionEvents {
+                    decoder_revision: 2,
+                    event_ids: vec![events[0].event_id.clone()],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap(),
+            i64::from(MAX_EVENTS_PER_BATCH) + 1
+        );
+
+        repository
+            .merge_removed_devices(
+                "group_123",
+                &[RemovedDevice {
+                    device_id: device.device_id.clone(),
+                    endpoint_id: device.endpoint_id.clone(),
+                    removed_at_ms: 100,
+                    restored_at_ms: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_retention_progress_rolls_back_mappings_and_protection_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let device = retention_test_device("device_123");
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+        let mut event = test_event(1);
+        event.retention_key = None;
+        repository
+            .insert_events("group_123", &[event], None)
+            .await
+            .unwrap();
+        let old_key = "a".repeat(64);
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                1,
+                Some(std::slice::from_ref(&old_key)),
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let result = repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                2,
+                Some(&["b".repeat(64)]),
+                &[RetentionMapping {
+                    event_id: "event_001".into(),
+                    item_key: "c".repeat(64),
+                    blob_ids: Vec::new(),
+                }],
+                Some(&DeferredRetentionEvents {
+                    decoder_revision: 1,
+                    event_ids: vec!["../invalid".into()],
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            repository
+                .retention_candidates("group_123", &device.endpoint_id, Some(1))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT item_key FROM retention_protections")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap(),
+            old_key
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT generation FROM retention_devices")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        for deferred in [
+            DeferredRetentionEvents {
+                decoder_revision: 0,
+                event_ids: vec!["event_001".into()],
+            },
+            DeferredRetentionEvents {
+                decoder_revision: 1,
+                event_ids: vec!["event_001".into(); usize::from(MAX_EVENTS_PER_BATCH) + 1],
+            },
+        ] {
+            assert!(
+                repository
+                    .set_retention(
+                        "group_123",
+                        &device.device_id,
+                        0,
+                        None,
+                        &[],
+                        Some(&deferred)
+                    )
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     fn retention_test_device(id: &str) -> DeviceAnnouncement {
