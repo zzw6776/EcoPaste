@@ -19,10 +19,10 @@ use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     limit_sync_request, limit_sync_response, read_frame, write_frame, CloudEvent,
     DeviceAnnouncement, EncryptedEvent, ErrorCode, PeerAnnouncement, RemovedDevice, Request,
-    Response, SyncEventKind, ALPN, ASYNC_SOURCE_ICON_PROTOCOL_VERSION,
-    BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES,
-    OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION, REDUNDANT_WATCH_PROTOCOL_VERSION,
-    SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
+    Response, SyncEventKind, ALL_EVENTS_HISTORY_PROTOCOL_VERSION, ALPN,
+    ASYNC_SOURCE_ICON_PROTOCOL_VERSION, BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH,
+    MAX_FRAME_BYTES, OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    REDUNDANT_WATCH_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION, TYPED_EVENTS_PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -100,6 +100,8 @@ const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
+const CLOUD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const CLOUD_UPLOAD_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 自动文件同步只看整张卡片的原始总大小；0 明确表示全部手动。
 fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
@@ -110,6 +112,19 @@ const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
 const LOCAL_SYNC_GC_BATCH_SIZE: u32 = 500;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
+
+/// Applies cloud keep-alive intervals while the maintained transport handles GSO fallback.
+fn sync_transport_config(cloud: bool) -> QuicTransportConfig {
+    let builder = QuicTransportConfig::builder();
+    let builder = if cloud {
+        builder
+            .keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
+            .default_path_keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
+    } else {
+        builder
+    };
+    builder.build()
+}
 
 fn remove_unreferenced_sync_blobs(root: &Path, live_blob_ids: &HashSet<String>) -> Result<u64> {
     if !root.exists() {
@@ -374,6 +389,20 @@ enum LanPeerSyncOutcome {
 
 struct SyncConnectionOutcome {
     has_more: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SyncExchange<'a> {
+    connection: &'a Connection,
+    target: &'a SyncConnectionTarget,
+    group: &'a GroupSecrets,
+    endpoint: &'a Endpoint,
+}
+
+struct SyncReadyOutcome {
+    latest_cursor: u64,
+    has_more: bool,
+    event_ids: Vec<String>,
 }
 
 struct SyncBatchResponse {
@@ -959,7 +988,9 @@ impl SyncManager {
             }
             let pool = self.pool().await;
             let _enqueue_guard = self.enqueue_lock.lock().await;
-            repository::clear_group_state(&pool).await?;
+            if switching_group {
+                repository::clear_group_state(&pool).await?;
+            }
             self.pending_observations
                 .lock()
                 .expect("pending clipboard observations poisoned")
@@ -967,6 +998,7 @@ impl SyncManager {
             self.identity.set_group(Some(bootstrap.group.clone()))?;
         }
         let pool = self.pool().await;
+        repository::clear_cloud_retention_snapshot(&pool).await?;
         repository::restore_and_upsert_peer(&pool, &bootstrap.inviter).await?;
         let cloud_enabled = !bootstrap.server_endpoint_id.trim().is_empty();
         let settings = self
@@ -1708,8 +1740,10 @@ impl SyncManager {
             &item.id,
             &item.sync_key,
             &item.source_revision,
-            true,
-            false,
+            crate::db::sync_queue::ContentSyncOptions {
+                force_files: true,
+                ..Default::default()
+            },
         )
         .await?;
         self.materialize_local_operations().await?;
@@ -1846,6 +1880,7 @@ impl SyncManager {
             access_token: group.access_token_bytes()?,
             before_cursor,
             limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
+            include_states: None,
         };
         let (connection, response) = self
             .request_cloud_query(connection, &group, &request)
@@ -2072,7 +2107,13 @@ impl SyncManager {
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
         let (envelope, blobs, fingerprint) = match self
-            .build_envelope(&event_id, &item, settings, group, operation.force_files)
+            .build_envelope(
+                &event_id,
+                &item,
+                settings,
+                group,
+                operation.force_files || operation.manual_share,
+            )
             .await?
         {
             Some(value) => value,
@@ -2426,8 +2467,10 @@ impl SyncManager {
                 &item.id,
                 &item.sync_key,
                 &item.source_revision,
-                false,
-                true,
+                db::sync_queue::ContentSyncOptions {
+                    history_backfill: true,
+                    ..Default::default()
+                },
             )
             .await?;
         }
@@ -2515,7 +2558,7 @@ impl SyncManager {
         Ok(reconciled)
     }
 
-    /// Notifies the list to reload after sync metadata changes item ordering.
+    /// Notifies the list to reload after synchronized history or metadata changes.
     fn emit_clipboard_reconciled(&self) {
         if let Err(error) = self.app.emit(
             crate::clipboard::CLIPBOARD_UPDATED_EVENT,
@@ -2675,6 +2718,7 @@ impl SyncManager {
                     let result = async {
                         let initialized_group =
                             self.ensure_cloud_group(&connection, &group).await?;
+                        self.sync_removed_devices(&connection, &group, true).await?;
                         let group_elapsed = group_started_at.elapsed();
                         let transfer_started_at = Instant::now();
                         let (cursor, bootstrap_target) = self
@@ -3180,7 +3224,7 @@ impl SyncManager {
                 0
             }
         };
-        if protocol_version < TYPED_EVENTS_PROTOCOL_VERSION {
+        if protocol_version < ALL_EVENTS_HISTORY_PROTOCOL_VERSION {
             bail!("同步服务版本过低，请升级到支持新版同步协议的版本");
         }
         *self
@@ -3310,6 +3354,7 @@ impl SyncManager {
         Ok((start_cursor, Some(latest_cursor)))
     }
 
+    /// Uploads attachments in bounded parallel streams and confirms unrelated records independently.
     async fn sync_connection(
         self: &Arc<Self>,
         connection: &Connection,
@@ -3319,9 +3364,8 @@ impl SyncManager {
         endpoint: &Endpoint,
     ) -> Result<SyncConnectionOutcome> {
         let _sync_activity = SyncActivityGuard::acquire();
-        let target_id = target.delivery_target();
         let is_cloud = target.is_cloud();
-        let language = crate::i18n::current_language(&self.app);
+        let target_id = target.delivery_target();
         if !is_cloud {
             match call(connection, Request::Health).await? {
                 Response::Health {
@@ -3334,6 +3378,397 @@ impl SyncManager {
         }
         let pool = self.pool().await;
         let identity = self.identity.snapshot();
+        if is_cloud
+            && self
+                .refresh_cloud_retention(
+                    connection,
+                    group,
+                    endpoint,
+                    MAX_SYNC_BATCHES_PER_CONNECTION,
+                )
+                .await?
+        {
+            return Ok(SyncConnectionOutcome { has_more: true });
+        }
+        let managed_hub_blobs = is_cloud && self.bounded_hub_supported(connection, &group.group_id);
+        let optional_blob_refs =
+            is_cloud && self.cloud_optional_blob_refs_supported(connection, &group.group_id);
+        let deferred_icons = is_cloud
+            && self.cloud_async_source_icons_supported(connection, &group.group_id)
+            && (!managed_hub_blobs || optional_blob_refs);
+        let context = SyncExchange {
+            connection,
+            target,
+            group,
+            endpoint,
+        };
+        let mut cursor = after_cursor;
+        let mut has_more = false;
+        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            let mut pending = if is_cloud {
+                repository::pending_origin_events_for_target(
+                    &pool,
+                    target_id,
+                    &identity.device_id,
+                    MAX_EVENTS_PER_BATCH,
+                )
+                .await?
+            } else {
+                repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
+                    .await?
+            };
+            let more_available = pending.len() == usize::from(MAX_EVENTS_PER_BATCH);
+            if is_cloud {
+                let key = group.content_key_bytes()?;
+                for stored in &mut pending {
+                    stored.event.retention_key =
+                        Some(crypto::retention_mapping(&key, &stored.event)?.item_key);
+                }
+            }
+            if managed_hub_blobs {
+                repository::attach_event_blob_ids(&pool, &mut pending).await?;
+                if optional_blob_refs {
+                    mark_optional_source_icon_refs(&mut pending, &group.content_key_bytes()?);
+                }
+            }
+            let ids = pending
+                .iter()
+                .map(|stored| stored.event.event_id.clone())
+                .collect::<Vec<_>>();
+            repository::mark_delivery_queued(&pool, target_id, &ids).await?;
+            let blobs = repository::blobs_for_events(&pool, &ids).await?;
+            let mut queue = super::transfer::TransferQueue::new(
+                pending,
+                blobs,
+                &group.content_key_bytes()?,
+                managed_hub_blobs && !deferred_icons,
+            )?;
+            let mut uploads = tokio::task::JoinSet::new();
+            let (upload_started, mut upload_notifications) = mpsc::unbounded_channel();
+            let mut failure = None;
+            for (id, reason) in queue.take_failures() {
+                repository::mark_delivery_error(&pool, target_id, &[id], &reason).await?;
+                failure.get_or_insert_with(|| anyhow::anyhow!(reason));
+            }
+            let mut pull_needed = true;
+            while pull_needed || queue.has_pending() {
+                while uploads.len() < MAX_CONCURRENT_BLOB_TRANSFERS {
+                    let Some(blob) = queue.next_blob() else {
+                        break;
+                    };
+                    let connection = connection.clone();
+                    let group = group.clone();
+                    let options = BlobUploadOptions {
+                        kind: BlobUploadKind::Content,
+                        managed_hub_blob: managed_hub_blobs,
+                        is_cloud,
+                        language: crate::i18n::current_language(&self.app),
+                        started: Some(upload_started.clone()),
+                    };
+                    uploads.spawn(async move {
+                        let result = upload_blob(&connection, &group, &blob, options).await;
+                        (blob.blob_id, result)
+                    });
+                }
+                self.emit_updated();
+                let mut ready = queue.ready_events();
+                if ready.is_empty() && !pull_needed {
+                    let result = tokio::select! {
+                        Some(blob_id) = upload_notifications.recv() => {
+                            repository::mark_delivery_syncing(
+                                &pool,
+                                target_id,
+                                &queue.events_for_blob(&blob_id),
+                            ).await?;
+                            self.emit_updated();
+                            continue;
+                        }
+                        result = uploads.join_next() => result,
+                    };
+                    let Some(result) = result else {
+                        break;
+                    };
+                    let (blob_id, result) = result.context("attachment upload task failed")?;
+                    match result {
+                        Ok(()) => queue.blob_stored(blob_id),
+                        Err(error) => {
+                            let ids = queue.fail_blob(&blob_id);
+                            log::warn!(
+                                "sync attachment upload failed: blobRef={} error={error:#}",
+                                blob_log_ref(&blob_id)
+                            );
+                            repository::mark_delivery_error(
+                                &pool,
+                                target_id,
+                                &ids,
+                                &error.to_string(),
+                            )
+                            .await?;
+                            self.emit_updated();
+                            let message = error.to_string();
+                            failure.get_or_insert(error);
+                            if connection.close_reason().is_some() {
+                                repository::mark_delivery_error(
+                                    &pool,
+                                    target_id,
+                                    &queue.active_events(),
+                                    &message,
+                                )
+                                .await?;
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                pull_needed = false;
+                let more_outgoing = more_available || queue.has_pending();
+                match self
+                    .exchange_ready_events(&context, cursor, &mut ready, more_outgoing)
+                    .await
+                {
+                    Ok(outcome) => {
+                        queue.confirm_events(&outcome.event_ids);
+                        cursor = outcome.latest_cursor;
+                        has_more = outcome.has_more;
+                    }
+                    Err(error) => {
+                        if is_cloud && should_invalidate_cloud_connection(connection, &error) {
+                            self.invalidate_cloud_connection(connection.stable_id());
+                            self.watch_wake.notify_one();
+                        }
+                        let submitted = ready
+                            .iter()
+                            .map(|stored| stored.event.event_id.clone())
+                            .collect::<Vec<_>>();
+                        queue.fail_events(&submitted);
+                        let message = error.to_string();
+                        repository::mark_delivery_error(&pool, target_id, &submitted, &message)
+                            .await?;
+                        self.emit_updated();
+                        failure.get_or_insert(error);
+                        if connection.close_reason().is_some() {
+                            repository::mark_delivery_error(
+                                &pool,
+                                target_id,
+                                &queue.active_events(),
+                                &message,
+                            )
+                            .await?;
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if !has_more {
+                break;
+            }
+        }
+        if is_cloud {
+            has_more |= self
+                .refresh_cloud_retention(connection, group, endpoint, 1)
+                .await?;
+            has_more |= self
+                .reconcile_legacy_cloud_deliveries(connection, group)
+                .await?;
+        }
+        self.source_asset_wake.notify_one();
+        Ok(SyncConnectionOutcome { has_more })
+    }
+
+    /// Publishes current protection before uploads and repairs old Hub metadata in bounded pages.
+    async fn refresh_cloud_retention(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        endpoint: &Endpoint,
+        max_pages: usize,
+    ) -> Result<bool> {
+        let pool = self.pool().await;
+        let key = group.content_key_bytes()?;
+        let device = self.cloud_device_announcement(endpoint);
+        let language = crate::i18n::current_language(&self.app);
+        for _ in 0..max_pages {
+            let response = call_cloud(
+                connection,
+                Request::RetentionPlan {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                },
+                language,
+            )
+            .await?;
+            let Response::RetentionPlan {
+                epoch,
+                events,
+                has_more,
+            } = response
+            else {
+                if let Response::Error { message, .. } = response {
+                    bail!(message);
+                }
+                bail!("invalid cloud retention plan");
+            };
+            let mut mappings = Vec::with_capacity(events.len());
+            for stored in &events {
+                match crypto::retention_mapping(&key, &stored.event) {
+                    Ok(mapping) => {
+                        let patch = match crypto::decrypt_sync_event(&key, &stored.event)? {
+                            DecryptedSyncEvent::ItemState(patch) => patch,
+                            DecryptedSyncEvent::Clipboard(envelope) => SyncedItemStatePatch {
+                                sync_key: envelope.item.sync_key,
+                                is_favorite: None,
+                                is_pinned: None,
+                                note: None,
+                                note_changed: false,
+                                is_present: Some(true),
+                            },
+                        };
+                        // Do not learn a newer tombstone halfway through an older content download.
+                        let _apply_guard = self.apply_lock.lock().await;
+                        db::sync_item_state::merge_retention_state(
+                            &pool,
+                            &patch,
+                            &db::sync_item_state::SyncEventVersion {
+                                origin_sequence: stored.event.origin_sequence,
+                                origin_device_id: stored.event.origin_device_id.clone(),
+                            },
+                        )
+                        .await?;
+                        mappings.push(mapping);
+                    }
+                    Err(error) => log::warn!("keep invalid legacy cloud event protected: {error}"),
+                }
+            }
+            let made_progress = !mappings.is_empty();
+            let mut protected_keys = repository::protected_sync_keys(&pool)
+                .await?
+                .iter()
+                .map(|sync_key| crypto::retention_key(&key, sync_key))
+                .collect::<Vec<_>>();
+            protected_keys.sort_unstable();
+            protected_keys.dedup();
+            let fingerprint = blake3::hash(&minicbor::to_vec((
+                &epoch,
+                &device.device_id,
+                &protected_keys,
+            ))?)
+            .to_hex()
+            .to_string();
+            let changed = repository::cloud_retention_snapshot(&pool)
+                .await?
+                .as_deref()
+                != Some(fingerprint.as_str());
+            if changed || !mappings.is_empty() {
+                let generation = if changed {
+                    repository::next_origin_sequence(&pool).await?
+                } else {
+                    0
+                };
+                let response = call_cloud(
+                    connection,
+                    Request::SetRetention {
+                        group_id: group.group_id.clone(),
+                        access_token: group.access_token_bytes()?,
+                        device: device.clone(),
+                        generation,
+                        protected_keys: changed.then_some(protected_keys),
+                        mappings,
+                    },
+                    language,
+                )
+                .await?;
+                match response {
+                    Response::RetentionUpdated => {
+                        if changed {
+                            repository::set_cloud_retention_snapshot(&pool, &fingerprint).await?;
+                        }
+                    }
+                    Response::Error { message, .. } => bail!(message),
+                    _ => bail!("invalid cloud retention acknowledgement"),
+                }
+            }
+            if !has_more || !made_progress {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Rechecks one bounded page of legacy delivery claims without pulling attachments or resetting sync.
+    async fn reconcile_legacy_cloud_deliveries(
+        self: &Arc<Self>,
+        connection: &Connection,
+        group: &GroupSecrets,
+    ) -> Result<bool> {
+        let pool = self.pool().await;
+        let Some(before_cursor) = repository::cloud_confirmation_repair_cursor(
+            &pool,
+            &self.identity.snapshot().device_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        let response = call_cloud(
+            connection,
+            Request::ListEvents {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                before_cursor,
+                limit: MAX_EVENTS_PER_BATCH,
+                include_states: Some(true),
+            },
+            crate::i18n::current_language(&self.app),
+        )
+        .await?;
+        let Response::EventsPage {
+            events,
+            next_before_cursor,
+            ..
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("invalid cloud confirmation history response");
+        };
+        let key = group.content_key_bytes()?;
+        let mut verified = Vec::new();
+        for stored in events {
+            if let Err(error) = crypto::decrypt_sync_event(&key, &stored.event) {
+                log::warn!("skip invalid cloud confirmation event: error={error}");
+                continue;
+            }
+            verified.push(stored.event);
+        }
+        repository::repair_cloud_confirmations(&pool, &verified, next_before_cursor).await?;
+        self.emit_updated();
+        Ok(next_before_cursor.is_some())
+    }
+
+    /// Publishes only attachment-ready records and applies the Hub/peer acknowledgement immediately.
+    async fn exchange_ready_events(
+        self: &Arc<Self>,
+        context: &SyncExchange<'_>,
+        after_cursor: u64,
+        pending: &mut Vec<StoredSyncEvent>,
+        more_outgoing: bool,
+    ) -> Result<SyncReadyOutcome> {
+        let SyncExchange {
+            connection,
+            target,
+            group,
+            endpoint,
+        } = *context;
+        let is_cloud = target.is_cloud();
+        let target_id = target.delivery_target();
+        let pool = self.pool().await;
+        let identity = self.identity.snapshot();
+        let language = crate::i18n::current_language(&self.app);
         let use_sync_v2 = is_cloud && self.cloud_sync_v2_supported(connection, &group.group_id);
         let managed_hub_blobs = is_cloud && self.bounded_hub_supported(connection, &group.group_id);
         let optional_blob_refs =
@@ -3348,304 +3783,249 @@ impl SyncManager {
                 .await?;
             Vec::new()
         };
-        let mut cursor = after_cursor;
-        let mut has_more = false;
-        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
-            let batch_started_at = Instant::now();
-            let mut pending = if is_cloud {
-                repository::pending_origin_events_for_target(
-                    &pool,
-                    target_id,
-                    &identity.device_id,
-                    MAX_EVENTS_PER_BATCH,
-                )
-                .await?
-            } else {
-                repository::pending_events_for_target(&pool, target_id, MAX_EVENTS_PER_BATCH)
-                    .await?
-            };
-            if managed_hub_blobs {
-                repository::attach_event_blob_ids(&pool, &mut pending).await?;
-                if optional_blob_refs {
-                    mark_optional_source_icon_refs(&mut pending, &group.content_key_bytes()?);
-                }
+        let batch_started_at = Instant::now();
+        let available_count = pending.len();
+        let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
+        // Keep the field present while byte-limiting so the final continuation value cannot
+        // make an otherwise fitting request exceed the frame limit.
+        let mut request = if use_sync_v2 {
+            Request::SyncV2 {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                device: self.cloud_device_announcement(endpoint),
+                after_cursor,
+                events: outgoing_events,
+                removed_devices: removed_devices.clone(),
+                limit: MAX_EVENTS_PER_BATCH,
+                byte_limited: Some(true),
+                events_complete: Some(false),
+                bounded_hub: managed_hub_blobs.then_some(true),
             }
-            let available_count = pending.len();
-            let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
-            // Keep the field present while byte-limiting so the final continuation value cannot
-            // make an otherwise fitting request exceed the frame limit.
-            let mut request = if use_sync_v2 {
-                Request::SyncV2 {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    device: self.cloud_device_announcement(endpoint),
-                    after_cursor: cursor,
-                    events: outgoing_events,
-                    removed_devices: removed_devices.clone(),
-                    limit: MAX_EVENTS_PER_BATCH,
-                    byte_limited: Some(true),
-                    events_complete: Some(false),
-                    bounded_hub: managed_hub_blobs.then_some(true),
-                }
-            } else {
-                Request::Sync {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    device: if is_cloud {
-                        self.cloud_device_announcement(endpoint)
-                    } else {
-                        self.device_announcement(endpoint)
-                    },
-                    after_cursor: cursor,
-                    events: outgoing_events,
-                    limit: MAX_EVENTS_PER_BATCH,
-                    byte_limited: Some(true),
-                    events_complete: Some(false),
-                    bounded_hub: managed_hub_blobs.then_some(true),
-                }
-            };
-            let pending_count = limit_sync_request(&mut request)?;
-            let outgoing_has_more = pending_count < available_count
-                || available_count == usize::from(MAX_EVENTS_PER_BATCH);
-            match &mut request {
-                Request::Sync {
-                    events_complete, ..
-                }
-                | Request::SyncV2 {
-                    events_complete, ..
-                } => *events_complete = Some(!outgoing_has_more),
-                _ => unreachable!("sync request variant was constructed above"),
+        } else {
+            Request::Sync {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                device: if is_cloud {
+                    self.cloud_device_announcement(endpoint)
+                } else {
+                    self.device_announcement(endpoint)
+                },
+                after_cursor,
+                events: outgoing_events,
+                limit: MAX_EVENTS_PER_BATCH,
+                byte_limited: Some(true),
+                events_complete: Some(false),
+                bounded_hub: managed_hub_blobs.then_some(true),
             }
-            pending.truncate(pending_count);
-            let event_ids = pending
-                .iter()
-                .map(|item| item.event.event_id.clone())
-                .collect::<Vec<_>>();
-            let source_icon_blob_ids = source_icon_blob_ids(&pending, &group.content_key_bytes()?);
-            repository::mark_delivery_syncing(&pool, target_id, &event_ids).await?;
-            self.emit_updated();
-            let blob_started_at = Instant::now();
-            let blobs = match repository::blobs_for_events(&pool, &event_ids).await {
-                Ok(blobs) => blobs,
-                Err(error) => {
-                    repository::mark_delivery_error(
-                        &pool,
-                        target_id,
-                        &event_ids,
-                        &error.to_string(),
-                    )
-                    .await?;
-                    self.emit_updated();
-                    return Err(error);
-                }
-            };
-            let (required_blobs, source_icon_blobs) =
-                split_source_icon_blobs(blobs, &source_icon_blob_ids);
-            let required_blob_count = required_blobs.len();
-            let source_icon_blob_count = source_icon_blobs.len();
-            // A bounded Hub can reclaim an icon while this QUIC connection is still alive.
-            let (source_icon_blobs, source_icon_cache_hits) = if is_cloud && !managed_hub_blobs {
-                self.confirmed_cloud_source_icons
-                    .write()
-                    .expect("confirmed cloud source icons poisoned")
-                    .retain_unconfirmed(connection.stable_id(), &group.group_id, source_icon_blobs)
-            } else {
-                (source_icon_blobs, 0)
-            };
-            let source_icon_blob_checks = source_icon_blobs.len();
-            let checked_source_icon_blob_ids = source_icon_blobs
-                .iter()
-                .map(|blob| blob.blob_id.clone())
-                .collect::<Vec<_>>();
-            if let Err(error) = upload_blobs(
+        };
+        let pending_count = match limit_sync_request(&mut request) {
+            Ok(count) => count,
+            Err(error) => {
+                pending.truncate(1);
+                return Err(error.into());
+            }
+        };
+        let outgoing_has_more = more_outgoing || pending_count < available_count;
+        match &mut request {
+            Request::Sync {
+                events_complete, ..
+            }
+            | Request::SyncV2 {
+                events_complete, ..
+            } => *events_complete = Some(!outgoing_has_more),
+            _ => unreachable!("sync request variant was constructed above"),
+        }
+        pending.truncate(pending_count);
+        let event_ids = pending
+            .iter()
+            .map(|item| item.event.event_id.clone())
+            .collect::<Vec<_>>();
+        let source_icon_blob_ids = source_icon_blob_ids(pending, &group.content_key_bytes()?);
+        repository::mark_delivery_confirming(&pool, target_id, &event_ids).await?;
+        self.emit_updated();
+        let blob_started_at = Instant::now();
+        let blobs = repository::blobs_for_events(&pool, &event_ids).await?;
+        let (required_blobs, source_icon_blobs) =
+            split_source_icon_blobs(blobs, &source_icon_blob_ids);
+        let required_blob_count = required_blobs.len();
+        let source_icon_blob_count = source_icon_blobs.len();
+        // A bounded Hub can reclaim an icon while this QUIC connection is still alive.
+        let (source_icon_blobs, source_icon_cache_hits) = if is_cloud && !managed_hub_blobs {
+            self.confirmed_cloud_source_icons
+                .write()
+                .expect("confirmed cloud source icons poisoned")
+                .retain_unconfirmed(connection.stable_id(), &group.group_id, source_icon_blobs)
+        } else {
+            (source_icon_blobs, 0)
+        };
+        let source_icon_blob_checks = source_icon_blobs.len();
+        let checked_source_icon_blob_ids = source_icon_blobs
+            .iter()
+            .map(|blob| blob.blob_id.clone())
+            .collect::<Vec<_>>();
+        let blob_elapsed = blob_started_at.elapsed();
+        let mut deferred_source_icon_blobs = source_icon_blobs;
+        let mut source_icon_elapsed = Duration::ZERO;
+        let mut queued_source_icon_count = 0;
+        if !publish_source_icons_after_event {
+            let source_icon_started_at = Instant::now();
+            match upload_blobs(
                 connection,
                 group,
-                required_blobs,
-                BlobUploadKind::Content,
-                managed_hub_blobs,
+                std::mem::take(&mut deferred_source_icon_blobs),
+                BlobUploadOptions {
+                    kind: BlobUploadKind::SourceIcon,
+                    managed_hub_blob: managed_hub_blobs,
+                    is_cloud,
+                    language,
+                    started: None,
+                },
             )
             .await
             {
-                repository::mark_delivery_error(&pool, target_id, &event_ids, &error.to_string())
-                    .await?;
-                self.emit_updated();
+                Ok(()) if is_cloud => {
+                    self.confirmed_cloud_source_icons
+                        .write()
+                        .expect("confirmed cloud source icons poisoned")
+                        .confirm(
+                            connection.stable_id(),
+                            &group.group_id,
+                            &checked_source_icon_blob_ids,
+                        );
+                }
+                Ok(()) => {}
+                Err(error) if managed_hub_blobs => return Err(error),
+                Err(error) => log::warn!("publish optional source app icons failed: {error}"),
+            }
+            source_icon_elapsed = source_icon_started_at.elapsed();
+        }
+        let request_started_at = Instant::now();
+        let result = async {
+            let protocol = if use_sync_v2 { "v2" } else { "legacy" };
+            let response = if is_cloud {
+                call_cloud(connection, request, language).await?
+            } else {
+                call_lan(connection, request).await?
+            };
+            let response = match response {
+                Response::Synced {
+                    events,
+                    peers,
+                    latest_cursor,
+                    has_more,
+                    ..
+                } => SyncBatchResponse {
+                    events,
+                    peers,
+                    latest_cursor,
+                    removed_devices: Vec::new(),
+                    has_more,
+                },
+                Response::SyncedV2 {
+                    events,
+                    peers,
+                    latest_cursor,
+                    removed_devices,
+                    has_more,
+                    ..
+                } => SyncBatchResponse {
+                    events,
+                    peers,
+                    latest_cursor,
+                    removed_devices,
+                    has_more,
+                },
+                Response::Error {
+                    code: ErrorCode::HistoryGap,
+                    ..
+                } if is_cloud => return Err(anyhow::Error::new(CloudHistoryGap)),
+                Response::Error { message, .. } => bail!(message),
+                _ => bail!("同步端返回了无效响应"),
+            };
+            Ok::<_, anyhow::Error>((response, protocol))
+        }
+        .await;
+        let (response, protocol) = match result {
+            Ok(response) => response,
+            Err(error) => {
+                if is_cloud && error.downcast_ref::<CloudHistoryGap>().is_some() {
+                    let (reset_cursor, _) = self
+                        .prepare_cloud_cursor(connection, group, &pool, true)
+                        .await?;
+                    log::info!("cloud history gap recovered: bootstrapCursor={reset_cursor}");
+                    return Ok(SyncReadyOutcome {
+                        latest_cursor: reset_cursor,
+                        has_more: true,
+                        event_ids: Vec::new(),
+                    });
+                }
                 return Err(error);
             }
-            let blob_elapsed = blob_started_at.elapsed();
-            let mut deferred_source_icon_blobs = source_icon_blobs;
-            let mut source_icon_elapsed = Duration::ZERO;
-            let mut queued_source_icon_count = 0;
-            if !publish_source_icons_after_event {
-                let source_icon_started_at = Instant::now();
-                match upload_blobs(
-                    connection,
-                    group,
-                    std::mem::take(&mut deferred_source_icon_blobs),
-                    BlobUploadKind::SourceIcon,
-                    managed_hub_blobs,
-                )
-                .await
-                {
-                    Ok(()) if is_cloud => {
-                        self.confirmed_cloud_source_icons
-                            .write()
-                            .expect("confirmed cloud source icons poisoned")
-                            .confirm(
-                                connection.stable_id(),
-                                &group.group_id,
-                                &checked_source_icon_blob_ids,
-                            );
-                    }
-                    Ok(()) => {}
-                    Err(error) if managed_hub_blobs => {
-                        repository::mark_delivery_error(
-                            &pool,
-                            target_id,
-                            &event_ids,
-                            &error.to_string(),
-                        )
-                        .await?;
-                        self.emit_updated();
-                        return Err(error);
-                    }
-                    Err(error) => log::warn!("publish optional source app icons failed: {error}"),
-                }
-                source_icon_elapsed = source_icon_started_at.elapsed();
-            }
-            let request_started_at = Instant::now();
-            let result = async {
-                let protocol = if use_sync_v2 { "v2" } else { "legacy" };
-                let response = if is_cloud {
-                    call_cloud(connection, request, language).await?
+        };
+        let request_elapsed = request_started_at.elapsed();
+        let received_count = response.events.len();
+        let incoming_has_more = response
+            .has_more
+            .unwrap_or(received_count == usize::from(MAX_EVENTS_PER_BATCH));
+        let mut has_more = outgoing_has_more || incoming_has_more;
+        let removed_count = response.removed_devices.len();
+        if !response.removed_devices.is_empty() {
+            self.apply_removed_devices(&pool, response.removed_devices)
+                .await?;
+        }
+        if publish_source_icons_after_event && !deferred_source_icon_blobs.is_empty() {
+            repository::enqueue_source_icon_uploads(
+                &pool,
+                &group.group_id,
+                &deferred_source_icon_blobs,
+            )
+            .await?;
+        }
+        repository::mark_delivered(&pool, target_id, &event_ids).await?;
+        self.emit_updated();
+        for peer in response.peers {
+            if peer.device_id != identity.device_id {
+                if is_cloud {
+                    repository::upsert_cloud_peer_identity(&pool, &peer).await?;
                 } else {
-                    call_lan(connection, request).await?
-                };
-                let response = match response {
-                    Response::Synced {
-                        events,
-                        peers,
-                        latest_cursor,
-                        has_more,
-                        ..
-                    } => SyncBatchResponse {
-                        events,
-                        peers,
-                        latest_cursor,
-                        removed_devices: Vec::new(),
-                        has_more,
-                    },
-                    Response::SyncedV2 {
-                        events,
-                        peers,
-                        latest_cursor,
-                        removed_devices,
-                        has_more,
-                        ..
-                    } => SyncBatchResponse {
-                        events,
-                        peers,
-                        latest_cursor,
-                        removed_devices,
-                        has_more,
-                    },
-                    Response::Error {
-                        code: ErrorCode::HistoryGap,
-                        ..
-                    } if is_cloud => return Err(anyhow::Error::new(CloudHistoryGap)),
-                    Response::Error { message, .. } => bail!(message),
-                    _ => bail!("同步端返回了无效响应"),
-                };
-                Ok::<_, anyhow::Error>((response, protocol))
-            }
-            .await;
-            let (response, protocol) = match result {
-                Ok(response) => response,
-                Err(error) => {
-                    if is_cloud && error.downcast_ref::<CloudHistoryGap>().is_some() {
-                        let (reset_cursor, _) = self
-                            .prepare_cloud_cursor(connection, group, &pool, true)
-                            .await?;
-                        log::info!("cloud history gap recovered: bootstrapCursor={reset_cursor}");
-                        return Ok(SyncConnectionOutcome { has_more: true });
-                    }
-                    if !is_cloud_attempt_timeout(&error) {
-                        repository::mark_delivery_error(
-                            &pool,
-                            target_id,
-                            &event_ids,
-                            &error.to_string(),
-                        )
-                        .await?;
-                        self.emit_updated();
-                    }
-                    return Err(error);
+                    repository::upsert_peer(&pool, &peer).await?;
                 }
-            };
-            let request_elapsed = request_started_at.elapsed();
-            let received_count = response.events.len();
-            let incoming_has_more = response
-                .has_more
-                .unwrap_or(received_count == usize::from(MAX_EVENTS_PER_BATCH));
-            has_more = outgoing_has_more || incoming_has_more;
-            let removed_count = response.removed_devices.len();
-            if !response.removed_devices.is_empty() {
-                self.apply_removed_devices(&pool, response.removed_devices)
-                    .await?;
-            }
-            if publish_source_icons_after_event && !deferred_source_icon_blobs.is_empty() {
-                repository::enqueue_source_icon_uploads(
-                    &pool,
-                    &group.group_id,
-                    &deferred_source_icon_blobs,
-                )
-                .await?;
-            }
-            repository::mark_delivered(&pool, target_id, &event_ids).await?;
-            for peer in response.peers {
-                if peer.device_id != identity.device_id {
-                    if is_cloud {
-                        repository::upsert_cloud_peer_identity(&pool, &peer).await?;
-                    } else {
-                        repository::upsert_peer(&pool, &peer).await?;
-                    }
-                }
-            }
-            let apply_started_at = Instant::now();
-            let content_has_more = self
-                .accept_remote_events(
-                    connection,
-                    response.events,
-                    group,
-                    target,
-                    response.latest_cursor,
-                    !incoming_has_more,
-                )
-                .await?;
-            has_more |= content_has_more;
-            let apply_elapsed = apply_started_at.elapsed();
-            if publish_source_icons_after_event {
-                queued_source_icon_count = deferred_source_icon_blobs.len();
-                if queued_source_icon_count > 0 {
-                    self.source_asset_wake.notify_one();
-                }
-            }
-            cursor = response.latest_cursor;
-            if is_cloud {
-                log::info!(
-                    "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} eventFirstSourceIcons={publish_source_icons_after_event} queuedSourceIcons={queued_source_icon_count} blobMs={} requestMs={} applyMs={} sourceIconMs={} totalMs={}",
-                    blob_elapsed.as_millis(),
-                    request_elapsed.as_millis(),
-                    apply_elapsed.as_millis(),
-                    source_icon_elapsed.as_millis(),
-                    batch_started_at.elapsed().as_millis()
-                );
-            }
-            if !has_more {
-                break;
             }
         }
-        self.source_asset_wake.notify_one();
-        Ok(SyncConnectionOutcome { has_more })
+        let apply_started_at = Instant::now();
+        let content_has_more = self
+            .accept_remote_events(
+                connection,
+                response.events,
+                group,
+                target,
+                response.latest_cursor,
+                !incoming_has_more,
+            )
+            .await?;
+        has_more |= content_has_more;
+        let apply_elapsed = apply_started_at.elapsed();
+        if publish_source_icons_after_event {
+            queued_source_icon_count = deferred_source_icon_blobs.len();
+            if queued_source_icon_count > 0 {
+                self.source_asset_wake.notify_one();
+            }
+        }
+        if is_cloud {
+            log::info!(
+                "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} sourceIconBlobChecks={source_icon_blob_checks} sourceIconBlobCacheHits={source_icon_cache_hits} eventFirstSourceIcons={publish_source_icons_after_event} queuedSourceIcons={queued_source_icon_count} blobMs={} requestMs={} applyMs={} sourceIconMs={} totalMs={}",
+                blob_elapsed.as_millis(),
+                request_elapsed.as_millis(),
+                apply_elapsed.as_millis(),
+                source_icon_elapsed.as_millis(),
+                batch_started_at.elapsed().as_millis()
+            );
+        }
+        Ok(SyncReadyOutcome {
+            latest_cursor: response.latest_cursor,
+            has_more,
+            event_ids,
+        })
     }
 
     /// Exchanges group-wide removal tombstones before normal events so a removed device leaves
@@ -3947,6 +4327,11 @@ impl SyncManager {
                 }
             }
             if outcome.canonical_presence == Some(false) {
+                if outcome.deleted {
+                    self.emit_clipboard_reconciled();
+                    #[cfg(target_os = "android")]
+                    crate::commands::android::notify_overlay_clipboard_changed();
+                }
                 crate::clipboard::shared_files::cleanup_after_delete(&self.app).await;
                 repository::mark_applied(pool, &event.event_id).await?;
                 made_content_progress = true;
@@ -4093,7 +4478,7 @@ impl SyncManager {
                 crate::clipboard::CLIPBOARD_UPDATED_EVENT,
                 serde_json::json!({ "id": item_id, "reconciled": true }),
             )?;
-        } else if outcome.presence_accepted && patch.is_present == Some(false) {
+        } else if outcome.canonical_presence == Some(false) {
             self.app.emit(
                 crate::clipboard::CLIPBOARD_UPDATED_EVENT,
                 serde_json::json!({ "deletedHash": sync_key, "reconciled": true }),
@@ -4526,8 +4911,13 @@ impl SyncManager {
             connection,
             group,
             blobs,
-            BlobUploadKind::PublishedSourceIcon,
-            self.bounded_hub_supported(connection, &group.group_id),
+            BlobUploadOptions {
+                kind: BlobUploadKind::PublishedSourceIcon,
+                managed_hub_blob: self.bounded_hub_supported(connection, &group.group_id),
+                is_cloud: true,
+                language: crate::i18n::current_language(&self.app),
+                started: None,
+            },
         )
         .await?;
         repository::complete_source_icon_uploads(&pool, &group.group_id, &blob_ids).await?;
@@ -4865,6 +5255,7 @@ impl SyncManager {
             .write()
             .expect("cloud connection route poisoned") = ConnectionRoute::default();
         let mut builder = Endpoint::builder(presets::Minimal)
+            .transport_config(sync_transport_config(false))
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::UNSPECIFIED, 0))
             .context("configure IPv4-only Iroh sync endpoint")?
@@ -5027,10 +5418,7 @@ impl SyncManager {
         if let Some(connection) = self.cached_cloud_connection() {
             return Ok(connection);
         }
-        let transport_config = QuicTransportConfig::builder()
-            .keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
-            .default_path_keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
-            .build();
+        let transport_config = sync_transport_config(true);
         let options = ConnectOptions::new().with_transport_config(transport_config);
         let connection = tokio::time::timeout(Duration::from_secs(8), async {
             let connecting = endpoint.connect_with_opts(server, ALPN, options).await?;
@@ -5039,10 +5427,11 @@ impl SyncManager {
         .await
         .context("云端同步连接超时")??;
         log::info!(
-            "cloud connection established: connectionId={} keepAliveMs={} pathKeepAliveMs={}",
+            "cloud connection established: connectionId={} keepAliveMs={} pathKeepAliveMs={} segmentationOffload=true atMs={}",
             connection.stable_id(),
             CLOUD_PATH_KEEP_ALIVE_INTERVAL.as_millis(),
             CLOUD_PATH_KEEP_ALIVE_INTERVAL.as_millis(),
+            Utc::now().timestamp_millis(),
         );
         *self
             .cloud_connection
@@ -7147,6 +7536,8 @@ async fn dispatch_peer(
         | Request::ListEvents { .. }
         | Request::ListDevices { .. }
         | Request::BootstrapPlan { .. }
+        | Request::RetentionPlan { .. }
+        | Request::SetRetention { .. }
         | Request::PutManagedBlob { .. }
         | Request::PutManagedSourceIcon { .. } => {
             bail!("LAN peer does not support this cloud operation")
@@ -7452,109 +7843,234 @@ impl BlobUploadKind {
     }
 }
 
+#[derive(Clone)]
+struct BlobUploadOptions {
+    kind: BlobUploadKind,
+    managed_hub_blob: bool,
+    is_cloud: bool,
+    language: Language,
+    started: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// Uploads one attachment, checking a stalled cloud path before discarding its connection.
 async fn upload_blob(
     connection: &Connection,
     group: &GroupSecrets,
     blob: &StoredBlob,
-    kind: BlobUploadKind,
-    managed_hub_blob: bool,
+    options: BlobUploadOptions,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
+    let started_at = Instant::now();
+    let mut progress =
+        super::upload::UploadProgress::new(connection.stable_id(), blob_log_ref(&blob.blob_id));
+    let (address, transport) = connection_path(connection);
+    log::info!(
+        "sync blob upload started: connectionId={} blobRef={} kind={} blobBytes={} cloud={} address={} transport={} atMs={}",
+        connection.stable_id(), blob_log_ref(&blob.blob_id), options.kind.label(), blob.size,
+        options.is_cloud, address.as_deref().unwrap_or("unknown"), transport.unwrap_or("unknown"), Utc::now().timestamp_millis(),
+    );
+    let result = upload_blob_inner(connection, group, blob, &options, &mut progress).await;
+    if let Err(error) = &result {
+        let probe = if options.is_cloud && super::upload::is_network_timeout(error) {
+            check_stalled_cloud_upload(connection).await
+        } else {
+            "not-needed"
+        };
+        log::warn!(
+            "sync blob upload failed: connectionId={} blobRef={} phase={:?} writtenBytes={} firstWriteMs={:?} totalMs={} probe={} closeReason={:?} stats={:?} error={error:#}",
+            connection.stable_id(), blob_log_ref(&blob.blob_id), progress.phase,
+            progress.written_bytes, progress.first_write_ms, started_at.elapsed().as_millis(),
+            probe, connection.close_reason(), connection.stats(),
+        );
+    }
+    result
+}
+
+/// A successful bounded control exchange distinguishes one stalled stream from a dead connection.
+async fn check_stalled_cloud_upload(connection: &Connection) -> &'static str {
+    if connection.close_reason().is_some() {
+        return "already-closed";
+    }
+    let health = tokio::time::timeout(
+        CLOUD_UPLOAD_PROBE_TIMEOUT,
+        call(connection, Request::HealthV2),
+    )
+    .await;
+    if matches!(health, Ok(Ok(Response::HealthV2 { .. }))) {
+        return "healthy";
+    }
+    log::warn!(
+        "cloud attachment stalled and health probe failed: connectionId={}",
+        connection.stable_id()
+    );
+    connection.close(
+        0_u32.into(),
+        b"cloud upload stalled and health probe failed",
+    );
+    "failed-closed"
+}
+
+async fn upload_blob_inner(
+    connection: &Connection,
+    group: &GroupSecrets,
+    blob: &StoredBlob,
+    options: &BlobUploadOptions,
+    progress: &mut super::upload::UploadProgress,
+) -> Result<()> {
+    use super::upload::{self, UploadPhase};
     let total_started_at = Instant::now();
     let open_started_at = Instant::now();
-    let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
-        .await
-        .context("open blob upload stream timeout")??;
-    let open_elapsed = open_started_at.elapsed();
-    let write_started_at = Instant::now();
-    let request = match (kind, managed_hub_blob) {
-        (BlobUploadKind::PublishedSourceIcon, true) => Request::PutManagedSourceIcon {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            blob_id: blob.blob_id.clone(),
-            size: blob.size,
-        },
-        (BlobUploadKind::PublishedSourceIcon, false) => Request::PutSourceIcon {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            blob_id: blob.blob_id.clone(),
-            size: blob.size,
-        },
-        (BlobUploadKind::Content | BlobUploadKind::SourceIcon, true) => Request::PutManagedBlob {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            blob_id: blob.blob_id.clone(),
-            size: blob.size,
-        },
-        (BlobUploadKind::Content | BlobUploadKind::SourceIcon, false) => Request::PutBlob {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            blob_id: blob.blob_id.clone(),
-            size: blob.size,
-        },
+    let control_timeout = if options.is_cloud {
+        CLOUD_CONTROL_REQUEST_TIMEOUT
+    } else {
+        FIRST_FRAME_TIMEOUT
     };
-    write_frame(&mut send, &request).await?;
-    let write_elapsed = write_started_at.elapsed();
-    let response_started_at = Instant::now();
-    match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame::<_, Response>(&mut recv))
-        .await
-        .context("wait for blob upload readiness timeout")??
-    {
-        Response::BlobStored => {
-            let response_elapsed = response_started_at.elapsed();
-            send.finish()?;
-            log_blob_upload_completed(
-                connection,
-                blob,
-                kind,
-                "already-stored",
-                0,
-                BlobUploadTimings {
-                    open: open_elapsed,
-                    write: write_elapsed,
-                    response: response_elapsed,
-                    total: total_started_at.elapsed(),
-                    ..Default::default()
-                },
-            );
-            return Ok(());
+    progress.phase = UploadPhase::OpenStream;
+    let (mut send, mut recv) = upload::timed(
+        control_timeout,
+        progress.phase,
+        options.language,
+        connection.open_bi(),
+    )
+    .await?;
+    let open_elapsed = open_started_at.elapsed();
+    let result = async {
+        let write_started_at = Instant::now();
+        let request = match (options.kind, options.managed_hub_blob) {
+            (BlobUploadKind::PublishedSourceIcon, true) => Request::PutManagedSourceIcon {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                blob_id: blob.blob_id.clone(),
+                size: blob.size,
+            },
+            (BlobUploadKind::PublishedSourceIcon, false) => Request::PutSourceIcon {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                blob_id: blob.blob_id.clone(),
+                size: blob.size,
+            },
+            (BlobUploadKind::Content | BlobUploadKind::SourceIcon, true) => {
+                Request::PutManagedBlob {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    blob_id: blob.blob_id.clone(),
+                    size: blob.size,
+                }
+            }
+            (BlobUploadKind::Content | BlobUploadKind::SourceIcon, false) => Request::PutBlob {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                blob_id: blob.blob_id.clone(),
+                size: blob.size,
+            },
+        };
+        progress.phase = UploadPhase::SendRequest;
+        upload::timed(
+            control_timeout,
+            progress.phase,
+            options.language,
+            write_frame(&mut send, &request),
+        )
+        .await?;
+        let write_elapsed = write_started_at.elapsed();
+        let response_started_at = Instant::now();
+        progress.phase = UploadPhase::WaitForReady;
+        match upload::timed(
+            control_timeout,
+            progress.phase,
+            options.language,
+            read_frame::<_, Response>(&mut recv),
+        )
+        .await?
+        {
+            Response::BlobStored => {
+                send.finish()?;
+                log_blob_upload_completed(
+                    connection,
+                    blob,
+                    options.kind,
+                    "already-stored",
+                    0,
+                    BlobUploadTimings {
+                        open: open_elapsed,
+                        write: write_elapsed,
+                        response: response_started_at.elapsed(),
+                        total: total_started_at.elapsed(),
+                        ..Default::default()
+                    },
+                );
+                return Ok(());
+            }
+            Response::BlobReady { .. } => {}
+            Response::Error { message, .. } => bail!(message),
+            _ => bail!("invalid blob upload response"),
         }
-        Response::BlobReady { .. } => {}
-        Response::Error { message, .. } => bail!(message),
-        _ => bail!("invalid blob upload response"),
-    }
-    let readiness_elapsed = response_started_at.elapsed();
-    let transfer_started_at = Instant::now();
-    let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
-    copy_with_idle_timeout(&mut file, &mut send, BLOB_IDLE_TIMEOUT).await?;
-    send.finish()?;
-    let transfer_elapsed = transfer_started_at.elapsed();
-    let confirmation_started_at = Instant::now();
-    match tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(&mut recv))
-        .await
-        .context("wait for blob storage confirmation timeout")??
-    {
-        Response::BlobStored => {
-            log_blob_upload_completed(
-                connection,
-                blob,
-                kind,
-                "uploaded",
-                blob.size,
-                BlobUploadTimings {
-                    open: open_elapsed,
-                    write: write_elapsed,
-                    response: readiness_elapsed,
-                    transfer: transfer_elapsed,
-                    confirmation: confirmation_started_at.elapsed(),
-                    total: total_started_at.elapsed(),
-                },
-            );
-            Ok(())
+        let readiness_elapsed = response_started_at.elapsed();
+        if let Some(started) = &options.started {
+            let _ = started.send(blob.blob_id.clone());
         }
-        Response::Error { message, .. } => bail!(message),
-        _ => bail!("invalid blob stored response"),
+        log::info!(
+            "sync blob upload ready: connectionId={} blobRef={} readyMs={}",
+            connection.stable_id(),
+            blob_log_ref(&blob.blob_id),
+            total_started_at.elapsed().as_millis()
+        );
+        let transfer_started_at = Instant::now();
+        progress.phase = UploadPhase::ReadFile;
+        let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
+        let idle_timeout = if options.is_cloud {
+            CLOUD_UPLOAD_IDLE_TIMEOUT
+        } else {
+            BLOB_IDLE_TIMEOUT
+        };
+        upload::copy(
+            &mut file,
+            &mut send,
+            idle_timeout,
+            options.language,
+            progress,
+        )
+        .await?;
+        send.finish()?;
+        let transfer_elapsed = transfer_started_at.elapsed();
+        let confirmation_started_at = Instant::now();
+        progress.phase = UploadPhase::WaitForConfirmation;
+        match upload::timed(
+            idle_timeout,
+            progress.phase,
+            options.language,
+            read_frame(&mut recv),
+        )
+        .await?
+        {
+            Response::BlobStored => {
+                log_blob_upload_completed(
+                    connection,
+                    blob,
+                    options.kind,
+                    "uploaded",
+                    blob.size,
+                    BlobUploadTimings {
+                        open: open_elapsed,
+                        write: write_elapsed,
+                        response: readiness_elapsed,
+                        transfer: transfer_elapsed,
+                        confirmation: confirmation_started_at.elapsed(),
+                        total: total_started_at.elapsed(),
+                    },
+                );
+                Ok(())
+            }
+            Response::Error { message, .. } => bail!(message),
+            _ => bail!("invalid blob stored response"),
+        }
     }
+    .await;
+    if result.is_err() {
+        let _ = send.reset(0_u32.into());
+        let _ = recv.stop(0_u32.into());
+    }
+    result
 }
 
 /// Records which stage of a blob existence check or upload consumed the elapsed time.
@@ -7637,24 +8153,39 @@ async fn upload_blobs(
     connection: &Connection,
     group: &GroupSecrets,
     blobs: Vec<StoredBlob>,
-    kind: BlobUploadKind,
-    managed_hub_blobs: bool,
+    options: BlobUploadOptions,
 ) -> Result<()> {
-    for batch in blobs.chunks(MAX_CONCURRENT_BLOB_TRANSFERS) {
-        let mut tasks = tokio::task::JoinSet::new();
-        for blob in batch {
+    let mut waiting = blobs.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut failure = None;
+    loop {
+        while tasks.len() < MAX_CONCURRENT_BLOB_TRANSFERS {
+            if let Some(reason) = connection.close_reason() {
+                failure.get_or_insert_with(|| anyhow::anyhow!(reason));
+                break;
+            }
+            let Some(blob) = waiting.next() else {
+                break;
+            };
             let connection = connection.clone();
             let group = group.clone();
-            let blob = blob.clone();
-            tasks.spawn(async move {
-                upload_blob(&connection, &group, &blob, kind, managed_hub_blobs).await
-            });
+            let options = options.clone();
+            tasks.spawn(async move { upload_blob(&connection, &group, &blob, options).await });
         }
-        while let Some(result) = tasks.join_next().await {
-            result.context("blob upload task failed")??;
+        let Some(result) = tasks.join_next().await else {
+            break;
+        };
+        if let Err(error) = result
+            .context("blob upload task failed")
+            .and_then(|value| value)
+        {
+            failure.get_or_insert(error);
         }
     }
-    Ok(())
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn download_blob(
@@ -8160,6 +8691,155 @@ fn parse_platform(value: &str) -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Establishes an isolated loopback QUIC session without discovery or external relays.
+    async fn upload_test_connection() -> (Endpoint, Endpoint, Connection, Connection) {
+        let server = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0]);
+        let (outgoing, incoming) = tokio::join!(client.connect(addr, ALPN), async {
+            server.accept().await.unwrap().await.unwrap()
+        },);
+        (client, server, outgoing.unwrap(), incoming)
+    }
+
+    #[tokio::test]
+    async fn attachment_stream_timeout_preserves_a_responsive_connection() {
+        let (_client, _server, connection, incoming) = upload_test_connection().await;
+        let peer = tokio::spawn(async move {
+            let (held_send, mut held_recv) = incoming.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_frame(&mut held_recv).await.unwrap(),
+                Request::PutManagedBlob { .. }
+            ));
+            let (mut send, mut recv) = incoming.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_frame(&mut recv).await.unwrap(),
+                Request::HealthV2
+            ));
+            write_frame(
+                &mut send,
+                &Response::HealthV2 {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_version: "test".into(),
+                    server_time_ms: 0,
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            drop(held_send);
+            incoming
+        });
+        let (started, mut notifications) = mpsc::unbounded_channel();
+        let blob = StoredBlob {
+            blob_id: "a".repeat(64),
+            encrypted_path: "missing-file".into(),
+            size: 1,
+        };
+        let error = upload_blob(
+            &connection,
+            &GroupSecrets::generate(),
+            &blob,
+            BlobUploadOptions {
+                kind: BlobUploadKind::Content,
+                managed_hub_blob: true,
+                is_cloud: true,
+                language: Language::ZhCN,
+                started: Some(started),
+            },
+        )
+        .await
+        .unwrap_err();
+        let incoming = peer.await.unwrap();
+        assert!(super::super::upload::is_network_timeout(&error));
+        assert_eq!(error.to_string(), "等待服务端允许上传附件超时");
+        assert!(connection.close_reason().is_none());
+        assert!(notifications.try_recv().is_err());
+        drop(incoming);
+    }
+
+    #[tokio::test]
+    async fn unresponsive_upload_connection_is_closed_after_the_bounded_probe() {
+        let (_client, _server, connection, incoming) = upload_test_connection().await;
+        let peer = tokio::spawn(async move {
+            let (_send, mut recv) = incoming.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_frame(&mut recv).await.unwrap(),
+                Request::HealthV2
+            ));
+            incoming.closed().await;
+        });
+        assert_eq!(
+            check_stalled_cloud_upload(&connection).await,
+            "failed-closed"
+        );
+        assert!(connection.close_reason().is_some());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn uploaded_attachment_is_confirmed_and_reports_upload_readiness() {
+        let (_client, _server, connection, incoming) = upload_test_connection().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted");
+        let bytes = vec![7_u8; 65_539];
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let expected = bytes.clone();
+        let peer = tokio::spawn(async move {
+            let (mut send, mut recv) = incoming.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_frame(&mut recv).await.unwrap(),
+                Request::PutManagedBlob { .. }
+            ));
+            write_frame(&mut send, &Response::BlobReady { size: 0 })
+                .await
+                .unwrap();
+            assert_eq!(recv.read_to_end(100_000).await.unwrap(), expected);
+            write_frame(&mut send, &Response::BlobStored).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            incoming
+        });
+        let (started, mut notifications) = mpsc::unbounded_channel();
+        let blob = StoredBlob {
+            blob_id: "b".repeat(64),
+            encrypted_path: path.to_string_lossy().into_owned(),
+            size: bytes.len() as u64,
+        };
+        upload_blob(
+            &connection,
+            &GroupSecrets::generate(),
+            &blob,
+            BlobUploadOptions {
+                kind: BlobUploadKind::Content,
+                managed_hub_blob: true,
+                is_cloud: true,
+                language: Language::ZhCN,
+                started: Some(started),
+            },
+        )
+        .await
+        .unwrap();
+        let incoming = peer.await.unwrap();
+        assert_eq!(notifications.try_recv().unwrap(), blob.blob_id);
+        assert!(connection.close_reason().is_none());
+        drop(incoming);
+    }
 
     #[test]
     fn cloud_attempt_timeout_uses_the_selected_language() {
@@ -8760,6 +9440,7 @@ mod tests {
             kind: ecopaste_sync_protocol::SyncEventKind::Content,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
+            retention_key: None,
         };
         let envelope = ClipboardEnvelope {
             version: 1,

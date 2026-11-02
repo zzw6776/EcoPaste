@@ -102,7 +102,147 @@ fn event(index: u64, size: usize) -> EncryptedEvent {
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
         optional_blob_ids: Vec::new(),
+        retention_key: None,
     }
+}
+
+#[test]
+fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
+    let events = (0..4)
+        .map(|cursor| CloudEvent {
+            cursor,
+            event: event(cursor, 3 * 1024 * 1024),
+        })
+        .collect::<Vec<_>>();
+    let mut response = Response::RetentionPlan {
+        epoch: "epoch".into(),
+        events: events.clone(),
+        has_more: false,
+    };
+    limit_retention_plan(&mut response).unwrap();
+    let bytes = minicbor::to_vec(&response).unwrap();
+    assert!(bytes.len() <= MAX_FRAME_BYTES);
+    let Response::RetentionPlan {
+        events: page,
+        has_more,
+        ..
+    } = minicbor::decode::<Response>(&bytes).unwrap()
+    else {
+        panic!("expected retention plan")
+    };
+    assert_eq!(page, events[..page.len()]);
+    assert!(!page.is_empty() && page.len() < events.len());
+    assert!(has_more);
+
+    let mut oversized = Response::RetentionPlan {
+        epoch: "epoch".into(),
+        events: vec![CloudEvent {
+            cursor: 1,
+            event: event(1, MAX_FRAME_BYTES),
+        }],
+        has_more: false,
+    };
+    assert!(matches!(
+        limit_retention_plan(&mut oversized),
+        Err(FrameError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn history_state_filter_is_opt_in_and_backward_compatible() {
+    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+    enum LegacyHistoryRequest {
+        #[n(6)]
+        ListEvents {
+            #[n(0)]
+            group_id: String,
+            #[n(1)]
+            access_token: Vec<u8>,
+            #[n(2)]
+            before_cursor: Option<u64>,
+            #[n(3)]
+            limit: u16,
+        },
+    }
+    let legacy = LegacyHistoryRequest::ListEvents {
+        group_id: "group".into(),
+        access_token: vec![7; 32],
+        before_cursor: Some(5),
+        limit: 100,
+    };
+    let decoded: Request = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
+    assert!(matches!(
+        decoded,
+        Request::ListEvents {
+            include_states: None,
+            ..
+        }
+    ));
+    let current = Request::ListEvents {
+        group_id: "group".into(),
+        access_token: vec![7; 32],
+        before_cursor: Some(5),
+        limit: 100,
+        include_states: Some(true),
+    };
+    let decoded: LegacyHistoryRequest =
+        minicbor::decode(&minicbor::to_vec(&current).unwrap()).unwrap();
+    assert_eq!(decoded, legacy);
+}
+
+#[test]
+fn verification_pages_keep_large_state_events_in_order_with_a_resumable_cursor() {
+    let events = (1..=4)
+        .rev()
+        .map(|cursor| {
+            let mut encrypted = event(cursor, 3 * 1024 * 1024);
+            encrypted.kind = SyncEventKind::ItemState;
+            CloudEvent {
+                cursor,
+                event: encrypted,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut remaining = events.clone();
+    let mut received = Vec::new();
+    loop {
+        let mut response = Response::EventsPage {
+            events: remaining.clone(),
+            next_before_cursor: None,
+            total: 4,
+        };
+        limit_events_page(&mut response).unwrap();
+        let bytes = minicbor::to_vec(&response).unwrap();
+        assert!(bytes.len() <= MAX_FRAME_BYTES);
+        let Response::EventsPage {
+            events: page,
+            next_before_cursor,
+            ..
+        } = minicbor::decode::<Response>(&bytes).unwrap()
+        else {
+            panic!("expected event page")
+        };
+        received.extend(page.clone());
+        let Some(before) = next_before_cursor else {
+            break;
+        };
+        assert_eq!(before, page.last().unwrap().cursor);
+        remaining.retain(|event| event.cursor < before);
+    }
+    assert_eq!(received, events);
+    let mut empty = Response::EventsPage {
+        events: Vec::new(),
+        next_before_cursor: None,
+        total: 0,
+    };
+    limit_events_page(&mut empty).unwrap();
+    assert!(matches!(
+        empty,
+        Response::EventsPage {
+            next_before_cursor: None,
+            ..
+        }
+    ));
 }
 
 fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {

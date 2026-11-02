@@ -260,7 +260,14 @@ export interface SyncPeerStatus {
   lastError: string | null;
 }
 
-export type SyncItemState = "idle" | "syncing" | "success" | "manual" | "error";
+export type SyncItemState =
+  | "idle"
+  | "queued"
+  | "syncing"
+  | "confirming"
+  | "success"
+  | "manual"
+  | "error";
 
 export interface SyncItemChannelStatus {
   state: SyncItemState;

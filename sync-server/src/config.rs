@@ -30,14 +30,27 @@ pub struct Config {
     pub max_group_bytes: u64,
 
     /// Maximum age of encrypted events retained by the Hub. Zero disables age pruning.
-    #[arg(long, env = "ECOPASTE_EVENT_RETENTION_DAYS", default_value_t = 90)]
+    #[arg(long, env = "ECOPASTE_EVENT_RETENTION_DAYS", default_value_t = 0)]
     pub event_retention_days: u32,
 
     /// Maximum raw encrypted events retained per group. Zero disables count pruning.
-    #[arg(long, env = "ECOPASTE_MAX_EVENTS_PER_GROUP", default_value_t = 100_000)]
+    #[arg(long, env = "ECOPASTE_MAX_EVENTS_PER_GROUP", default_value_t = 0)]
     pub max_events_per_group: u64,
 
     /// Disable the public Iroh relay network. Direct LAN/public-IP access remains available.
     #[arg(long, env = "ECOPASTE_NO_RELAY", default_value_t = true)]
     pub no_relay: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_defaults_keep_only_the_space_limit() {
+        let config = Config::parse_from(["ecopaste-sync-server"]);
+        assert_eq!(config.event_retention_days, 0);
+        assert_eq!(config.max_events_per_group, 0);
+        assert_eq!(config.max_group_bytes, 10 * 1024 * 1024 * 1024);
+    }
 }

@@ -53,8 +53,14 @@ test("accepts single and multiple shares of every MIME type outside the generate
     "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
     "utf8",
   );
-  const manualManifest = manifest.split(MARKER)[0];
-  const shareFilter = manualManifest.match(
+  const activity = manifest.match(
+    /<activity\b[^>]*android:name="\.ShareActivity"[\s\S]*?<\/activity>/,
+  )?.[0];
+
+  assert.ok(activity);
+  assert.match(activity, /android:taskAffinity="\$\{applicationId\}\.share"/);
+  assert.match(activity, /android:theme="@android:style\/Theme.NoDisplay"/);
+  const shareFilter = activity.match(
     /<intent-filter>\s*<action android:name="android.intent.action.SEND"[\s\S]*?<\/intent-filter>/,
   )?.[0];
 
@@ -63,4 +69,23 @@ test("accepts single and multiple shares of every MIME type outside the generate
   assert.match(shareFilter, /android.intent.category.DEFAULT/);
   assert.match(shareFilter, /android:mimeType="\*\/\*"/);
   assert.doesNotMatch(shareFilter, /android.intent.action.VIEW/);
+});
+
+test("keeps Android sharing out of the Tauri activity and preserves backup opening", () => {
+  const manifest = readFileSync(
+    "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+    "utf8",
+  );
+  const activity = manifest.match(
+    /<activity\b[^>]*android:name="\.MainActivity"[\s\S]*?<\/activity>/,
+  )?.[0];
+  const androidConfig = JSON.parse(
+    readFileSync("src-tauri/tauri.android.conf.json", "utf8"),
+  );
+
+  assert.ok(activity);
+  assert.doesNotMatch(activity, /android.intent.action.SEND/);
+  assert.match(activity, /android.intent.action.VIEW/);
+  assert.match(activity, /application\/vnd.ecopaste.backup/);
+  assert.deepEqual(androidConfig.bundle.fileAssociations, []);
 });

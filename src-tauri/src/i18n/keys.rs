@@ -60,6 +60,12 @@ pub enum SyncKey {
     SendRequest,
     WaitForResponse,
     ReadResponse,
+    OpenUpload,
+    SendUploadRequest,
+    WaitForUpload,
+    ReadUploadFile,
+    WriteUpload,
+    ConfirmUpload,
 }
 
 #[cfg(not(target_os = "android"))]

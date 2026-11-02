@@ -49,8 +49,9 @@ impl DirtyItemState {
 #[derive(Debug, Default)]
 pub struct ApplyStateOutcome {
     pub item_id: Option<String>,
+    /// History can be removed while replaying an already known deletion version.
+    pub deleted: bool,
     pub image_files: Vec<String>,
-    pub presence_accepted: bool,
     pub canonical_presence: Option<bool>,
 }
 
@@ -218,17 +219,25 @@ pub async fn dirty_states(
 ) -> Result<Vec<DirtyItemState>> {
     Ok(sqlx::query_as::<_, DirtyItemState>(
         r#"
+        WITH pending_states AS (
+            SELECT state.*, EXISTS (
+                SELECT 1 FROM sync_content_outbox manual
+                WHERE manual.sync_key = state.sync_key AND manual.manual_share = 1
+                  AND manual.operation_order >= state.pending_order
+            ) AS manual_share_pending
+            FROM sync_item_states state
+        )
         SELECT sync_key, is_favorite, is_pinned, note, is_present,
                CASE
-                   WHEN ? OR is_sensitive = 0 THEN dirty_mask
+                   WHEN ? OR is_sensitive = 0 OR manual_share_pending THEN dirty_mask
                    ELSE dirty_mask & ?
                END AS dirty_mask,
                local_revision, pending_order
-        FROM sync_item_states state
+        FROM pending_states state
         WHERE dirty_mask <> 0
           AND pending_order IS NOT NULL
           AND (
-              ? OR is_sensitive = 0
+              ? OR is_sensitive = 0 OR manual_share_pending
               OR ((dirty_mask & ?) <> 0 AND presence_origin_sequence IS NOT NULL)
           )
           AND NOT EXISTS (
@@ -372,6 +381,58 @@ async fn set_version(
     Ok(())
 }
 
+/// Learns remote versions, protection and presence before Hub cleanup without changing visible history.
+/// Normal event application later materializes the same state alongside the other metadata.
+pub async fn merge_retention_state(
+    pool: &SqlitePool,
+    patch: &SyncedItemStatePatch,
+    version: &SyncEventVersion,
+) -> Result<()> {
+    let mut transaction = pool.begin().await.context("begin retention state merge")?;
+    crate::sync::repository::observe_origin_sequence_on(&mut transaction, version.origin_sequence)
+        .await?;
+    if patch.is_favorite.is_none() && patch.is_pinned.is_none() && patch.is_present.is_none() {
+        transaction
+            .commit()
+            .await
+            .context("commit retention sequence observation")?;
+        return Ok(());
+    }
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_item_states(sync_key,created_at,updated_at) VALUES (?,?,?)",
+    )
+    .bind(&patch.sync_key)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .context("ensure legacy retention state")?;
+    for (value, column, prefix, dirty) in [
+        (patch.is_favorite, "is_favorite", "favorite", FAVORITE_DIRTY),
+        (patch.is_pinned, "is_pinned", "pinned", PINNED_DIRTY),
+        (patch.is_present, "is_present", "presence", PRESENCE_DIRTY),
+    ] {
+        if let Some(value) = value {
+            merge_bool_field(
+                &mut transaction,
+                &patch.sync_key,
+                column,
+                prefix,
+                dirty,
+                value,
+                version,
+            )
+            .await?;
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit retention state merge")?;
+    Ok(())
+}
+
 /// Merges an incoming state patch per field. The operation is idempotent and may run before the
 /// corresponding clipboard content exists.
 pub async fn apply_remote_patch(
@@ -425,7 +486,7 @@ pub async fn apply_remote_patch(
         merge_note_field(&mut transaction, patch, version).await?;
     }
 
-    let presence_accepted = if let Some(value) = patch.is_present {
+    if let Some(value) = patch.is_present {
         merge_bool_field(
             &mut transaction,
             &patch.sync_key,
@@ -435,10 +496,8 @@ pub async fn apply_remote_patch(
             value,
             version,
         )
-        .await?
-    } else {
-        false
-    };
+        .await?;
+    }
 
     let canonical_presence: Option<bool> = sqlx::query_scalar(
         "SELECT is_present FROM sync_item_states WHERE sync_key = ? AND presence_origin_sequence IS NOT NULL",
@@ -449,6 +508,7 @@ pub async fn apply_remote_patch(
     .context("read merged synchronized item presence")?
     .flatten();
 
+    let mut deleted = false;
     let mut image_files = Vec::new();
     if canonical_presence == Some(false) {
         let rows = sqlx::query_as::<_, (ClipboardKind, String)>(
@@ -458,6 +518,7 @@ pub async fn apply_remote_patch(
         .fetch_all(&mut *transaction)
         .await
         .context("delete clipboard item from synchronized state")?;
+        deleted = !rows.is_empty();
         image_files.extend(
             rows.into_iter()
                 .filter_map(|(kind, content)| (kind == ClipboardKind::Image).then_some(content)),
@@ -480,8 +541,8 @@ pub async fn apply_remote_patch(
         .context("commit synchronized state merge")?;
     Ok(ApplyStateOutcome {
         item_id,
+        deleted,
         image_files,
-        presence_accepted,
         canonical_presence,
     })
 }
@@ -774,6 +835,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_clock_keeps_later_local_changes_newer_than_legacy_events() {
+        let pool = memory_pool().await;
+        let mut item = sample_item("favorite", "stable-key");
+        item.is_favorite = true;
+        insert_item(&pool, &item).await.unwrap();
+        let patch = SyncedItemStatePatch {
+            sync_key: item.sync_key.clone(),
+            is_favorite: Some(true),
+            is_pinned: None,
+            note: None,
+            note_changed: false,
+            is_present: Some(true),
+        };
+        let remote_sequence = u64::try_from(Utc::now().timestamp_millis()).unwrap() + 3_600_000;
+        let remote = version(remote_sequence, "remote");
+        merge_retention_state(&pool, &patch, &remote).await.unwrap();
+
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_favorite(&mut connection, &item.sync_key, false, false)
+            .await
+            .unwrap();
+        drop(connection);
+        let local_sequence = crate::sync::repository::next_origin_sequence(&pool)
+            .await
+            .unwrap();
+        assert!(local_sequence > remote_sequence);
+        let dirty = dirty_states(&pool, 1, false).await.unwrap().remove(0);
+        mark_state_sent(&pool, &dirty, &version(local_sequence, "local"))
+            .await
+            .unwrap();
+
+        apply_remote_patch(&pool, &patch, &remote).await.unwrap();
+        let visible = find_item_by_id(&pool, &item.id).await.unwrap().unwrap();
+        assert!(!visible.is_favorite);
+        assert!(dirty_states(&pool, 1, false).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_note_only_observes_the_clock_without_materializing_metadata() {
+        let pool = memory_pool().await;
+        let patch = SyncedItemStatePatch {
+            sync_key: "stable-key".into(),
+            is_favorite: None,
+            is_pinned: None,
+            note: Some("deferred note".into()),
+            note_changed: true,
+            is_present: None,
+        };
+        let remote_sequence = u64::try_from(Utc::now().timestamp_millis()).unwrap() + 3_600_000;
+        merge_retention_state(&pool, &patch, &version(remote_sequence, "remote"))
+            .await
+            .unwrap();
+
+        let local_sequence = crate::sync::repository::next_origin_sequence(&pool)
+            .await
+            .unwrap();
+        assert!(local_sequence > remote_sequence);
+        let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_item_states")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(staged, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_clock_advancement_rolls_back_with_a_failed_state_merge() {
+        let pool = memory_pool().await;
+        let before = crate::sync::repository::next_origin_sequence(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_retention BEFORE INSERT ON sync_item_states \
+             BEGIN SELECT RAISE(ABORT, 'state unavailable'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let patch = SyncedItemStatePatch {
+            sync_key: "stable-key".into(),
+            is_favorite: Some(true),
+            is_pinned: None,
+            note: None,
+            note_changed: false,
+            is_present: None,
+        };
+        assert!(
+            merge_retention_state(&pool, &patch, &version(before + 3_600_000, "remote"))
+                .await
+                .is_err()
+        );
+
+        let after: String =
+            sqlx::query_scalar("SELECT value FROM sync_state WHERE key = 'origin_sequence'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.parse::<u64>().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn retention_presence_is_only_materialized_by_normal_event_application() {
+        let pool = memory_pool().await;
+        let item = sample_item("visible", "stable-key");
+        insert_item(&pool, &item).await.unwrap();
+        let patch = SyncedItemStatePatch {
+            sync_key: item.sync_key.clone(),
+            is_favorite: None,
+            is_pinned: None,
+            note: None,
+            note_changed: false,
+            is_present: Some(false),
+        };
+        let deletion = version(20, "remote");
+
+        merge_retention_state(&pool, &patch, &deletion)
+            .await
+            .unwrap();
+        assert_eq!(
+            is_present(&pool, &item.sync_key).await.unwrap(),
+            Some(false)
+        );
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
+
+        // An older content replay must report the deletion even without a new deletion event.
+        let mut older_content = patch.clone();
+        older_content.is_present = Some(true);
+        let outcome = apply_remote_patch(&pool, &older_content, &version(10, "remote"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.canonical_presence, Some(false));
+        assert!(outcome.deleted);
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_none());
+
+        let replay = apply_remote_patch(&pool, &patch, &deletion).await.unwrap();
+        assert_eq!(replay.canonical_presence, Some(false));
+        assert!(!replay.deleted);
+    }
+
+    #[tokio::test]
+    async fn retention_presence_preserves_a_pending_local_delete() {
+        let pool = memory_pool().await;
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_deleted(&mut connection, "stable-key", false)
+            .await
+            .unwrap();
+        drop(connection);
+        let before = dirty_states(&pool, 1, false).await.unwrap().remove(0);
+        let patch = SyncedItemStatePatch {
+            sync_key: "stable-key".into(),
+            is_favorite: None,
+            is_pinned: None,
+            note: None,
+            note_changed: false,
+            is_present: Some(true),
+        };
+
+        merge_retention_state(&pool, &patch, &version(100, "remote"))
+            .await
+            .unwrap();
+        let after = dirty_states(&pool, 1, false).await.unwrap().remove(0);
+        assert_eq!(after.patch().is_present, Some(false));
+        assert_eq!(after.local_revision, before.local_revision);
+        assert_eq!(after.pending_order, before.pending_order);
+        assert_eq!(after.dirty_mask, PRESENCE_DIRTY);
+    }
+
+    #[tokio::test]
     async fn missing_content_state_is_materialized_when_content_arrives() {
         let pool = memory_pool().await;
         let patch = SyncedItemStatePatch {
@@ -955,8 +1183,7 @@ mod tests {
             &item.id,
             &item.sync_key,
             &item.source_revision,
-            false,
-            false,
+            crate::db::sync_queue::ContentSyncOptions::default(),
         )
         .await
         .unwrap();
@@ -990,6 +1217,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_share_unblocks_only_its_earlier_sensitive_state() {
+        let pool = memory_pool().await;
+        let mut item = sample_item("shared", "shared-key");
+        item.is_sensitive = true;
+        insert_item(&pool, &item).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        mark_local_note(&mut connection, &item.sync_key, true, Some("shared note"))
+            .await
+            .unwrap();
+        mark_local_note(&mut connection, "unrelated-key", true, Some("private note"))
+            .await
+            .unwrap();
+        drop(connection);
+        assert!(dirty_states(&pool, 10, false).await.unwrap().is_empty());
+
+        let order = crate::db::sync_queue::stage_existing_content(
+            &pool,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            crate::db::sync_queue::ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .is_none());
+        let states = dirty_states(&pool, 10, false).await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].sync_key, item.sync_key);
+        assert_eq!(states[0].patch().note.as_deref(), Some("shared note"));
+        crate::db::sync_queue::complete_content(&pool, order)
+            .await
+            .unwrap();
+        assert!(dirty_states(&pool, 10, false).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn local_queue_orders_delete_before_later_content_for_the_same_item() {
         let pool = memory_pool().await;
         let item = sample_item("item", "stable-key");
@@ -1005,8 +1274,7 @@ mod tests {
             &item.id,
             &item.sync_key,
             &item.source_revision,
-            false,
-            false,
+            crate::db::sync_queue::ContentSyncOptions::default(),
         )
         .await
         .unwrap();
@@ -1044,8 +1312,7 @@ mod tests {
             &item.id,
             &item.sync_key,
             &item.source_revision,
-            false,
-            false,
+            crate::db::sync_queue::ContentSyncOptions::default(),
         )
         .await
         .unwrap();

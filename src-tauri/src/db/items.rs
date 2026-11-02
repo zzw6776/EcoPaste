@@ -86,15 +86,18 @@ pub fn content_hash(kind: ClipboardKind, content: &str) -> String {
 /// 未命中 → 调用 [`insert_item`] 插入。返回生效行 id 与是否去重。
 #[cfg(test)]
 pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
-    upsert_item_with_sync_outbox(pool, item, false).await
+    upsert_item_with_sync_outbox(pool, item, None)
+        .await
+        .map(|(result, _)| result)
 }
 
 /// Persists one local capture and its synchronization intent in the same SQLite transaction.
+/// Returns its history identity and whether sync was staged, including carried manual-share intent.
 pub async fn upsert_item_with_sync_outbox(
     pool: &SqlitePool,
     item: &ClipboardItem,
-    stage_sync: bool,
-) -> Result<UpsertResult> {
+    sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
+) -> Result<(UpsertResult, bool)> {
     let mut transaction = pool.begin().await.context("begin local clipboard upsert")?;
     let existing_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM clipboard_items WHERE content_hash = ? ORDER BY created_at DESC LIMIT 1",
@@ -112,7 +115,25 @@ pub async fn upsert_item_with_sync_outbox(
         (item.id.clone(), false)
     };
 
-    if stage_sync {
+    // Reusing identical content can change its source revision before a queued share is sent.
+    // Carry explicit share intent forward even when automatic synchronization is disabled.
+    let pending_manual_share: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_content_outbox WHERE item_id = ? AND manual_share = 1)",
+    )
+    .bind(&id)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("read pending manual share intent")?;
+    let sync_options = if pending_manual_share {
+        Some(crate::db::sync_queue::ContentSyncOptions {
+            manual_share: true,
+            ..sync_options.unwrap_or_default()
+        })
+    } else {
+        sync_options
+    };
+
+    if let Some(options) = sync_options {
         let (source_revision, sync_key): (String, String) =
             sqlx::query_as("SELECT source_revision, sync_key FROM clipboard_items WHERE id = ?")
                 .bind(&id)
@@ -124,8 +145,7 @@ pub async fn upsert_item_with_sync_outbox(
             &id,
             &sync_key,
             &source_revision,
-            false,
-            false,
+            options,
         )
         .await?;
     }
@@ -134,7 +154,7 @@ pub async fn upsert_item_with_sync_outbox(
         .commit()
         .await
         .context("commit local clipboard upsert")?;
-    Ok(UpsertResult { id, deduplicated })
+    Ok((UpsertResult { id, deduplicated }, sync_options.is_some()))
 }
 
 /// Merges a synchronized record without turning network receipt into local reuse time.
@@ -647,7 +667,7 @@ pub struct CleanupOutcome {
     pub image_files: Vec<String>,
 }
 
-/// 历史清理：按「时间下限」和「最大条数」删除条目；置顶 / 收藏项一律保留。
+/// 历史清理：按时间和条数裁剪，保留置顶、收藏与尚未生成同步事件的手动分享。
 /// 返回删除行数与被删图片的文件名。`older_than = None` 跳过时长清理；`max_count = None` 或 `Some(0)` 跳过条数清理。
 pub async fn cleanup_history(
     pool: &SqlitePool,
@@ -671,6 +691,8 @@ pub async fn cleanup_history(
                 "DELETE FROM clipboard_items WHERE id IN ( \
                      SELECT id FROM clipboard_items \
                      WHERE is_pinned = 0 AND is_favorite = 0 AND created_at < ? \
+                       AND NOT EXISTS (SELECT 1 FROM sync_content_outbox manual \
+                           WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1) \
                      LIMIT ? \
                  ) \
                  RETURNING CASE WHEN kind = ? THEN content ELSE NULL END",
@@ -694,6 +716,8 @@ pub async fn cleanup_history(
                 "DELETE FROM clipboard_items WHERE id IN ( \
                      SELECT id FROM clipboard_items \
                      WHERE is_pinned = 0 AND is_favorite = 0 \
+                       AND NOT EXISTS (SELECT 1 FROM sync_content_outbox manual \
+                           WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1) \
                      ORDER BY created_at DESC \
                      LIMIT ? OFFSET ? \
                  ) \
@@ -945,6 +969,7 @@ mod tests {
     use crate::db::models::{
         ClipboardApp, ClipboardGroup, ClipboardKind, ClipboardSubKind, Platform,
     };
+    use crate::db::sync_queue::{self, ContentSyncOptions};
     use crate::db::test_support::memory_pool;
     use chrono::DateTime;
 
@@ -992,6 +1017,131 @@ mod tests {
 
     fn ids(items: &[ClipboardItem]) -> Vec<&str> {
         items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn manual_share_is_atomic_and_survives_local_reuse_without_auto_sync() {
+        let pool = memory_pool().await;
+        let mut item = sample_item("share");
+        item.is_sensitive = true;
+        let (saved, staged) = upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(staged);
+        let first = sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.manual_share && first.force_files);
+        assert_eq!(first.item_id, saved.id);
+
+        item.source_revision = "recaptured".to_owned();
+        item.updated_at += chrono::Duration::seconds(1);
+        let (reused, staged) = upsert_item_with_sync_outbox(&pool, &item, None)
+            .await
+            .unwrap();
+        assert!(reused.deduplicated && staged);
+        assert_eq!(reused.id, saved.id);
+        sync_queue::complete_content(&pool, first.operation_order)
+            .await
+            .unwrap();
+        let current = sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.source_revision, "recaptured");
+        assert!(current.manual_share && current.force_files);
+
+        sync_queue::complete_content(&pool, current.operation_order)
+            .await
+            .unwrap();
+        let (_, staged) = upsert_item_with_sync_outbox(&pool, &item, None)
+            .await
+            .unwrap();
+        assert!(!staged);
+        assert!(sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_share_queue_failure_rolls_back_history() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_share BEFORE INSERT ON sync_content_outbox \
+             WHEN NEW.manual_share = 1 BEGIN SELECT RAISE(ABORT, 'queue unavailable'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let item = sample_item("share");
+        assert!(upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .is_err());
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_cleanup_preserves_manual_shares_until_content_is_materialized() {
+        let pool = memory_pool().await;
+        let item = sample_item("share");
+        upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for index in 1..=2 {
+            let mut recent = sample_item(&format!("ordinary-{index}"));
+            recent.created_at += chrono::Duration::seconds(index);
+            insert_item(&pool, &recent).await.unwrap();
+        }
+        assert_eq!(
+            cleanup_history(&pool, None, Some(1)).await.unwrap().removed,
+            1
+        );
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
+        assert_eq!(
+            cleanup_history(&pool, Some(Utc::now()), None)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
+        let pending = sync_queue::next_ready_content(&pool, false)
+            .await
+            .unwrap()
+            .unwrap();
+        sync_queue::complete_content(&pool, pending.operation_order)
+            .await
+            .unwrap();
+        assert_eq!(
+            cleanup_history(&pool, Some(Utc::now()), None)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
     }
 
     async fn insert_source_app(pool: &SqlitePool, id: &str) {
@@ -1113,6 +1263,7 @@ mod tests {
                 kind: ecopaste_sync_protocol::SyncEventKind::Content,
                 blob_ids: Vec::new(),
                 optional_blob_ids: Vec::new(),
+                retention_key: None,
             };
             crate::sync::repository::insert_event(&pool, &event, true, &[])
                 .await

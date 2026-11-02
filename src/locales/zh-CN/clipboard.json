@@ -124,20 +124,24 @@
   "syncItem": {
     "cloud": {
       "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
+      "confirming": "云端：等待确认",
       "error": "云端同步失败，点击重试",
-      "errorWithReason": "云端：{{reason}}，点击重试",
+      "errorWithReason": "云端：{{reason}}，等待重试或点击重试",
       "idle": "云端：本次未使用",
       "manual": "云端：超过自动同步大小，点击上传",
-      "queued": "已开始云端同步",
-      "success": "云端：已上传",
+      "queued": "云端：等待同步",
+      "started": "已开始云端同步",
+      "success": "云端：已同步",
       "syncing": "云端：正在上传"
     },
     "lan": {
+      "confirming": "局域网：等待确认",
       "error": "局域网同步失败，点击重试",
-      "errorWithReason": "局域网：{{reason}}，点击重试",
+      "errorWithReason": "局域网：{{reason}}，等待重试或点击重试",
       "idle": "局域网：当前无在线设备，已跳过",
       "manual": "局域网：需要手动同步，点击传输",
-      "queued": "已开始局域网同步",
+      "queued": "局域网：等待同步",
+      "started": "已开始局域网同步",
       "success": "局域网：已投递到 {{delivered}}/{{total}} 台设备",
       "syncing": "局域网：正在投递"
     }

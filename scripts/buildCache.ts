@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import { lstat, mkdir, mkdtemp, opendir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { acquireAndroidBuildLock } from "./androidBuildLock";
 
 const GIBIBYTE = 1024 ** 3;
 const DESKTOP_CACHE_LIMIT = 6 * GIBIBYTE;
@@ -123,6 +124,24 @@ export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
     return;
   }
 
+  // Android release builds also load host proc macros from target/release.
+  const buildLock = await acquireAndroidBuildLock(
+    projectRoot,
+    "shared Cargo cache cleanup",
+  );
+  try {
+    await cleanDesktopCargoCache(projectRoot, targetRoot, cachePaths);
+  } finally {
+    await buildLock.release();
+  }
+}
+
+/** 清理桌面 profile，调用方须持有保护 Android 宿主宏库的构建锁。 */
+async function cleanDesktopCargoCache(
+  projectRoot: string,
+  targetRoot: string,
+  cachePaths: string[],
+) {
   const bundle = resolve(targetRoot, "release/bundle");
   let bundleBackupRoot: string | undefined;
   try {
@@ -137,7 +156,7 @@ export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
 
   let cargoError: unknown;
   try {
-    cleanCargoProfiles(projectRoot, ["dev", "release"]);
+    cleanCargoProfiles(projectRoot, ["dev", "release"], targetRoot);
   } catch (error) {
     cargoError = error;
   } finally {

@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    CloudDevice, CloudEvent, DeviceAnnouncement, EncryptedEvent, PeerAnnouncement, RemovedDevice,
-    SyncEventKind,
+    CloudDevice, CloudEvent, DeviceAnnouncement, EncryptedEvent, MAX_EVENTS_PER_BATCH,
+    PeerAnnouncement, RemovedDevice, RetentionMapping, SyncEventKind,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -432,6 +432,9 @@ impl Repository {
         for event in events {
             validate_identifier("event_id", &event.event_id)?;
             validate_identifier("origin_device_id", &event.origin_device_id)?;
+            if let Some(key) = &event.retention_key {
+                validate_blob_id(key)?;
+            }
             if event.nonce.len() != 24 || event.ciphertext.is_empty() {
                 bail!("invalid encrypted event");
             }
@@ -455,8 +458,8 @@ impl Repository {
                 r#"
                 INSERT OR IGNORE INTO events (
                     group_id, event_id, origin_device_id, origin_sequence,
-                    created_at_ms, received_at_ms, nonce, ciphertext, event_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at_ms, received_at_ms, nonce, ciphertext, event_kind, retention_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(group_id)
@@ -468,6 +471,7 @@ impl Repository {
             .bind(&event.nonce)
             .bind(&event.ciphertext)
             .bind(event.kind.as_i64())
+            .bind(&event.retention_key)
             .execute(&mut *transaction)
             .await
             .context("insert encrypted event")?;
@@ -523,6 +527,130 @@ impl Repository {
         Ok(accepted)
     }
 
+    /// Invalidates cached protection snapshots when a Hub group is recreated.
+    pub async fn retention_epoch(&self, group_id: &str) -> Result<String> {
+        sqlx::query(
+            "UPDATE sync_groups SET retention_epoch = lower(hex(randomblob(16))) \
+             WHERE group_id = ? AND retention_epoch = ''",
+        )
+        .bind(group_id)
+        .execute(&self.pool)
+        .await
+        .context("initialize retention epoch")?;
+        sqlx::query_scalar("SELECT retention_epoch FROM sync_groups WHERE group_id = ?")
+            .bind(group_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("read retention epoch")
+    }
+
+    /// Unknown legacy identities remain protected until a client decrypts and registers them.
+    pub async fn retention_candidates(&self, group_id: &str) -> Result<Vec<CloudEvent>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT cursor, event_id, origin_device_id, origin_sequence,
+                   created_at_ms, nonce, ciphertext, event_kind, retention_key
+            FROM events WHERE group_id = ? AND retention_key IS NULL
+            ORDER BY cursor ASC LIMIT ?
+            "#,
+        )
+        .bind(group_id)
+        .bind(i64::from(MAX_EVENTS_PER_BATCH))
+        .fetch_all(&self.pool)
+        .await
+        .context("list legacy retention candidates")?;
+        rows.into_iter().map(cloud_event_from_row).collect()
+    }
+
+    /// Atomically updates one device's protection snapshot and maps existing encrypted history.
+    /// The union of active-device snapshots protects offline copies until their flags converge.
+    pub async fn set_retention(
+        &self,
+        group_id: &str,
+        device_id: &str,
+        generation: u64,
+        protected_keys: Option<&[String]>,
+        mappings: &[RetentionMapping],
+    ) -> Result<()> {
+        if mappings.len() > usize::from(MAX_EVENTS_PER_BATCH) {
+            bail!("too many retention mappings");
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("begin retention registration")?;
+        let now = now_ms().to_string();
+        if let Some(keys) = protected_keys {
+            for key in keys {
+                validate_blob_id(key)?;
+            }
+            let accepted = sqlx::query(
+                "INSERT INTO retention_devices(group_id,device_id,generation,created_at,updated_at) VALUES (?,?,?,?,?) \
+                 ON CONFLICT(group_id,device_id) DO UPDATE SET generation=excluded.generation,updated_at=excluded.updated_at \
+                 WHERE retention_devices.generation < excluded.generation",
+            ).bind(group_id).bind(device_id).bind(i64::try_from(generation).context("invalid retention generation")?)
+                .bind(&now).bind(&now).execute(&mut *transaction).await?.rows_affected() > 0;
+            if accepted {
+                sqlx::query(
+                    "DELETE FROM retention_protections WHERE group_id = ? AND device_id = ?",
+                )
+                .bind(group_id)
+                .bind(device_id)
+                .execute(&mut *transaction)
+                .await?;
+                for key in keys {
+                    sqlx::query("INSERT OR IGNORE INTO retention_protections(group_id,device_id,item_key,created_at,updated_at) VALUES (?,?,?,?,?)")
+                        .bind(group_id).bind(device_id).bind(key).bind(&now).bind(&now).execute(&mut *transaction).await?;
+                }
+            }
+        }
+        for mapping in mappings {
+            validate_identifier("event_id", &mapping.event_id)?;
+            validate_blob_id(&mapping.item_key)?;
+            if mapping.blob_ids.len() > 256 {
+                bail!("too many event blob references");
+            }
+            let existing: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT retention_key FROM events WHERE group_id = ? AND event_id = ?",
+            )
+            .bind(group_id)
+            .bind(&mapping.event_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(existing) = existing else {
+                continue;
+            };
+            if existing
+                .as_ref()
+                .is_some_and(|key| key != &mapping.item_key)
+            {
+                bail!("retention identity mismatch");
+            }
+            sqlx::query("UPDATE events SET retention_key = ? WHERE group_id = ? AND event_id = ?")
+                .bind(&mapping.item_key)
+                .bind(group_id)
+                .bind(&mapping.event_id)
+                .execute(&mut *transaction)
+                .await?;
+            for blob_id in &mapping.blob_ids {
+                validate_blob_id(blob_id)?;
+                sqlx::query("INSERT OR IGNORE INTO event_blob_refs(group_id,event_id,blob_id,created_at_ms) VALUES (?,?,?,?)")
+                    .bind(group_id).bind(&mapping.event_id).bind(blob_id).bind(now_ms())
+                    .execute(&mut *transaction).await?;
+            }
+        }
+        // A legacy blob can be shared with an event whose references are not registered yet.
+        sqlx::query("UPDATE blobs SET gc_protected = 0 WHERE group_id = ? AND gc_protected = 1 \
+                     AND NOT EXISTS(SELECT 1 FROM events WHERE group_id = ? AND retention_key IS NULL)")
+            .bind(group_id).bind(group_id).execute(&mut *transaction).await?;
+        transaction
+            .commit()
+            .await
+            .context("commit retention registration")?;
+        Ok(())
+    }
+
     /// Reads encrypted cloud events after the caller's delivery cursor.
     pub async fn list_events(
         &self,
@@ -533,7 +661,7 @@ impl Repository {
         let rows = sqlx::query(
             r#"
             SELECT cursor, event_id, origin_device_id, origin_sequence,
-                   created_at_ms, nonce, ciphertext, event_kind
+                   created_at_ms, nonce, ciphertext, event_kind, retention_key
             FROM events
             WHERE group_id = ? AND cursor > ?
             ORDER BY cursor ASC
@@ -601,20 +729,22 @@ impl Repository {
         group_id: &str,
         before_cursor: Option<u64>,
         limit: u16,
+        include_states: bool,
     ) -> Result<(Vec<CloudEvent>, Option<u64>)> {
         let fetch_limit = i64::from(limit) + 1;
         let rows = if let Some(before_cursor) = before_cursor {
             sqlx::query(
                 r#"
                 SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext, event_kind
+                       created_at_ms, nonce, ciphertext, event_kind, retention_key
                 FROM events
-                WHERE group_id = ? AND event_kind = ? AND cursor < ?
+                WHERE group_id = ? AND (? OR event_kind = ?) AND cursor < ?
                 ORDER BY cursor DESC
                 LIMIT ?
                 "#,
             )
             .bind(group_id)
+            .bind(include_states)
             .bind(SyncEventKind::Content.as_i64())
             .bind(i64::try_from(before_cursor).unwrap_or(i64::MAX))
             .bind(fetch_limit)
@@ -624,14 +754,15 @@ impl Repository {
             sqlx::query(
                 r#"
                 SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext, event_kind
+                       created_at_ms, nonce, ciphertext, event_kind, retention_key
                 FROM events
-                WHERE group_id = ? AND event_kind = ?
+                WHERE group_id = ? AND (? OR event_kind = ?)
                 ORDER BY cursor DESC
                 LIMIT ?
                 "#,
             )
             .bind(group_id)
+            .bind(include_states)
             .bind(SyncEventKind::Content.as_i64())
             .bind(fetch_limit)
             .fetch_all(&self.pool)
@@ -838,13 +969,15 @@ impl Repository {
         if cursor == 0 {
             return Ok(());
         }
-        let pruned: i64 =
-            sqlx::query_scalar("SELECT pruned_through_cursor FROM sync_groups WHERE group_id = ?")
+        let (pruned, retained): (i64, bool) =
+            sqlx::query_as("SELECT pruned_through_cursor, EXISTS(SELECT 1 FROM events WHERE group_id = ? AND cursor = ?) FROM sync_groups WHERE group_id = ?")
+                .bind(group_id)
+                .bind(i64::try_from(cursor).unwrap_or(i64::MAX))
                 .bind(group_id)
                 .fetch_one(&self.pool)
                 .await
                 .context("read retained sync cursor floor")?;
-        if cursor < u64::try_from(pruned).context("negative retained cursor floor")? {
+        if !retained && cursor < u64::try_from(pruned).context("negative retained cursor floor")? {
             return Err(HistoryGap.into());
         }
         Ok(())
@@ -854,13 +987,16 @@ impl Repository {
     pub async fn bootstrap_cursor_bounds(&self, group_id: &str) -> Result<(u64, u64)> {
         let (pruned, latest): (i64, i64) = sqlx::query_as(
             r#"
-            SELECT pruned_through_cursor,
+            SELECT CASE WHEN EXISTS(
+                       SELECT 1 FROM events WHERE group_id = ? AND cursor <= pruned_through_cursor
+                   ) THEN 0 ELSE pruned_through_cursor END,
                    MAX(pruned_through_cursor,
                        COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0))
             FROM sync_groups
             WHERE group_id = ?
             "#,
         )
+        .bind(group_id)
         .bind(group_id)
         .bind(group_id)
         .fetch_one(&self.pool)
@@ -880,6 +1016,19 @@ impl Repository {
     ) -> Result<CleanupResult> {
         let batch_size = policy.batch_size.max(1);
         let mut transaction = self.pool.begin().await.context("begin Hub cleanup")?;
+        // Protection patches can occur after their content. Until every legacy event has been
+        // inspected, a new device cannot prove that an earlier mapped item is unprotected.
+        let registration_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE group_id = ? AND retention_key IS NULL)",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read legacy retention registration state")?;
+        if registration_pending {
+            transaction.commit().await?;
+            return Ok(CleanupResult::default());
+        }
         let stale_blob_rows = sqlx::query(
             r#"
             SELECT blob_id, size FROM blobs b
@@ -939,7 +1088,7 @@ impl Repository {
 
         let usage_row = sqlx::query(
             r#"
-            SELECT event_bytes + blob_bytes AS used_bytes, event_count
+            SELECT event_bytes + blob_bytes AS used_bytes
             FROM sync_groups
             WHERE group_id = ?
             "#,
@@ -950,13 +1099,15 @@ impl Repository {
         .context("read Hub cleanup usage")?;
         let used_bytes = u64::try_from(usage_row.try_get::<i64, _>("used_bytes")?)
             .context("negative Hub cleanup usage")?;
-        let event_count = u64::try_from(usage_row.try_get::<i64, _>("event_count")?)
-            .context("negative Hub cleanup event count")?;
         let candidates = sqlx::query(
             r#"
             SELECT cursor, length(nonce) + length(ciphertext) AS event_bytes
-            FROM events
-            WHERE group_id = ?
+            FROM events e
+            WHERE group_id = ? AND retention_key IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM retention_protections p
+                  WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
+              )
             ORDER BY cursor ASC
             LIMIT ?
             "#,
@@ -978,9 +1129,19 @@ impl Repository {
             });
         }
 
-        let count_excess = policy
-            .max_events
-            .map_or(0, |maximum| event_count.saturating_sub(maximum));
+        let count_excess =
+            if let Some(maximum) = policy.max_events {
+                let eligible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM events e WHERE group_id = ? AND retention_key IS NOT NULL \
+                 AND NOT EXISTS(SELECT 1 FROM retention_protections p \
+                     WHERE p.group_id = e.group_id AND p.item_key = e.retention_key)",
+            ).bind(group_id).fetch_one(&mut *transaction).await?;
+                u64::try_from(eligible)
+                    .context("negative Hub cleanup event count")?
+                    .saturating_sub(maximum)
+            } else {
+                0
+            };
         let time_boundary = if let Some(cutoff) = policy.retention_cutoff_ms {
             sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT MAX(cursor) FROM events WHERE group_id = ? AND received_at_ms < ?",
@@ -1019,7 +1180,11 @@ impl Repository {
                   ON b.group_id = r.group_id AND b.blob_id = r.blob_id
                 WHERE r.group_id = ? AND b.gc_protected = 0
                 GROUP BY r.blob_id, b.size
-                HAVING MAX(e.cursor) <= ?
+                HAVING MAX(e.cursor) <= ? AND MIN(CASE
+                    WHEN e.retention_key IS NOT NULL AND NOT EXISTS(
+                        SELECT 1 FROM retention_protections p
+                        WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
+                    ) THEN 1 ELSE 0 END) = 1
                 "#,
             )
             .bind(group_id)
@@ -1089,7 +1254,11 @@ impl Repository {
               ON b.group_id = r.group_id AND b.blob_id = r.blob_id
             WHERE r.group_id = ? AND b.gc_protected = 0
             GROUP BY r.blob_id
-            HAVING MAX(e.cursor) <= ?
+            HAVING MAX(e.cursor) <= ? AND MIN(CASE
+                WHEN e.retention_key IS NOT NULL AND NOT EXISTS(
+                    SELECT 1 FROM retention_protections p
+                    WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
+                ) THEN 1 ELSE 0 END) = 1
             "#,
         )
         .bind(group_id)
@@ -1108,12 +1277,16 @@ impl Repository {
             })
             .collect::<Result<HashMap<_, _>>>()?;
         deleted_blob_ids.extend(released_blob_sizes.keys().cloned());
-        sqlx::query("DELETE FROM events WHERE group_id = ? AND cursor <= ?")
-            .bind(group_id)
-            .bind(deleted_through)
-            .execute(&mut *transaction)
-            .await
-            .context("delete retained Hub events")?;
+        sqlx::query(
+            "DELETE FROM events WHERE group_id = ? AND cursor <= ? AND retention_key IS NOT NULL \
+                     AND NOT EXISTS(SELECT 1 FROM retention_protections p \
+                         WHERE p.group_id = events.group_id AND p.item_key = events.retention_key)",
+        )
+        .bind(group_id)
+        .bind(deleted_through)
+        .execute(&mut *transaction)
+        .await
+        .context("delete retained Hub events")?;
         sqlx::query(
             "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?) WHERE group_id = ?",
         )
@@ -1260,6 +1433,7 @@ fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
             kind: event_kind_from_row(&row)?,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
+            retention_key: row.try_get("retention_key")?,
         },
     })
 }
@@ -1296,6 +1470,7 @@ mod tests {
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
+            retention_key: None,
         };
         repository
             .insert_events("group_123", &[event], None)
@@ -1371,6 +1546,7 @@ mod tests {
                 kind: SyncEventKind::Content,
                 blob_ids: Vec::new(),
                 optional_blob_ids: Vec::new(),
+                retention_key: None,
             })
             .collect::<Vec<_>>();
         repository
@@ -1390,6 +1566,7 @@ mod tests {
                     kind: SyncEventKind::ItemState,
                     blob_ids: Vec::new(),
                     optional_blob_ids: Vec::new(),
+                    retention_key: None,
                 }],
                 None,
             )
@@ -1397,7 +1574,7 @@ mod tests {
             .unwrap();
 
         let (first, next) = repository
-            .list_events_before("group_123", None, 2)
+            .list_events_before("group_123", None, 2, false)
             .await
             .unwrap();
         assert_eq!(
@@ -1407,7 +1584,7 @@ mod tests {
         assert_eq!(next, Some(2));
 
         let (second, next) = repository
-            .list_events_before("group_123", next, 2)
+            .list_events_before("group_123", next, 2, false)
             .await
             .unwrap();
         assert_eq!(
@@ -1416,6 +1593,31 @@ mod tests {
         );
         assert_eq!(next, None);
         assert_eq!(repository.event_count("group_123").await.unwrap(), 3);
+
+        let (first, next) = repository
+            .list_events_before("group_123", None, 2, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.event.kind)
+                .collect::<Vec<_>>(),
+            [SyncEventKind::ItemState, SyncEventKind::Content]
+        );
+        assert_eq!(
+            first.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            [4, 3]
+        );
+        let (second, next) = repository
+            .list_events_before("group_123", next, 2, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -1855,6 +2057,385 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn protected_events_and_shared_blobs_survive_quota_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let device = retention_test_device("device_123");
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+        let shared_blob = "a".repeat(64);
+        let ordinary_blob = "b".repeat(64);
+        repository
+            .record_blob("group_123", &shared_blob, 1000, true)
+            .await
+            .unwrap();
+        repository
+            .record_blob("group_123", &ordinary_blob, 80, true)
+            .await
+            .unwrap();
+        let mut events = (1..=4).map(test_event).collect::<Vec<_>>();
+        let protected_key = events[0].retention_key.clone().unwrap();
+        events[0].blob_ids.push(shared_blob.clone());
+        events[1].blob_ids.push(shared_blob.clone());
+        events[2].blob_ids.push(ordinary_blob.clone());
+        events[3].kind = SyncEventKind::ItemState;
+        events[3].retention_key = Some(protected_key.clone());
+        repository
+            .insert_events("group_123", &events, None)
+            .await
+            .unwrap();
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                1,
+                Some(&[protected_key]),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let mut policy = retention_test_policy();
+        policy.max_events = Some(2);
+        assert_eq!(
+            repository
+                .cleanup_group("group_123", policy)
+                .await
+                .unwrap()
+                .deleted_events,
+            0
+        );
+        policy.max_events = None;
+        policy.target_bytes = Some(1080);
+        let result = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(result.deleted_events, 2);
+        assert_eq!(result.deleted_blob_ids, [ordinary_blob]);
+        assert_eq!(
+            repository
+                .group_usage("group_123")
+                .await
+                .unwrap()
+                .used_bytes,
+            1080
+        );
+        let retained = repository.list_events("group_123", 0, 10).await.unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|stored| stored.cursor)
+                .collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert_eq!(
+            retained[0].event.blob_ids,
+            std::slice::from_ref(&shared_blob)
+        );
+
+        policy.target_bytes = Some(0);
+        policy.retention_cutoff_ms = Some(i64::MAX);
+        policy.max_events = Some(0);
+        let idle = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(idle.deleted_events, 0);
+        assert!(idle.deleted_blob_ids.is_empty());
+        assert!(!idle.has_more);
+
+        repository
+            .set_retention("group_123", &device.device_id, 2, Some(&[]), &[])
+            .await
+            .unwrap();
+        let released = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(released.deleted_events, 2);
+        assert_eq!(released.deleted_blob_ids, [shared_blob]);
+        assert_eq!(
+            repository
+                .group_usage("group_123")
+                .await
+                .unwrap()
+                .used_bytes,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn protection_snapshots_ignore_stale_generations_and_removed_devices() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let event = test_event(1);
+        let keys = [event.retention_key.clone().unwrap()];
+        repository
+            .insert_events("group_123", &[event], None)
+            .await
+            .unwrap();
+        for id in ["device_123", "device_456"] {
+            repository
+                .upsert_device("group_123", &retention_test_device(id))
+                .await
+                .unwrap();
+            repository
+                .set_retention("group_123", id, 10, Some(&keys), &[])
+                .await
+                .unwrap();
+        }
+        repository
+            .set_retention("group_123", "device_123", 11, Some(&[]), &[])
+            .await
+            .unwrap();
+        repository
+            .set_retention("group_123", "device_123", 10, Some(&keys), &[])
+            .await
+            .unwrap();
+        let mut policy = retention_test_policy();
+        policy.target_bytes = Some(0);
+        assert_eq!(
+            repository
+                .cleanup_group("group_123", policy)
+                .await
+                .unwrap()
+                .deleted_events,
+            0
+        );
+
+        repository
+            .merge_removed_devices(
+                "group_123",
+                &[RemovedDevice {
+                    device_id: "device_456".into(),
+                    endpoint_id: "endpoint_device_456".into(),
+                    removed_at_ms: 100,
+                    restored_at_ms: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .cleanup_group("group_123", policy)
+                .await
+                .unwrap()
+                .deleted_events,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_identities_and_shared_blob_references_are_registered_before_reclamation() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let device = retention_test_device("device_123");
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+        let blob = "c".repeat(64);
+        repository
+            .record_blob("group_123", &blob, 200, false)
+            .await
+            .unwrap();
+        let mut events = (1..=2).map(test_event).collect::<Vec<_>>();
+        for event in &mut events {
+            event.retention_key = None;
+        }
+        repository
+            .insert_events("group_123", &events, None)
+            .await
+            .unwrap();
+        let mut policy = retention_test_policy();
+        policy.target_bytes = Some(0);
+        policy.retention_cutoff_ms = Some(i64::MAX);
+        policy.legacy_blob_cutoff_ms = Some(i64::MAX);
+        let unchanged = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(unchanged.deleted_events, 0);
+        assert!(unchanged.deleted_blob_ids.is_empty());
+        assert!(!unchanged.has_more);
+        let epoch = repository.retention_epoch("group_123").await.unwrap();
+        assert!(!epoch.is_empty());
+        assert_eq!(
+            repository.retention_epoch("group_123").await.unwrap(),
+            epoch
+        );
+        assert_eq!(
+            repository
+                .retention_candidates("group_123")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let first = RetentionMapping {
+            event_id: events[0].event_id.clone(),
+            item_key: "1".repeat(64),
+            blob_ids: vec![blob.clone()],
+        };
+        repository
+            .set_retention("group_123", &device.device_id, 1, Some(&[]), &[first])
+            .await
+            .unwrap();
+        let partially_registered = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(partially_registered.deleted_events, 0);
+        assert!(partially_registered.deleted_blob_ids.is_empty());
+        assert_eq!(
+            repository
+                .group_usage("group_123")
+                .await
+                .unwrap()
+                .blob_count,
+            1
+        );
+
+        let second = RetentionMapping {
+            event_id: events[1].event_id.clone(),
+            item_key: "2".repeat(64),
+            blob_ids: vec![blob.clone()],
+        };
+        repository
+            .set_retention(
+                "group_123",
+                &device.device_id,
+                2,
+                Some(std::slice::from_ref(&second.item_key)),
+                std::slice::from_ref(&second),
+            )
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .retention_candidates("group_123")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .cleanup_group("group_123", policy)
+                .await
+                .unwrap()
+                .deleted_events,
+            1
+        );
+        repository
+            .set_retention("group_123", &device.device_id, 3, Some(&[]), &[])
+            .await
+            .unwrap();
+        let released = repository.cleanup_group("group_123", policy).await.unwrap();
+        assert_eq!(released.deleted_events, 1);
+        assert_eq!(released.deleted_blob_ids, [blob]);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_pages_include_protected_history_below_the_pruned_watermark() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let device = retention_test_device("device_123");
+        repository
+            .upsert_device("group_123", &device)
+            .await
+            .unwrap();
+        let protected = "a".repeat(64);
+        let events = (1..=260)
+            .map(|sequence| {
+                let mut event = test_event(sequence);
+                if sequence != 259 {
+                    event.retention_key = Some(protected.clone());
+                }
+                event
+            })
+            .collect::<Vec<_>>();
+        repository
+            .insert_events("group_123", &events, None)
+            .await
+            .unwrap();
+        repository
+            .set_retention("group_123", &device.device_id, 1, Some(&[protected]), &[])
+            .await
+            .unwrap();
+        let mut policy = retention_test_policy();
+        policy.target_bytes = Some(0);
+        assert_eq!(
+            repository
+                .cleanup_group("group_123", policy)
+                .await
+                .unwrap()
+                .deleted_events,
+            1
+        );
+        assert_eq!(
+            repository
+                .bootstrap_cursor_bounds("group_123")
+                .await
+                .unwrap(),
+            (0, 260)
+        );
+        let first = repository
+            .list_events("group_123", 0, MAX_EVENTS_PER_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 256);
+        let cursor = first.last().unwrap().cursor;
+        repository
+            .ensure_cursor_available("group_123", cursor)
+            .await
+            .unwrap();
+        let rest = repository
+            .list_events("group_123", cursor, MAX_EVENTS_PER_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.iter().map(|stored| stored.cursor).collect::<Vec<_>>(),
+            [257, 258, 260]
+        );
+    }
+
+    fn retention_test_device(id: &str) -> DeviceAnnouncement {
+        DeviceAnnouncement {
+            device_id: id.into(),
+            device_name: id.into(),
+            platform: "macos".into(),
+            endpoint_id: format!("endpoint_{id}"),
+            direct_addresses: Vec::new(),
+            relay_urls: Vec::new(),
+            app_version: "1.1.167".into(),
+        }
+    }
+
+    fn retention_test_policy() -> CleanupPolicy {
+        CleanupPolicy {
+            retention_cutoff_ms: None,
+            legacy_blob_cutoff_ms: None,
+            max_events: None,
+            target_bytes: None,
+            orphan_cutoff_ms: i64::MAX,
+            batch_size: 500,
+        }
+    }
+
     fn test_event(sequence: u64) -> EncryptedEvent {
         EncryptedEvent {
             event_id: format!("event_{sequence:03}"),
@@ -1866,6 +2447,7 @@ mod tests {
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
+            retention_key: Some(format!("{sequence:064x}")),
         }
     }
 }

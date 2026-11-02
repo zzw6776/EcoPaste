@@ -19,7 +19,9 @@ pub const TYPED_EVENTS_PROTOCOL_VERSION: u16 = 9;
 pub const CLOUD_DEVICE_DIRECTORY_PROTOCOL_VERSION: u16 = 10;
 pub const BOUNDED_HUB_PROTOCOL_VERSION: u16 = 11;
 pub const OPTIONAL_BLOB_REFS_PROTOCOL_VERSION: u16 = 12;
-pub const PROTOCOL_VERSION: u16 = OPTIONAL_BLOB_REFS_PROTOCOL_VERSION;
+pub const RETENTION_PROTECTION_PROTOCOL_VERSION: u16 = 13;
+pub const ALL_EVENTS_HISTORY_PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = ALL_EVENTS_HISTORY_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -162,6 +164,21 @@ pub struct EncryptedEvent {
     #[n(8)]
     #[cbor(default)]
     pub optional_blob_ids: Vec<String>,
+    /// Group-keyed anonymous item identity used only for cloud retention.
+    #[n(9)]
+    #[cbor(default)]
+    pub retention_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct RetentionMapping {
+    #[n(0)]
+    pub event_id: String,
+    #[n(1)]
+    pub item_key: String,
+    #[n(2)]
+    pub blob_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
@@ -280,6 +297,10 @@ pub enum Request {
         before_cursor: Option<u64>,
         #[n(3)]
         limit: u16,
+        /// Includes metadata/presence events for delivery verification; history browsing omits it.
+        #[n(4)]
+        #[cbor(default)]
+        include_states: Option<bool>,
     },
     #[n(7)]
     SyncRemovedDevices {
@@ -409,6 +430,30 @@ pub enum Request {
         #[n(3)]
         size: u64,
     },
+    /// Reads a bounded page of legacy events whose retention identity is still unknown.
+    #[n(19)]
+    RetentionPlan {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+    },
+    /// Replaces a device's protection snapshot and registers identities without revealing content.
+    #[n(20)]
+    SetRetention {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        device: DeviceAnnouncement,
+        #[n(3)]
+        generation: u64,
+        #[n(4)]
+        protected_keys: Option<Vec<String>>,
+        #[n(5)]
+        mappings: Vec<RetentionMapping>,
+    },
     /// Stores an optional source icon that participates in reference reclamation.
     #[n(18)]
     PutManagedSourceIcon {
@@ -537,6 +582,17 @@ pub enum Response {
         #[n(1)]
         latest_cursor: u64,
     },
+    #[n(15)]
+    RetentionPlan {
+        #[n(0)]
+        epoch: String,
+        #[n(1)]
+        events: Vec<CloudEvent>,
+        #[n(2)]
+        has_more: bool,
+    },
+    #[n(16)]
+    RetentionUpdated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -624,6 +680,56 @@ fn fitting_event_count<T: Encode<()>>(
         count += 1;
     }
     Ok(count)
+}
+
+/// Bounds legacy metadata registration without skipping an oversized encrypted record.
+pub fn limit_retention_plan(response: &mut Response) -> Result<(), FrameError> {
+    let mut events = match response {
+        Response::RetentionPlan { events, .. } => std::mem::take(events),
+        _ => return Err(FrameError::Encode("expected a retention plan".into())),
+    };
+    let count = fitting_event_count(&events, encoded_size(response)?)?;
+    if let Response::RetentionPlan {
+        events: outgoing,
+        has_more,
+        ..
+    } = response
+    {
+        *has_more |= count < events.len();
+        events.truncate(count);
+        *outgoing = events;
+    }
+    Ok(())
+}
+
+/// Keeps newest-first history pages within the frame while retaining their continuation cursor.
+pub fn limit_events_page(response: &mut Response) -> Result<(), FrameError> {
+    let (mut events, had_more) = match response {
+        Response::EventsPage {
+            events,
+            next_before_cursor,
+            ..
+        } => {
+            let more = next_before_cursor.is_some();
+            *next_before_cursor = Some(u64::MAX);
+            (std::mem::take(events), more)
+        }
+        _ => return Err(FrameError::Encode("expected an event page".into())),
+    };
+    let count = fitting_event_count(&events, encoded_size(response)?)?;
+    let has_more = had_more || count < events.len();
+    events.truncate(count);
+    if let Response::EventsPage {
+        events: outgoing,
+        next_before_cursor,
+        ..
+    } = response
+    {
+        *next_before_cursor =
+            has_more.then(|| events.last().expect("non-empty continued page").cursor);
+        *outgoing = events;
+    }
+    Ok(())
 }
 
 /// Keeps only the outgoing prefix that fits in one frame. Remaining events stay in the outbox.
@@ -799,6 +905,7 @@ mod tests {
             access_token: vec![7; 32],
             before_cursor: Some(42),
             limit: 30,
+            include_states: Some(true),
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 

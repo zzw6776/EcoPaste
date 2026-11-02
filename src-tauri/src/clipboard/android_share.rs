@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::{build_item_with_settings, ClipboardPayload, ImagePayload, ImageStore, TextPayload};
 use crate::db::models::ClipboardItem;
-use crate::settings::{Capture, Clipboard};
+use crate::settings::{Capture, Sensitive};
 
 const MAX_FILE_NAME_BYTES: usize = 200;
 
@@ -36,15 +36,17 @@ pub(crate) struct ShareOutcome {
     pub failed: usize,
 }
 
-/// Explicit shares accept all content types while retaining size and sensitive-content limits.
-fn share_capture(capture: &Capture) -> Capture {
+/// Explicit shares preserve every supported representation without automatic capture limits.
+fn share_capture() -> Capture {
     Capture {
         text: true,
         html: true,
         rtf: true,
         image: true,
         files: true,
-        ..capture.clone()
+        max_text_mb: 0,
+        max_image_mb: 0,
+        ..Default::default()
     }
 }
 
@@ -114,17 +116,13 @@ fn attachment_payload(
     file: &SharedFile,
     staging_root: &Path,
     owned_root: &Path,
-    capture: &Capture,
 ) -> Result<ClipboardPayload> {
     let source = file.path.canonicalize()?;
     anyhow::ensure!(
         source.starts_with(staging_root.canonicalize()?) && source.is_file(),
         "shared attachment is outside the private staging directory"
     );
-    let within_image_limit = capture
-        .max_image_bytes()
-        .is_none_or(|limit| fs::metadata(&source).is_ok_and(|meta| meta.len() <= limit));
-    if file.mime.starts_with("image/") && within_image_limit {
+    if file.mime.starts_with("image/") {
         let decoded = (|| -> image::ImageResult<Option<image::DynamicImage>> {
             use image::ImageDecoder;
 
@@ -159,16 +157,11 @@ fn attachment_payload(
             let mut png = Cursor::new(Vec::new());
             image.write_to(&mut png, image::ImageFormat::Png)?;
             let bytes = png.into_inner();
-            if capture
-                .max_image_bytes()
-                .is_none_or(|limit| bytes.len() as u64 <= limit)
-            {
-                return Ok(ClipboardPayload::Image(ImagePayload {
-                    bytes,
-                    width,
-                    height,
-                }));
-            }
+            return Ok(ClipboardPayload::Image(ImagePayload {
+                bytes,
+                width,
+                height,
+            }));
         }
     }
     let destination = store_attachment(&source, owned_root, &file.name)?;
@@ -182,7 +175,6 @@ fn append_item(
     store: &ImageStore,
     payload: ClipboardPayload,
     capture: &Capture,
-    settings: &Clipboard,
     items: &mut Vec<ClipboardItem>,
     outcome: &mut ShareOutcome,
 ) {
@@ -190,8 +182,11 @@ fn append_item(
         store,
         &payload,
         capture,
-        &settings.sensitive,
-        settings.content.copy_plain,
+        &Sensitive {
+            collect_secrets: true,
+            ..Default::default()
+        },
+        false,
     ) {
         Ok(Some(item)) => items.push(item),
         Ok(None) => outcome.skipped += 1,
@@ -208,9 +203,8 @@ fn prepare_items(
     store: &ImageStore,
     staging_root: &Path,
     owned_root: &Path,
-    settings: &Clipboard,
 ) -> (Vec<ClipboardItem>, ShareOutcome) {
-    let capture = share_capture(&settings.capture);
+    let capture = share_capture();
     let mut outcome = ShareOutcome {
         failed: delivery.failed,
         ..Default::default()
@@ -229,18 +223,15 @@ fn prepare_items(
                 rtf: None,
             }),
             &capture,
-            settings,
             &mut items,
             &mut outcome,
         );
     }
     let mut files = Vec::new();
     for file in delivery.files {
-        match attachment_payload(&file, staging_root, owned_root, &capture) {
+        match attachment_payload(&file, staging_root, owned_root) {
             Ok(ClipboardPayload::Files(paths)) => files.extend(paths),
-            Ok(payload) => {
-                append_item(store, payload, &capture, settings, &mut items, &mut outcome)
-            }
+            Ok(payload) => append_item(store, payload, &capture, &mut items, &mut outcome),
             Err(error) => {
                 outcome.failed += 1;
                 log::warn!("prepare Android shared attachment failed: {error:#}");
@@ -252,7 +243,6 @@ fn prepare_items(
             store,
             ClipboardPayload::Files(files),
             &capture,
-            settings,
             &mut items,
             &mut outcome,
         );
@@ -269,24 +259,29 @@ pub(crate) async fn receive(
     use tauri::Manager;
 
     let _guard = super::shared_files::lock().await;
-    let settings = app.state::<crate::settings::SettingsStore>().snapshot();
     let store = app.state::<ImageStore>().inner().clone();
     let staging_root = app.path().app_cache_dir()?.join("ecopaste-share");
     let owned_root = crate::core::paths::resources_dir(app)?.join(super::shared_files::DIRECTORY);
     let owned_root_for_task = owned_root.clone();
     let (items, mut outcome) = tauri::async_runtime::spawn_blocking(move || {
-        prepare_items(
-            delivery,
-            &store,
-            &staging_root,
-            &owned_root_for_task,
-            &settings.clipboard,
-        )
+        prepare_items(delivery, &store, &staging_root, &owned_root_for_task)
     })
     .await?;
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
     for item in items {
-        match super::persist_and_notify(app, &pool, &item, None, None).await {
+        match super::watcher::persist_and_notify_with_sync(
+            app,
+            &pool,
+            &item,
+            None,
+            None,
+            Some(crate::db::sync_queue::ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        {
             Ok(_) => outcome.saved += 1,
             Err(error) => {
                 outcome.failed += 1;
@@ -340,22 +335,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let settings = Clipboard {
-            capture: Capture {
-                text: false,
-                image: false,
-                files: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (items, outcome) = prepare_items(
-            delivery,
-            &store,
-            &staging,
-            &temp.path().join("owned"),
-            &settings,
-        );
+        let (items, outcome) =
+            prepare_items(delivery, &store, &staging, &temp.path().join("owned"));
         assert_eq!(outcome.saved, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.skipped, 0);
@@ -385,11 +366,8 @@ mod tests {
             mime: "image/gif".to_owned(),
         };
         let owned = temp.path().join("owned");
-        let first = attachment_payload(&file, &staging, &owned, &Capture::default()).unwrap();
-        assert_eq!(
-            first,
-            attachment_payload(&file, &staging, &owned, &Capture::default()).unwrap()
-        );
+        let first = attachment_payload(&file, &staging, &owned).unwrap();
+        assert_eq!(first, attachment_payload(&file, &staging, &owned).unwrap());
         let ClipboardPayload::Files(paths) = first else {
             panic!("animation must remain a file")
         };
@@ -419,7 +397,7 @@ mod tests {
                 name: "animation.png".to_owned(),
                 mime: mime.to_owned(),
             };
-            let payload = attachment_payload(&file, &staging, &owned, &Capture::default()).unwrap();
+            let payload = attachment_payload(&file, &staging, &owned).unwrap();
             let ClipboardPayload::Files(paths) = payload else {
                 panic!("APNG must retain all animation frames")
             };
@@ -440,13 +418,7 @@ mod tests {
             name: format!("{}.pdf", "文".repeat(68)),
             mime: "application/pdf".to_owned(),
         };
-        let payload = attachment_payload(
-            &file,
-            &staging,
-            &temp.path().join("owned"),
-            &Capture::default(),
-        )
-        .unwrap();
+        let payload = attachment_payload(&file, &staging, &temp.path().join("owned")).unwrap();
         let ClipboardPayload::Files(paths) = payload else {
             panic!("document must remain a file")
         };
@@ -485,13 +457,7 @@ mod tests {
             name: "../../escape\n.txt".to_owned(),
             mime: "application/octet-stream".to_owned(),
         };
-        assert!(attachment_payload(
-            &file,
-            &staging,
-            &temp.path().join("owned"),
-            &Capture::default()
-        )
-        .is_err());
+        assert!(attachment_payload(&file, &staging, &temp.path().join("owned")).is_err());
         assert_eq!(safe_file_name("../../escape\n.txt"), ".._.._escape_.txt");
         assert_eq!(safe_file_name(".env"), ".env");
     }
@@ -519,13 +485,8 @@ mod tests {
             ..Default::default()
         };
         let store = ImageStore::for_test(temp.path().join("images"));
-        let (items, outcome) = prepare_items(
-            delivery,
-            &store,
-            &staging,
-            &temp.path().join("owned"),
-            &Clipboard::default(),
-        );
+        let (items, outcome) =
+            prepare_items(delivery, &store, &staging, &temp.path().join("owned"));
         assert_eq!(outcome.failed, 0);
         assert_eq!(items.len(), 1);
         let paths = items[0].content.lines().collect::<Vec<_>>();
@@ -537,30 +498,24 @@ mod tests {
     }
 
     #[test]
-    fn respects_sensitive_content_and_text_size_settings_and_reports_partial_results() {
+    fn accepts_secrets_and_large_text_without_automatic_capture_settings() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageStore::for_test(temp.path().join("images"));
-        let mut settings = Clipboard::default();
-        settings.sensitive.collect_secrets = false;
-        settings.capture.max_text_mb = 1;
         let delivery = ShareDelivery {
             texts: vec![
                 "ordinary text".to_owned(),
                 "-----BEGIN PRIVATE KEY-----".to_owned(),
-                "x".repeat(1024 * 1024 + 1),
+                "x".repeat(4 * 1024 * 1024 + 1),
             ],
             failed: 1,
             ..Default::default()
         };
-        let (items, outcome) = prepare_items(
-            delivery,
-            &store,
-            temp.path(),
-            &temp.path().join("owned"),
-            &settings,
-        );
-        assert_eq!(items.len(), 1);
-        assert_eq!(outcome.skipped, 2);
+        let (items, outcome) =
+            prepare_items(delivery, &store, temp.path(), &temp.path().join("owned"));
+        assert_eq!(items.len(), 3);
+        assert!(items[1].is_sensitive);
+        assert_eq!(items[2].content.len(), 4 * 1024 * 1024 + 1);
+        assert_eq!(outcome.skipped, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(
             crate::i18n::commands::share_result(
@@ -569,7 +524,24 @@ mod tests {
                 outcome.skipped,
                 outcome.failed
             ),
-            "已加入 1 条记录，跳过 2 条，失败 1 项"
+            "已收录并加入同步队列 3 条记录，跳过 0 条，失败 1 项"
         );
+    }
+
+    #[test]
+    fn preserves_html_representation_for_explicit_shares() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageStore::for_test(temp.path().join("images"));
+        let html = "<p><strong>Shared content</strong></p>";
+        let delivery = ShareDelivery {
+            texts: vec!["Shared content".to_owned()],
+            html: Some(html.to_owned()),
+            ..Default::default()
+        };
+        let (items, outcome) = prepare_items(delivery, &store, temp.path(), temp.path());
+        assert_eq!(outcome.skipped + outcome.failed, 0);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sub_kind, Some(ClipboardSubKind::Html));
+        assert_eq!(items[0].content, html);
     }
 }

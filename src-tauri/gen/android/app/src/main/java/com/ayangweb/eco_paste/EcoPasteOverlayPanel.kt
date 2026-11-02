@@ -2163,11 +2163,13 @@ class EcoPasteOverlayPanel(
             "success" -> if (target == "lan") {
                 "$name：已投递到 ${channel.deliveredTargets}/${channel.totalTargets} 台设备"
             } else {
-                "$name：已上传"
+                "$name：已同步"
             }
+            "queued" -> "$name：等待同步"
+            "confirming" -> "$name：等待确认"
             "syncing" -> "$name：同步中"
             "manual" -> "$name：需要手动同步，点击开始"
-            "error" -> "$name：${channel.lastError.ifBlank { "同步失败" }}，点击重试"
+            "error" -> "$name：${channel.lastError.ifBlank { "同步失败" }}，等待重试或点击重试"
             else -> if (target == "lan") "$name：当前无在线设备，已跳过" else "$name：本次未使用"
         }
     }
@@ -2535,6 +2537,7 @@ class EcoPasteOverlayPanel(
         return when (state) {
             "success" -> Color.rgb(82, 196, 26)
             "syncing" -> Color.rgb(22, 119, 255)
+            "confirming" -> Color.rgb(22, 119, 255)
             "manual" -> Color.rgb(250, 173, 20)
             "error" -> Color.rgb(255, 77, 79)
             else -> tertiaryTextColor()

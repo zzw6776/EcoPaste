@@ -13,7 +13,7 @@ use chacha20poly1305::{
     },
     XChaCha20Poly1305, XNonce,
 };
-use ecopaste_sync_protocol::{EncryptedEvent, SyncEventKind};
+use ecopaste_sync_protocol::{EncryptedEvent, RetentionMapping, SyncEventKind};
 use rand::RngCore;
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
@@ -101,6 +101,7 @@ fn encrypt_raw_event(
         kind,
         blob_ids: Vec::new(),
         optional_blob_ids: Vec::new(),
+        retention_key: None,
     })
 }
 
@@ -113,7 +114,7 @@ pub fn encrypt_event(
     envelope: &ClipboardEnvelope,
 ) -> Result<EncryptedEvent> {
     let plaintext = minicbor::to_vec(envelope).context("failed to encode sync event")?;
-    encrypt_raw_event(
+    let mut event = encrypt_raw_event(
         key,
         event_id,
         origin_device_id,
@@ -121,7 +122,9 @@ pub fn encrypt_event(
         created_at_ms,
         SyncEventKind::Content,
         &plaintext,
-    )
+    )?;
+    event.retention_key = Some(retention_key(key, &envelope.item.sync_key));
+    Ok(event)
 }
 
 pub fn encrypt_item_state(
@@ -133,7 +136,7 @@ pub fn encrypt_item_state(
     patch: &SyncedItemStatePatch,
 ) -> Result<EncryptedEvent> {
     let plaintext = minicbor::to_vec(patch).context("failed to encode synchronized item state")?;
-    encrypt_raw_event(
+    let mut event = encrypt_raw_event(
         key,
         event_id,
         origin_device_id,
@@ -141,7 +144,9 @@ pub fn encrypt_item_state(
         created_at_ms,
         SyncEventKind::ItemState,
         &plaintext,
-    )
+    )?;
+    event.retention_key = Some(retention_key(key, &patch.sync_key));
+    Ok(event)
 }
 
 fn decrypt_event_plaintext(key: &[u8; 32], event: &EncryptedEvent) -> Result<Vec<u8>> {
@@ -175,17 +180,56 @@ fn decrypt_event_plaintext(key: &[u8; 32], event: &EncryptedEvent) -> Result<Vec
 
 pub fn decrypt_sync_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<DecryptedSyncEvent> {
     let plaintext = decrypt_event_plaintext(key, event)?;
-    match event.kind {
+    let decoded = match event.kind {
         SyncEventKind::Content => {
             let envelope = minicbor::decode(&plaintext).context("failed to decode sync event")?;
-            Ok(DecryptedSyncEvent::Clipboard(Box::new(envelope)))
+            DecryptedSyncEvent::Clipboard(Box::new(envelope))
         }
         SyncEventKind::ItemState => {
             let patch =
                 minicbor::decode(&plaintext).context("failed to decode synchronized item state")?;
-            Ok(DecryptedSyncEvent::ItemState(patch))
+            DecryptedSyncEvent::ItemState(patch)
+        }
+    };
+    if event
+        .retention_key
+        .as_ref()
+        .is_some_and(|value| value != &retention_key(key, decoded.sync_key()))
+    {
+        bail!("sync event retention identity mismatch");
+    }
+    Ok(decoded)
+}
+
+/// Derives a space-specific opaque identity without exposing content hashes or the content key.
+pub fn retention_key(key: &[u8; 32], sync_key: &str) -> String {
+    let mut hash = blake3::Hasher::new_keyed(key);
+    hash.update(b"ecopaste/retention/1\0");
+    hash.update(sync_key.as_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
+/// Reconstructs legacy attachment references from authenticated ciphertext without fetching files.
+pub fn retention_mapping(key: &[u8; 32], event: &EncryptedEvent) -> Result<RetentionMapping> {
+    let decoded = decrypt_sync_event(key, event)?;
+    let mut blob_ids = Vec::new();
+    if let DecryptedSyncEvent::Clipboard(envelope) = &decoded {
+        blob_ids.extend(envelope.blobs.iter().map(|blob| blob.blob_id.clone()));
+        if let Some(icon) = envelope
+            .source_app
+            .as_ref()
+            .and_then(|source| source.icon.as_ref())
+        {
+            blob_ids.push(icon.blob_id.clone());
         }
     }
+    blob_ids.sort_unstable();
+    blob_ids.dedup();
+    Ok(RetentionMapping {
+        event_id: event.event_id.clone(),
+        item_key: retention_key(key, decoded.sync_key()),
+        blob_ids,
+    })
 }
 
 pub fn decrypt_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<ClipboardEnvelope> {
@@ -807,6 +851,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decrypt_event(&key, &event).unwrap(), envelope);
+        let anonymous = retention_key(&key, "hash");
+        assert_eq!(event.retention_key.as_deref(), Some(anonymous.as_str()));
+        assert_ne!(anonymous, retention_key(&[8; 32], "hash"));
+        assert_ne!(anonymous, retention_key(&key, "other-hash"));
+        let mut legacy = event.clone();
+        legacy.retention_key = None;
+        assert_eq!(decrypt_event(&key, &legacy).unwrap(), envelope);
+        let mapping = retention_mapping(&key, &legacy).unwrap();
+        assert_eq!(mapping.item_key, anonymous);
+        let mut incorrect_identity = event.clone();
+        incorrect_identity.retention_key = Some("0".repeat(64));
+        assert!(decrypt_event(&key, &incorrect_identity).is_err());
 
         let mut tampered = event;
         tampered.origin_sequence = 2;
@@ -850,6 +906,63 @@ mod tests {
             _ => panic!("expected synchronized item state"),
         }
         assert!(decrypt_event(&key, &event).is_err());
+        let mapping = retention_mapping(&key, &event).unwrap();
+        assert_eq!(mapping.item_key, retention_key(&key, &patch.sync_key));
+        assert!(mapping.blob_ids.is_empty());
+    }
+
+    #[test]
+    fn retention_mapping_recovers_content_and_optional_icon_references() {
+        let key = [6; 32];
+        let envelope = ClipboardEnvelope {
+            version: 1,
+            item: super::super::model::SyncedClipboardItem {
+                kind: "image".into(),
+                sub_kind: None,
+                content: "".into(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: Some(32),
+                width: Some(2),
+                height: Some(2),
+                is_sensitive: false,
+                source_platform: "android".into(),
+                created_at_ms: 1,
+                sync_key: "protected-image".into(),
+                updated_at_ms: None,
+                source_revision: None,
+            },
+            blobs: vec![super::super::model::BlobManifest {
+                blob_id: "b".repeat(64),
+                name: "image.png".into(),
+                original_size: 32,
+                encrypted_size: 64,
+                role: super::super::model::BlobRole::Image,
+                file_index: None,
+                is_directory_archive: false,
+            }],
+            source_app: Some(super::super::model::SourceAppRef {
+                version: 1,
+                source_key: "app".into(),
+                platform: "android".into(),
+                display_name: "app".into(),
+                icon: Some(super::super::model::SourceIconRef {
+                    icon_hash: "hash".into(),
+                    blob_id: "a".repeat(64),
+                    original_size: 8,
+                    encrypted_size: 40,
+                }),
+                accent_start: None,
+                accent_end: None,
+            }),
+        };
+        let mut event =
+            encrypt_event(&key, "image-event".into(), "device".into(), 1, 1, &envelope).unwrap();
+        event.retention_key = None;
+        let mapping = retention_mapping(&key, &event).unwrap();
+        assert_eq!(mapping.event_id, event.event_id);
+        assert_eq!(mapping.blob_ids, ["a".repeat(64), "b".repeat(64)]);
     }
 
     #[test]

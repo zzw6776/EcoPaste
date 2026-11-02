@@ -83,7 +83,6 @@ pub enum DecryptedSyncEvent {
 }
 
 impl DecryptedSyncEvent {
-    #[allow(dead_code)]
     pub fn sync_key(&self) -> &str {
         match self {
             Self::Clipboard(envelope) => &envelope.item.sync_key,
@@ -261,7 +260,9 @@ pub enum SyncTarget {
 #[serde(rename_all = "camelCase")]
 pub enum SyncItemState {
     Idle,
+    Queued,
     Syncing,
+    Confirming,
     Success,
     Manual,
     Error,

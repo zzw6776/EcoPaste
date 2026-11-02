@@ -6,6 +6,7 @@ COPY protocol ./protocol
 COPY migrations ./migrations
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --locked --release \
     && cp /build/target/release/ecopaste-sync-server /build/ecopaste-sync-server
