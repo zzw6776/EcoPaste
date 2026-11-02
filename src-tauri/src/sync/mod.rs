@@ -5,6 +5,8 @@ mod manager;
 mod model;
 mod pairing;
 pub(crate) mod repository;
+mod transfer;
+mod upload;
 
 pub use identity::PairingCode;
 pub use manager::SyncManager;

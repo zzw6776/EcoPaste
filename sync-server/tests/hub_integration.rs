@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::{
     ALPN, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice, Request, Response,
-    SyncEventKind, read_frame, write_frame,
+    RetentionMapping, SyncEventKind, read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -15,7 +15,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let repository = Repository::open(&directory.path().join("hub.sqlite3")).await?;
     let service = HubService::new(
-        repository,
+        repository.clone(),
         directory.path().join("blobs"),
         1024 * 1024,
         10 * 1024 * 1024,
@@ -113,6 +113,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         kind: SyncEventKind::Content,
         blob_ids: vec![source_icon_id.clone()],
         optional_blob_ids: vec![source_icon_id.clone()],
+        retention_key: None,
     };
     let first = sync_request(
         &group_id,
@@ -171,6 +172,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
         optional_blob_ids: Vec::new(),
+        retention_key: None,
     };
     let removed_device = RemovedDevice {
         device_id: "device_removed".into(),
@@ -368,6 +370,136 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         }
     ));
 
+    let audit_group = "group_audit".to_owned();
+    assert_eq!(
+        call(
+            &connection,
+            Request::CreateGroup {
+                group_id: audit_group.clone(),
+                access_token: access_token.clone()
+            }
+        )
+        .await?,
+        Response::GroupCreated
+    );
+    let mut content = next_event.clone();
+    content.retention_key = Some("a".repeat(64));
+    let mut state = content.clone();
+    state.event_id = "audit_state".into();
+    state.origin_sequence += 1;
+    state.kind = SyncEventKind::ItemState;
+    call(
+        &connection,
+        sync_request(
+            &audit_group,
+            &access_token,
+            device("device_123456", "Mac", &client_endpoint_id),
+            0,
+            vec![content, state],
+        ),
+    )
+    .await?;
+    for (include_states, expected) in [
+        (None, vec![SyncEventKind::Content]),
+        (
+            Some(true),
+            vec![SyncEventKind::ItemState, SyncEventKind::Content],
+        ),
+    ] {
+        let mut before_cursor = None;
+        let mut kinds = Vec::new();
+        loop {
+            let Response::EventsPage {
+                events,
+                next_before_cursor,
+                total,
+            } = call(
+                &connection,
+                Request::ListEvents {
+                    group_id: audit_group.clone(),
+                    access_token: access_token.clone(),
+                    before_cursor,
+                    limit: 1,
+                    include_states,
+                },
+            )
+            .await?
+            else {
+                anyhow::bail!("expected event page")
+            };
+            assert_eq!(total, expected.len() as u64);
+            kinds.extend(events.into_iter().map(|stored| stored.event.kind));
+            before_cursor = next_before_cursor;
+            if before_cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(kinds, expected);
+    }
+
+    let Response::RetentionPlan {
+        epoch,
+        events: legacy_events,
+        has_more,
+    } = call(
+        &connection,
+        Request::RetentionPlan {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected retention plan")
+    };
+    assert!(!epoch.is_empty());
+    assert!(!has_more);
+    assert_eq!(legacy_events.len(), 2);
+    let item_key = "a".repeat(64);
+    assert_eq!(
+        call(
+            &connection,
+            Request::SetRetention {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                device: device("device_123456", "Mac", &client_endpoint_id),
+                generation: 10,
+                protected_keys: Some(vec![item_key.clone()]),
+                mappings: legacy_events
+                    .iter()
+                    .map(|stored| RetentionMapping {
+                        event_id: stored.event.event_id.clone(),
+                        item_key: item_key.clone(),
+                        blob_ids: stored.event.blob_ids.clone(),
+                    })
+                    .collect(),
+            }
+        )
+        .await?,
+        Response::RetentionUpdated
+    );
+    assert!(matches!(call(&connection, Request::RetentionPlan {
+        group_id: group_id.clone(), access_token: access_token.clone(),
+    }).await?, Response::RetentionPlan { events, has_more: false, .. } if events.is_empty()));
+    assert!(matches!(
+        call(
+            &connection,
+            Request::SetRetention {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                device: device("device_123456", "Mac", "different_endpoint"),
+                generation: 11,
+                protected_keys: Some(Vec::new()),
+                mappings: Vec::new(),
+            }
+        )
+        .await?,
+        Response::Error {
+            code: ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+
     let rejected_event = EncryptedEvent {
         event_id: "event_after_removal".into(),
         origin_device_id: "device_123456".into(),
@@ -378,6 +510,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
         optional_blob_ids: Vec::new(),
+        retention_key: None,
     };
     let remove_self = Request::SyncV2 {
         group_id: group_id.clone(),
@@ -410,6 +543,79 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     assert!(removed_devices.iter().any(|device| {
         device.device_id == "device_123456" && device.endpoint_id == client_endpoint_id
     }));
+
+    assert_eq!(
+        call(
+            &connection,
+            Request::SyncRemovedDevices {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                devices: Vec::new(),
+            },
+        )
+        .await?,
+        Response::RemovedDevices {
+            devices: removed_devices,
+        }
+    );
+    for request in [
+        Request::BootstrapPlan {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+        },
+        Request::RetentionPlan {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+        },
+    ] {
+        assert!(matches!(
+            call(&connection, request).await?,
+            Response::Error { message, .. } if message.contains("device was removed")
+        ));
+    }
+
+    repository
+        .merge_removed_devices(
+            &group_id,
+            &[RemovedDevice {
+                device_id: "device_123456".into(),
+                endpoint_id: client_endpoint_id.clone(),
+                removed_at_ms: 500,
+                restored_at_ms: Some(600),
+            }],
+        )
+        .await?;
+    assert_eq!(repository.retention_epoch(&group_id).await?, epoch);
+    assert_eq!(
+        call(
+            &connection,
+            Request::SetRetention {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                device: device("device_123456", "Mac", &client_endpoint_id),
+                generation: 11,
+                protected_keys: Some(vec![item_key]),
+                mappings: Vec::new(),
+            },
+        )
+        .await?,
+        Response::RetentionUpdated
+    );
+    let cleanup = repository
+        .cleanup_group(
+            &group_id,
+            ecopaste_sync_server::repository::CleanupPolicy {
+                retention_cutoff_ms: None,
+                legacy_blob_cutoff_ms: None,
+                max_events: None,
+                target_bytes: Some(0),
+                orphan_cutoff_ms: 0,
+                batch_size: 100,
+            },
+        )
+        .await?;
+    assert_eq!(cleanup.deleted_events, 0);
+    assert_eq!(repository.group_usage(&group_id).await?.event_count, 2);
 
     connection.close(0_u32.into(), b"test complete");
     client.close().await;

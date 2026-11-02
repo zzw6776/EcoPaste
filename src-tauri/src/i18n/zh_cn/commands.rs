@@ -13,7 +13,9 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(target_os = "android")]
         Key::AndroidShareFailed => "无法接收分享内容，请重新分享",
         #[cfg(any(target_os = "android", test))]
-        Key::AndroidShareResult => "已加入 {saved} 条记录，跳过 {skipped} 条，失败 {failed} 项",
+        Key::AndroidShareResult => {
+            "已收录并加入同步队列 {saved} 条记录，跳过 {skipped} 条，失败 {failed} 项"
+        }
         #[cfg(not(target_os = "android"))]
         Key::DragSourceFilesMissing => "拖拽源文件已不存在",
         #[cfg(not(target_os = "android"))]

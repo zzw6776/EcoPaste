@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
     ErrorCode, FrameError, HubStatus, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, Request, Response,
-    limit_sync_response, read_frame, write_frame,
+    limit_events_page, limit_retention_plan, limit_sync_response, read_frame, write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -579,6 +579,54 @@ impl HubService {
                     .create_group(&group_id, &access_token)
                     .await?;
                 write_frame(send, &Response::GroupCreated).await?;
+            }
+            Request::RetentionPlan {
+                group_id,
+                access_token,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
+                let events = self.repository.retention_candidates(&group_id).await?;
+                let mut response = Response::RetentionPlan {
+                    epoch: self.repository.retention_epoch(&group_id).await?,
+                    has_more: events.len() == usize::from(MAX_EVENTS_PER_BATCH),
+                    events,
+                };
+                limit_retention_plan(&mut response)?;
+                write_frame(send, &response).await?;
+            }
+            Request::SetRetention {
+                group_id,
+                access_token,
+                device,
+                generation,
+                protected_keys,
+                mappings,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                if device.endpoint_id != remote_endpoint_id {
+                    bail!("device endpoint identity does not match the connection");
+                }
+                let group_lock = self.group_sync_lock(&group_id).await;
+                let guard = group_lock.lock().await;
+                self.repository.upsert_device(&group_id, &device).await?;
+                self.repository
+                    .set_retention(
+                        &group_id,
+                        &device.device_id,
+                        generation,
+                        protected_keys.as_deref(),
+                        &mappings,
+                    )
+                    .await?;
+                drop(guard);
+                self.cleanup_wake.notify_one();
+                write_frame(send, &Response::RetentionUpdated).await?;
             }
             Request::Sync {
                 group_id,
@@ -1155,6 +1203,7 @@ impl HubService {
                 access_token,
                 before_cursor,
                 limit,
+                include_states,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
@@ -1162,20 +1211,23 @@ impl HubService {
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 let limit = limit.clamp(1, 100);
+                let include_states = include_states.unwrap_or(false);
                 let (events, next_before_cursor) = self
                     .repository
-                    .list_events_before(&group_id, before_cursor, limit)
+                    .list_events_before(&group_id, before_cursor, limit, include_states)
                     .await?;
-                let total = self.repository.event_count(&group_id).await?;
-                write_frame(
-                    send,
-                    &Response::EventsPage {
-                        events,
-                        next_before_cursor,
-                        total,
-                    },
-                )
-                .await?;
+                let total = if include_states {
+                    self.repository.group_usage(&group_id).await?.event_count
+                } else {
+                    self.repository.event_count(&group_id).await?
+                };
+                let mut response = Response::EventsPage {
+                    events,
+                    next_before_cursor,
+                    total,
+                };
+                limit_events_page(&mut response)?;
+                write_frame(send, &response).await?;
             }
             Request::ListDevices {
                 group_id,
@@ -1510,6 +1562,7 @@ mod tests {
                     kind: SyncEventKind::Content,
                     blob_ids: Vec::new(),
                     optional_blob_ids: Vec::new(),
+                    retention_key: Some("a".repeat(64)),
                 }],
                 None,
             )
@@ -1570,6 +1623,7 @@ mod tests {
                     kind: SyncEventKind::Content,
                     blob_ids: vec![blob_id],
                     optional_blob_ids: Vec::new(),
+                    retention_key: Some("a".repeat(64)),
                 }],
                 None,
             )
@@ -1632,5 +1686,106 @@ mod tests {
 
         assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 48);
         assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(32));
+    }
+
+    #[tokio::test]
+    async fn full_hub_reclaims_space_after_more_than_one_cycle_of_legacy_registration() {
+        use ecopaste_sync_protocol::{DeviceAnnouncement, RetentionMapping};
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let events = (1..=u64::from(MAX_EVENTS_PER_BATCH) * 8 + 1)
+            .map(|sequence| EncryptedEvent {
+                event_id: format!("legacy_{sequence}"),
+                origin_device_id: "device_123".into(),
+                origin_sequence: sequence,
+                created_at_ms: 1,
+                nonce: vec![1; 24],
+                ciphertext: vec![2; 16],
+                kind: SyncEventKind::Content,
+                blob_ids: Vec::new(),
+                optional_blob_ids: Vec::new(),
+                retention_key: None,
+            })
+            .collect::<Vec<_>>();
+        repository
+            .insert_events("group_123", &events, None)
+            .await
+            .unwrap();
+        let used = repository.group_used_bytes("group_123").await.unwrap();
+        let service = HubService::new(
+            repository.clone(),
+            directory.path().join("blobs"),
+            1024,
+            used,
+            0,
+            0,
+        );
+        let error = service
+            .reserve_blob_quota_locked("group_123", 64)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.is::<QuotaExceeded>());
+        repository
+            .upsert_device(
+                "group_123",
+                &DeviceAnnouncement {
+                    device_id: "device_123".into(),
+                    device_name: "test".into(),
+                    platform: "macos".into(),
+                    endpoint_id: "endpoint_123".into(),
+                    direct_addresses: Vec::new(),
+                    relay_urls: Vec::new(),
+                    app_version: "1.1.168".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut pages = 0;
+        loop {
+            let candidates = repository.retention_candidates("group_123").await.unwrap();
+            if candidates.is_empty() {
+                break;
+            }
+            let mappings = candidates
+                .iter()
+                .map(|stored| RetentionMapping {
+                    event_id: stored.event.event_id.clone(),
+                    item_key: format!("{:064x}", stored.cursor),
+                    blob_ids: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            repository
+                .set_retention("group_123", "device_123", 1, Some(&[]), &mappings)
+                .await
+                .unwrap();
+            pages += 1;
+            service.cleanup_all_groups().await.unwrap();
+            if pages <= 8 {
+                assert_eq!(
+                    repository.group_used_bytes("group_123").await.unwrap(),
+                    used
+                );
+                assert!(service.pending_quota_cleanup_target("group_123").is_some());
+            }
+        }
+        assert_eq!(pages, 9);
+        assert!(
+            repository.group_used_bytes("group_123").await.unwrap()
+                <= service.quota_low_watermark()
+        );
+        let reservation = service
+            .reserve_blob_quota_locked("group_123", 64)
+            .await
+            .unwrap();
+        drop(reservation);
     }
 }

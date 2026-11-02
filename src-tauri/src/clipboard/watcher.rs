@@ -245,6 +245,20 @@ pub async fn persist_and_notify(
     source_app: Option<&ClipboardApp>,
     observation: Option<ClipboardObservation>,
 ) -> crate::core::Result<UpsertResult> {
+    let sync_options = crate::sync::should_stage_local_item(app, item)
+        .then_some(crate::db::sync_queue::ContentSyncOptions::default());
+    persist_and_notify_with_sync(app, pool, item, source_app, observation, sync_options).await
+}
+
+/// Persists explicit sync intent with the record instead of reapplying automatic capture policy.
+pub(crate) async fn persist_and_notify_with_sync(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    item: &ClipboardItem,
+    source_app: Option<&ClipboardApp>,
+    observation: Option<ClipboardObservation>,
+    sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
+) -> crate::core::Result<UpsertResult> {
     let mut item_to_write = item.clone();
     if let Some(src) = source_app {
         match upsert_app(pool, src).await {
@@ -255,9 +269,8 @@ pub async fn persist_and_notify(
             }
         }
     }
-    let stage_sync = crate::sync::should_stage_local_item(app, &item_to_write);
-    let result =
-        crate::db::items::upsert_item_with_sync_outbox(pool, &item_to_write, stage_sync).await?;
+    let (result, stage_sync) =
+        crate::db::items::upsert_item_with_sync_outbox(pool, &item_to_write, sync_options).await?;
     sound::maybe_play_copy(app);
     notify_clipboard_updated(app, &result.id, item_to_write.kind, result.deduplicated);
     item_to_write.id = result.id.clone();

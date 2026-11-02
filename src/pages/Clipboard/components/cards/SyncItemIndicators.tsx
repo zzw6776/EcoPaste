@@ -41,7 +41,7 @@ const SyncItemIndicators: FC<SyncItemIndicatorsProps> = (props) => {
     try {
       const next = await syncItemNow(itemId, target);
       onChange?.(next);
-      getMessageApi().success(t(`syncItem.${target}.queued`));
+      getMessageApi().success(t(`syncItem.${target}.started`));
     } catch {
       // 命令层已统一记录并显示错误。
     } finally {
@@ -137,7 +137,10 @@ function channelClassName(state: SyncItemChannelStatus["state"]) {
     case "success":
       return "text-ant-success";
     case "syncing":
+    case "confirming":
       return "text-ant-info";
+    case "queued":
+      return "text-ant-secondary";
     case "manual":
       return "text-ant-warning";
     case "error":

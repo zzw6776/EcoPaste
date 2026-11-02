@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.164"
+version = "1.1.169"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -117,8 +117,14 @@ windows = { version = "0.52", features = [
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 
-# Remove the local overrides when the corresponding upstream fixes are released.
+# Keep the maintained Iroh fork pinned to the same commit as the Hub.
 [patch.crates-io]
+iroh = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
+iroh-base = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
+iroh-dns = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
+iroh-relay = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
+
+# Remove these mDNS overrides once equivalent upstream fixes are released.
 iroh-mdns-address-lookup = { path = "vendor/iroh-mdns-address-lookup" }
 swarm-discovery = { path = "vendor/swarm-discovery" }
 

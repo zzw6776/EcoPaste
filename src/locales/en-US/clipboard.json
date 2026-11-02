@@ -124,20 +124,24 @@
   "syncItem": {
     "cloud": {
       "activeRoute": "Last successful route ({{transport}}): {{address}}",
+      "confirming": "Cloud: awaiting confirmation",
       "error": "Cloud sync failed; click to retry",
-      "errorWithReason": "Cloud: {{reason}}; click to retry",
+      "errorWithReason": "Cloud: {{reason}}; retrying automatically, or click to retry",
       "idle": "Cloud: not used for this item",
       "manual": "Cloud: exceeds the automatic limit; click to upload",
-      "queued": "Cloud sync started",
-      "success": "Cloud: uploaded",
+      "queued": "Cloud: waiting to sync",
+      "started": "Cloud sync started",
+      "success": "Cloud: synced",
       "syncing": "Cloud: uploading"
     },
     "lan": {
+      "confirming": "LAN: awaiting confirmation",
       "error": "LAN sync failed; click to retry",
-      "errorWithReason": "LAN: {{reason}}; click to retry",
+      "errorWithReason": "LAN: {{reason}}; retrying automatically, or click to retry",
       "idle": "LAN: no online devices; skipped",
       "manual": "LAN: manual sync required; click to transfer",
-      "queued": "LAN sync started",
+      "queued": "LAN: waiting to sync",
+      "started": "LAN sync started",
       "success": "LAN: delivered to {{delivered}}/{{total}} devices",
       "syncing": "LAN: delivering"
     }

@@ -4,6 +4,14 @@ use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 const LOCAL_OPERATION_SEQUENCE_KEY: &str = "local_operation_sequence";
 
+/// Durable intent carried through staging, background materialization and retries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContentSyncOptions {
+    pub force_files: bool,
+    pub history_backfill: bool,
+    pub manual_share: bool,
+}
+
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct ContentOutboxOperation {
     pub operation_order: i64,
@@ -12,6 +20,7 @@ pub struct ContentOutboxOperation {
     pub source_revision: String,
     pub force_files: bool,
     pub history_backfill: bool,
+    pub manual_share: bool,
 }
 
 /// Allocates the durable order shared by local content and item-state operations.
@@ -50,8 +59,7 @@ pub async fn stage_content(
     item_id: &str,
     sync_key: &str,
     source_revision: &str,
-    force_files: bool,
-    history_backfill: bool,
+    options: ContentSyncOptions,
 ) -> Result<i64> {
     let operation_order = next_operation_order(connection).await?;
     let now = Utc::now();
@@ -59,12 +67,13 @@ pub async fn stage_content(
         r#"
         INSERT INTO sync_content_outbox (
             operation_order, item_id, sync_key, source_revision,
-            force_files, history_backfill, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            force_files, history_backfill, manual_share, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(item_id, source_revision, force_files, history_backfill) DO UPDATE SET
             attempt_count = 0,
             next_attempt_at = NULL,
             last_error = NULL,
+            manual_share = MAX(sync_content_outbox.manual_share, excluded.manual_share),
             updated_at = excluded.updated_at
         RETURNING operation_order
         "#,
@@ -73,8 +82,9 @@ pub async fn stage_content(
     .bind(item_id)
     .bind(sync_key)
     .bind(source_revision)
-    .bind(force_files)
-    .bind(history_backfill)
+    .bind(options.force_files || options.manual_share)
+    .bind(options.history_backfill)
+    .bind(options.manual_share)
     .bind(now)
     .bind(now)
     .fetch_one(connection)
@@ -89,8 +99,7 @@ pub async fn stage_existing_content(
     item_id: &str,
     sync_key: &str,
     source_revision: &str,
-    force_files: bool,
-    history_backfill: bool,
+    options: ContentSyncOptions,
 ) -> Result<i64> {
     let mut transaction = pool
         .begin()
@@ -101,8 +110,7 @@ pub async fn stage_existing_content(
         item_id,
         sync_key,
         source_revision,
-        force_files,
-        history_backfill,
+        options,
     )
     .await?;
     transaction
@@ -121,7 +129,8 @@ pub async fn next_ready_content(
     sqlx::query_as::<_, ContentOutboxOperation>(
         r#"
         SELECT current.operation_order, current.item_id, current.sync_key,
-               current.source_revision, current.force_files, current.history_backfill
+               current.source_revision, current.force_files, current.history_backfill,
+               current.manual_share
         FROM sync_content_outbox current
         LEFT JOIN clipboard_items item ON item.id = current.item_id
         WHERE (
@@ -131,7 +140,14 @@ pub async fn next_ready_content(
               OR item.source_revision <> current.source_revision
               OR item.sync_key <> current.sync_key
           )
-          AND (? OR item.is_sensitive = 0 OR item.id IS NULL)
+          AND (
+              ? OR item.is_sensitive = 0 OR item.id IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM sync_content_outbox manual
+                  WHERE manual.sync_key = current.sync_key AND manual.manual_share = 1
+                    AND manual.operation_order >= current.operation_order
+              )
+          )
           AND NOT EXISTS (
               SELECT 1 FROM sync_content_outbox earlier
               WHERE earlier.sync_key = current.sync_key
@@ -218,7 +234,14 @@ pub async fn next_content_retry_at(
         FROM sync_content_outbox current
         LEFT JOIN clipboard_items item ON item.id = current.item_id
         WHERE current.next_attempt_at IS NOT NULL
-          AND (? OR item.is_sensitive = 0 OR item.id IS NULL)
+          AND (
+              ? OR item.is_sensitive = 0 OR item.id IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM sync_content_outbox manual
+                  WHERE manual.sync_key = current.sync_key AND manual.manual_share = 1
+                    AND manual.operation_order >= current.operation_order
+              )
+          )
         "#,
     )
     .bind(sync_sensitive)
@@ -241,9 +264,162 @@ fn retry_delay(attempt_count: i64) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use crate::clipboard::{build_item, ClipboardPayload, ImageStore, TextPayload};
     use crate::db::test_support::memory_pool;
+    use crate::db::{items, models::ClipboardItem};
 
     use super::*;
+
+    /// Builds a real classified record so queue tests retain its sensitive-content marker.
+    fn sensitive_item() -> ClipboardItem {
+        let temp = tempfile::tempdir().unwrap();
+        build_item(
+            &ImageStore::for_test(temp.path().join("images")),
+            &ClipboardPayload::Text(TextPayload {
+                text: "-----BEGIN PRIVATE KEY-----".to_owned(),
+                html: None,
+                rtf: None,
+            }),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_share_survives_database_reopen_and_sensitive_retry() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let directory = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(directory.path().join("share.db"))
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let item = sensitive_item();
+        assert!(item.is_sensitive);
+        items::upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let reopened = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let operation = next_ready_content(&reopened, false).await.unwrap().unwrap();
+        assert!(operation.manual_share && operation.force_files);
+        assert!(
+            items::find_item_by_id(&reopened, &item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_sensitive
+        );
+        fail_content(&reopened, operation.operation_order, "temporary failure")
+            .await
+            .unwrap();
+        assert!(next_ready_content(&reopened, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(next_content_retry_at(&reopened, false)
+            .await
+            .unwrap()
+            .is_some());
+        sqlx::query("UPDATE sync_content_outbox SET next_attempt_at = ?")
+            .bind(Utc::now() - Duration::seconds(1))
+            .execute(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_ready_content(&reopened, false).await.unwrap(),
+            Some(operation)
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn manual_share_unblocks_earlier_content_without_changing_automatic_policy() {
+        let pool = memory_pool().await;
+        let mut item = sensitive_item();
+        items::upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
+        assert!(next_ready_content(&pool, true).await.unwrap().is_some());
+
+        item.updated_at += Duration::seconds(1);
+        item.source_revision = "recaptured".to_owned();
+        items::upsert_item_with_sync_outbox(&pool, &item, None)
+            .await
+            .unwrap();
+        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
+
+        let shared = stage_existing_content(
+            &pool,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let earlier = next_ready_content(&pool, false).await.unwrap().unwrap();
+        assert!(earlier.operation_order < shared);
+        complete_content(&pool, earlier.operation_order)
+            .await
+            .unwrap();
+        let manual = next_ready_content(&pool, false).await.unwrap().unwrap();
+        assert_eq!(manual.operation_order, shared);
+        assert!(manual.force_files && manual.manual_share);
+        let restaged = stage_existing_content(
+            &pool,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            ContentSyncOptions {
+                force_files: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(restaged, shared);
+        assert!(
+            next_ready_content(&pool, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .manual_share
+        );
+        complete_content(&pool, shared).await.unwrap();
+
+        stage_existing_content(
+            &pool,
+            &item.id,
+            &item.sync_key,
+            &item.source_revision,
+            ContentSyncOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn duplicate_stage_preserves_the_original_causal_order() {
@@ -254,8 +430,7 @@ mod tests {
             "item",
             "stable-key",
             "revision",
-            false,
-            false,
+            ContentSyncOptions::default(),
         )
         .await
         .unwrap();
@@ -267,8 +442,7 @@ mod tests {
             "item",
             "stable-key",
             "revision",
-            false,
-            false,
+            ContentSyncOptions::default(),
         )
         .await
         .unwrap();
