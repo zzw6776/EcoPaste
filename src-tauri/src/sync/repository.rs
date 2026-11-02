@@ -86,6 +86,7 @@ impl RemoteBatchSource<'_> {
 
 #[derive(Debug, Default)]
 pub struct StoreRemoteBatchResult {
+    pub inserted_event_ids: Vec<String>,
     pub received_new_events: bool,
     pub conflicts: Vec<(String, String)>,
 }
@@ -149,6 +150,7 @@ pub(crate) async fn observe_origin_sequence_on(
 }
 
 /// Stores an encrypted event in the local append-only log. Duplicate events are idempotent.
+#[cfg(test)]
 pub async fn insert_event(
     pool: &SqlitePool,
     event: &EncryptedEvent,
@@ -171,6 +173,7 @@ pub async fn insert_content_event(
         .await
 }
 
+#[cfg(test)]
 async fn insert_event_with_content_presence(
     pool: &SqlitePool,
     event: &EncryptedEvent,
@@ -1009,12 +1012,13 @@ async fn mark_delivered_on(
     Ok(())
 }
 
-/// Stores a pulled batch, delivery acknowledgements, and its pull cursor in one transaction.
+/// Stores received events, route acknowledgements, and an optional pull cursor atomically.
+/// Inbound pushes omit the cursor so they cannot skip events in a later peer pull.
 /// A crash therefore either replays the whole batch or observes every event on the next cycle.
 pub async fn store_remote_batch(
     pool: &SqlitePool,
     source: RemoteBatchSource<'_>,
-    latest_cursor: u64,
+    latest_cursor: Option<u64>,
     events: &[EncryptedEvent],
     local_device_id: &str,
 ) -> Result<StoreRemoteBatchResult> {
@@ -1040,6 +1044,9 @@ pub async fn store_remote_batch(
             continue;
         }
         received_event_ids.push(event.event_id.clone());
+        if inserted.inserted {
+            result.inserted_event_ids.push(event.event_id.clone());
+        }
         if event.origin_device_id != local_device_id {
             remote_event_ids.push(event.event_id.clone());
             result.received_new_events |= inserted.inserted;
@@ -1049,12 +1056,14 @@ pub async fn store_remote_batch(
     mark_delivered_on(&mut transaction, &target_id, &received_event_ids).await?;
     match source {
         RemoteBatchSource::Cloud => {
-            set_state_value_on(
-                &mut transaction,
-                CLOUD_CURSOR_KEY,
-                &latest_cursor.to_string(),
-            )
-            .await?;
+            if let Some(latest_cursor) = latest_cursor {
+                set_state_value_on(
+                    &mut transaction,
+                    CLOUD_CURSOR_KEY,
+                    &latest_cursor.to_string(),
+                )
+                .await?;
+            }
         }
         RemoteBatchSource::Peer { device_id } => {
             // Receipt from a peer confirms only that peer route, never Hub delivery.
@@ -1067,15 +1076,17 @@ pub async fn store_remote_batch(
                 None,
             )
             .await?;
-            sqlx::query(
-                "UPDATE sync_peers SET pull_cursor = ?, updated_at = ? WHERE device_id = ?",
-            )
-            .bind(i64::try_from(latest_cursor).unwrap_or(i64::MAX))
-            .bind(Utc::now())
-            .bind(device_id)
-            .execute(&mut *transaction)
-            .await
-            .context("update peer cursor with remote sync batch")?;
+            if let Some(latest_cursor) = latest_cursor {
+                sqlx::query(
+                    "UPDATE sync_peers SET pull_cursor = ?, updated_at = ? WHERE device_id = ?",
+                )
+                .bind(i64::try_from(latest_cursor).unwrap_or(i64::MAX))
+                .bind(Utc::now())
+                .bind(device_id)
+                .execute(&mut *transaction)
+                .await
+                .context("update peer cursor with remote sync batch")?;
+            }
         }
     }
 
@@ -3230,7 +3241,7 @@ mod tests {
             RemoteBatchSource::Peer {
                 device_id: "android",
             },
-            17,
+            Some(17),
             &[event],
             "local",
         )
@@ -3549,7 +3560,7 @@ mod tests {
         store_remote_batch(
             &pool,
             RemoteBatchSource::Peer { device_id: "peer" },
-            17,
+            Some(17),
             std::slice::from_ref(&event),
             "local",
         )
@@ -3569,7 +3580,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        store_remote_batch(&pool, RemoteBatchSource::Cloud, 42, &[event], "local")
+        store_remote_batch(&pool, RemoteBatchSource::Cloud, Some(42), &[event], "local")
             .await
             .unwrap();
         assert_eq!(
@@ -3577,6 +3588,101 @@ mod tests {
             SyncItemState::Success
         );
         assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn inbound_peer_push_confirms_only_lan_and_preserves_pull_progress() {
+        let pool = memory_pool().await;
+        upsert_peer(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "peer".into(),
+                device_name: "Phone".into(),
+                platform: "android".into(),
+                endpoint_id: "endpoint".into(),
+                direct_addresses: Vec::new(),
+                relay_urls: Vec::new(),
+                last_seen_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sync_peers SET pull_cursor = 17 WHERE device_id = 'peer'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let event = test_event("push", 1);
+        let source = RemoteBatchSource::Peer { device_id: "peer" };
+        let stored = store_remote_batch(&pool, source, None, std::slice::from_ref(&event), "local")
+            .await
+            .unwrap();
+        assert_eq!(stored.inserted_event_ids, ["push"]);
+        insert_test_item(&pool, "item").await;
+        link_event_to_item(&pool, "item", &event.event_id, "remote")
+            .await
+            .unwrap();
+        let ids = ["item".to_owned()];
+        let status = item_statuses(&pool, &ids).await.unwrap().remove(0);
+        assert_eq!(status.lan.state, SyncItemState::Success);
+        assert_eq!(status.cloud.state, SyncItemState::Queued);
+        assert_eq!(status.cloud.delivered_targets, 0);
+        assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
+
+        let duplicate =
+            store_remote_batch(&pool, source, None, std::slice::from_ref(&event), "local")
+                .await
+                .unwrap();
+        assert!(duplicate.inserted_event_ids.is_empty());
+        assert_eq!(
+            item_statuses(&pool, &ids).await.unwrap()[0].cloud.state,
+            SyncItemState::Queued
+        );
+
+        store_remote_batch(
+            &pool,
+            RemoteBatchSource::Cloud,
+            Some(42),
+            std::slice::from_ref(&event),
+            "local",
+        )
+        .await
+        .unwrap();
+        store_remote_batch(&pool, source, None, &[event], "local")
+            .await
+            .unwrap();
+        let status = item_statuses(&pool, &ids).await.unwrap().remove(0);
+        assert_eq!(status.cloud.state, SyncItemState::Success);
+        assert_eq!(status.cloud.delivered_targets, 1);
+        assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
+        assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn inbound_peer_push_rolls_back_events_when_route_acknowledgement_fails() {
+        let pool = memory_pool().await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_peer_receipt BEFORE INSERT ON sync_deliveries \
+             WHEN NEW.target_id = 'peer:phone' BEGIN SELECT RAISE(ABORT, 'receipt failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result = store_remote_batch(
+            &pool,
+            RemoteBatchSource::Peer { device_id: "phone" },
+            None,
+            &[test_event("push", 1)],
+            "local",
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
