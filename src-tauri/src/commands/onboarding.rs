@@ -151,6 +151,7 @@ pub async fn import_legacy_data(
         .ok_or_else(|| AppError::Clipboard("未找到可导入的旧版数据库".to_owned()))?;
     let legacy_db_path = PathBuf::from(&db_path);
     let legacy_pool = open_legacy_pool(&legacy_db_path).await?;
+    let _files_guard = crate::clipboard::shared_files::lock().await;
     let db = app.state::<DatabaseState>();
     let pool = db.pool().await;
     let image_store = app.state::<ImageStore>();

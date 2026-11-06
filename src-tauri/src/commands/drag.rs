@@ -62,9 +62,11 @@ pub async fn start_drag_clipboard_item(
     id: String,
 ) -> Result<()> {
     let pool = db.pool().await;
-    let item = find_item_by_id(&pool, &id)
+    let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    let resources = crate::core::paths::resources_dir(&app)?;
+    crate::clipboard::shared_files::resolve_item_content(&resources, &mut item)?;
 
     let lang = crate::i18n::current_language(&app);
     let payload = resolve_drag_payload(&item, &store, lang)?;

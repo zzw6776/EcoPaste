@@ -26,6 +26,11 @@ pub const PROTOCOL_VERSION: u16 = RETENTION_PROGRESS_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
+/// Target after quota pressure, leaving 20% free for subsequent writes on clients and the Hub.
+pub fn quota_low_watermark(limit_bytes: u64) -> u64 {
+    limit_bytes - limit_bytes.div_ceil(5)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cbor(map)]

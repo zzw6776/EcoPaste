@@ -200,6 +200,7 @@ struct BackupManifest {
 #[serde(default, rename_all = "camelCase")]
 struct BackupResourcePaths {
     shared_files_root: Option<String>,
+    sync_files_root: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1035,11 +1036,11 @@ async fn merge_import(
 ) -> Result<ImportHistoryBackupResult> {
     let db_path = root.join(DB_ARCHIVE_DIR).join(DB_FILENAME);
     let backup_pool = open_backup_db(&db_path).await?;
-    let relocation = shared_file_relocation(app, root)?;
+    let migration = managed_resource_migration(app, root)?;
     let resources = root.join(RESOURCES_ARCHIVE_DIR);
     let imported_resources =
         copy_dir_missing(&resources, &crate::core::paths::resources_dir(app)?)?;
-    let outcome = merge_history(pool, &backup_pool, relocation.as_ref()).await?;
+    let outcome = merge_history(pool, &backup_pool, &migration).await?;
     emit_clipboard_imported(app);
 
     let settings_path = root.join(CONFIG_ARCHIVE_DIR).join(SETTINGS_FILENAME);
@@ -1066,7 +1067,7 @@ async fn overwrite_import(
     _options: &ImportHistoryBackupOptions,
 ) -> Result<ImportHistoryBackupResult> {
     let _pause_guard = pause_watcher(app);
-    let relocation = shared_file_relocation(app, root)?;
+    let migration = managed_resource_migration(app, root)?;
 
     let db_src = root.join(DB_ARCHIVE_DIR).join(DB_FILENAME);
     let resources_src = root.join(RESOURCES_ARCHIVE_DIR);
@@ -1080,9 +1081,7 @@ async fn overwrite_import(
                 replace_dir(&resources_src, &crate::core::paths::resources_dir(&app)?)?;
             }
             let pool = crate::db::init(&app).await?;
-            if let Some(relocation) = relocation {
-                relocation.apply(&pool).await?;
-            }
+            migration.apply(&pool).await?;
             Ok(pool)
         }
     })
@@ -1126,31 +1125,32 @@ async fn open_backup_db(path: &Path) -> Result<SqlitePool> {
         .with_context(|| format!("failed to open backup database at {path:?}"))?)
 }
 
-/// Older backups omit the optional root and keep their original external-file references.
-fn shared_file_relocation(
+/// Converts both declared legacy roots and validated resources from older backup archives.
+fn managed_resource_migration(
     app: &AppHandle,
     root: &Path,
-) -> Result<Option<crate::clipboard::shared_files::Relocation>> {
+) -> Result<crate::clipboard::shared_files::ReferenceMigration> {
     let paths: BackupResourcePaths =
         serde_json::from_value(read_json_file(&root.join(MANIFEST_FILENAME))?)
             .context("read backup resource paths")?;
-    let target =
-        crate::core::paths::resources_dir(app)?.join(crate::clipboard::shared_files::DIRECTORY);
-    Ok(paths
-        .shared_files_root
-        .map(|source| crate::clipboard::shared_files::Relocation::new(source, target)))
+    let resources = crate::core::paths::resources_dir(app)?;
+    Ok(crate::clipboard::shared_files::ReferenceMigration::backup(
+        resources,
+        paths.shared_files_root,
+        paths.sync_files_root,
+    ))
 }
 
 async fn merge_history(
     current: &SqlitePool,
     backup: &SqlitePool,
-    relocation: Option<&crate::clipboard::shared_files::Relocation>,
+    migration: &crate::clipboard::shared_files::ReferenceMigration,
 ) -> Result<MergeOutcome> {
     let mut tx = current.begin().await.context("failed to begin import")?;
     merge_groups(&mut tx, backup).await?;
     merge_apps(&mut tx, backup).await?;
     merge_file_type_icons(&mut tx, backup).await?;
-    let outcome = merge_items(&mut tx, backup, relocation).await?;
+    let outcome = merge_items(&mut tx, backup, migration).await?;
     tx.commit().await.context("failed to commit import")?;
 
     Ok(outcome)
@@ -1278,7 +1278,7 @@ async fn merge_file_type_icons(
 async fn merge_items(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     backup: &SqlitePool,
-    relocation: Option<&crate::clipboard::shared_files::Relocation>,
+    migration: &crate::clipboard::shared_files::ReferenceMigration,
 ) -> Result<MergeOutcome> {
     let mut rows = sqlx::query_as::<_, BackupItemRow>(
         "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, sync_key, search_text, \
@@ -1292,7 +1292,7 @@ async fn merge_items(
     while let Some(row) = rows.next().await {
         let mut row = row.context("failed to read backup items")?;
         if row.kind == "files" {
-            if let Some(content) = relocation.and_then(|paths| paths.rewrite(&row.content)) {
+            if let Some(content) = migration.rewrite(&row.content)? {
                 row.content_hash = crate::db::items::content_hash(
                     crate::db::models::ClipboardKind::Files,
                     &content,
@@ -1744,6 +1744,7 @@ mod tests {
             stored_manifest["sharedFilesRoot"],
             manifest.shared_files_root
         );
+        assert!(stored_manifest.get("syncFilesRoot").is_none());
         let mut names = Vec::new();
         for index in 0..archive.len() {
             let file = archive.by_index(index).unwrap();
@@ -1774,10 +1775,8 @@ mod tests {
             .path()
             .join("archive/resources")
             .join(shared_files::DIRECTORY);
-        let target = temp
-            .path()
-            .join("current/resources")
-            .join(shared_files::DIRECTORY);
+        let target_resources = temp.path().join("current/resources");
+        let target = target_resources.join(shared_files::DIRECTORY);
         let digest = "a".repeat(64);
         fs::create_dir_all(archived.join(&digest)).unwrap();
         fs::write(archived.join(&digest).join("report.pdf"), b"restored").unwrap();
@@ -1794,14 +1793,19 @@ mod tests {
         let current = memory_pool().await;
         insert_item(&backup, &item).await.unwrap();
         assert_eq!(copy_dir_missing(&archived, &target).unwrap(), 1);
-        let relocation = shared_files::Relocation::new(source.to_owned(), target.clone());
-        let outcome = merge_history(&current, &backup, Some(&relocation))
-            .await
-            .unwrap();
+        let migration = shared_files::ReferenceMigration::backup(
+            target_resources.clone(),
+            Some(source.to_owned()),
+            None,
+        );
+        let outcome = merge_history(&current, &backup, &migration).await.unwrap();
         assert_eq!(outcome.imported_items, 1);
         let restored = find_item_by_id(&current, &item.id).await.unwrap().unwrap();
         let first = restored.content.lines().next().unwrap();
-        assert_eq!(fs::read(first).unwrap(), b"restored");
+        assert_eq!(
+            fs::read(shared_files::resolve_path(&target_resources, first).unwrap()).unwrap(),
+            b"restored"
+        );
         assert!(restored
             .content
             .ends_with("\n/storage/emulated/0/external.txt"));
@@ -1817,16 +1821,61 @@ mod tests {
                 .files,
             0
         );
-        let again = merge_history(&current, &backup, Some(&relocation))
-            .await
-            .unwrap();
+        let again = merge_history(&current, &backup, &migration).await.unwrap();
         assert_eq!((again.imported_items, again.skipped_items), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn legacy_backup_infers_synchronized_resources_and_preserves_protected_records() {
+        use crate::clipboard::{build_item, shared_files, ClipboardPayload, ImageStore};
+        use crate::db::items::{find_item_by_id, insert_item};
+        use crate::db::test_support::memory_pool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_resources = temp.path().join("current/resources");
+        let target_file = target_resources
+            .join(shared_files::SYNC_DIRECTORY)
+            .join("event-1/000/report.pdf");
+        fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        fs::write(&target_file, b"restored").unwrap();
+        let legacy_path = "/data/user/0/app/files/resources/sync-files/event-1/000/report.pdf";
+        let store = ImageStore::for_test(temp.path().join("images"));
+        let mut item = build_item(
+            &store,
+            &ClipboardPayload::Files(vec![legacy_path.to_owned()]),
+        )
+        .unwrap()
+        .unwrap();
+        item.is_favorite = true;
+        item.is_pinned = true;
+        let backup = memory_pool().await;
+        let current = memory_pool().await;
+        insert_item(&backup, &item).await.unwrap();
+        let migration =
+            shared_files::ReferenceMigration::backup(target_resources.clone(), None, None);
+
+        let outcome = merge_history(&current, &backup, &migration).await.unwrap();
+        assert_eq!(outcome.imported_items, 1);
+        let restored = find_item_by_id(&current, &item.id).await.unwrap().unwrap();
+        let resolved = shared_files::resolve_path(&target_resources, &restored.content).unwrap();
+        assert_eq!(resolved, target_file);
+        assert_eq!(fs::read(resolved).unwrap(), b"restored");
+        assert!(restored.is_favorite);
+        assert!(restored.is_pinned);
+        assert_eq!(
+            shared_files::cleanup_resources_locked(&current, target_resources)
+                .await
+                .unwrap()
+                .files,
+            0
+        );
     }
 
     #[test]
     fn older_backups_can_omit_shared_attachment_metadata() {
         let paths: BackupResourcePaths = serde_json::from_str(r#"{"formatVersion":1}"#).unwrap();
         assert!(paths.shared_files_root.is_none());
+        assert!(paths.sync_files_root.is_none());
     }
 
     #[tokio::test]
@@ -1883,7 +1932,11 @@ mod tests {
         };
         insert_item(&backup, &item).await.unwrap();
 
-        let outcome = merge_history(&current, &backup, None).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let migration = crate::clipboard::shared_files::ReferenceMigration::current(
+            temp.path().join("resources"),
+        );
+        let outcome = merge_history(&current, &backup, &migration).await.unwrap();
         assert_eq!(
             outcome.imported_items, 1,
             "sensitive item should be imported"

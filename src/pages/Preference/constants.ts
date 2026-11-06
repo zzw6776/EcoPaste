@@ -3,8 +3,7 @@ import type { PreferenceTabId } from "./types/preferences";
 
 export const APP_NAME_PLACEHOLDER = "EcoPaste";
 
-export const STORAGE_WARNING_BYTES = 1024 * 1024 * 1024;
-export const STORAGE_ERROR_BYTES = 2 * 1024 * 1024 * 1024;
+export const BYTES_PER_GB = 1024 ** 3;
 
 interface PreferenceTabMeta {
   activeClass: string;

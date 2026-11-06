@@ -7,6 +7,7 @@ import {
 } from "@/constants/windowOpenSelection";
 import type { Settings } from "@/types/settings";
 import { isAndroid, isMac, isWin } from "@/utils/is";
+import { BYTES_PER_GB } from "../constants";
 import type { PreferenceSetting, PreferenceTab } from "../types/preferences";
 
 const CLICK_ACTION_OPTIONS = [
@@ -175,6 +176,21 @@ export const preferenceTabs: PreferenceTab[] = [
             path: ["clipboard", "history", "maxCount"],
             value: (settings) => {
               return settings.clipboard.history.maxCount;
+            },
+          },
+          {
+            control: {
+              max: Math.floor(Number.MAX_SAFE_INTEGER / BYTES_PER_GB),
+              min: 0,
+              suffixKey: "gb",
+              type: "number",
+              unitScale: BYTES_PER_GB,
+            },
+            id: "history.maxStorageBytes",
+            keywords: ["storage", "quota", "limit", "GB"],
+            path: ["clipboard", "history", "maxStorageBytes"],
+            value: (settings) => {
+              return settings.clipboard.history.maxStorageBytes;
             },
           },
           {

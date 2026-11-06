@@ -154,6 +154,7 @@ export interface Retention {
 export interface History {
   retention: Retention;
   maxCount: number;
+  maxStorageBytes: number;
   cleanupIntervalHours: number;
 }
 

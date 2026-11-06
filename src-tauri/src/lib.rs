@@ -268,9 +268,18 @@ pub fn run() {
                     log::error!("database initialization failed: {err:?}");
                     err
                 })?;
+                let resources = core::paths::resources_dir(&handle_db)?;
+                clipboard::shared_files::ReferenceMigration::current(resources)
+                    .apply(&pool)
+                    .await
+                    .map_err(|err| {
+                        log::error!("managed resource reference migration failed: {err:#}");
+                        err
+                    })?;
                 handle_db.manage(db::DatabaseState::new(pool));
                 clipboard::init(&handle_db)?;
                 sync::init(&handle_db).await?;
+                clipboard::cleanup::spawn(handle_db.clone());
                 #[cfg(target_os = "android")]
                 {
                     commands::android::set_app_handle(handle_db.clone());

@@ -14,6 +14,7 @@ use std::{
 #[cfg(any(not(target_os = "android"), test))]
 use std::net::IpAddr;
 
+use crate::clipboard::cleanup::CleanupTrigger;
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
@@ -102,6 +103,7 @@ const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
 const CLOUD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_UPLOAD_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CLOUD_RECORD_CACHE_DIR: &str = "cloud-records";
 
 /// 自动文件同步只看整张卡片的原始总大小；0 明确表示全部手动。
 fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
@@ -136,7 +138,13 @@ fn remove_unreferenced_sync_blobs(root: &Path, live_blob_ids: &HashSet<String>) 
         .max_depth(2)
         .into_iter()
     {
-        let entry = entry.context("walk local sync blob directory")?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("scan local sync blob for reclamation failed: {error}");
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -148,13 +156,14 @@ fn remove_unreferenced_sync_blobs(root: &Path, live_blob_ids: &HashSet<String>) 
         {
             continue;
         }
-        fs::remove_file(entry.path()).with_context(|| {
-            format!(
-                "remove unreferenced local sync blob {}",
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "remove unreferenced local sync blob {} failed: {error}",
                 entry.path().display()
-            )
-        })?;
-        removed = removed.saturating_add(1);
+            ),
+        }
     }
     Ok(removed)
 }
@@ -542,6 +551,26 @@ impl Drop for AndroidLanDiscoveryGuard {
 }
 
 pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
+    match app.path().app_cache_dir() {
+        Ok(cache) => {
+            let cloud_record_cache = cache.join(CLOUD_RECORD_CACHE_DIR);
+            if cloud_record_cache.exists() {
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    fs::remove_dir_all(cloud_record_cache)
+                        .context("clear cloud record preview cache")
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        log::warn!("clear cloud record preview cache failed: {error:#}")
+                    }
+                    Err(error) => log::warn!("cloud record cache cleanup task failed: {error}"),
+                }
+            }
+        }
+        Err(error) => log::warn!("resolve cloud record preview cache failed: {error}"),
+    }
     let identity = Arc::new(IdentityStore::load_or_create(app)?);
     let mut presence_nonce = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut presence_nonce);
@@ -1559,78 +1588,51 @@ impl SyncManager {
 
     /// Applies local history retention while transfers are paused, then reclaims encrypted content
     /// that no current route can still need.
-    pub(crate) async fn run_local_retention_cleanup(&self, cloud_cycle_held: bool) -> bool {
-        if cloud_cycle_held {
-            let _lan_guard = self.lan_cycle_lock.write().await;
-            let _enqueue_guard = self.enqueue_lock.lock().await;
-            return self.run_local_retention_cleanup_locked().await;
-        }
-
-        let _cloud_guard = self.cloud_cycle_lock.lock().await;
+    pub(crate) async fn run_local_retention_cleanup(&self, trigger: CleanupTrigger) -> bool {
+        let _cloud_guard = if trigger == CleanupTrigger::CloudBootstrap {
+            None
+        } else {
+            Some(self.cloud_cycle_lock.lock().await)
+        };
         let _lan_guard = self.lan_cycle_lock.write().await;
         let _enqueue_guard = self.enqueue_lock.lock().await;
-        self.run_local_retention_cleanup_locked().await
+        let _apply_guard = self.apply_lock.lock().await;
+        let _files_guard = crate::clipboard::shared_files::lock().await;
+        let pool = self.pool().await;
+        match crate::clipboard::cleanup::apply_retention(&self.app, self, &pool, trigger).await {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("local retention cleanup failed: {error:#}");
+                false
+            }
+        }
     }
 
-    async fn run_local_retention_cleanup_locked(&self) -> bool {
-        if !crate::clipboard::cleanup::apply_retention(&self.app).await {
-            return false;
-        }
-
-        let pool = self.pool().await;
+    /// Reclaims encrypted events and blobs after their last local reference disappears.
+    pub(crate) async fn reclaim_released_sync_content(&self, pool: &SqlitePool) -> Result<()> {
         let mut removed_events = 0_u64;
         loop {
             let removed =
-                match repository::prune_released_content_events(&pool, LOCAL_SYNC_GC_BATCH_SIZE)
-                    .await
-                {
-                    Ok(removed) => removed,
-                    Err(error) => {
-                        log::warn!("local sync event cleanup failed: {error}");
-                        return false;
-                    }
-                };
+                repository::prune_released_content_events(pool, LOCAL_SYNC_GC_BATCH_SIZE).await?;
             removed_events = removed_events.saturating_add(removed);
             if removed < u64::from(LOCAL_SYNC_GC_BATCH_SIZE) {
                 break;
             }
         }
 
-        let live_blob_ids = match repository::live_sync_blob_ids(&pool).await {
-            Ok(ids) => ids,
-            Err(error) => {
-                log::warn!("list live local sync blobs failed: {error}");
-                return false;
-            }
-        };
-        let blob_root = match crate::core::paths::resources_dir(&self.app) {
-            Ok(root) => root.join("sync-blobs"),
-            Err(error) => {
-                log::warn!("resolve local sync blob directory failed: {error}");
-                return false;
-            }
-        };
-        let removed_blobs = match tauri::async_runtime::spawn_blocking(move || {
+        let live_blob_ids = repository::live_sync_blob_ids(pool).await?;
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let blob_root = resources.join("sync-blobs");
+        let removed_blobs = tauri::async_runtime::spawn_blocking(move || {
             remove_unreferenced_sync_blobs(&blob_root, &live_blob_ids)
         })
-        .await
-        {
-            Ok(Ok(removed)) => removed,
-            Ok(Err(error)) => {
-                log::warn!("local sync blob cleanup failed: {error}");
-                return false;
-            }
-            Err(error) => {
-                log::warn!("local sync blob cleanup task failed: {error}");
-                return false;
-            }
-        };
+        .await??;
         if removed_events > 0 || removed_blobs > 0 {
             log::info!(
                 "local sync cleanup removed {removed_events} event(s) and {removed_blobs} blob(s)"
             );
         }
-        true
+        Ok(())
     }
 
     /// Immediately reconnects all paired devices or one selected device.
@@ -2212,8 +2214,14 @@ impl SyncManager {
         )>,
     > {
         let _sync_activity = SyncActivityGuard::acquire();
+        let _resource_guard = if item.kind == ClipboardKind::Text {
+            None
+        } else {
+            Some(crate::clipboard::shared_files::lock().await)
+        };
         let key = group.content_key_bytes()?;
-        let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let blob_root = resources.join("sync-blobs");
         let mut manifests = Vec::new();
         let mut stored_blobs = Vec::new();
         let mut envelope_size = item.size;
@@ -2245,8 +2253,8 @@ impl SyncManager {
                     .content
                     .lines()
                     .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>();
+                    .map(|value| crate::clipboard::shared_files::resolve_path(&resources, value))
+                    .collect::<Result<Vec<_>>>()?;
                 if paths.is_empty() {
                     bail!("没有可同步的文件");
                 }
@@ -2254,8 +2262,10 @@ impl SyncManager {
                     if settings.auto_upload_max_mb == 0 {
                         return Ok(None);
                     }
+                    let resources = crate::core::paths::resources_dir(&self.app)?;
                     let total_size =
-                        calculate_current_file_item_size(&self.pool().await, item).await;
+                        calculate_current_file_item_size(&self.pool().await, item, &resources)
+                            .await;
                     let total_size = match total_size {
                         Ok(Some(size)) => {
                             u64::try_from(size).context("invalid clipboard file size")?
@@ -2739,8 +2749,9 @@ impl SyncManager {
                             false
                         };
                         if bootstrap_reached {
-                            let local_cleanup_succeeded =
-                                self.run_local_retention_cleanup(true).await;
+                            let local_cleanup_succeeded = self
+                                .run_local_retention_cleanup(CleanupTrigger::CloudBootstrap)
+                                .await;
                             if local_cleanup_succeeded {
                                 repository::mark_cloud_bootstrap_completed(&pool, &group.group_id)
                                     .await?;
@@ -4301,6 +4312,7 @@ impl SyncManager {
         // SQLite 写入按游标顺序串行完成，避免并发事务互相触发 SQLITE_BUSY；
         // 只有不持有数据库事务的 Blob 网络与文件 I/O 才并发执行。
         let mut ready_content = Vec::new();
+        let resources = crate::core::paths::resources_dir(&self.app)?;
         for (event, envelope) in pending_content {
             let presence = SyncedItemStatePatch {
                 sync_key: envelope.item.sync_key.clone(),
@@ -4310,6 +4322,7 @@ impl SyncManager {
                 note_changed: false,
                 is_present: Some(true),
             };
+            let _resource_guard = crate::clipboard::shared_files::lock().await;
             let outcome = match db::sync_item_state::apply_remote_patch(
                 pool,
                 &presence,
@@ -4336,10 +4349,16 @@ impl SyncManager {
 
             if !outcome.image_files.is_empty() {
                 let store = self.app.state::<ImageStore>();
-                for file_name in outcome.image_files {
-                    if let Err(error) = store.remove(&file_name) {
-                        log::warn!("remove deleted synchronized image {file_name} failed: {error}");
-                    }
+                if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
+                    pool,
+                    store.inner(),
+                    &outcome.image_files,
+                )
+                .await
+                {
+                    log::warn!(
+                        "reclaim deleted synchronized images after content presence failed: {error:#}"
+                    );
                 }
             }
             if outcome.canonical_presence == Some(false) {
@@ -4348,7 +4367,16 @@ impl SyncManager {
                     #[cfg(target_os = "android")]
                     crate::commands::android::notify_overlay_clipboard_changed();
                 }
-                crate::clipboard::shared_files::cleanup_after_delete(&self.app).await;
+                if let Err(error) = crate::clipboard::shared_files::cleanup_resources_locked(
+                    pool,
+                    resources.clone(),
+                )
+                .await
+                {
+                    log::warn!(
+                        "reclaim deleted synchronized files after content presence failed: {error:#}"
+                    );
+                }
                 repository::mark_applied(pool, &event.event_id).await?;
                 made_content_progress = true;
                 continue;
@@ -4478,6 +4506,8 @@ impl SyncManager {
         patch: SyncedItemStatePatch,
     ) -> Result<()> {
         let sync_key = patch.sync_key.clone();
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let _resource_guard = crate::clipboard::shared_files::lock().await;
         let outcome = db::sync_item_state::apply_remote_patch(
             pool,
             &patch,
@@ -4503,15 +4533,27 @@ impl SyncManager {
 
         if !outcome.image_files.is_empty() {
             let store = self.app.state::<ImageStore>();
-            for file_name in outcome.image_files {
-                if let Err(error) = store.remove(&file_name) {
-                    log::warn!("remove deleted synchronized image {file_name} failed: {error}");
-                }
+            if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
+                pool,
+                store.inner(),
+                &outcome.image_files,
+            )
+            .await
+            {
+                log::warn!(
+                    "reclaim deleted synchronized images after state apply failed: {error:#}"
+                );
             }
         }
 
         if outcome.canonical_presence == Some(false) {
-            crate::clipboard::shared_files::cleanup_after_delete(&self.app).await;
+            if let Err(error) =
+                crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
+            {
+                log::warn!(
+                    "reclaim deleted synchronized files after state apply failed: {error:#}"
+                );
+            }
         }
         repository::mark_applied(pool, &event.event_id).await?;
         Ok(())
@@ -4523,9 +4565,21 @@ impl SyncManager {
         group: &GroupSecrets,
         manifest: &BlobManifest,
     ) -> Result<PathBuf> {
-        validate_blob_manifest(manifest)?;
         let root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
-        let path = crypto::blob_path(&root, &manifest.blob_id)?;
+        self.ensure_blob_at(connection, group, manifest, &root)
+            .await
+    }
+
+    /// Downloads one encrypted blob into the caller-owned cache root.
+    async fn ensure_blob_at(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        manifest: &BlobManifest,
+        root: &Path,
+    ) -> Result<PathBuf> {
+        validate_blob_manifest(manifest)?;
+        let path = crypto::blob_path(root, &manifest.blob_id)?;
         let download_lock = {
             let mut locks = self.blob_download_locks.lock().await;
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -4546,7 +4600,7 @@ impl SyncManager {
         Ok(path)
     }
 
-    /// Downloads and decrypts a cloud image into the shared image cache without importing history.
+    /// Downloads and decrypts a cloud-only image into an ephemeral cache outside durable history.
     async fn cloud_record_image_path(
         &self,
         connection: &Connection,
@@ -4560,10 +4614,24 @@ impl SyncManager {
         else {
             return Ok(None);
         };
-        let encrypted = self.ensure_blob(connection, group, manifest).await?;
-        let image_name = sanitize_name(&manifest.name);
-        let destination = self.app.state::<ImageStore>().origin_path(&image_name);
+        let group_cache = self
+            .app
+            .path()
+            .app_cache_dir()?
+            .join(CLOUD_RECORD_CACHE_DIR)
+            .join(blake3::hash(group.group_id.as_bytes()).to_hex().as_str());
+        let encrypted = self
+            .ensure_blob_at(connection, group, manifest, &group_cache.join("blobs"))
+            .await?;
+        let destination = group_cache
+            .join("images")
+            .join(format!("{}.png", manifest.blob_id));
         if !destination.is_file() || destination.metadata()?.len() != manifest.original_size {
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .context("cloud record image cache has no parent")?,
+            )?;
             let destination_for_task = destination.clone();
             let original_size = manifest.original_size;
             let key = group.content_key_bytes()?;
@@ -4588,7 +4656,15 @@ impl SyncManager {
             bail!("不支持的同步事件版本");
         }
         let kind = parse_kind(&envelope.item.kind)?;
-        let blob_root = crate::core::paths::resources_dir(&self.app)?.join("sync-blobs");
+        // Resource GC uses the same lock. Keep materialized files alive until their database
+        // references commit, while preserving the global apply_lock -> resource lock order.
+        let _resource_guard = if kind == ClipboardKind::Text {
+            None
+        } else {
+            Some(crate::clipboard::shared_files::lock().await)
+        };
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let blob_root = resources.join("sync-blobs");
         let (content, files_fingerprint) = match kind {
             ClipboardKind::Text => (envelope.item.content.clone(), None),
             ClipboardKind::Image => {
@@ -4610,9 +4686,7 @@ impl SyncManager {
                 (image_name, None)
             }
             ClipboardKind::Files => {
-                let directory = crate::core::paths::resources_dir(&self.app)?
-                    .join("sync-files")
-                    .join(&event.event_id);
+                let directory = resources.join("sync-files").join(&event.event_id);
                 let mut paths = Vec::new();
                 let mut file_fingerprints = Vec::new();
                 for manifest in &envelope.blobs {
@@ -4661,8 +4735,14 @@ impl SyncManager {
                     });
                     paths.push(destination.to_string_lossy().into_owned());
                 }
+                let physical_content = paths.join("\n");
+                let content = crate::clipboard::shared_files::normalize_owned_content(
+                    &resources,
+                    &physical_content,
+                )?
+                .context("materialized synchronized files are outside the managed root")?;
                 (
-                    paths.join("\n"),
+                    content,
                     ClipboardFingerprint::from_file_entries(&file_fingerprints),
                 )
             }
@@ -4765,16 +4845,30 @@ impl SyncManager {
         {
             return;
         }
+        let mut resolved_item = item.clone();
+        let resources = match crate::core::paths::resources_dir(&self.app) {
+            Ok(resources) => resources,
+            Err(error) => {
+                log::warn!("resolve synchronized clipboard resources failed: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) =
+            crate::clipboard::shared_files::resolve_item_content(&resources, &mut resolved_item)
+        {
+            log::warn!("resolve synchronized clipboard item failed: {error:#}");
+            return;
+        }
 
         let guard = self.app.state::<Arc<WritebackGuard>>();
         let fingerprints = self.app.state::<Arc<ClipboardFingerprintState>>();
         #[cfg(target_os = "android")]
-        let result = if item.kind == ClipboardKind::Text {
+        let result = if resolved_item.kind == ClipboardKind::Text {
             crate::clipboard::write_synced_item_to_clipboard_app(
                 &self.app,
                 &guard,
                 &fingerprints,
-                item,
+                &resolved_item,
             )
         } else {
             Ok(false)
@@ -4784,7 +4878,7 @@ impl SyncManager {
             &self.app.state::<ImageStore>(),
             &guard,
             &fingerprints,
-            item,
+            &resolved_item,
             _fingerprint,
         );
 
@@ -8634,7 +8728,7 @@ fn synced_file_destination(root: &Path, file_index: u32, name: &str) -> PathBuf 
 }
 
 fn sanitize_name(value: &str) -> String {
-    let name = value.replace(['/', '\\', '\0'], "_");
+    let name = value.replace(['/', '\\', ':', '\0'], "_");
     if name.is_empty() || name == "." || name == ".." {
         "file".into()
     } else {

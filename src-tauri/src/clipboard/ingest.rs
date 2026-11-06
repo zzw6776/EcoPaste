@@ -162,6 +162,7 @@ fn calculate_files_total_size_cancellable(
 pub(crate) async fn calculate_current_file_item_size(
     pool: &sqlx::SqlitePool,
     item: &ClipboardItem,
+    resources: &Path,
 ) -> AnyhowResult<Option<i64>> {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -190,7 +191,16 @@ pub(crate) async fn calculate_current_file_item_size(
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-    let content = item.content.clone();
+    let content = item
+        .content
+        .lines()
+        .map(|value| {
+            Ok(super::shared_files::resolve_path(resources, value)?
+                .to_string_lossy()
+                .into_owned())
+        })
+        .collect::<AnyhowResult<Vec<_>>>()?
+        .join("\n");
     let mut task = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         calculate_files_total_size_cancellable(&content, || cancelled.load(Ordering::Relaxed))

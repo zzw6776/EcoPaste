@@ -22,6 +22,15 @@ const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clip
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
 const HISTORY_CLEANUP_BATCH_SIZE: i64 = 256;
+/// The same protection predicate is compiled into the age, count and capacity queries.
+macro_rules! evictable_history {
+    () => {
+        "is_pinned = 0 AND is_favorite = 0 AND NOT EXISTS (
+            SELECT 1 FROM sync_content_outbox manual
+            WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1
+        )"
+    };
+}
 
 /// 列表/单条刷新场景的精简 SELECT：普通 text 由前端用 `summary` 渲染；URL 保留完整
 /// `content`，避免长地址被摘要截断。HTML/RTF/长纯文本可能很大（用户复制整段文档），
@@ -687,16 +696,16 @@ pub async fn cleanup_history(
 
     if let Some(cutoff) = older_than {
         loop {
-            let rows = sqlx::query_scalar::<_, Option<String>>(
+            let rows = sqlx::query_scalar::<_, Option<String>>(concat!(
                 "DELETE FROM clipboard_items WHERE id IN ( \
                      SELECT id FROM clipboard_items \
-                     WHERE is_pinned = 0 AND is_favorite = 0 AND created_at < ? \
-                       AND NOT EXISTS (SELECT 1 FROM sync_content_outbox manual \
-                           WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1) \
+                     WHERE ",
+                evictable_history!(),
+                " AND created_at < ? \
                      LIMIT ? \
                  ) \
-                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END",
-            )
+                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END"
+            ))
             .bind(cutoff)
             .bind(HISTORY_CLEANUP_BATCH_SIZE)
             .bind(ClipboardKind::Image)
@@ -712,17 +721,17 @@ pub async fn cleanup_history(
     if let Some(max) = max_count {
         // 仅在非置顶 / 非收藏集合内按 created_at DESC 保留前 max 条，多余的删除。
         loop {
-            let rows = sqlx::query_scalar::<_, Option<String>>(
+            let rows = sqlx::query_scalar::<_, Option<String>>(concat!(
                 "DELETE FROM clipboard_items WHERE id IN ( \
                      SELECT id FROM clipboard_items \
-                     WHERE is_pinned = 0 AND is_favorite = 0 \
-                       AND NOT EXISTS (SELECT 1 FROM sync_content_outbox manual \
-                           WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1) \
+                     WHERE ",
+                evictable_history!(),
+                " \
                      ORDER BY created_at DESC \
                      LIMIT ? OFFSET ? \
                  ) \
-                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END",
-            )
+                 RETURNING CASE WHEN kind = ? THEN content ELSE NULL END"
+            ))
             .bind(HISTORY_CLEANUP_BATCH_SIZE)
             .bind(max as i64)
             .bind(ClipboardKind::Image)
@@ -739,6 +748,44 @@ pub async fn cleanup_history(
         .commit()
         .await
         .context("failed to commit clipboard history cleanup")?;
+    Ok(outcome)
+}
+
+/// Deletes an oldest-first prefix atomically. Managed resources and images with unknown sizes form
+/// a remeasurement boundary; external file cards use their database footprint and stay batched.
+pub(crate) async fn evict_oldest_history(
+    pool: &SqlitePool,
+    excess_bytes: u64,
+    managed_reference_prefix: &str,
+) -> Result<CleanupOutcome> {
+    let rows = sqlx::query_scalar::<_, Option<String>>(concat!(
+        "WITH oldest AS MATERIALIZED (
+            SELECT id, created_at,
+                CASE WHEN kind = 'text' THEN MAX(1, length(CAST(content AS BLOB))
+                    + COALESCE(length(CAST(search_text AS BLOB)), 0)
+                    + COALESCE(length(CAST(note AS BLOB)), 0))
+                    WHEN kind = 'image' AND size > 0 THEN MIN(size, ?1)
+                    WHEN kind = 'files' AND instr(content, ?2) = 0 THEN
+                        MAX(1, length(CAST(content AS BLOB))
+                            + COALESCE(length(CAST(search_text AS BLOB)), 0)
+                            + COALESCE(length(CAST(note AS BLOB)), 0))
+                    ELSE ?1 END AS bytes
+            FROM clipboard_items WHERE ", evictable_history!(), "
+            ORDER BY created_at, id LIMIT ?3
+        ), ranked AS (
+            SELECT id, SUM(bytes) OVER (ORDER BY created_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_bytes
+            FROM oldest
+        )
+        DELETE FROM clipboard_items WHERE id IN (
+            SELECT id FROM ranked WHERE COALESCE(previous_bytes, 0) < ?1
+        ) RETURNING CASE WHEN kind = 'image' THEN content ELSE NULL END"
+    ))
+    .bind(i64::try_from(excess_bytes).unwrap_or(i64::MAX))
+    .bind(managed_reference_prefix)
+    .bind(HISTORY_CLEANUP_BATCH_SIZE)
+    .fetch_all(pool).await.context("evict oldest local clipboard records")?;
+    let mut outcome = CleanupOutcome::default();
+    absorb_cleanup_rows(&mut outcome, rows);
     Ok(outcome)
 }
 
@@ -2118,6 +2165,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&all), ["pin", "p4", "p3", "fav"]);
+    }
+
+    #[tokio::test]
+    async fn quota_cleanup_removes_only_the_oldest_eligible_prefix() {
+        let pool = memory_pool().await;
+        let protected = sample_item("pending");
+        upsert_item_with_sync_outbox(
+            &pool,
+            &protected,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for (index, id) in [
+            "favorite",
+            "pinned",
+            "old",
+            "external-files-a",
+            "external-files-b",
+            "shared-files",
+            "new",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut item = sample_item(id);
+            item.is_favorite = id == "favorite";
+            item.is_pinned = id == "pinned";
+            item.created_at += chrono::Duration::seconds(index as i64 + 1);
+            if matches!(id, "external-files-a" | "external-files-b" | "shared-files") {
+                item.kind = ClipboardKind::Files;
+            }
+            if id == "shared-files" {
+                item.content = format!(
+                    "{}shared-files/{}/report.pdf",
+                    crate::clipboard::shared_files::REFERENCE_PREFIX,
+                    "a".repeat(64)
+                );
+                item.content_hash = content_hash(ClipboardKind::Files, &item.content);
+                item.sync_key.clone_from(&item.content_hash);
+            }
+            insert_item(&pool, &item).await.unwrap();
+        }
+        assert_eq!(
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(find_item_by_id(&pool, "old").await.unwrap().is_none());
+        assert_eq!(
+            evict_oldest_history(
+                &pool,
+                1024,
+                crate::clipboard::shared_files::REFERENCE_PREFIX,
+            )
+            .await
+            .unwrap()
+            .removed,
+            3
+        );
+        for id in ["external-files-a", "external-files-b", "shared-files"] {
+            assert!(find_item_by_id(&pool, id).await.unwrap().is_none());
+        }
+        assert!(find_item_by_id(&pool, "new").await.unwrap().is_some());
+        assert_eq!(
+            evict_oldest_history(
+                &pool,
+                1024,
+                crate::clipboard::shared_files::REFERENCE_PREFIX,
+            )
+            .await
+            .unwrap()
+            .removed,
+            1
+        );
+        assert_eq!(
+            evict_oldest_history(
+                &pool,
+                1024,
+                crate::clipboard::shared_files::REFERENCE_PREFIX,
+            )
+            .await
+            .unwrap()
+            .removed,
+            0
+        );
+        for id in ["pending", "pinned", "favorite"] {
+            assert!(find_item_by_id(&pool, id).await.unwrap().is_some());
+        }
     }
 
     #[tokio::test]

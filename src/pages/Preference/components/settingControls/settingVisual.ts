@@ -48,6 +48,7 @@ const SETTING_ICON_MAP: Record<string, string> = {
   "diagnostics.windowLifecycle": "i-lucide:activity",
   "history.cleanupIntervalHours": "i-lucide:timer-reset",
   "history.maxCount": "i-lucide:list-ordered",
+  "history.maxStorageBytes": "i-lucide:hard-drive",
   "history.retention": "i-lucide:calendar-clock",
   "localData.cleanCache": "i-lucide:brush-cleaning",
   "localData.dataDirectory": "i-lucide:folder-root",

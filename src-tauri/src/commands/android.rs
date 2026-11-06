@@ -191,7 +191,11 @@ fn load_overlay_items_json(keyword: Option<String>, limit: i64) -> Result<String
             limit: limit.clamp(1, 50),
             ..Default::default()
         };
-        let (items, _) = crate::db::items::query_items_page(&pool, &query).await?;
+        let (mut items, _) = crate::db::items::query_items_page(&pool, &query).await?;
+        let resources = crate::core::paths::resources_dir(&app)?;
+        for item in &mut items {
+            crate::clipboard::shared_files::resolve_item_content(&resources, item)?;
+        }
         let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         let mut sync_statuses =
             if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
@@ -437,9 +441,11 @@ fn paste_overlay_item(id: String) -> Result<()> {
     tauri::async_runtime::block_on(async {
         let db = app.state::<crate::db::DatabaseState>();
         let pool = db.pool().await;
-        let item = find_item_by_id(&pool, &id)
+        let mut item = find_item_by_id(&pool, &id)
             .await?
             .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+        let resources = crate::core::paths::resources_dir(&app)?;
+        crate::clipboard::shared_files::resolve_item_content(&resources, &mut item)?;
         let guard = app.state::<Arc<WritebackGuard>>();
         crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
 

@@ -1,6 +1,5 @@
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
-import type { StorageUsage } from "@/commands";
 import { openAndroidPermissionsModal } from "@/stores/android";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMac, isMobile } from "@/utils/is";
@@ -17,8 +16,9 @@ interface PreferenceSidebarProps {
   activeTabId: PreferenceTabId;
   appName: string;
   appVersion: string;
+  storageLimitBytes: number;
   storageState: PreferenceStorageState;
-  storageUsage: StorageUsage | null;
+  usedBytes: number | null;
   onTabSelect: (tabId: PreferenceTabId) => void;
 }
 
@@ -31,8 +31,9 @@ const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
     activeTabId,
     appName,
     appVersion,
+    storageLimitBytes,
     storageState,
-    storageUsage,
+    usedBytes,
     onTabSelect,
   } = props;
   const isCompact = isAndroid || isMobile();
@@ -146,8 +147,9 @@ const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
 
       {!isCompact && (
         <PreferenceStorageUsagePanel
+          limitBytes={storageLimitBytes}
           state={storageState}
-          storageUsage={storageUsage}
+          usedBytes={usedBytes}
         />
       )}
     </aside>

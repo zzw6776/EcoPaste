@@ -14,7 +14,6 @@ import {
   getStorageUsage,
   type ImportHistoryBackupResult,
   type StorageLocation,
-  type StorageUsage,
   takePendingBackup,
   takePendingPreferenceHighlight,
 } from "@/commands";
@@ -89,7 +88,9 @@ const Preference: FC = () => {
   });
   const [storageState, setStorageState] =
     useState<PreferenceStorageState>("loading");
-  const [storageUsage, setStorageUsage] = useState<StorageUsage | null>(null);
+  const [usedBytes, setUsedBytes] = useState<number | null>(null);
+  const usageRevision = useRef(0);
+  const storageRequestRevision = useRef(0);
   const [storageLocation, setStorageLocation] =
     useState<StorageLocation | null>(null);
   const [backupImportTarget, setBackupImportTarget] =
@@ -217,15 +218,14 @@ const Preference: FC = () => {
       | ExportHistoryBackupResult,
   ) => {
     if (result && "location" in result) {
+      storageRequestRevision.current += 1;
       setStorageLocation(result.location);
-      setStorageUsage(result.storageUsage);
-      setStorageState("ready");
+      updateUsage(result.storageUsage.totalBytes);
       return;
     }
 
     if (result && "storageUsage" in result) {
-      setStorageUsage(result.storageUsage);
-      setStorageState("ready");
+      updateUsage(result.storageUsage.totalBytes);
       return;
     }
 
@@ -237,10 +237,19 @@ const Preference: FC = () => {
     }
   };
 
+  const updateUsage = (totalBytes: number) => {
+    usageRevision.current += 1;
+    setUsedBytes(totalBytes);
+    setStorageState("ready");
+  };
+
   /**
    * 加载当前环境数据目录的递归占用，用于侧栏低频状态展示。
    */
   const initializeStorageUsage = async () => {
+    storageRequestRevision.current += 1;
+    const requestRevision = storageRequestRevision.current;
+    const usageAtStart = usageRevision.current;
     setStorageState("loading");
 
     try {
@@ -249,12 +258,21 @@ const Preference: FC = () => {
         getStorageLocation(),
       ]);
 
-      setStorageUsage(usage);
+      if (requestRevision !== storageRequestRevision.current) return;
+
       setStorageLocation(location);
-      setStorageState("ready");
+      if (usageAtStart === usageRevision.current) {
+        setUsedBytes(usage.totalBytes);
+        setStorageState("ready");
+      }
     } catch (error) {
       log.warn("load storage usage failed", error);
-      setStorageState("error");
+      if (
+        requestRevision === storageRequestRevision.current &&
+        usageAtStart === usageRevision.current
+      ) {
+        setStorageState("error");
+      }
     }
   };
 
@@ -290,6 +308,10 @@ const Preference: FC = () => {
     if (pendingHighlight) {
       highlightSetting(pendingHighlight);
     }
+  });
+
+  useTauriListen<number>(TAURI_EVENT.STORAGE_USAGE_UPDATED, (event) => {
+    updateUsage(event.payload);
   });
 
   useTauriListen<BackupReceivedPayload>(
@@ -362,8 +384,9 @@ const Preference: FC = () => {
             appName={appMetadata.name}
             appVersion={appMetadata.version}
             onTabSelect={handleTabSelect}
+            storageLimitBytes={settings.clipboard.history.maxStorageBytes}
             storageState={storageState}
-            storageUsage={storageUsage}
+            usedBytes={usedBytes}
           />
         ) : null}
 

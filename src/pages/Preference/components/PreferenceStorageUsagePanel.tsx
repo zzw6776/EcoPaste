@@ -1,19 +1,19 @@
 import { Progress } from "antd";
 import type { FC } from "react";
 import { useTranslation } from "react-i18next";
-import type { StorageUsage } from "@/commands";
 import { cn } from "@/utils/cn";
+import { BYTES_PER_GB } from "../constants";
 import type { PreferenceStorageState } from "../types/preferences";
 import {
   formatBytes,
   storageMeterPercent,
-  storageTargetBytes,
   storageTone,
 } from "../utils/storageUsage";
 
 interface PreferenceStorageUsagePanelProps {
+  limitBytes: number;
   state: PreferenceStorageState;
-  storageUsage: StorageUsage | null;
+  usedBytes: number | null;
 }
 
 /**
@@ -23,21 +23,22 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
   props,
 ) => {
   const { t } = useTranslation("preferences");
-  const { state, storageUsage } = props;
-  const isReady = state === "ready" && storageUsage !== null;
-  const totalLabel = storageUsage ? formatBytes(storageUsage.totalBytes) : "--";
-  const targetLabel = storageUsage
-    ? formatBytes(storageTargetBytes(storageUsage.totalBytes))
-    : "--";
+  const { limitBytes, state, usedBytes } = props;
+  const isReady = state === "ready" && usedBytes !== null;
+  const totalLabel = usedBytes !== null ? formatBytes(usedBytes) : "--";
+  const targetLabel =
+    limitBytes > 0
+      ? `${Number((limitBytes / BYTES_PER_GB).toFixed(2))} GB`
+      : t("storage.unlimited");
   const usageLabel =
     state === "loading"
       ? t("storage.loading")
       : t("storage.usage", { target: targetLabel, total: totalLabel });
   const meterPercent = isReady
-    ? storageMeterPercent(storageUsage.totalBytes)
+    ? storageMeterPercent(usedBytes, limitBytes)
     : 20;
   const storageToneValue = isReady
-    ? storageTone(storageUsage.totalBytes)
+    ? storageTone(meterPercent)
     : {
         stroke: "var(--ant-color-success)",
         text: "text-ant-success",
@@ -72,16 +73,18 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
           </div>
         </div>
 
-        <Progress
-          aria-label={usageLabel}
-          className="mt-3 leading-none"
-          percent={meterPercent}
-          railColor="var(--ant-color-fill-secondary)"
-          showInfo={false}
-          size={["100%", 4]}
-          status={state === "error" ? "exception" : "normal"}
-          strokeColor={meterStrokeColor}
-        />
+        {limitBytes > 0 && (
+          <Progress
+            aria-label={usageLabel}
+            className="mt-3 leading-none"
+            percent={meterPercent}
+            railColor="var(--ant-color-fill-secondary)"
+            showInfo={false}
+            size={["100%", 4]}
+            status={state === "error" ? "exception" : "normal"}
+            strokeColor={meterStrokeColor}
+          />
+        )}
       </div>
     </div>
   );

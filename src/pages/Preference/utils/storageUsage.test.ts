@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { STORAGE_ERROR_BYTES, STORAGE_WARNING_BYTES } from "../constants";
-import { storageMeterPercent } from "./storageUsage";
+import { BYTES_PER_GB } from "../constants";
+import { formatBytes, storageMeterPercent } from "./storageUsage";
 
-test("storage meter uses the actual ratio below the warning threshold", () => {
-  assert.equal(storageMeterPercent(94 * 1024 * 1024), 9.1796875);
+test("storage labels use binary GB and MB", () => {
+  assert.equal(formatBytes(100 * 1024 ** 2), "100 MB");
+  assert.equal(formatBytes(Math.round(BYTES_PER_GB / 10)), "102 MB");
+  assert.equal(formatBytes(1024 ** 3), "1.0 GB");
 });
 
-test("storage meter switches target at the warning threshold", () => {
-  assert.equal(storageMeterPercent(STORAGE_WARNING_BYTES), 50);
+test("storage meter uses the configured limit, including fractional GB", () => {
+  assert.equal(storageMeterPercent(BYTES_PER_GB, 4 * BYTES_PER_GB), 25);
+  assert.equal(storageMeterPercent(BYTES_PER_GB / 4, BYTES_PER_GB / 2), 50);
 });
 
-test("storage meter clamps empty and oversized usage", () => {
-  assert.equal(storageMeterPercent(0), 0);
-  assert.equal(storageMeterPercent(STORAGE_ERROR_BYTES * 2), 100);
+test("storage meter handles unlimited, empty and over-limit usage", () => {
+  assert.equal(storageMeterPercent(BYTES_PER_GB, 0), 0);
+  assert.equal(storageMeterPercent(0, BYTES_PER_GB), 0);
+  assert.equal(storageMeterPercent(2 * BYTES_PER_GB, BYTES_PER_GB), 100);
 });
