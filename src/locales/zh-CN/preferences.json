@@ -429,6 +429,10 @@
           "description": "超过上限后，自动清理较旧的普通记录；收藏和置顶始终保留，0 表示不限数量。",
           "title": "最大保留条数"
         },
+        "maxStorageBytes": {
+          "description": "按二进制容量配置（1 GB = 1024 MB），支持小数，0 表示不限。数据目录超出上限时，从最旧的普通记录开始清理，目标为上限的 80%。收藏和置顶始终保留。",
+          "title": "本地存储容量上限"
+        },
         "retention": {
           "description": "超过该天数的普通记录会自动清理；收藏和置顶始终保留，0 表示不按时间清理。",
           "title": "保留周期"
@@ -749,6 +753,7 @@
     "error": "统计失败",
     "loading": "统计中",
     "title": "本地存储",
+    "unlimited": "不限",
     "usage": "{{total}} / {{target}}"
   },
   "storageLocation": {

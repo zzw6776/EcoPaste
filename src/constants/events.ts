@@ -15,6 +15,7 @@ export const TAURI_EVENT = {
   PREVIEW_UPDATED: "preview://updated",
   SETTINGS_UPDATED: "settings://updated",
   SOURCE_APP_UPDATED: "source-app://updated",
+  STORAGE_USAGE_UPDATED: "storage://usage-updated",
   SYNC_JOIN_ATTEMPT_UPDATED: "sync://join-attempt-updated",
   SYNC_JOIN_REQUESTED: "sync://join-requested",
   SYNC_UPDATED: "sync://updated",

@@ -11,7 +11,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
     ErrorCode, FrameError, HubStatus, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, Request, Response,
-    limit_events_page, limit_retention_plan, limit_sync_response, read_frame, write_frame,
+    limit_events_page, limit_retention_plan, limit_sync_response, quota_low_watermark, read_frame,
+    write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -236,18 +237,12 @@ impl HubService {
             .is_some_and(|state| state.active_uploads > 0)
     }
 
-    fn quota_low_watermark(&self) -> u64 {
-        let reduction =
-            self.max_group_bytes / 5 + u64::from(!self.max_group_bytes.is_multiple_of(5));
-        self.max_group_bytes.saturating_sub(reduction)
-    }
-
     /// Coalesces quota pressure into the strictest requested target without blocking the request.
     fn request_quota_cleanup(&self, group_id: &str, target_bytes: u64) {
         if self.max_group_bytes == 0 {
             return;
         }
-        let target_bytes = target_bytes.min(self.quota_low_watermark());
+        let target_bytes = target_bytes.min(quota_low_watermark(self.max_group_bytes));
         let mut targets = self
             .quota_cleanup_targets
             .lock()
@@ -349,7 +344,7 @@ impl HubService {
         if let Err(error) = &result
             && error.chain().any(|cause| cause.is::<QuotaExceeded>())
         {
-            self.request_quota_cleanup(group_id, self.quota_low_watermark());
+            self.request_quota_cleanup(group_id, quota_low_watermark(self.max_group_bytes));
         }
         result
     }
@@ -1789,7 +1784,7 @@ mod tests {
         assert_eq!(pages, 9);
         assert!(
             repository.group_used_bytes("group_123").await.unwrap()
-                <= service.quota_low_watermark()
+                <= quota_low_watermark(service.max_group_bytes)
         );
         let reservation = service
             .reserve_blob_quota_locked("group_123", 64)

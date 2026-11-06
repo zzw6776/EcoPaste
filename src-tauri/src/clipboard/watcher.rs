@@ -260,6 +260,8 @@ pub(crate) async fn persist_and_notify_with_sync(
     sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
 ) -> crate::core::Result<UpsertResult> {
     let mut item_to_write = item.clone();
+    let resources = crate::core::paths::resources_dir(app)?;
+    super::shared_files::normalize_new_item(&resources, &mut item_to_write)?;
     if let Some(src) = source_app {
         match upsert_app(pool, src).await {
             Ok(()) => {}
@@ -316,7 +318,14 @@ fn resolve_file_size_and_enqueue(
     let app = app.clone();
     let pool = pool.clone();
     tauri::async_runtime::spawn(async move {
-        let size = match calculate_current_file_item_size(&pool, &item).await {
+        let resources = match crate::core::paths::resources_dir(&app) {
+            Ok(resources) => resources,
+            Err(error) => {
+                log::warn!("resolve clipboard resource directory failed: {error:#}");
+                return;
+            }
+        };
+        let size = match calculate_current_file_item_size(&pool, &item, &resources).await {
             Ok(Some(size)) => size,
             Ok(None) => {
                 if staged_for_sync {
@@ -368,8 +377,15 @@ fn spawn_file_size_backfill(app: AppHandle) {
         };
         let candidate_count = items.len();
         let mut updated_count = 0_usize;
+        let resources = match crate::core::paths::resources_dir(&app) {
+            Ok(resources) => resources,
+            Err(error) => {
+                log::warn!("resolve clipboard resource directory failed: {error:#}");
+                return;
+            }
+        };
         for item in items {
-            let size = match calculate_current_file_item_size(&pool, &item).await {
+            let size = match calculate_current_file_item_size(&pool, &item, &resources).await {
                 Ok(Some(size)) => size,
                 Ok(None) => continue,
                 Err(error) => {
@@ -454,7 +470,6 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     }
 
     spawn_file_size_backfill(app.clone());
-    super::cleanup::spawn(app.clone());
     #[cfg(not(target_os = "android"))]
     spawn_watch_thread(
         app.clone(),
@@ -657,6 +672,9 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 return;
             }
         };
+        // The watcher runs on a dedicated OS thread. Keep the image alive through its async insert.
+        let image_guard = matches!(payload, super::ClipboardPayload::Image(_))
+            .then(|| tauri::async_runtime::block_on(super::shared_files::lock()));
         let mut item = match build_item_with_settings(
             &self.store,
             &payload,
@@ -738,6 +756,7 @@ impl ClipboardHandler for ClipboardChangeHandler {
         // 入库与 emit 交给异步运行时；只移动 Send 数据，不碰平台句柄。
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
+            let _image_guard = image_guard;
             let pool = app.state::<crate::db::DatabaseState>().pool().await;
             if let Err(err) =
                 persist_and_notify(&app, &pool, &item, source_app.as_ref(), sync_observation).await

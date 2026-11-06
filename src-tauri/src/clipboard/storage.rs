@@ -272,9 +272,10 @@ impl ImageStore {
     /// 删除一张图片的原图与缩略图。缩略图懒生成、可能不存在，缺失文件视作成功（幂等）。
     /// 删后顺手清理变空的分片目录（`origin/<ab>`、`thumbnails/<ab>`）。
     ///
-    /// 调用前提：库里该图至多一行（image 去重指纹源自 PNG 字节，落盘文件名即字节哈希），
-    /// 故删行后该文件必为孤儿，可直接删，无需引用计数。其余 IO 错误上抛由调用方记日志。
+    /// 本方法只负责幂等文件删除，不判断数据库引用。业务删除统一先经资源锁和引用检查，
+    /// 确认文件已成为孤儿后再调用；其余 IO 错误上抛由调用方记日志。
     pub fn remove(&self, file_name: &str) -> Result<()> {
+        validate_image_file_name(file_name)?;
         let origin = self.origin_path(file_name);
         let thumb = self.thumbnail_path(file_name);
         remove_if_present(&origin)?;
@@ -311,14 +312,27 @@ impl ImageStore {
     }
 }
 
+/// 校验图片文件名：必须是单层 `<name>.png`，不含路径分隔符 / 父目录引用。
+pub(crate) fn validate_image_file_name(file_name: &str) -> Result<()> {
+    let invalid = file_name.is_empty()
+        || file_name.contains(':')
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || !file_name.ends_with(".png");
+
+    if invalid {
+        return Err(AppError::Clipboard(format!(
+            "invalid image file name: {file_name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// 分片子目录名：取来源串前 2 个字符（hash 恒为 hex，必有 2 位）；
 /// 异常短串兜底为 `00`，保证始终有一层分片。
 fn shard_dir(src: &str) -> &str {
-    if src.len() >= 2 {
-        &src[..2]
-    } else {
-        "00"
-    }
+    src.get(..2).unwrap_or("00")
 }
 
 /// 从文件名 `<hash>.png` 取分片来源（即 hash 本身）。

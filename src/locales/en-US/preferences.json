@@ -429,6 +429,10 @@
           "description": "When the limit is exceeded, older regular records are cleaned automatically; favorites and pinned items are always kept. 0 means unlimited items.",
           "title": "Maximum Items"
         },
+        "maxStorageBytes": {
+          "description": "Uses binary capacity units (1 GB = 1024 MB) and supports fractional values. Set to 0 for unlimited storage. When the data directory exceeds the limit, the oldest ordinary records are removed to bring usage down to 80%. Favorites and pinned records are kept.",
+          "title": "Local storage limit"
+        },
         "retention": {
           "description": "Regular records older than this many days are cleaned automatically; favorites and pinned items are always kept. 0 disables time-based cleanup.",
           "title": "Retention Period"
@@ -749,6 +753,7 @@
     "error": "Calculation failed",
     "loading": "Calculating",
     "title": "Local Storage",
+    "unlimited": "Unlimited",
     "usage": "{{total}} / {{target}}"
   },
   "storageLocation": {

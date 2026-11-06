@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "ecopaste-sync-server"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "blake3",

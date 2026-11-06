@@ -44,6 +44,38 @@ const DEV_ENV_DIR: &str = "dev";
 /// 生产环境数据子目录名（`tauri build`）。
 const PROD_ENV_DIR: &str = "prod";
 
+/// Counts regular files under a data directory, omitting links and files removed mid-scan.
+pub(crate) fn dir_size(root: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in walkdir::WalkDir::new(root).follow_root_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        };
+        if entry.file_type().is_file() {
+            match entry.metadata() {
+                Ok(metadata) => total += metadata.len(),
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(anyhow::Error::from(error).into()),
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// 当前环境的数据子目录名：dev 构建走 `dev/`，release 构建走 `prod/`。
 /// `cfg!(dev)` 是 Tauri 在 `tauri dev` 时注入的 cfg，与各模块原先选文件名后缀用的判定同源。
 const fn env_dir() -> &'static str {

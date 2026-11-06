@@ -59,6 +59,7 @@ export type PreferenceControl =
   | {
       type: "number";
       max?: number;
+      unitScale?: number;
       min?: number;
       suffixKey?: string;
     }

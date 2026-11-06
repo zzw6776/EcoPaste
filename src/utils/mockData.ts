@@ -78,6 +78,7 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
     history: {
       cleanupIntervalHours: 24,
       maxCount: 1000,
+      maxStorageBytes: 0,
       retention: {
         unit: "forever",
         value: 0,

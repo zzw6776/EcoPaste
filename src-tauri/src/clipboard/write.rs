@@ -307,7 +307,7 @@ fn write_files(ctx: &ClipboardContext, guard: &WritebackGuard, item: &ClipboardI
         return Err(AppError::Clipboard("no files to write".to_owned()));
     }
 
-    guard.suppress(item.content_hash.clone());
+    guard.suppress(content_hash(ClipboardKind::Files, &item.content));
     ctx.set_files(paths).map_err(clip_err)?;
     Ok(())
 }

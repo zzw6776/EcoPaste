@@ -21,6 +21,7 @@ use super::model::{
 };
 
 const FILENAME: &str = "settings.json";
+const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 pub struct SettingsStore {
     path: RwLock<PathBuf>,
@@ -203,6 +204,11 @@ fn write_atomic(path: &Path, settings: &Settings) -> Result<()> {
 
 /// 校验设置之间的跨字段约束，避免非法配置写入磁盘。
 fn validate_settings(settings: &Settings) -> Result<()> {
+    if settings.clipboard.history.max_storage_bytes > MAX_JSON_SAFE_INTEGER {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "local storage limit exceeds the supported range"
+        )));
+    }
     validate_window_open_group(&settings.clipboard.window.select_group_on_open)?;
     validate_android_gesture(&settings.android.gesture)?;
     validate_sync(&settings.sync)?;
@@ -386,6 +392,14 @@ mod tests {
     }
 
     #[test]
+    fn validate_settings_rejects_storage_limits_above_javascript_safe_integer() {
+        let mut settings = Settings::default();
+        settings.clipboard.history.max_storage_bytes = MAX_JSON_SAFE_INTEGER + 1;
+
+        assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
     fn missing_fields_fall_back_to_defaults() {
         let partial = r#"{"general": {"autoStart": true}}"#;
         let parsed: Settings = serde_json::from_str(partial).unwrap();
@@ -427,6 +441,7 @@ mod tests {
         assert!(parsed.clipboard.content.delete_pinned_confirm);
         assert!(!parsed.clipboard.content.update_on_reuse);
         assert_eq!(parsed.clipboard.history.cleanup_interval_hours, 0);
+        assert_eq!(parsed.clipboard.history.max_storage_bytes, 0);
         assert!(parsed.clipboard.window.scroll_to_top_on_open);
         assert_eq!(
             parsed.clipboard.window.select_range_on_open,

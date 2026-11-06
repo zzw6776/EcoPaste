@@ -9,6 +9,9 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
+use crate::clipboard::cache::{clean_unreferenced_files, reclaim_unreferenced_images};
+use crate::clipboard::shared_files;
+use crate::core::paths::dir_size;
 use crate::core::Result;
 use crate::db::DatabaseState;
 use crate::settings::Settings;
@@ -105,32 +108,22 @@ pub async fn clean_resource_cache(
     app: AppHandle,
     db: tauri::State<'_, DatabaseState>,
 ) -> Result<CleanCacheResult> {
+    let _files_guard = shared_files::lock().await;
     let pool = db.pool().await;
     let resources_dir = crate::core::paths::resources_dir(&app)?;
-    let image_files = referenced_image_files(&pool).await?;
     let app_icon_files = referenced_app_icon_files(&pool).await?;
     let file_icon_files = referenced_file_icon_files(&pool).await?;
 
-    let mut removed = CleanCacheStats::default();
-    let shared = crate::clipboard::shared_files::cleanup(&app).await?;
-    removed.files += shared.files;
-    removed.bytes += shared.bytes;
-    clean_sharded_files(
-        &resources_dir.join("clipboard-images").join("origin"),
-        &image_files,
-        &mut removed,
-    )?;
-    clean_sharded_files(
-        &resources_dir.join("clipboard-images").join("thumbnails"),
-        &image_files,
-        &mut removed,
-    )?;
-    clean_flat_files(
+    let mut removed = shared_files::cleanup_resources_locked(&pool, resources_dir.clone()).await?;
+    let images = reclaim_unreferenced_images(&pool, &resources_dir).await?;
+    removed.files += images.files;
+    removed.bytes += images.bytes;
+    clean_unreferenced_files(
         &resources_dir.join("app-icons"),
         &app_icon_files,
         &mut removed,
     )?;
-    clean_flat_files(
+    clean_unreferenced_files(
         &resources_dir.join("file-icons"),
         &file_icon_files,
         &mut removed,
@@ -194,15 +187,9 @@ async fn switch_storage_location(
     let app_for_db = app.clone();
     let current_for_db = current.clone();
     let target_for_db = target.clone();
-    let shared_files_relocation = crate::clipboard::shared_files::Relocation::new(
-        current
-            .join("resources")
-            .join(crate::clipboard::shared_files::DIRECTORY)
-            .to_string_lossy()
-            .into_owned(),
-        target
-            .join("resources")
-            .join(crate::clipboard::shared_files::DIRECTORY),
+    let reference_migration = crate::clipboard::shared_files::ReferenceMigration::storage_move(
+        &current.join("resources"),
+        target.join("resources"),
     );
 
     db.close_and_replace(|| async move {
@@ -222,7 +209,7 @@ async fn switch_storage_location(
 
         let initialized = async {
             let pool = crate::db::init(&app_for_db).await?;
-            shared_files_relocation.apply(&pool).await?;
+            reference_migration.apply(&pool).await?;
             Ok::<_, crate::core::AppError>(pool)
         }
         .await;
@@ -437,17 +424,6 @@ impl Drop for WatcherPauseRestore {
     }
 }
 
-/// 查询仍被 image 历史记录引用的图片文件名。
-async fn referenced_image_files(pool: &SqlitePool) -> Result<HashSet<String>> {
-    let rows =
-        sqlx::query_scalar::<_, String>("SELECT content FROM clipboard_items WHERE kind = 'image'")
-            .fetch_all(pool)
-            .await
-            .context("failed to query referenced image files")?;
-
-    Ok(rows.into_iter().collect())
-}
-
 /// 查询仍被来源应用引用的应用图标文件名。
 async fn referenced_app_icon_files(pool: &SqlitePool) -> Result<HashSet<String>> {
     let rows = sqlx::query_scalar::<_, String>(
@@ -482,80 +458,6 @@ fn database_bytes(app: &AppHandle) -> Result<u64> {
     Ok(total)
 }
 
-#[derive(Default)]
-struct CleanCacheStats {
-    files: u64,
-    bytes: u64,
-}
-
-/// 清理平铺目录下没有被引用的文件。
-fn clean_flat_files(
-    root: &Path,
-    referenced_files: &HashSet<String>,
-    removed: &mut CleanCacheStats,
-) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-
-    for entry in
-        fs::read_dir(root).with_context(|| format!("failed to read directory at {root:?}"))?
-    {
-        let entry = entry.with_context(|| format!("failed to read entry under {root:?}"))?;
-        let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("failed to read metadata at {path:?}"))?;
-
-        if metadata.is_dir() {
-            clean_flat_files(&path, referenced_files, removed)?;
-            remove_dir_if_empty(&path);
-            continue;
-        }
-
-        remove_unreferenced_file(&path, metadata.len(), referenced_files, removed)?;
-    }
-
-    remove_dir_if_empty(root);
-
-    Ok(())
-}
-
-/// 清理带分片子目录的缓存文件，保留仍被数据库引用的文件名。
-fn clean_sharded_files(
-    root: &Path,
-    referenced_files: &HashSet<String>,
-    removed: &mut CleanCacheStats,
-) -> Result<()> {
-    clean_flat_files(root, referenced_files, removed)
-}
-
-/// 文件名不在引用集合中时删除该文件，并累计删除数量与字节数。
-fn remove_unreferenced_file(
-    path: &Path,
-    file_bytes: u64,
-    referenced_files: &HashSet<String>,
-    removed: &mut CleanCacheStats,
-) -> Result<()> {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(());
-    };
-    if referenced_files.contains(file_name) {
-        return Ok(());
-    }
-
-    fs::remove_file(path).with_context(|| format!("failed to remove cache file {path:?}"))?;
-    removed.files += 1;
-    removed.bytes += file_bytes;
-
-    Ok(())
-}
-
-/// 尽力删除空目录；非空、缺失或无权限时由文件清理主流程处理即可。
-fn remove_dir_if_empty(path: &Path) {
-    let _ = fs::remove_dir(path);
-}
-
 /// 统计设置主文件大小。
 fn settings_bytes(app: &AppHandle) -> Result<u64> {
     let settings_path = crate::core::paths::config_dir(app)?.join("settings.json");
@@ -572,33 +474,6 @@ fn file_size(path: &Path) -> Result<u64> {
     Ok(fs::metadata(path)
         .with_context(|| format!("failed to read metadata at {path:?}"))?
         .len())
-}
-
-/// 递归统计目录大小；目录不存在时按 0 处理。
-fn dir_size(path: &Path) -> Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-
-    let mut total = 0;
-    for entry in
-        fs::read_dir(path).with_context(|| format!("failed to read directory at {path:?}"))?
-    {
-        let entry = entry.with_context(|| format!("failed to read entry under {path:?}"))?;
-        let entry_path = entry.path();
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("failed to read metadata at {entry_path:?}"))?;
-
-        if metadata.is_dir() {
-            total += dir_size(&entry_path)?;
-            continue;
-        }
-
-        total += metadata.len();
-    }
-
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -636,9 +511,9 @@ mod tests {
         fs::write(root.join("drop.png"), b"drop-this").unwrap();
 
         let referenced = HashSet::from(["keep.png".to_string()]);
-        let mut removed = CleanCacheStats::default();
+        let mut removed = shared_files::CleanupStats::default();
 
-        clean_flat_files(&root, &referenced, &mut removed).unwrap();
+        clean_unreferenced_files(&root, &referenced, &mut removed).unwrap();
 
         assert!(root.join("keep.png").exists());
         assert!(!root.join("drop.png").exists());
@@ -654,9 +529,9 @@ mod tests {
         fs::create_dir_all(&shard).unwrap();
         fs::write(shard.join("abandoned.png"), b"x").unwrap();
 
-        let mut removed = CleanCacheStats::default();
+        let mut removed = shared_files::CleanupStats::default();
 
-        clean_sharded_files(&root, &HashSet::new(), &mut removed).unwrap();
+        clean_unreferenced_files(&root, &HashSet::new(), &mut removed).unwrap();
 
         assert_eq!(removed.files, 1);
         assert!(!shard.exists());

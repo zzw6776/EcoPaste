@@ -12,8 +12,9 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::clipboard::{
     add_app_from_path, build_item_with_settings, delete_unreferenced_apps, detect_frontmost,
-    materialize_source, persist_and_notify, refresh_running_apps, sanitize_css_color, AppIconStore,
-    AppsRegistry, ClipboardReader, FileIconStore, ImageStore, WritebackGuard,
+    materialize_source, persist_and_notify, refresh_running_apps, sanitize_css_color,
+    validate_image_file_name, AppIconStore, AppsRegistry, ClipboardReader, FileIconStore,
+    ImageStore, WritebackGuard,
 };
 use crate::core::{AppError, Result};
 use crate::db::items::{
@@ -86,6 +87,7 @@ pub async fn read_clipboard(
     // 注意：手动「重新读取」时前台应用就是 EcoPaste 自己，不像 OS 监听场景能拿到原应用——
     // 这里仍保留探测：若用户在外部应用复制后立刻命令式触发，多少能捕获到正确来源；
     // 命中我们自己也无害（apps 表只是多记一条「EcoPaste」）。
+    let _files_guard = crate::clipboard::shared_files::lock().await;
     let (item_opt, source) = {
         let source = detect_frontmost(&app_icon_store, &registry);
         let reader = ClipboardReader::new()?;
@@ -318,7 +320,7 @@ async fn android_clipboard_file_path(
     index: usize,
 ) -> Result<PathBuf> {
     let pool = db.pool().await;
-    let item = match find_item_by_id(&pool, id).await {
+    let mut item = match find_item_by_id(&pool, id).await {
         Ok(Some(item)) => item,
         Ok(None) => {
             log_android_file_action(&format!("rust.{action}.item_missing"), format!("id={id}"));
@@ -335,6 +337,7 @@ async fn android_clipboard_file_path(
             return Err(error);
         }
     };
+    resolve_managed_file_content(app, &mut item)?;
     let (path, path_count) = match item.kind {
         ClipboardKind::Image if index == 0 => {
             validate_image_file_name(&item.content)?;
@@ -510,9 +513,10 @@ pub async fn get_clipboard_preview_payload(
     item_id: String,
 ) -> Result<Option<ClipboardPreviewPayload>> {
     let pool = db.pool().await;
-    let Some(item) = find_item_by_id(&pool, &item_id).await? else {
+    let Some(mut item) = find_item_by_id(&pool, &item_id).await? else {
         return Ok(None);
     };
+    resolve_managed_file_content(&app, &mut item)?;
 
     let redact_sensitive = app
         .state::<SettingsStore>()
@@ -553,9 +557,10 @@ pub async fn write_to_clipboard(
     _plain: bool,
 ) -> Result<()> {
     let pool = db.pool().await;
-    let item = find_item_by_id(&pool, &id)
+    let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    resolve_managed_file_content(&app, &mut item)?;
 
     let settings = app.state::<SettingsStore>().snapshot();
     #[cfg(not(target_os = "android"))]
@@ -599,9 +604,10 @@ pub async fn paste_clipboard_item(
     ensure_macos_paste_permission(&app).await?;
 
     let pool = db.pool().await;
-    let item = find_item_by_id(&pool, &id)
+    let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    resolve_managed_file_content(&app, &mut item)?;
 
     #[cfg(not(target_os = "android"))]
     let settings = app.state::<SettingsStore>().snapshot();
@@ -802,6 +808,7 @@ pub async fn list_clipboard_items(
     let file_entry_limit = settings.clipboard.display.file_entry_limit();
     let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
     for item in &mut items {
+        resolve_managed_file_content(&app, item)?;
         attach_source_app_icon_path(&app_icon_store, item);
         attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
         attach_image_thumbnail_path(&image_store, item).await?;
@@ -835,6 +842,7 @@ pub async fn get_clipboard_item(
     let pool = db.pool().await;
     let mut item = find_item_for_list_by_id(&pool, &id).await?;
     if let Some(item) = item.as_mut() {
+        resolve_managed_file_content(&app, item)?;
         let settings = app.state::<SettingsStore>().snapshot();
         let file_entry_limit = settings.clipboard.display.file_entry_limit();
         let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
@@ -1645,14 +1653,22 @@ pub async fn delete_clipboard_item(
     store: State<'_, ImageStore>,
     id: String,
 ) -> Result<()> {
+    let _resource_guard = crate::clipboard::shared_files::lock().await;
+    let resources = crate::core::paths::resources_dir(&app)?;
     let pool = db.pool().await;
     if let Some(outcome) = crate::db::items::delete_item(&pool, &id).await? {
-        if let Some(file_name) = outcome.image_file_name {
-            if let Err(err) = store.remove(&file_name) {
-                log::warn!("remove deleted image {file_name} failed: {err}");
-            }
+        let image_files = outcome.image_file_name.into_iter().collect::<Vec<_>>();
+        if let Err(error) =
+            crate::clipboard::cache::reclaim_deleted_images(&pool, store.inner(), &image_files)
+                .await
+        {
+            log::warn!("reclaim deleted image resources failed: {error:#}");
         }
-        crate::clipboard::shared_files::cleanup_after_delete(&app).await;
+        if let Err(error) =
+            crate::clipboard::shared_files::cleanup_resources_locked(&pool, resources).await
+        {
+            log::warn!("reclaim deleted file resources failed: {error:#}");
+        }
         crate::sync::notify_local_state_changed(&app);
     }
     Ok(())
@@ -1667,15 +1683,22 @@ pub async fn clear_clipboard_items(
     delete_favorites: bool,
     delete_pinned: bool,
 ) -> Result<u64> {
+    let _resource_guard = crate::clipboard::shared_files::lock().await;
+    let resources = crate::core::paths::resources_dir(&app)?;
     let pool = db.pool().await;
     let outcome = clear_items(&pool, delete_favorites, delete_pinned).await?;
 
-    for file_name in &outcome.image_files {
-        if let Err(err) = store.remove(file_name) {
-            log::warn!("remove cleared image {file_name} failed: {err}");
-        }
+    if let Err(error) =
+        crate::clipboard::cache::reclaim_deleted_images(&pool, store.inner(), &outcome.image_files)
+            .await
+    {
+        log::warn!("reclaim cleared image resources failed: {error:#}");
     }
-    crate::clipboard::shared_files::cleanup_after_delete(&app).await;
+    if let Err(error) =
+        crate::clipboard::shared_files::cleanup_resources_locked(&pool, resources).await
+    {
+        log::warn!("reclaim cleared file resources failed: {error:#}");
+    }
 
     if let Err(err) = app.emit(
         CLIPBOARD_UPDATED_EVENT,
@@ -1810,9 +1833,10 @@ pub async fn reveal_clipboard_item(
     use tauri_plugin_opener::OpenerExt;
 
     let pool = db.pool().await;
-    let item = find_item_by_id(&pool, &id)
+    let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    resolve_managed_file_content(&app, &mut item)?;
 
     let target = if item.kind == ClipboardKind::Files {
         item.content
@@ -1833,20 +1857,12 @@ pub async fn reveal_clipboard_item(
         .map_err(|err| AppError::Clipboard(err.to_string()))
 }
 
-/// 校验图片文件名：必须是单层 `<name>.png`，不含路径分隔符 / 父目录引用。
-fn validate_image_file_name(file_name: &str) -> Result<()> {
-    let invalid = file_name.is_empty()
-        || file_name.contains('/')
-        || file_name.contains('\\')
-        || file_name.contains("..")
-        || !file_name.ends_with(".png");
-
-    if invalid {
-        return Err(AppError::Clipboard(format!(
-            "invalid image file name: {file_name:?}"
-        )));
-    }
-    Ok(())
+/// Materializes stable managed references only at OS/UI boundaries.
+fn resolve_managed_file_content(app: &AppHandle, item: &mut ClipboardItem) -> Result<()> {
+    let resources = crate::core::paths::resources_dir(app)?;
+    Ok(crate::clipboard::shared_files::resolve_item_content(
+        &resources, item,
+    )?)
 }
 
 #[cfg(test)]

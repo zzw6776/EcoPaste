@@ -2,6 +2,7 @@
 pub(crate) mod android_share;
 mod app_store;
 mod apps_registry;
+pub(crate) mod cache;
 pub(crate) mod cleanup;
 mod detect;
 mod file_icon_store;
@@ -41,6 +42,7 @@ pub use sound::play_copy_sound;
 pub use source::detect_frontmost;
 #[cfg(target_os = "android")]
 pub use source::FrontmostApp;
+pub(crate) use storage::validate_image_file_name;
 pub use storage::ImageStore;
 #[cfg(target_os = "android")]
 pub use watcher::capture_android_text;
