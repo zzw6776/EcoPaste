@@ -17,8 +17,8 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     let service = HubService::new(
         repository.clone(),
         directory.path().join("blobs"),
-        1024 * 1024,
         10 * 1024 * 1024,
+        ecopaste_sync_protocol::QuotaPolicy::default(),
         90,
         100_000,
     );
@@ -267,6 +267,46 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     upload_blob(&connection, &group_id, &access_token, &blob_id, blob).await?;
     let downloaded = download_blob(&connection, &group_id, &access_token, &blob_id).await?;
     assert_eq!(downloaded, blob);
+
+    let streamed_blob = b"streamed-encrypted-file-payload";
+    let streamed_blob_id = "a".repeat(64);
+    upload_stream_blob(
+        &connection,
+        &group_id,
+        &access_token,
+        &streamed_blob_id,
+        streamed_blob,
+    )
+    .await?;
+    let downloaded =
+        download_blob(&connection, &group_id, &access_token, &streamed_blob_id).await?;
+    assert_eq!(downloaded, streamed_blob);
+
+    let uncommitted_blob_id = "b".repeat(64);
+    let response = upload_invalid_stream_blob(
+        &connection,
+        &group_id,
+        &access_token,
+        &uncommitted_blob_id,
+        streamed_blob,
+    )
+    .await?;
+    assert!(matches!(response, Response::Error { .. }));
+    assert!(matches!(
+        call(
+            &connection,
+            Request::GetBlob {
+                group_id: group_id.clone(),
+                access_token: access_token.clone(),
+                blob_id: uncommitted_blob_id,
+            },
+        )
+        .await?,
+        Response::Error {
+            code: ErrorCode::NotFound,
+            ..
+        }
+    ));
 
     let (mut asset_watch_send, mut asset_watch_recv) = connection.open_bi().await?;
     write_frame(
@@ -734,6 +774,80 @@ async fn upload_blob(
         Response::BlobStored
     );
     Ok(())
+}
+
+async fn upload_stream_blob(
+    connection: &Connection,
+    group_id: &str,
+    access_token: &[u8],
+    blob_id: &str,
+    blob: &[u8],
+) -> Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(
+        &mut send,
+        &Request::PutStreamBlob {
+            group_id: group_id.into(),
+            access_token: access_token.to_vec(),
+            blob_id: blob_id.into(),
+            size: blob.len() as u64,
+        },
+    )
+    .await?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobReady { size: 0 }
+    );
+    send.write_all(blob).await?;
+    write_frame(
+        &mut send,
+        &Request::CommitStreamBlob {
+            blob_id: blob_id.into(),
+        },
+    )
+    .await?;
+    send.finish()?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobStored
+    );
+    Ok(())
+}
+
+async fn upload_invalid_stream_blob(
+    connection: &Connection,
+    group_id: &str,
+    access_token: &[u8],
+    blob_id: &str,
+    blob: &[u8],
+) -> Result<Response> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(
+        &mut send,
+        &Request::PutStreamBlob {
+            group_id: group_id.into(),
+            access_token: access_token.to_vec(),
+            blob_id: blob_id.into(),
+            size: blob.len() as u64,
+        },
+    )
+    .await?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobReady { size: 0 }
+    );
+    send.write_all(blob).await?;
+    write_frame(
+        &mut send,
+        &Request::CommitStreamBlob {
+            blob_id: "c".repeat(64),
+        },
+    )
+    .await?;
+    send.finish()?;
+    read_frame(&mut recv)
+        .await
+        .context("read rejected stream upload")
 }
 
 async fn upload_source_icon(

@@ -524,7 +524,7 @@ pub async fn apply_remote_patch(
                 .filter_map(|(kind, content)| (kind == ClipboardKind::Image).then_some(content)),
         );
     } else {
-        materialize_state(&mut transaction, &patch.sync_key).await?;
+        materialize_state_on(&mut transaction, &patch.sync_key).await?;
     }
 
     let item_id = sqlx::query_scalar(
@@ -631,7 +631,7 @@ async fn merge_note_field(
     Ok(result.rows_affected() == 1)
 }
 
-async fn materialize_state(
+pub(crate) async fn materialize_state_on(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     sync_key: &str,
 ) -> Result<()> {
@@ -666,12 +666,13 @@ async fn materialize_state(
 }
 
 /// Applies retained state after clipboard content has been inserted.
+#[cfg(test)]
 pub async fn materialize_for_content(pool: &SqlitePool, sync_key: &str) -> Result<()> {
     let mut transaction = pool
         .begin()
         .await
         .context("begin item state materialization")?;
-    materialize_state(&mut transaction, sync_key).await?;
+    materialize_state_on(&mut transaction, sync_key).await?;
     transaction
         .commit()
         .await
@@ -821,6 +822,7 @@ mod tests {
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
+            remote_file_state: None,
             available_actions: Vec::new(),
             color_preview: None,
             display_created_at: String::new(),

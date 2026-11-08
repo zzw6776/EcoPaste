@@ -1,7 +1,7 @@
 import type { DragEvent, FC, MouseEvent, PointerEvent, Ref } from "react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { SyncItemStatus } from "@/commands";
+import type { SyncItemStatus, TransferTask } from "@/commands";
 import { popupClipboardItemMenu, startDragClipboardItem } from "@/commands";
 import AssetImage from "@/components/AssetImage";
 import type { ItemActionLabels } from "@/constants/itemActions";
@@ -50,6 +50,7 @@ interface ClipboardCardProps {
   rootRef?: Ref<HTMLDivElement>;
   syncStatus?: SyncItemStatus;
   onSyncStatusChange?: (status: SyncItemStatus) => void;
+  transferTasks?: TransferTask[];
 }
 
 /**
@@ -86,6 +87,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     rootRef,
     syncStatus,
     onSyncStatusChange,
+    transferTasks,
   } = props;
   const {
     kind,
@@ -235,7 +237,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
           : "h-full",
         isSelected && !isMob ? "z-10" : "hover:shadow-md",
       )}
-      draggable={!isMob}
+      draggable={!isMob && !item.remoteFileState}
       onAuxClick={onAuxClick}
       onClick={onClick}
       onContextMenu={handleContextMenu}
@@ -339,7 +341,9 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                 />
               )}
               {kind === "image" && <ImageCard {...item} />}
-              {kind === "files" && <FilesCard {...item} />}
+              {kind === "files" && (
+                <FilesCard {...item} transferTasks={transferTasks} />
+              )}
             </NoteContentSwitcher>
           ) : (
             <>
@@ -352,7 +356,9 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                 />
               )}
               {kind === "image" && <ImageCard {...item} />}
-              {kind === "files" && <FilesCard {...item} />}
+              {kind === "files" && (
+                <FilesCard {...item} transferTasks={transferTasks} />
+              )}
             </>
           )}
         </div>

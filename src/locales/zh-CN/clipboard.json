@@ -95,6 +95,20 @@
     "star": "收藏",
     "starActive": "取消收藏"
   },
+  "remoteFile": {
+    "cancel": "取消",
+    "canceled": "下载已取消",
+    "completed": "已保存到所选位置",
+    "confirming": "正在校验并保存",
+    "connecting": "正在连接",
+    "download": "下载",
+    "eta": "预计 {{seconds}} 秒",
+    "expired": "远端已过期",
+    "failed": "下载失败，点击重试",
+    "notDownloaded": "未下载",
+    "queued": "等待下载",
+    "transferring": "正在下载"
+  },
   "shortcuts": {
     "closePreviewFilterWindow": "关闭预览 / 筛选 / 窗口",
     "copySelected": "复制选中项",
@@ -221,6 +235,42 @@
       "direct": "直连",
       "relay": "中继",
       "unknown": "连接方式未知"
+    }
+  },
+  "transfer": {
+    "upload": {
+      "canceled": "上传已取消",
+      "completed": "上传完成",
+      "confirming": "等待对端确认",
+      "connecting": "正在连接",
+      "failed": "上传失败",
+      "preparing": "正在准备上传",
+      "queued": "等待上传",
+      "transferring": "正在上传"
+    }
+  },
+  "transferCenter": {
+    "download": {
+      "canceled": "下载已取消",
+      "completed": "下载完成",
+      "confirming": "正在保存",
+      "connecting": "正在连接下载",
+      "failed": "下载失败",
+      "queued": "等待下载",
+      "transferring": "正在下载"
+    },
+    "empty": "暂无传输任务",
+    "retry": "重试",
+    "title": "传输任务",
+    "upload": {
+      "canceled": "上传已取消",
+      "completed": "上传完成",
+      "confirming": "等待确认",
+      "connecting": "正在连接上传",
+      "failed": "上传失败",
+      "preparing": "正在准备上传",
+      "queued": "等待上传",
+      "transferring": "正在上传"
     }
   },
   "types": {

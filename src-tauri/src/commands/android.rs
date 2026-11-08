@@ -46,6 +46,31 @@ pub struct AndroidFileActionResult {
 }
 
 #[cfg(target_os = "android")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct AndroidRemoteDownloadTarget {
+    pub status: String,
+    pub uri: String,
+    pub message: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct AndroidRemoteDownloadSink {
+    pub status: String,
+    pub fd: i32,
+    pub token: String,
+    pub message: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Deserialize)]
+struct AndroidRemoteDownloadFinishResult {
+    status: String,
+    message: String,
+    uri: String,
+}
+
+#[cfg(target_os = "android")]
 static GLOBAL_VM: std::sync::OnceLock<jni::JavaVM> = std::sync::OnceLock::new();
 #[cfg(target_os = "android")]
 static GLOBAL_CONTEXT: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
@@ -1176,6 +1201,152 @@ mod jni_bridge {
         file_action("saveClipboardFile", path)
     }
 
+    pub fn pick_remote_download_target() -> Result<AndroidRemoteDownloadTarget> {
+        with_jni_env(|env, context, bridge_class| {
+            let result = env
+                .call_static_method(
+                    bridge_class,
+                    "pickRemoteDownloadTarget",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(context)],
+                )
+                .map_err(|error| anyhow!("call pickRemoteDownloadTarget failed: {error}"))?;
+            let result: JString = result
+                .l()
+                .map_err(|error| anyhow!("extract remote download target failed: {error}"))?
+                .into();
+            let json = env
+                .get_string(&result)
+                .map(String::from)
+                .map_err(|error| anyhow!("read remote download target failed: {error}"))?;
+            serde_json::from_str(&json)
+                .map_err(|error| anyhow!("parse remote download target failed: {error}").into())
+        })
+    }
+
+    pub fn open_remote_download_sink(
+        target_uri: &str,
+        file_name: &str,
+        mime_type: &str,
+        directory_archive: bool,
+    ) -> Result<AndroidRemoteDownloadSink> {
+        with_jni_env(|env, context, bridge_class| {
+            let target_uri = env
+                .new_string(target_uri)
+                .map_err(|error| anyhow!("encode remote destination failed: {error}"))?;
+            let file_name = env
+                .new_string(file_name)
+                .map_err(|error| anyhow!("encode remote file name failed: {error}"))?;
+            let mime_type = env
+                .new_string(mime_type)
+                .map_err(|error| anyhow!("encode remote file MIME type failed: {error}"))?;
+            let result = env
+                .call_static_method(
+                    bridge_class,
+                    "openRemoteDownloadSink",
+                    "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;",
+                    &[
+                        JValue::Object(context),
+                        JValue::Object(&target_uri),
+                        JValue::Object(&file_name),
+                        JValue::Object(&mime_type),
+                        JValue::Bool(directory_archive as u8),
+                    ],
+                )
+                .map_err(|error| anyhow!("call openRemoteDownloadSink failed: {error}"))?;
+            let result: JString = result
+                .l()
+                .map_err(|error| anyhow!("extract remote download sink failed: {error}"))?
+                .into();
+            let json = env
+                .get_string(&result)
+                .map(String::from)
+                .map_err(|error| anyhow!("read remote download sink failed: {error}"))?;
+            serde_json::from_str(&json)
+                .map_err(|error| anyhow!("parse remote download sink failed: {error}").into())
+        })
+    }
+
+    pub fn finish_remote_download_sink(token: &str, success: bool) -> Result<String> {
+        with_jni_env(|env, context, bridge_class| {
+            let token = env
+                .new_string(token)
+                .map_err(|error| anyhow!("encode remote download token failed: {error}"))?;
+            let result = env
+                .call_static_method(
+                    bridge_class,
+                    "finishRemoteDownloadSink",
+                    "(Landroid/content/Context;Ljava/lang/String;Z)Ljava/lang/String;",
+                    &[
+                        JValue::Object(context),
+                        JValue::Object(&token),
+                        JValue::Bool(success as u8),
+                    ],
+                )
+                .map_err(|error| anyhow!("call finishRemoteDownloadSink failed: {error}"))?;
+            let result: JString = result
+                .l()
+                .map_err(|error| anyhow!("extract remote download finish failed: {error}"))?
+                .into();
+            let json = env
+                .get_string(&result)
+                .map(String::from)
+                .map_err(|error| anyhow!("read remote download finish failed: {error}"))?;
+            let result: AndroidRemoteDownloadFinishResult = serde_json::from_str(&json)
+                .map_err(|error| anyhow!("parse remote download finish failed: {error}"))?;
+            if result.status == "success" || result.status == "cancelled" {
+                return Ok(result.uri);
+            }
+            Err(anyhow!(result.message).into())
+        })
+    }
+
+    pub fn cancel_remote_download_sink(token: &str) -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            let token = env
+                .new_string(token)
+                .map_err(|error| anyhow!("encode remote download token failed: {error}"))?;
+            env.call_static_method(
+                bridge_class,
+                "cancelRemoteDownloadSink",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&token)],
+            )
+            .map_err(|error| anyhow!("call cancelRemoteDownloadSink failed: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn discard_remote_download_document(uri: &str) -> Result<()> {
+        with_jni_env(|env, context, bridge_class| {
+            let uri = env
+                .new_string(uri)
+                .map_err(|error| anyhow!("encode remote document URI failed: {error}"))?;
+            let result = env
+                .call_static_method(
+                    bridge_class,
+                    "discardRemoteDownloadDocument",
+                    "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(context), JValue::Object(&uri)],
+                )
+                .map_err(|error| anyhow!("call discardRemoteDownloadDocument failed: {error}"))?;
+            let result: JString = result
+                .l()
+                .map_err(|error| anyhow!("extract remote document cleanup failed: {error}"))?
+                .into();
+            let json = env
+                .get_string(&result)
+                .map(String::from)
+                .map_err(|error| anyhow!("read remote document cleanup failed: {error}"))?;
+            let result: AndroidFileActionResult = serde_json::from_str(&json)
+                .map_err(|error| anyhow!("parse remote document cleanup failed: {error}"))?;
+            if result.status == "success" {
+                return Ok(());
+            }
+            Err(anyhow!(result.message).into())
+        })
+    }
+
     pub fn open_package_installer(path: &std::path::Path) -> Result<()> {
         let result = file_action("openPackageInstaller", path)?;
         if result.status == "success" {
@@ -1314,6 +1485,94 @@ pub fn save_android_clipboard_file_path(path: &std::path::Path) -> Result<Androi
             message: String::new(),
         })
     }
+}
+
+/// Opens Android's destination directory picker without creating an app-managed file copy.
+#[cfg(target_os = "android")]
+pub fn pick_android_remote_download_target() -> Result<Option<AndroidRemoteDownloadTarget>> {
+    let result = jni_bridge::pick_remote_download_target()?;
+    match result.status.as_str() {
+        "success" if !result.uri.is_empty() => Ok(Some(result)),
+        "cancelled" => Ok(None),
+        _ => {
+            log::warn!(
+                "Android remote download picker failed: status={} error={}",
+                result.status,
+                result.message
+            );
+            Err(anyhow::anyhow!(crate::i18n::commands::label(
+                APP_HANDLE
+                    .get()
+                    .map(crate::i18n::current_language)
+                    .unwrap_or_default(),
+                crate::i18n::commands::Key::AndroidFileSaveFailed,
+            ))
+            .into())
+        }
+    }
+}
+
+/// Returns a raw descriptor owned by Rust until the streamed download is finalized.
+#[cfg(target_os = "android")]
+pub fn open_android_remote_download_sink(
+    target: &AndroidRemoteDownloadTarget,
+    file_name: &str,
+    mime_type: &str,
+    directory_archive: bool,
+) -> Result<AndroidRemoteDownloadSink> {
+    let result = jni_bridge::open_remote_download_sink(
+        &target.uri,
+        file_name,
+        mime_type,
+        directory_archive,
+    )?;
+    if result.status == "success" && result.fd >= 0 && !result.token.is_empty() {
+        return Ok(result);
+    }
+    log::warn!(
+        "Android remote download sink failed: status={} error={}",
+        result.status,
+        result.message
+    );
+    Err(anyhow::anyhow!(crate::i18n::commands::label(
+        APP_HANDLE
+            .get()
+            .map(crate::i18n::current_language)
+            .unwrap_or_default(),
+        crate::i18n::commands::Key::AndroidFileSaveFailed,
+    ))
+    .into())
+}
+
+/// Commits or removes the Android Storage Access Framework destination.
+#[cfg(target_os = "android")]
+pub fn finish_android_remote_download_sink(token: &str, success: bool) -> Result<String> {
+    match jni_bridge::finish_remote_download_sink(token, success) {
+        Ok(uri) => Ok(uri),
+        Err(error) => {
+            log::warn!("Android remote download finalization failed: {error:#}");
+            Err(anyhow::anyhow!(crate::i18n::commands::label(
+                APP_HANDLE
+                    .get()
+                    .map(crate::i18n::current_language)
+                    .unwrap_or_default(),
+                crate::i18n::commands::Key::AndroidFileSaveFailed,
+            ))
+            .into())
+        }
+    }
+}
+
+/// Signals an in-progress Android directory extraction to stop and roll back.
+#[cfg(target_os = "android")]
+pub fn cancel_android_remote_download_sink(token: &str) -> Result<()> {
+    jni_bridge::cancel_remote_download_sink(token)
+}
+
+/// Removes one document committed as part of a failed multi-file download.
+#[cfg(target_os = "android")]
+pub fn discard_android_remote_download_document(uri: &str) -> Result<()> {
+    jni_bridge::discard_remote_download_document(uri)
 }
 
 /// Opens Android's package installer for an APK downloaded into app-private storage.

@@ -268,6 +268,11 @@ pub(crate) async fn receive(
     })
     .await?;
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
+    let delivery_route = app
+        .try_state::<std::sync::Arc<crate::sync::SyncManager>>()
+        .is_some_and(|manager| manager.has_connected_lan_peer())
+        .then_some(crate::db::sync_queue::ContentDeliveryRoute::Lan)
+        .unwrap_or(crate::db::sync_queue::ContentDeliveryRoute::Cloud);
     for item in items {
         match super::watcher::persist_and_notify_with_sync(
             app,
@@ -277,6 +282,7 @@ pub(crate) async fn receive(
             None,
             Some(crate::db::sync_queue::ContentSyncOptions {
                 manual_share: true,
+                delivery_route: Some(delivery_route),
                 ..Default::default()
             }),
         )

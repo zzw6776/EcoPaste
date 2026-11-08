@@ -107,6 +107,31 @@ fn event(index: u64, size: usize) -> EncryptedEvent {
 }
 
 #[test]
+fn lan_content_plan_is_frame_bounded_without_skipping_event_order() {
+    let events = (0..4)
+        .map(|index| event(index, 3 * 1024 * 1024))
+        .collect::<Vec<_>>();
+    let mut request = Request::PlanLanContent {
+        group_id: "group".into(),
+        access_token: vec![7; 32],
+        device_id: "device".into(),
+        events: events.clone(),
+    };
+
+    let count = limit_lan_content_plan(&mut request).unwrap();
+    let encoded = minicbor::to_vec(&request).unwrap();
+    assert!(encoded.len() <= MAX_FRAME_BYTES);
+    assert!(count > 0 && count < events.len());
+    let Request::PlanLanContent {
+        events: planned, ..
+    } = request
+    else {
+        panic!("expected LAN content plan")
+    };
+    assert_eq!(planned, events[..count]);
+}
+
+#[test]
 fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
     let events = (0..4)
         .map(|cursor| CloudEvent {

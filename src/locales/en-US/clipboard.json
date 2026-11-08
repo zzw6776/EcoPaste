@@ -95,6 +95,20 @@
     "star": "Favorite",
     "starActive": "Unfavorite"
   },
+  "remoteFile": {
+    "cancel": "Cancel",
+    "canceled": "Download canceled",
+    "completed": "Saved to the selected location",
+    "confirming": "Verifying and saving",
+    "connecting": "Connecting",
+    "download": "Download",
+    "eta": "about {{seconds}}s remaining",
+    "expired": "Remote file expired",
+    "failed": "Download failed; click to retry",
+    "notDownloaded": "Not downloaded",
+    "queued": "Waiting to download",
+    "transferring": "Downloading"
+  },
   "shortcuts": {
     "closePreviewFilterWindow": "Close preview / filters / window",
     "copySelected": "Copy selected item",
@@ -221,6 +235,42 @@
       "direct": "Direct",
       "relay": "Relay",
       "unknown": "Unknown route"
+    }
+  },
+  "transfer": {
+    "upload": {
+      "canceled": "Upload canceled",
+      "completed": "Upload complete",
+      "confirming": "Waiting for confirmation",
+      "connecting": "Connecting",
+      "failed": "Upload failed",
+      "preparing": "Preparing upload",
+      "queued": "Waiting to upload",
+      "transferring": "Uploading"
+    }
+  },
+  "transferCenter": {
+    "download": {
+      "canceled": "Download canceled",
+      "completed": "Download complete",
+      "confirming": "Saving",
+      "connecting": "Connecting download",
+      "failed": "Download failed",
+      "queued": "Waiting to download",
+      "transferring": "Downloading"
+    },
+    "empty": "No transfers",
+    "retry": "Retry",
+    "title": "Transfers",
+    "upload": {
+      "canceled": "Upload canceled",
+      "completed": "Upload complete",
+      "confirming": "Waiting for confirmation",
+      "connecting": "Connecting upload",
+      "failed": "Upload failed",
+      "preparing": "Preparing upload",
+      "queued": "Waiting to upload",
+      "transferring": "Uploading"
     }
   },
   "types": {

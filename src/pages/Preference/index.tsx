@@ -386,6 +386,12 @@ const Preference: FC = () => {
             onTabSelect={handleTabSelect}
             storageLimitBytes={settings.clipboard.history.maxStorageBytes}
             storageState={storageState}
+            storageTargetPercent={
+              settings.clipboard.history.storageCleanupTargetPercent
+            }
+            storageTriggerPercent={
+              settings.clipboard.history.storageCleanupTriggerPercent
+            }
             usedBytes={usedBytes}
           />
         ) : null}

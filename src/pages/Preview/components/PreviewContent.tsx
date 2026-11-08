@@ -78,6 +78,8 @@ export const PreviewHeader: FC<PreviewHeaderProps> = (props) => {
       void writeToClipboard(payload.id, false);
     }
   };
+  const isRemoteFile =
+    payload.kind === "files" && payload.files.some((file) => file.isRemote);
 
   return (
     <div className="relative flex h-10 shrink-0 select-none items-center justify-between bg-transparent px-3.5">
@@ -110,14 +112,16 @@ export const PreviewHeader: FC<PreviewHeaderProps> = (props) => {
         )}
 
         {/* 复制操作 */}
-        <button
-          className="flex cursor-pointer items-center gap-1 rounded-[6px] bg-black/[0.05] px-2.5 py-0.5 font-medium text-neutral-700 text-xs transition-colors hover:bg-black/10 dark:bg-white/10 dark:text-neutral-200 dark:hover:bg-white/15"
-          onClick={handleCopy}
-          type="button"
-        >
-          <i className="i-lucide:copy size-3" />
-          <span>复制</span>
-        </button>
+        {!isRemoteFile && (
+          <button
+            className="flex cursor-pointer items-center gap-1 rounded-[6px] bg-black/[0.05] px-2.5 py-0.5 font-medium text-neutral-700 text-xs transition-colors hover:bg-black/10 dark:bg-white/10 dark:text-neutral-200 dark:hover:bg-white/15"
+            onClick={handleCopy}
+            type="button"
+          >
+            <i className="i-lucide:copy size-3" />
+            <span>复制</span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -331,7 +335,7 @@ const FilesViewer: FC<PayloadViewerProps> = (props) => {
   function computeFileRowKey(index: number) {
     const file = payload.files[index];
 
-    return file ? `${file.path}:${index}` : index;
+    return file?.entryKey ?? index;
   }
 
   function renderFileRow(index: number) {
@@ -370,9 +374,9 @@ const FilePreviewRow: FC<FilePreviewRowProps> = (props) => {
     <div
       className={cn(
         "flex min-h-10 items-center gap-2 rounded-lg px-3 py-1.5 transition-colors hover:bg-neutral-50 dark:hover:bg-neutral-800",
-        { "opacity-50": !file.exists },
+        { "opacity-50": !file.exists && !file.isRemote },
       )}
-      title={file.path}
+      title={file.isRemote ? file.name : file.path}
     >
       {file.iconPath ? (
         <AssetImage className="size-6 shrink-0" src={file.iconPath} />
@@ -388,14 +392,18 @@ const FilePreviewRow: FC<FilePreviewRowProps> = (props) => {
           className={cn(
             "truncate font-medium text-neutral-800 text-xs dark:text-neutral-200",
             {
-              "line-through": !file.exists,
+              "line-through": !file.exists && !file.isRemote,
             },
           )}
         >
           {file.name}
         </div>
         <div className="truncate text-[11px] text-neutral-400">
-          {file.exists ? file.path : t("file.missingPath")}
+          {file.isRemote
+            ? t("file.remoteNotDownloaded")
+            : file.exists
+              ? file.path
+              : t("file.missingPath")}
         </div>
       </div>
 

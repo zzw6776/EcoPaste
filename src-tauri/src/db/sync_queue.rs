@@ -4,12 +4,29 @@ use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 const LOCAL_OPERATION_SEQUENCE_KEY: &str = "local_operation_sequence";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub enum ContentDeliveryRoute {
+    Lan,
+    Cloud,
+}
+
+impl ContentDeliveryRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
 /// Durable intent carried through staging, background materialization and retries.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContentSyncOptions {
     pub force_files: bool,
     pub history_backfill: bool,
     pub manual_share: bool,
+    pub delivery_route: Option<ContentDeliveryRoute>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
@@ -21,6 +38,7 @@ pub struct ContentOutboxOperation {
     pub force_files: bool,
     pub history_backfill: bool,
     pub manual_share: bool,
+    pub delivery_route: Option<String>,
 }
 
 /// Allocates the durable order shared by local content and item-state operations.
@@ -67,13 +85,14 @@ pub async fn stage_content(
         r#"
         INSERT INTO sync_content_outbox (
             operation_order, item_id, sync_key, source_revision,
-            force_files, history_backfill, manual_share, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            force_files, history_backfill, manual_share, delivery_route, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(item_id, source_revision, force_files, history_backfill) DO UPDATE SET
             attempt_count = 0,
             next_attempt_at = NULL,
             last_error = NULL,
             manual_share = MAX(sync_content_outbox.manual_share, excluded.manual_share),
+            delivery_route = COALESCE(excluded.delivery_route, sync_content_outbox.delivery_route),
             updated_at = excluded.updated_at
         RETURNING operation_order
         "#,
@@ -85,6 +104,7 @@ pub async fn stage_content(
     .bind(options.force_files || options.manual_share)
     .bind(options.history_backfill)
     .bind(options.manual_share)
+    .bind(options.delivery_route.map(ContentDeliveryRoute::as_str))
     .bind(now)
     .bind(now)
     .fetch_one(connection)
@@ -130,7 +150,7 @@ pub async fn next_ready_content(
         r#"
         SELECT current.operation_order, current.item_id, current.sync_key,
                current.source_revision, current.force_files, current.history_backfill,
-               current.manual_share
+               current.manual_share, current.delivery_route
         FROM sync_content_outbox current
         LEFT JOIN clipboard_items item ON item.id = current.item_id
         WHERE (

@@ -140,6 +140,9 @@ pub struct BlobManifest {
     pub file_index: Option<u32>,
     #[n(6)]
     pub is_directory_archive: bool,
+    #[n(7)]
+    #[cbor(default)]
+    pub stream_commitment: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -148,6 +151,47 @@ pub enum BlobRole {
     Image,
     #[n(1)]
     File,
+}
+
+#[cfg(test)]
+mod blob_manifest_tests {
+    use super::*;
+
+    #[derive(Encode)]
+    #[cbor(map)]
+    struct LegacyBlobManifest {
+        #[n(0)]
+        blob_id: String,
+        #[n(1)]
+        name: String,
+        #[n(2)]
+        original_size: u64,
+        #[n(3)]
+        encrypted_size: u64,
+        #[n(4)]
+        role: BlobRole,
+        #[n(5)]
+        file_index: Option<u32>,
+        #[n(6)]
+        is_directory_archive: bool,
+    }
+
+    #[test]
+    fn legacy_blob_manifest_defaults_to_ciphertext_identity() {
+        let encoded = minicbor::to_vec(LegacyBlobManifest {
+            blob_id: "a".repeat(64),
+            name: "example.bin".into(),
+            original_size: 4,
+            encrypted_size: 47,
+            role: BlobRole::File,
+            file_index: Some(0),
+            is_directory_archive: false,
+        })
+        .unwrap();
+        let decoded: BlobManifest = minicbor::decode(&encoded).unwrap();
+
+        assert!(!decoded.stream_commitment);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +211,9 @@ pub struct StoredBlob {
     pub blob_id: String,
     pub encrypted_path: String,
     pub size: u64,
+    pub source_path: Option<String>,
+    pub source_is_directory: bool,
+    pub stream_nonce: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

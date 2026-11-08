@@ -34,10 +34,21 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(target_os = "macos")]
         Key::PasteTargetUnavailable => "无法恢复原输入窗口，请重新唤起后再试",
         Key::SaveImage => "保存图片",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileSave => "保存远端文件",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileSaveDirectory => "选择远端文件保存目录",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileInvalidDestination => "保存位置无效",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileInvalidDirectory => "保存目录无效",
+        Key::RemoteFileNotDownloaded => "远端文件尚未下载，请先选择保存位置",
         Key::SyncDisabled => "请先启用多端同步",
         Key::SyncGroupRequired => "请先创建或加入同步设备组",
         Key::SyncLanDisabled => "局域网同步已关闭",
         Key::SyncOperationPending => "此记录仍在等待前序同步操作，请稍后重试",
+        Key::SyncPreparationFailed => "准备上传失败",
         Key::SyncSensitiveDisabled => "敏感内容同步已关闭",
+        Key::SyncTransferCancelFailed => "取消传输失败",
     }
 }

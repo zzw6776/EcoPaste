@@ -32,6 +32,7 @@ impl TransferQueue {
         blobs: Vec<StoredBlob>,
         key: &[u8; 32],
         require_source_icons: bool,
+        deferred_event_ids: &HashSet<String>,
     ) -> Result<Self> {
         let available: HashMap<_, _> = blobs
             .into_iter()
@@ -44,17 +45,22 @@ impl TransferQueue {
         for stored in events {
             let decrypted = crypto::decrypt_sync_event(key, &stored.event)?;
             let sync_key = decrypted.sync_key().to_owned();
-            let mut required = HashSet::new();
+            let mut referenced = HashSet::new();
             if let DecryptedSyncEvent::Clipboard(envelope) = decrypted {
                 for blob in &envelope.blobs {
-                    required.insert(blob.blob_id.clone());
+                    referenced.insert(blob.blob_id.clone());
                 }
                 if require_source_icons {
                     if let Some(icon) = envelope.source_app.and_then(|app| app.icon) {
-                        required.insert(icon.blob_id);
+                        referenced.insert(icon.blob_id);
                     }
                 }
             }
+            let required = if deferred_event_ids.contains(&stored.event.event_id) {
+                HashSet::new()
+            } else {
+                referenced.clone()
+            };
             let mut failed = false;
             for blob_id in &required {
                 match available.get(blob_id) {
@@ -119,6 +125,13 @@ impl TransferQueue {
             .collect()
     }
 
+    pub fn event_for_blob(&self, blob_id: &str) -> Option<&str> {
+        self.events
+            .iter()
+            .find(|event| !event.failed && !event.complete && event.required.contains(blob_id))
+            .map(|event| event.stored.event.event_id.as_str())
+    }
+
     /// Fails only records requiring this attachment; unrelated uploads remain runnable.
     pub fn fail_blob(&mut self, blob_id: &str) -> Vec<String> {
         let ids = self.events_for_blob(blob_id);
@@ -132,6 +145,27 @@ impl TransferQueue {
                 event.failed = true;
             }
         }
+    }
+
+    /// Removes explicitly canceled records without affecting records sharing the same blob.
+    pub fn cancel_events(&mut self, ids: &HashSet<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        for event in &mut self.events {
+            if ids.contains(&event.stored.event.event_id) {
+                event.complete = true;
+            }
+        }
+        self.failures.retain(|(id, _)| !ids.contains(id));
+    }
+
+    pub fn pending_event_ids(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter(|event| !event.complete)
+            .map(|event| event.stored.event.event_id.clone())
+            .collect()
     }
 
     /// Selects ready records across independent keys, holding updates/deletes behind earlier content.
@@ -209,6 +243,7 @@ mod tests {
                     role: BlobRole::File,
                     file_index: Some(0),
                     is_directory_archive: false,
+                    stream_commitment: false,
                 })
                 .collect(),
             source_app: None,
@@ -226,6 +261,9 @@ mod tests {
                 blob_id: (*id).into(),
                 encrypted_path: (*id).into(),
                 size: 20,
+                source_path: None,
+                source_is_directory: false,
+                stream_nonce: None,
             })
             .collect()
     }
@@ -241,6 +279,7 @@ mod tests {
             blobs(&["slow", "fast", "next"]),
             &KEY,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(queue.next_blob().unwrap().blob_id, "slow");
@@ -282,6 +321,7 @@ mod tests {
             blobs(&["broken", "good"]),
             &KEY,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(queue.fail_blob("broken"), ["content"]);
@@ -303,6 +343,7 @@ mod tests {
             blobs(&["one", "two"]),
             &KEY,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         queue.blob_stored("one".into());
@@ -331,6 +372,7 @@ mod tests {
             blobs(&["shared"]),
             &KEY,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(queue.take_failures().len(), 1);
@@ -340,5 +382,50 @@ mod tests {
         assert_eq!(queue.ready_events().len(), 2);
         queue.confirm_events(&["first".into(), "second".into()]);
         assert!(queue.ready_events().is_empty());
+    }
+
+    #[test]
+    fn canceled_record_does_not_restart_or_block_a_shared_blob() {
+        let mut queue = TransferQueue::new(
+            vec![
+                event("canceled", "a", &["shared"]),
+                event("active", "b", &["shared"]),
+            ],
+            blobs(&["shared"]),
+            &KEY,
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+        queue.cancel_events(&HashSet::from(["canceled".to_owned()]));
+
+        let blob = queue.next_blob().unwrap();
+        assert_eq!(queue.event_for_blob(&blob.blob_id), Some("active"));
+        queue.blob_stored(blob.blob_id);
+
+        let ready = queue.ready_events();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].event.event_id, "active");
+    }
+
+    #[test]
+    fn deferred_file_event_is_ready_without_uploading_its_available_blob() {
+        let mut deferred = HashSet::new();
+        deferred.insert("large".to_owned());
+        let mut queue = TransferQueue::new(
+            vec![
+                event("large", "a", &["large-blob"]),
+                event("small", "b", &["small-blob"]),
+            ],
+            blobs(&["small-blob"]),
+            &KEY,
+            false,
+            &deferred,
+        )
+        .unwrap();
+
+        assert_eq!(queue.next_blob().unwrap().blob_id, "small-blob");
+        assert!(queue.next_blob().is_none());
+        assert_eq!(queue.ready_events()[0].event.event_id, "large");
     }
 }

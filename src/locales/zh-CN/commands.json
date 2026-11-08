@@ -13,6 +13,7 @@
   "labels": {
     "addApp": "添加应用",
     "cancelFavorite": "取消收藏",
+    "cancelSyncTransfer": "取消传输",
     "changeStorageLocation": "更改数据目录",
     "checkForUpdates": "检查更新",
     "cleanCache": "清理缓存",
@@ -26,6 +27,7 @@
     "deleteClipboardGroup": "删除分组",
     "detectLegacyData": "检测旧版数据",
     "discoverNearbySyncSpaces": "发现附近同步空间",
+    "downloadRemoteFiles": "下载远端文件",
     "downloadUpdate": "下载更新",
     "drag": "拖拽",
     "exportBackup": "导出备份",
@@ -40,6 +42,7 @@
     "isClipboardWindowPinned": "读取窗口固定状态",
     "joinSyncGroup": "连接已有设备",
     "leaveSyncGroup": "断开本机连接",
+    "listSyncTransfers": "加载传输任务",
     "loadApps": "加载应用",
     "loadAutostart": "读取开机启动状态",
     "loadClipboardGroups": "加载分组",

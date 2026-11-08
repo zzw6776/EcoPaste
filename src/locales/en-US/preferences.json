@@ -64,6 +64,7 @@
       "hours": "hours",
       "items": "items",
       "mb": "MB",
+      "minutes": "minutes",
       "percent": "%",
       "seconds": "seconds"
     },
@@ -430,12 +431,28 @@
           "title": "Maximum Items"
         },
         "maxStorageBytes": {
-          "description": "Uses binary capacity units (1 GB = 1024 MB) and supports fractional values. Set to 0 for unlimited storage. When the data directory exceeds the limit, the oldest ordinary records are removed to bring usage down to 80%. Favorites and pinned records are kept.",
+          "description": "Uses binary capacity units (1 GB = 1024 MB) and supports fractional values. Set to 0 for unlimited storage. Once usage exceeds the configured trigger percentage, the oldest ordinary records are removed. Favorites and pinned records are kept.",
           "title": "Local storage limit"
         },
         "retention": {
           "description": "Regular records older than this many days are cleaned automatically; favorites and pinned items are always kept. 0 disables time-based cleanup.",
           "title": "Retention Period"
+        },
+        "storageCheckMinIntervalMinutes": {
+          "description": "After clipboard changes, capacity is measured at most this often to avoid repeated disk scans during copy bursts.",
+          "title": "Minimum capacity check interval"
+        },
+        "storageCleanupTargetPercent": {
+          "description": "After capacity cleanup starts, continue until usage reaches this percentage. It must be below the trigger percentage.",
+          "title": "Capacity cleanup target"
+        },
+        "storageCleanupTriggerPercent": {
+          "description": "Start cleanup when local usage exceeds this percentage of the storage limit.",
+          "title": "Capacity cleanup trigger"
+        },
+        "storageFallbackIntervalMinutes": {
+          "description": "When the clipboard is quiet, check at this interval for silent growth such as sync downloads. It cannot be shorter than the minimum capacity check interval.",
+          "title": "Capacity fallback interval"
         }
       },
       "localData": {
@@ -600,6 +617,10 @@
         }
       },
       "sync": {
+        "autoDownloadMaxMb": {
+          "description": "Automatically download a remote file card into EcoPaste-managed storage when its total original size is within this limit. Larger cards sync metadata only. Set 0 for manual download only.",
+          "title": "Automatic Download Limit"
+        },
         "autoUploadMaxMb": {
           "description": "Automatically encrypt and upload a file card when its total original size is within this limit. Folders include all nested files. Set 0 for manual upload only.",
           "title": "Automatic Sync Size Limit"

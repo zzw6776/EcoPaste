@@ -64,6 +64,7 @@
       "hours": "小时",
       "items": "条",
       "mb": "MB",
+      "minutes": "分钟",
       "percent": "%",
       "seconds": "秒"
     },
@@ -430,12 +431,28 @@
           "title": "最大保留条数"
         },
         "maxStorageBytes": {
-          "description": "按二进制容量配置（1 GB = 1024 MB），支持小数，0 表示不限。数据目录超出上限时，从最旧的普通记录开始清理，目标为上限的 80%。收藏和置顶始终保留。",
+          "description": "按二进制容量配置（1 GB = 1024 MB），支持小数，0 表示不限。超过配置的触发占比后，从最旧的普通记录开始清理；收藏和置顶始终保留。",
           "title": "本地存储容量上限"
         },
         "retention": {
           "description": "超过该天数的普通记录会自动清理；收藏和置顶始终保留，0 表示不按时间清理。",
           "title": "保留周期"
+        },
+        "storageCheckMinIntervalMinutes": {
+          "description": "剪贴板内容变化后，容量统计最多按此频率执行一次，避免连续复制时反复扫描磁盘。",
+          "title": "容量检查最短间隔"
+        },
+        "storageCleanupTargetPercent": {
+          "description": "触发容量清理后持续清理到该占比，必须低于触发占比。",
+          "title": "容量清理目标占比"
+        },
+        "storageCleanupTriggerPercent": {
+          "description": "本地占用超过容量上限的该占比时触发清理。",
+          "title": "容量清理触发占比"
+        },
+        "storageFallbackIntervalMinutes": {
+          "description": "没有剪贴板变化时按此间隔兜底检查同步下载等静默增长，不能短于容量检查最短间隔。",
+          "title": "容量兜底检查间隔"
         }
       },
       "localData": {
@@ -600,6 +617,10 @@
         }
       },
       "sync": {
+        "autoDownloadMaxMb": {
+          "description": "远端文件卡片的原始总大小不超过该值时自动下载到 EcoPaste 托管缓存；超过后只同步文件名、大小等信息，0 表示全部手动下载。",
+          "title": "自动下载上限"
+        },
         "autoUploadMaxMb": {
           "description": "整张文件卡片的原始总大小不超过该值时自动加密上传；目录按内部全部文件计算，0 表示全部手动上传。",
           "title": "单次自动同步上限"

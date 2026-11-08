@@ -115,6 +115,10 @@ pub struct ClipboardItem {
     #[sqlx(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_preview_kind: Option<FilesPreviewKind>,
+    /// 远端文件尚未进入托管缓存时的可用状态；本地文件及已自动下载的文件为 `None`。
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_file_state: Option<String>,
     /// 当前条目右键菜单可用的动作列表（按 kind / sub_kind 计算），按建议展示顺序排列。
     /// 前端只负责把动作映射成菜单项 + 文案 + 快捷键，不再判定「能否打开链接」等业务条件。
     #[sqlx(skip)]
@@ -170,12 +174,16 @@ pub enum ClipboardAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
+    pub entry_key: String,
     pub path: String,
     pub name: String,
     pub is_dir: bool,
     pub is_image: bool,
     /// 命令层组装时实时检测：路径是否仍存在于磁盘，前端据此对失效条目划删除线并回退预览。
     pub exists: bool,
+    /// 仅有远端元数据、尚未下载到本机的条目。
+    #[serde(default)]
+    pub is_remote: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_path: Option<String>,
 }

@@ -3,7 +3,7 @@ use std::{path::Path, str::FromStr, time::Duration};
 use anyhow::{Context, Result};
 use clap::Parser;
 use data_encoding::HEXLOWER;
-use ecopaste_sync_protocol::ALPN;
+use ecopaste_sync_protocol::{ALPN, QuotaPolicy};
 use ecopaste_sync_server::{config::Config, repository::Repository, service::HubService};
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets, protocol::Router};
 use tracing::info;
@@ -15,6 +15,11 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let config = Config::parse();
+    let quota_policy = QuotaPolicy::new(
+        config.group_quota_trigger_percent,
+        config.group_quota_target_percent,
+    )
+    .context("invalid Hub quota policy")?;
     tokio::fs::create_dir_all(&config.data_dir)
         .await
         .with_context(|| format!("create data directory {}", config.data_dir.display()))?;
@@ -27,8 +32,8 @@ async fn main() -> Result<()> {
     let service = HubService::new(
         repository,
         blob_root,
-        config.max_blob_bytes,
         config.max_group_bytes,
+        quota_policy,
         config.event_retention_days,
         config.max_events_per_group,
     );
