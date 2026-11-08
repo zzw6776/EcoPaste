@@ -80,6 +80,8 @@ export interface ClipboardItem {
   colorPreview?: string;
   /** Files 卡片渲染模式，由 Rust 命令层根据 `fileEntries` 计算。 */
   filesPreviewKind?: "imagePreview" | "list";
+  /** 远端文件只同步了元数据时的状态。 */
+  remoteFileState?: "available" | "expired";
   /** Rust 按本地时区做三档格式化的 createdAt：HH:mm / MM-DD HH:mm / YYYY-MM-DD HH:mm。 */
   displayCreatedAt?: string;
 }
@@ -98,11 +100,13 @@ export interface ClipboardApp {
 }
 
 export interface FileEntry {
+  entryKey: string;
   path: string;
   name: string;
   isDir: boolean;
   isImage: boolean;
   exists: boolean;
+  isRemote: boolean;
   iconPath?: string;
 }
 

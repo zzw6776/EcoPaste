@@ -18,6 +18,8 @@ interface PreferenceSidebarProps {
   appVersion: string;
   storageLimitBytes: number;
   storageState: PreferenceStorageState;
+  storageTargetPercent: number;
+  storageTriggerPercent: number;
   usedBytes: number | null;
   onTabSelect: (tabId: PreferenceTabId) => void;
 }
@@ -33,6 +35,8 @@ const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
     appVersion,
     storageLimitBytes,
     storageState,
+    storageTargetPercent,
+    storageTriggerPercent,
     usedBytes,
     onTabSelect,
   } = props;
@@ -149,6 +153,8 @@ const PreferenceSidebar: FC<PreferenceSidebarProps> = (props) => {
         <PreferenceStorageUsagePanel
           limitBytes={storageLimitBytes}
           state={storageState}
+          targetPercent={storageTargetPercent}
+          triggerPercent={storageTriggerPercent}
           usedBytes={usedBytes}
         />
       )}

@@ -470,11 +470,13 @@ pub struct ClipboardPreviewPayload {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardPreviewFileEntry {
+    pub entry_key: String,
     pub path: String,
     pub name: String,
     pub is_dir: bool,
     pub is_image: bool,
     pub exists: bool,
+    pub is_remote: bool,
     pub size: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_path: Option<String>,
@@ -560,6 +562,7 @@ pub async fn write_to_clipboard(
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    reject_remote_file_write(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
     let settings = app.state::<SettingsStore>().snapshot();
@@ -607,6 +610,7 @@ pub async fn paste_clipboard_item(
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    reject_remote_file_write(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
     #[cfg(not(target_os = "android"))]
@@ -1039,6 +1043,14 @@ fn attach_display_created_at(item: &mut ClipboardItem, now: &chrono::DateTime<Lo
 fn compute_available_actions(item: &ClipboardItem) -> Vec<ClipboardAction> {
     let mut actions = Vec::with_capacity(10);
 
+    if item.remote_file_state.is_some() {
+        actions.push(ClipboardAction::ToggleFavorite);
+        actions.push(ClipboardAction::TogglePinned);
+        actions.push(ClipboardAction::EditNote);
+        actions.push(ClipboardAction::Delete);
+        return actions;
+    }
+
     actions.push(ClipboardAction::Paste);
 
     match item.kind {
@@ -1130,9 +1142,13 @@ async fn attach_file_entries(
         .collect();
 
     let mut entries = Vec::with_capacity(paths.len());
+    let is_remote = item.remote_file_state.is_some();
     for (index, path) in paths.iter().enumerate() {
-        let (icon_path, exists) =
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?;
+        let (icon_path, exists) = if is_remote {
+            (None, false)
+        } else {
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?
+        };
         let is_dir = types.get(index).copied() == Some("d");
         let name = std::path::Path::new(path)
             .file_name()
@@ -1142,11 +1158,13 @@ async fn attach_file_entries(
         let is_image = !is_dir && is_image_path(path);
 
         entries.push(FileEntry {
+            entry_key: format!("{index}:{path}"),
             path: (*path).to_owned(),
             name,
             is_dir,
             is_image,
             exists,
+            is_remote,
             icon_path,
         });
     }
@@ -1227,13 +1245,21 @@ async fn build_preview_file_entries(
         .collect();
 
     let mut entries = Vec::with_capacity(paths.len());
+    let is_remote = item.remote_file_state.is_some();
     for (index, path) in paths.iter().enumerate() {
-        let (icon_path, exists) =
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?;
+        let (icon_path, exists) = if is_remote {
+            (None, false)
+        } else {
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?
+        };
         let path_obj = Path::new(path);
         let is_dir = resolve_preview_file_is_dir(path_obj, item.file_types.as_deref(), index);
         let is_image = !is_dir && is_image_path(path);
-        let size = resolve_preview_file_size(path_obj, is_dir);
+        let size = if is_remote {
+            None
+        } else {
+            resolve_preview_file_size(path_obj, is_dir)
+        };
         let name = path_obj
             .file_name()
             .and_then(|n| n.to_str())
@@ -1241,11 +1267,13 @@ async fn build_preview_file_entries(
             .unwrap_or_else(|| (*path).to_owned());
 
         entries.push(ClipboardPreviewFileEntry {
+            entry_key: format!("{index}:{path}"),
             path: (*path).to_owned(),
             name,
             is_dir,
             is_image,
             exists,
+            is_remote,
             size,
             icon_path,
         });
@@ -1865,6 +1893,21 @@ fn resolve_managed_file_content(app: &AppHandle, item: &mut ClipboardItem) -> Re
     )?)
 }
 
+/// Metadata-only remote files cannot be copied or pasted as if their display names were paths.
+pub(super) fn reject_remote_file_write(app: &AppHandle, item: &ClipboardItem) -> Result<()> {
+    if item.remote_file_state.is_none() {
+        return Ok(());
+    }
+
+    Err(AppError::Clipboard(
+        crate::i18n::commands::label(
+            crate::i18n::current_language(app),
+            crate::i18n::commands::Key::RemoteFileNotDownloaded,
+        )
+        .to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,6 +1951,7 @@ mod tests {
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
+            remote_file_state: None,
             available_actions: Vec::new(),
             color_preview: None,
             display_created_at: String::new(),

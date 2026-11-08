@@ -1,0 +1,76 @@
+use super::*;
+
+/// Owns all volatile connection, worker and channel state for one sync manager.
+pub(super) struct RuntimeCoordinator {
+    pub(super) update_notification_pending: Arc<AtomicBool>,
+    pub(super) endpoint: Mutex<Option<EndpointRuntime>>,
+    pub(super) lan_transfer_wake: Notify,
+    pub(super) cloud_transfer_wake: Notify,
+    pub(super) watch_wake: Notify,
+    pub(super) source_asset_wake: Notify,
+    pub(super) local_outbox_wake: Notify,
+    pub(super) nearby_wake: Notify,
+    pub(super) lan_cycle_lock: AsyncRwLock<()>,
+    pub(super) cloud_cycle_lock: Mutex<()>,
+    pub(super) cloud_connect_lock: Mutex<()>,
+    pub(super) cloud_connection_ready: Notify,
+    pub(super) cloud_session_lock: Mutex<()>,
+    pub(super) cloud_force_reconnect: AtomicBool,
+    pub(super) inbound_stream_admission: Arc<Semaphore>,
+    pub(super) inbound_blob_concurrency: Arc<Semaphore>,
+    pub(super) lan_status: RwLock<SyncChannelStatus>,
+    pub(super) cloud_status: RwLock<SyncChannelStatus>,
+    pub(super) cloud_watch_status: RwLock<SyncChannelStatus>,
+    pub(super) cloud_path: RwLock<ConnectionRoute>,
+    pub(super) cloud_server_version: RwLock<Option<String>>,
+    pub(super) cloud_connection: RwLock<Option<Connection>>,
+    pub(super) cloud_session: RwLock<Option<CloudSessionState>>,
+    pub(super) confirmed_cloud_source_icons: RwLock<ConfirmedCloudSourceIcons>,
+    pub(super) lan_connections: RwLock<HashMap<String, Connection>>,
+    pub(super) lan_peer_actors: RwLock<HashMap<String, Arc<LanPeerActor>>>,
+    pub(super) lan_peer_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    pub(super) lan_suspended_peers: RwLock<HashSet<String>>,
+    #[cfg(target_os = "android")]
+    pub(super) android_lan_multicast_interfaces: RwLock<BTreeSet<Ipv4Addr>>,
+    pub(super) lan_presence_nonce: AtomicU64,
+    pub(super) nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
+}
+
+impl RuntimeCoordinator {
+    pub(super) fn new(presence_nonce: u64) -> Self {
+        Self {
+            update_notification_pending: Arc::new(AtomicBool::new(false)),
+            endpoint: Mutex::new(None),
+            lan_transfer_wake: Notify::new(),
+            cloud_transfer_wake: Notify::new(),
+            watch_wake: Notify::new(),
+            source_asset_wake: Notify::new(),
+            local_outbox_wake: Notify::new(),
+            nearby_wake: Notify::new(),
+            lan_cycle_lock: AsyncRwLock::new(()),
+            cloud_cycle_lock: Mutex::new(()),
+            cloud_connect_lock: Mutex::new(()),
+            cloud_connection_ready: Notify::new(),
+            cloud_session_lock: Mutex::new(()),
+            cloud_force_reconnect: AtomicBool::new(false),
+            inbound_stream_admission: Arc::new(Semaphore::new(128)),
+            inbound_blob_concurrency: Arc::new(Semaphore::new(4)),
+            lan_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Idle)),
+            cloud_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Disabled)),
+            cloud_watch_status: RwLock::new(SyncChannelStatus::new(SyncChannelState::Disabled)),
+            cloud_path: RwLock::new(ConnectionRoute::default()),
+            cloud_server_version: RwLock::new(None),
+            cloud_connection: RwLock::new(None),
+            cloud_session: RwLock::new(None),
+            confirmed_cloud_source_icons: RwLock::new(ConfirmedCloudSourceIcons::default()),
+            lan_connections: RwLock::new(HashMap::new()),
+            lan_peer_actors: RwLock::new(HashMap::new()),
+            lan_peer_locks: RwLock::new(HashMap::new()),
+            lan_suspended_peers: RwLock::new(HashSet::new()),
+            #[cfg(target_os = "android")]
+            android_lan_multicast_interfaces: RwLock::new(BTreeSet::new()),
+            lan_presence_nonce: AtomicU64::new(presence_nonce),
+            nearby_devices: RwLock::new(HashMap::new()),
+        }
+    }
+}

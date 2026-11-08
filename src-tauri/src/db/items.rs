@@ -18,9 +18,11 @@ const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clip
      clipboard_apps.name AS source_app_name, \
      clipboard_apps.icon_file AS source_app_icon_file, \
      clipboard_apps.accent_start AS source_app_accent_start, \
-     clipboard_apps.accent_end AS source_app_accent_end \
+     clipboard_apps.accent_end AS source_app_accent_end, \
+     sync_remote_file_items.state AS remote_file_state \
      FROM clipboard_items \
-     LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
+     LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id \
+     LEFT JOIN sync_remote_file_items ON sync_remote_file_items.item_id = clipboard_items.id";
 const HISTORY_CLEANUP_BATCH_SIZE: i64 = 256;
 /// The same protection predicate is compiled into the age, count and capacity queries.
 macro_rules! evictable_history {
@@ -28,6 +30,54 @@ macro_rules! evictable_history {
         "is_pinned = 0 AND is_favorite = 0 AND NOT EXISTS (
             SELECT 1 FROM sync_content_outbox manual
             WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1
+        ) AND NOT EXISTS (
+            SELECT 1 FROM sync_active_transfers active
+            WHERE active.item_id = clipboard_items.id
+        ) AND NOT EXISTS (
+            SELECT 1 FROM sync_item_events links
+            JOIN sync_delivery_states delivery ON delivery.event_id = links.event_id
+            WHERE links.item_id = clipboard_items.id AND delivery.state = 'syncing'
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM sync_item_events links
+            JOIN sync_events event ON event.event_id = links.event_id
+            WHERE links.item_id = clipboard_items.id
+              AND links.direction = 'local'
+              AND event.delivery_route IS NOT NULL
+              AND (
+                  (
+                      NOT EXISTS (
+                          SELECT 1 FROM sync_delivery_states delivery
+                          WHERE delivery.event_id = event.event_id
+                            AND (
+                                (event.delivery_route = 'cloud' AND delivery.target_id = 'cloud')
+                                OR (event.delivery_route = 'lan' AND delivery.target_id LIKE 'peer:%')
+                            )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM sync_canceled_deliveries canceled
+                          WHERE canceled.event_id = event.event_id
+                            AND (
+                                (event.delivery_route = 'cloud' AND canceled.target_id = 'cloud')
+                                OR (event.delivery_route = 'lan' AND canceled.target_id LIKE 'peer:%')
+                            )
+                      )
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM sync_delivery_states delivery
+                      WHERE delivery.event_id = event.event_id
+                        AND delivery.state <> 'success'
+                        AND (
+                            (event.delivery_route = 'cloud' AND delivery.target_id = 'cloud')
+                            OR (event.delivery_route = 'lan' AND delivery.target_id LIKE 'peer:%')
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM sync_canceled_deliveries canceled
+                            WHERE canceled.event_id = delivery.event_id
+                              AND canceled.target_id = delivery.target_id
+                        )
+                  )
+              )
         )"
     };
 }
@@ -58,9 +108,11 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
      clipboard_apps.name AS source_app_name, \
      clipboard_apps.icon_file AS source_app_icon_file, \
      clipboard_apps.accent_start AS source_app_accent_start, \
-     clipboard_apps.accent_end AS source_app_accent_end \
+     clipboard_apps.accent_end AS source_app_accent_end, \
+     sync_remote_file_items.state AS remote_file_state \
      FROM clipboard_items \
-     LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id";
+     LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id \
+     LEFT JOIN sync_remote_file_items ON sync_remote_file_items.item_id = clipboard_items.id";
 
 fn kind_tag(kind: ClipboardKind) -> &'static str {
     match kind {
@@ -167,45 +219,14 @@ pub async fn upsert_item_with_sync_outbox(
 }
 
 /// Merges a synchronized record without turning network receipt into local reuse time.
+#[cfg(test)]
 pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<UpsertResult> {
     if let Some(existing) = find_item_by_sync_key(pool, &item.sync_key).await? {
-        sqlx::query(
-            r#"
-            UPDATE clipboard_items
-            SET created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
-                updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END,
-                source_app_id = CASE
-                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
-                    THEN ? ELSE source_app_id END,
-                source_revision = CASE
-                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
-                    THEN ? ELSE source_revision END,
-                source_updated_at = CASE
-                    WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
-                    THEN ? ELSE source_updated_at END
-            WHERE id = ?
-            "#,
-        )
-        .bind(item.created_at)
-        .bind(item.created_at)
-        .bind(item.updated_at)
-        .bind(item.updated_at)
-        .bind(item.updated_at)
-        .bind(item.updated_at)
-        .bind(&item.source_revision)
-        .bind(item.source_app_id.as_deref())
-        .bind(item.updated_at)
-        .bind(item.updated_at)
-        .bind(&item.source_revision)
-        .bind(&item.source_revision)
-        .bind(item.updated_at)
-        .bind(item.updated_at)
-        .bind(&item.source_revision)
-        .bind(item.updated_at)
-        .bind(&existing.id)
-        .execute(pool)
-        .await
-        .context("merge synchronized clipboard timestamps")?;
+        let mut connection = pool
+            .acquire()
+            .await
+            .context("acquire synchronized clipboard connection")?;
+        merge_synced_item_on(&mut connection, &existing.id, item).await?;
         return Ok(UpsertResult {
             id: existing.id,
             deduplicated: true,
@@ -217,6 +238,247 @@ pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Resu
         id: item.id.clone(),
         deduplicated: false,
     })
+}
+
+/// Atomically creates or refreshes a metadata-only remote file card and its backing event.
+pub async fn upsert_remote_file_item(
+    pool: &SqlitePool,
+    item: &ClipboardItem,
+    event_id: &str,
+    origin_device_id: &str,
+) -> Result<UpsertResult> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin remote file metadata upsert")?;
+    let existing: Option<(String, bool)> = sqlx::query_as(
+        r#"
+        SELECT item.id,
+               EXISTS(SELECT 1 FROM sync_remote_file_items remote WHERE remote.item_id = item.id)
+        FROM clipboard_items item
+        WHERE item.sync_key = ?
+        ORDER BY item.created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&item.sync_key)
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("find remote file metadata item")?;
+
+    let (id, deduplicated) = match existing {
+        Some((id, true)) => {
+            replace_remote_content_on(&mut transaction, &id, item).await?;
+            (id, true)
+        }
+        Some((id, false)) => {
+            replace_remote_content_on(&mut transaction, &id, item).await?;
+            (id, true)
+        }
+        None => {
+            insert_item_on(&mut transaction, item).await?;
+            (item.id.clone(), false)
+        }
+    };
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+            INSERT INTO sync_remote_file_items (
+                item_id, event_id, origin_device_id, state, created_at, updated_at
+            ) VALUES (?, ?, ?, 'available', ?, ?)
+            ON CONFLICT(item_id) DO UPDATE SET
+                event_id = excluded.event_id,
+                origin_device_id = excluded.origin_device_id,
+                state = 'available',
+                updated_at = excluded.updated_at
+            "#,
+    )
+    .bind(&id)
+    .bind(event_id)
+    .bind(origin_device_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .context("register remote file metadata")?;
+    crate::db::sync_item_state::materialize_state_on(&mut transaction, &item.sync_key).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit remote file metadata upsert")?;
+    Ok(UpsertResult { id, deduplicated })
+}
+
+/// Promotes a metadata-only card to materialized local content without leaving a remote marker.
+pub async fn upsert_materialized_synced_item(
+    pool: &SqlitePool,
+    item: &ClipboardItem,
+) -> Result<UpsertResult> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin materialized synchronized item upsert")?;
+    let existing: Option<(String, bool)> = sqlx::query_as(
+        r#"
+        SELECT item.id,
+               EXISTS(SELECT 1 FROM sync_remote_file_items remote WHERE remote.item_id = item.id)
+        FROM clipboard_items item
+        WHERE item.sync_key = ?
+        ORDER BY item.created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&item.sync_key)
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("find materialized synchronized item")?;
+
+    let (id, deduplicated) = match existing {
+        Some((id, true)) => {
+            replace_remote_content_on(&mut transaction, &id, item).await?;
+            sqlx::query("DELETE FROM sync_remote_file_items WHERE item_id = ?")
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await
+                .context("clear remote file metadata after materialization")?;
+            (id, true)
+        }
+        Some((id, false)) => {
+            if item.kind == ClipboardKind::Files {
+                replace_materialized_file_paths_on(&mut transaction, &id, item).await?;
+            }
+            merge_synced_item_on(&mut transaction, &id, item).await?;
+            (id, true)
+        }
+        None => {
+            insert_item_on(&mut transaction, item).await?;
+            (item.id.clone(), false)
+        }
+    };
+    crate::db::sync_item_state::materialize_state_on(&mut transaction, &item.sync_key).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit materialized synchronized item upsert")?;
+    Ok(UpsertResult { id, deduplicated })
+}
+
+async fn merge_synced_item_on(
+    connection: &mut SqliteConnection,
+    id: &str,
+    item: &ClipboardItem,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE clipboard_items
+        SET created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END,
+            source_app_id = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_app_id END,
+            source_revision = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_revision END,
+            source_updated_at = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_updated_at END
+        WHERE id = ?
+        "#,
+    )
+    .bind(item.created_at)
+    .bind(item.created_at)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_app_id.as_deref())
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(id)
+    .execute(connection)
+    .await
+    .context("merge synchronized clipboard timestamps")?;
+    Ok(())
+}
+
+async fn replace_remote_content_on(
+    connection: &mut SqliteConnection,
+    id: &str,
+    item: &ClipboardItem,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE clipboard_items
+        SET kind = ?, sub_kind = ?, source_app_id = ?, source_revision = ?,
+            source_updated_at = ?, content = ?, content_hash = ?, search_text = ?,
+            summary = ?, file_types = ?, size = ?, width = ?, height = ?,
+            is_sensitive = ?, platform = ?,
+            created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+        WHERE id = ?
+        "#,
+    )
+    .bind(item.kind)
+    .bind(item.sub_kind)
+    .bind(item.source_app_id.as_deref())
+    .bind(&item.source_revision)
+    .bind(item.updated_at)
+    .bind(&item.content)
+    .bind(&item.content_hash)
+    .bind(item.search_text.as_deref())
+    .bind(item.summary.as_deref())
+    .bind(item.file_types.as_deref())
+    .bind(item.size)
+    .bind(item.width)
+    .bind(item.height)
+    .bind(item.is_sensitive)
+    .bind(item.platform)
+    .bind(item.created_at)
+    .bind(item.created_at)
+    .bind(item.updated_at)
+    .bind(item.updated_at)
+    .bind(id)
+    .execute(connection)
+    .await
+    .context("promote remote metadata to local content")?;
+    Ok(())
+}
+
+/// Repairs only the physical paths of an existing local file record while preserving its metadata.
+async fn replace_materialized_file_paths_on(
+    connection: &mut SqliteConnection,
+    id: &str,
+    item: &ClipboardItem,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE clipboard_items
+        SET content = ?, content_hash = ?, search_text = ?, summary = ?,
+            file_types = ?, size = ?, width = ?, height = ?, is_sensitive = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&item.content)
+    .bind(&item.content_hash)
+    .bind(item.search_text.as_deref())
+    .bind(item.summary.as_deref())
+    .bind(item.file_types.as_deref())
+    .bind(item.size)
+    .bind(item.width)
+    .bind(item.height)
+    .bind(item.is_sensitive)
+    .bind(id)
+    .execute(connection)
+    .await
+    .context("replace synchronized file paths")?;
+    Ok(())
 }
 
 /// Replaces timestamps with values reconciled from all versioned sync events for an item.
@@ -254,6 +516,7 @@ pub async fn find_item_by_sync_key(
 }
 
 /// 插入一条剪贴板记录（不做去重；本地捕获去重请走 [`upsert_item_with_sync_outbox`]）。
+#[cfg(test)]
 pub async fn insert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<()> {
     let mut connection = pool
         .acquire()
@@ -760,7 +1023,7 @@ pub(crate) async fn evict_oldest_history(
 ) -> Result<CleanupOutcome> {
     let rows = sqlx::query_scalar::<_, Option<String>>(concat!(
         "WITH oldest AS MATERIALIZED (
-            SELECT id, created_at,
+            SELECT id, updated_at, created_at,
                 CASE WHEN kind = 'text' THEN MAX(1, length(CAST(content AS BLOB))
                     + COALESCE(length(CAST(search_text AS BLOB)), 0)
                     + COALESCE(length(CAST(note AS BLOB)), 0))
@@ -771,9 +1034,9 @@ pub(crate) async fn evict_oldest_history(
                             + COALESCE(length(CAST(note AS BLOB)), 0))
                     ELSE ?1 END AS bytes
             FROM clipboard_items WHERE ", evictable_history!(), "
-            ORDER BY created_at, id LIMIT ?3
+            ORDER BY updated_at, created_at, id LIMIT ?3
         ), ranked AS (
-            SELECT id, SUM(bytes) OVER (ORDER BY created_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_bytes
+            SELECT id, SUM(bytes) OVER (ORDER BY updated_at, created_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_bytes
             FROM oldest
         )
         DELETE FROM clipboard_items WHERE id IN (
@@ -1056,6 +1319,7 @@ mod tests {
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
+            remote_file_state: None,
             available_actions: Vec::new(),
             color_preview: None,
             display_created_at: String::new(),
@@ -1399,6 +1663,198 @@ mod tests {
         assert_eq!(merged.created_at, incoming.created_at);
         assert_eq!(merged.updated_at, incoming.updated_at);
         assert_eq!(merged.use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_file_metadata_is_atomic_and_promotes_in_place() {
+        let pool = memory_pool().await;
+        let event = ecopaste_sync_protocol::EncryptedEvent {
+            event_id: "remote-event".into(),
+            origin_device_id: "origin".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 32],
+            kind: ecopaste_sync_protocol::SyncEventKind::Content,
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+            retention_key: None,
+        };
+        crate::sync::repository::insert_event(&pool, &event, false, &[])
+            .await
+            .unwrap();
+        let mut remote = sample_item("remote");
+        remote.kind = ClipboardKind::Files;
+        remote.content = "large.bin".into();
+        remote.content_hash = remote.sync_key.clone();
+        remote.size = Some(10);
+
+        let inserted = upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+            .await
+            .unwrap();
+        assert_eq!(inserted.id, "remote");
+        assert_eq!(
+            find_item_by_id(&pool, "remote")
+                .await
+                .unwrap()
+                .unwrap()
+                .remote_file_state
+                .as_deref(),
+            Some("available")
+        );
+
+        let mut materialized = remote.clone();
+        materialized.id = "materialized".into();
+        materialized.content = "/managed/large.bin".into();
+        materialized.content_hash = content_hash(ClipboardKind::Files, &materialized.content);
+        materialized.source_revision = "materialized".into();
+        let promoted = upsert_materialized_synced_item(&pool, &materialized)
+            .await
+            .unwrap();
+        assert_eq!(promoted.id, "remote");
+        let stored = find_item_by_id(&pool, "remote").await.unwrap().unwrap();
+        assert_eq!(stored.content, materialized.content);
+        assert!(stored.remote_file_state.is_none());
+        let marker_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_remote_file_items WHERE item_id = ?")
+                .bind("remote")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(marker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_local_file_can_become_a_remote_metadata_card() {
+        let pool = memory_pool().await;
+        let event = ecopaste_sync_protocol::EncryptedEvent {
+            event_id: "remote-event".into(),
+            origin_device_id: "origin".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 32],
+            kind: ecopaste_sync_protocol::SyncEventKind::Content,
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+            retention_key: None,
+        };
+        crate::sync::repository::insert_event(&pool, &event, false, &[])
+            .await
+            .unwrap();
+        let mut local = sample_item("local");
+        local.kind = ClipboardKind::Files;
+        local.content = "/missing/large.bin".into();
+        local.content_hash = content_hash(local.kind, &local.content);
+        local.is_favorite = true;
+        insert_item(&pool, &local).await.unwrap();
+
+        let mut remote = local.clone();
+        remote.id = "remote".into();
+        remote.content = "large.bin".into();
+        remote.content_hash = content_hash(remote.kind, &remote.content);
+        let result = upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+            .await
+            .unwrap();
+        let stored = find_item_by_id(&pool, &local.id).await.unwrap().unwrap();
+
+        assert_eq!(result.id, local.id);
+        assert_eq!(stored.content, "large.bin");
+        assert!(stored.is_favorite);
+        assert_eq!(stored.remote_file_state.as_deref(), Some("available"));
+    }
+
+    #[tokio::test]
+    async fn materialized_file_repairs_paths_of_a_same_key_local_record() {
+        let pool = memory_pool().await;
+        let mut local = sample_item("local");
+        local.kind = ClipboardKind::Files;
+        local.content = "/missing/large.bin".into();
+        local.content_hash = content_hash(local.kind, &local.content);
+        local.size = Some(10);
+        local.file_types = Some("f".into());
+        local.is_pinned = true;
+        insert_item(&pool, &local).await.unwrap();
+
+        let mut materialized = local.clone();
+        materialized.id = "materialized".into();
+        materialized.content = "ecopaste-resource://sync-files/event/000/large.bin".into();
+        materialized.content_hash = content_hash(materialized.kind, &materialized.content);
+        materialized.size = Some(20);
+        materialized.file_types = Some("d".into());
+        let result = upsert_materialized_synced_item(&pool, &materialized)
+            .await
+            .unwrap();
+        let stored = find_item_by_id(&pool, &local.id).await.unwrap().unwrap();
+
+        assert_eq!(result.id, local.id);
+        assert_eq!(stored.content, materialized.content);
+        assert_eq!(stored.size, materialized.size);
+        assert_eq!(stored.file_types, materialized.file_types);
+        assert!(stored.is_pinned);
+    }
+
+    #[tokio::test]
+    async fn repeated_remote_file_event_refreshes_content_metadata() {
+        let pool = memory_pool().await;
+        let event = ecopaste_sync_protocol::EncryptedEvent {
+            event_id: "remote-event-1".into(),
+            origin_device_id: "origin".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 32],
+            kind: ecopaste_sync_protocol::SyncEventKind::Content,
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+            retention_key: None,
+        };
+        crate::sync::repository::insert_event(&pool, &event, false, &[])
+            .await
+            .unwrap();
+        let mut remote = sample_item("remote");
+        remote.kind = ClipboardKind::Files;
+        remote.content = "large.bin".into();
+        remote.content_hash = remote.sync_key.clone();
+        remote.size = Some(10);
+        remote.file_types = Some("f".into());
+        upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+            .await
+            .unwrap();
+
+        let mut next_event = event.clone();
+        next_event.event_id = "remote-event-2".into();
+        next_event.origin_sequence = 2;
+        crate::sync::repository::insert_event(&pool, &next_event, false, &[])
+            .await
+            .unwrap();
+        let mut refreshed = remote.clone();
+        refreshed.source_revision = "new-revision".into();
+        refreshed.size = Some(20);
+        refreshed.file_types = Some("d".into());
+        upsert_remote_file_item(&pool, &refreshed, &next_event.event_id, "origin")
+            .await
+            .unwrap();
+
+        let stored = find_item_by_id(&pool, &remote.id).await.unwrap().unwrap();
+        assert_eq!(stored.size, refreshed.size);
+        assert_eq!(stored.file_types, refreshed.file_types);
+        assert_eq!(stored.source_revision, refreshed.source_revision);
+    }
+
+    #[tokio::test]
+    async fn remote_file_metadata_rolls_back_when_event_registration_fails() {
+        let pool = memory_pool().await;
+        let mut remote = sample_item("remote");
+        remote.kind = ClipboardKind::Files;
+        remote.content = "large.bin".into();
+
+        assert!(
+            upsert_remote_file_item(&pool, &remote, "missing-event", "origin")
+                .await
+                .is_err()
+        );
+        assert!(find_item_by_id(&pool, "remote").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2259,6 +2715,112 @@ mod tests {
         for id in ["pending", "pinned", "favorite"] {
             assert!(find_item_by_id(&pool, id).await.unwrap().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn quota_cleanup_uses_last_reuse_time() {
+        let pool = memory_pool().await;
+        let mut recently_reused = sample_item("recently-reused");
+        recently_reused.updated_at += chrono::Duration::seconds(20);
+        insert_item(&pool, &recently_reused).await.unwrap();
+
+        let mut stale = sample_item("stale");
+        stale.created_at += chrono::Duration::seconds(10);
+        stale.updated_at += chrono::Duration::seconds(10);
+        insert_item(&pool, &stale).await.unwrap();
+
+        let outcome =
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(find_item_by_id(&pool, "stale").await.unwrap().is_none());
+        assert!(find_item_by_id(&pool, "recently-reused")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn quota_cleanup_keeps_explicit_delivery_until_success() {
+        use ecopaste_sync_protocol::{EncryptedEvent, SyncEventKind};
+
+        let pool = memory_pool().await;
+        let item = sample_item("manual-cloud");
+        insert_item(&pool, &item).await.unwrap();
+        let event_id = "manual-cloud-event";
+        crate::sync::repository::insert_event(
+            &pool,
+            &EncryptedEvent {
+                event_id: event_id.into(),
+                origin_device_id: "local-device".into(),
+                origin_sequence: 1,
+                created_at_ms: 1,
+                nonce: vec![1; 24],
+                ciphertext: vec![2; 32],
+                kind: SyncEventKind::Content,
+                blob_ids: Vec::new(),
+                optional_blob_ids: Vec::new(),
+                retention_key: None,
+            },
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sync_events SET delivery_route = 'cloud' WHERE event_id = ?")
+            .bind(event_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO sync_item_events (item_id, event_id, direction, created_at, updated_at) \
+             VALUES (?, ?, 'local', ?, ?)",
+        )
+        .bind(&item.id)
+        .bind(event_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap()
+                .removed,
+            0
+        );
+
+        crate::sync::repository::mark_delivery_error(
+            &pool,
+            "cloud",
+            &[event_id.to_owned()],
+            "offline",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap()
+                .removed,
+            0
+        );
+
+        crate::sync::repository::mark_delivered(&pool, "cloud", &[event_id.to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
     }
 
     #[tokio::test]

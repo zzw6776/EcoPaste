@@ -1008,6 +1008,16 @@ impl Repository {
             .context("list sync groups")
     }
 
+    /// Returns the blob files that still have durable metadata for one group.
+    pub async fn blob_ids(&self, group_id: &str) -> Result<HashSet<String>> {
+        let ids = sqlx::query_scalar("SELECT blob_id FROM blobs WHERE group_id = ?")
+            .bind(group_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("list sync group blobs")?;
+        Ok(ids.into_iter().collect())
+    }
+
     pub async fn ensure_cursor_available(&self, group_id: &str, cursor: u64) -> Result<()> {
         if cursor == 0 {
             return Ok(());

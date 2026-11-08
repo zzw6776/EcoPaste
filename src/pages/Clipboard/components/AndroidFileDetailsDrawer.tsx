@@ -52,7 +52,7 @@ const AndroidFileDetailsDrawer: FC<AndroidFileDetailsDrawerProps> = (props) => {
           return (
             <div
               className="flex items-center gap-2 rounded-2 border border-ant-border-secondary bg-ant-fill-quaternary p-2"
-              key={entry.path}
+              key={entry.entryKey}
             >
               <button
                 className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-not-allowed"

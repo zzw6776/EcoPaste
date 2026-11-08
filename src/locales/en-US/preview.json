@@ -9,6 +9,7 @@
     "folder": "Folder",
     "item": "File",
     "missingPath": "Path unavailable",
+    "remoteNotDownloaded": "Remote file, not downloaded",
     "shownCount": "Showing first {{shown}} of {{total}} items"
   },
   "image": {

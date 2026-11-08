@@ -243,9 +243,12 @@ pub async fn export_history_backup(
         .await
         .context("backup worker closed")?;
     let resources_dir = source_paths.resources_dir.clone();
-    let resource_bytes = tauri::async_runtime::spawn_blocking(move || dir_size(&resources_dir))
-        .await
-        .context("backup size task failed")??;
+    let size_target = target.clone();
+    let resource_bytes = tauri::async_runtime::spawn_blocking(move || {
+        backup_resources_size(&resources_dir, &size_target)
+    })
+    .await
+    .context("backup size task failed")??;
     let manifest = build_manifest(app, exported_at, options.mode, counts, resource_bytes)?;
 
     checkpoint_database(pool).await?;
@@ -682,6 +685,7 @@ fn add_dir_contents<W: Write + Seek>(
 
     for entry in WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| !is_transport_only_resource_path(root, entry.path()))
         .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
@@ -735,6 +739,25 @@ fn should_skip_backup_path(path: &Path, file_name: &str, target_path: &Path) -> 
         || file_name.ends_with(".temp")
         || file_name.starts_with(".tmp")
         || file_name == ".DS_Store"
+}
+
+fn is_transport_only_resource_path(root: &Path, path: &Path) -> bool {
+    let Some(directory) = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+
+    matches!(
+        directory,
+        crate::sync::SYNC_STAGING_DIR | crate::sync::LEGACY_SYNC_BLOB_DIR
+    )
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1068,6 +1091,10 @@ async fn overwrite_import(
 ) -> Result<ImportHistoryBackupResult> {
     let _pause_guard = pause_watcher(app);
     let migration = managed_resource_migration(app, root)?;
+    let current_pool = db.pool().await;
+    let current_origin_sequence =
+        crate::sync::repository::current_origin_sequence(&current_pool).await?;
+    drop(current_pool);
 
     let db_src = root.join(DB_ARCHIVE_DIR).join(DB_FILENAME);
     let resources_src = root.join(RESOURCES_ARCHIVE_DIR);
@@ -1082,6 +1109,15 @@ async fn overwrite_import(
             }
             let pool = crate::db::init(&app).await?;
             migration.apply(&pool).await?;
+            let removed_remote_items =
+                crate::sync::repository::clear_imported_group_state(&pool, current_origin_sequence)
+                    .await?;
+            remove_imported_sync_staging(&app)?;
+            if removed_remote_items > 0 {
+                log::info!(
+                    "backup overwrite skipped {removed_remote_items} remote file metadata card(s)"
+                );
+            }
             Ok(pool)
         }
     })
@@ -1095,6 +1131,9 @@ async fn overwrite_import(
         .state::<crate::settings::SettingsStore>()
         .replace_from_file(&settings_path)?;
     emit_settings_updated(app, &next);
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
+        manager.wake();
+    }
 
     Ok(ImportHistoryBackupResult {
         strategy: BackupImportStrategy::Overwrite,
@@ -1104,6 +1143,22 @@ async fn overwrite_import(
         imported_settings: true,
         requires_restart: false,
     })
+}
+
+/// Removes transport-only ciphertext restored inside the resources directory.
+fn remove_imported_sync_staging(app: &AppHandle) -> Result<()> {
+    let resources = crate::core::paths::resources_dir(app)?;
+    for directory in [
+        crate::sync::SYNC_STAGING_DIR,
+        crate::sync::LEGACY_SYNC_BLOB_DIR,
+    ] {
+        let path = resources.join(directory);
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove imported sync staging {path:?}"))?;
+        }
+    }
+    Ok(())
 }
 
 struct MergeOutcome {
@@ -1280,17 +1335,37 @@ async fn merge_items(
     backup: &SqlitePool,
     migration: &crate::clipboard::shared_files::ReferenceMigration,
 ) -> Result<MergeOutcome> {
-    let mut rows = sqlx::query_as::<_, BackupItemRow>(
+    let has_remote_file_metadata: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'sync_remote_file_items')",
+    )
+    .fetch_one(backup)
+    .await
+    .context("failed to inspect backup schema")?;
+    let select_items = if has_remote_file_metadata != 0 {
+        "SELECT item.id, item.kind, item.sub_kind, item.group_id, item.source_app_id, item.content, \
+         item.content_hash, item.sync_key, item.search_text, item.summary, item.file_types, item.size, \
+         item.width, item.height, item.use_count, item.is_favorite, item.is_pinned, item.is_sensitive, \
+         item.platform, item.note, item.created_at, item.updated_at, remote.item_id AS remote_item_id \
+         FROM clipboard_items item \
+         LEFT JOIN sync_remote_file_items remote ON remote.item_id = item.id \
+         ORDER BY item.created_at ASC"
+    } else {
         "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, sync_key, search_text, \
          summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
-         created_at, updated_at FROM clipboard_items ORDER BY created_at ASC",
-    )
-    .fetch(backup);
+         created_at, updated_at, CAST(NULL AS TEXT) AS remote_item_id \
+         FROM clipboard_items ORDER BY created_at ASC"
+    };
+    let mut rows = sqlx::query_as::<_, BackupItemRow>(select_items).fetch(backup);
 
     let mut imported_items = 0;
     let mut skipped_items = 0;
     while let Some(row) = rows.next().await {
         let mut row = row.context("failed to read backup items")?;
+        if row.remote_item_id.is_some() {
+            skipped_items += 1;
+            continue;
+        }
         if row.kind == "files" {
             if let Some(content) = migration.rewrite(&row.content)? {
                 row.content_hash = crate::db::items::content_hash(
@@ -1382,6 +1457,7 @@ struct BackupItemRow {
     note: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    remote_item_id: Option<String>,
 }
 
 struct WatcherPauseRestore {
@@ -1460,6 +1536,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<u64> {
     let mut copied = 0;
     for entry in WalkDir::new(src)
         .into_iter()
+        .filter_entry(|entry| !is_transport_only_resource_path(src, entry.path()))
         .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
@@ -1492,6 +1569,7 @@ fn copy_dir_missing(src: &Path, dst: &Path) -> Result<u64> {
     let mut copied = 0;
     for entry in WalkDir::new(src)
         .into_iter()
+        .filter_entry(|entry| !is_transport_only_resource_path(src, entry.path()))
         .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
@@ -1550,24 +1628,32 @@ fn copy_file_into_writer<W: Write>(path: &Path, writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn dir_size(path: &Path) -> Result<u64> {
-    if !path.exists() {
+fn backup_resources_size(root: &Path, target_path: &Path) -> Result<u64> {
+    if !root.exists() {
         return Ok(0);
     }
 
     let mut total = 0;
-    for entry in WalkDir::new(path)
+    for entry in WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| !is_transport_only_resource_path(root, entry.path()))
         .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
         let metadata = entry
             .metadata()
             .with_context(|| format!("failed to read metadata at {path:?}"))?;
-
-        if metadata.is_file() {
-            total += metadata.len();
+        if !metadata.is_file() {
+            continue;
         }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if should_skip_backup_path(path, file_name, target_path) {
+            continue;
+        }
+
+        total += metadata.len();
     }
 
     Ok(total)
@@ -1708,6 +1794,22 @@ mod tests {
         fs::write(root.join("window-state.json"), b"skip").unwrap();
         fs::write(root.join("settings.json.bak"), b"skip").unwrap();
         fs::write(resources.join("clipboard-images/origin/demo.png"), b"image").unwrap();
+        fs::create_dir_all(resources.join(crate::sync::SYNC_STAGING_DIR)).unwrap();
+        fs::write(
+            resources
+                .join(crate::sync::SYNC_STAGING_DIR)
+                .join("current.bin"),
+            b"transport",
+        )
+        .unwrap();
+        fs::create_dir_all(resources.join(crate::sync::LEGACY_SYNC_BLOB_DIR)).unwrap();
+        fs::write(
+            resources
+                .join(crate::sync::LEGACY_SYNC_BLOB_DIR)
+                .join("legacy.bin"),
+            b"legacy",
+        )
+        .unwrap();
 
         let payload = root.join("payload.zip");
         let target = root.join("backup.ecopastebak");
@@ -1730,9 +1832,11 @@ mod tests {
         };
         let source_paths = BackupSourcePaths {
             db_path: root.join("clipboard.db"),
-            resources_dir: resources,
+            resources_dir: resources.clone(),
             settings_path: root.join("settings.json"),
         };
+
+        assert_eq!(backup_resources_size(&resources, &target).unwrap(), 5);
 
         write_payload_zip(&source_paths, &payload, &manifest, &target).unwrap();
 
@@ -1825,6 +1929,53 @@ mod tests {
         assert_eq!((again.imported_items, again.skipped_items), (0, 1));
     }
 
+    #[test]
+    fn merge_resource_copy_skips_transport_directories_and_preserves_live_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let archived = temp.path().join("archive/resources");
+        let current = temp.path().join("current/resources");
+        fs::create_dir_all(archived.join("shared-files/item")).unwrap();
+        fs::create_dir_all(archived.join(crate::sync::SYNC_STAGING_DIR)).unwrap();
+        fs::create_dir_all(archived.join(crate::sync::LEGACY_SYNC_BLOB_DIR)).unwrap();
+        fs::write(archived.join("shared-files/item/file.txt"), b"history").unwrap();
+        fs::write(
+            archived
+                .join(crate::sync::SYNC_STAGING_DIR)
+                .join("imported"),
+            b"staging",
+        )
+        .unwrap();
+        fs::write(
+            archived
+                .join(crate::sync::LEGACY_SYNC_BLOB_DIR)
+                .join("imported"),
+            b"legacy",
+        )
+        .unwrap();
+        fs::create_dir_all(current.join(crate::sync::SYNC_STAGING_DIR)).unwrap();
+        fs::write(
+            current.join(crate::sync::SYNC_STAGING_DIR).join("active"),
+            b"active",
+        )
+        .unwrap();
+
+        assert_eq!(copy_dir_missing(&archived, &current).unwrap(), 1);
+
+        assert_eq!(
+            fs::read(current.join("shared-files/item/file.txt")).unwrap(),
+            b"history"
+        );
+        assert!(current
+            .join(crate::sync::SYNC_STAGING_DIR)
+            .join("active")
+            .is_file());
+        assert!(!current
+            .join(crate::sync::SYNC_STAGING_DIR)
+            .join("imported")
+            .exists());
+        assert!(!current.join(crate::sync::LEGACY_SYNC_BLOB_DIR).exists());
+    }
+
     #[tokio::test]
     async fn legacy_backup_infers_synchronized_resources_and_preserves_protected_records() {
         use crate::clipboard::{build_item, shared_files, ClipboardPayload, ImageStore};
@@ -1879,6 +2030,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_skips_remote_file_metadata_cards() {
+        use crate::clipboard::shared_files;
+        use crate::db::test_support::memory_pool;
+
+        let backup = memory_pool().await;
+        let current = memory_pool().await;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO clipboard_items \
+             (id, kind, content, content_hash, sync_key, platform, created_at, updated_at) \
+             VALUES (?, 'files', ?, ?, ?, 'macos', ?, ?)",
+        )
+        .bind("remote-file")
+        .bind("large.bin")
+        .bind("remote-content-hash")
+        .bind("remote-sync-key")
+        .bind(now)
+        .bind(now)
+        .execute(&backup)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sync_remote_file_items \
+             (item_id, event_id, origin_device_id, state, created_at, updated_at) \
+             VALUES (?, NULL, ?, 'expired', ?, ?)",
+        )
+        .bind("remote-file")
+        .bind("origin-device")
+        .bind(now)
+        .bind(now)
+        .execute(&backup)
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let migration = shared_files::ReferenceMigration::current(temp.path().join("resources"));
+
+        let outcome = merge_history(&current, &backup, &migration).await.unwrap();
+
+        assert_eq!((outcome.imported_items, outcome.skipped_items), (0, 1));
+        let imported: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM clipboard_items WHERE id = ?")
+            .bind("remote-file")
+            .fetch_one(&current)
+            .await
+            .unwrap();
+        assert_eq!(imported, 0);
+    }
+
+    #[tokio::test]
     async fn merge_preserves_sensitive_flag_and_sync_key() {
         use crate::db::items::{content_hash, insert_item};
         use crate::db::models::{ClipboardItem, ClipboardKind, Platform};
@@ -1926,11 +2125,16 @@ mod tests {
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
+            remote_file_state: None,
             available_actions: Vec::new(),
             color_preview: None,
             display_created_at: String::new(),
         };
         insert_item(&backup, &item).await.unwrap();
+        sqlx::query("DROP TABLE sync_remote_file_items")
+            .execute(&backup)
+            .await
+            .unwrap();
 
         let temp = tempfile::tempdir().unwrap();
         let migration = crate::clipboard::shared_files::ReferenceMigration::current(

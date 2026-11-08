@@ -13,6 +13,7 @@
   "labels": {
     "addApp": "Add app",
     "cancelFavorite": "Unfavorite",
+    "cancelSyncTransfer": "Cancel transfer",
     "changeStorageLocation": "Change data directory",
     "checkForUpdates": "Check for updates",
     "cleanCache": "Clean cache",
@@ -26,6 +27,7 @@
     "deleteClipboardGroup": "Delete group",
     "detectLegacyData": "Detect legacy data",
     "discoverNearbySyncSpaces": "Discover nearby sync spaces",
+    "downloadRemoteFiles": "Download remote files",
     "downloadUpdate": "Download update",
     "drag": "Drag",
     "exportBackup": "Export backup",
@@ -40,6 +42,7 @@
     "isClipboardWindowPinned": "Query pinned status",
     "joinSyncGroup": "Connect existing device",
     "leaveSyncGroup": "Disconnect this device",
+    "listSyncTransfers": "Load transfers",
     "loadApps": "Load apps",
     "loadAutostart": "Load launch-at-login state",
     "loadClipboardGroups": "Load groups",

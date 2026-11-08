@@ -155,6 +155,10 @@ export interface History {
   retention: Retention;
   maxCount: number;
   maxStorageBytes: number;
+  storageCheckMinIntervalMinutes: number;
+  storageFallbackIntervalMinutes: number;
+  storageCleanupTriggerPercent: number;
+  storageCleanupTargetPercent: number;
   cleanupIntervalHours: number;
 }
 
@@ -193,6 +197,7 @@ export interface SyncSettings {
   cloudEnabled: boolean;
   autoWriteClipboard: boolean;
   autoUploadMaxMb: number;
+  autoDownloadMaxMb: number;
   syncSensitive: boolean;
   cloudRelayMode: CloudRelayMode;
   serverEndpointId: string;

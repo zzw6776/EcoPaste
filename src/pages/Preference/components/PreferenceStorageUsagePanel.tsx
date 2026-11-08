@@ -13,6 +13,8 @@ import {
 interface PreferenceStorageUsagePanelProps {
   limitBytes: number;
   state: PreferenceStorageState;
+  targetPercent: number;
+  triggerPercent: number;
   usedBytes: number | null;
 }
 
@@ -23,7 +25,7 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
   props,
 ) => {
   const { t } = useTranslation("preferences");
-  const { limitBytes, state, usedBytes } = props;
+  const { limitBytes, state, targetPercent, triggerPercent, usedBytes } = props;
   const isReady = state === "ready" && usedBytes !== null;
   const totalLabel = usedBytes !== null ? formatBytes(usedBytes) : "--";
   const targetLabel =
@@ -38,7 +40,7 @@ const PreferenceStorageUsagePanel: FC<PreferenceStorageUsagePanelProps> = (
     ? storageMeterPercent(usedBytes, limitBytes)
     : 20;
   const storageToneValue = isReady
-    ? storageTone(meterPercent)
+    ? storageTone(meterPercent, triggerPercent, targetPercent)
     : {
         stroke: "var(--ant-color-success)",
         text: "text-ant-success",

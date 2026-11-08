@@ -117,11 +117,13 @@ export interface ClipboardPreviewLayout {
 }
 
 export interface ClipboardPreviewFileEntry {
+  entryKey: string;
   path: string;
   name: string;
   isDir: boolean;
   isImage: boolean;
   exists: boolean;
+  isRemote: boolean;
   size: number | null;
   iconPath?: string;
 }
@@ -182,6 +184,37 @@ export interface SyncStatus {
   cloudTransport: string | null;
   cloudServerVersion: string | null;
   peers: SyncPeerStatus[];
+}
+
+export type TransferDirection = "upload" | "download";
+export type TransferRoute = "lan" | "cloud";
+export type TransferPhase =
+  | "queued"
+  | "preparing"
+  | "connecting"
+  | "transferring"
+  | "confirming"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export interface TransferTask {
+  id: string;
+  operationId: string;
+  itemId: string;
+  direction: TransferDirection;
+  route: TransferRoute;
+  target: string;
+  fileName: string | null;
+  phase: TransferPhase;
+  transferredBytes: number;
+  totalBytes: number;
+  operationTotalBytes: number;
+  speedBytesPerSecond: number;
+  elapsedMs: number;
+  etaSeconds: number | null;
+  error: string | null;
+  cancellable: boolean;
 }
 
 export interface CloudRecord {
@@ -485,6 +518,32 @@ export const getSyncItemStatuses = async (itemIds: string[]) => {
     TAURI_COMMAND.GET_SYNC_ITEM_STATUSES,
     "commands:labels.loadSyncItemStatuses",
     { itemIds },
+  );
+};
+
+export const listSyncTransfers = async () => {
+  return call<TransferTask[]>(
+    TAURI_COMMAND.LIST_SYNC_TRANSFERS,
+    "commands:labels.listSyncTransfers",
+  );
+};
+
+export const cancelSyncTransfer = async (taskId: string) => {
+  return call<boolean>(
+    TAURI_COMMAND.CANCEL_SYNC_TRANSFER,
+    "commands:labels.cancelSyncTransfer",
+    { taskId },
+  );
+};
+
+export const downloadRemoteFiles = async (
+  itemId: string,
+  route?: TransferRoute,
+) => {
+  return call<TransferTask | null>(
+    TAURI_COMMAND.DOWNLOAD_REMOTE_FILES,
+    "commands:labels.downloadRemoteFiles",
+    { itemId, route: route ?? null },
   );
 };
 

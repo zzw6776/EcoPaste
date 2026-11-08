@@ -31,17 +31,21 @@ export function storageMeterPercent(totalBytes: number, limitBytes: number) {
 }
 
 /**
- * 按本地数据总量返回状态色：低占用绿色、中等黄色、高占用红色。
+ * 按容量清理策略返回状态色：目标以下绿色、目标以上黄色、触发线以上红色。
  */
-export function storageTone(percent: number): StorageTone {
-  if (percent >= 100) {
+export function storageTone(
+  percent: number,
+  triggerPercent: number,
+  targetPercent: number,
+): StorageTone {
+  if (percent >= triggerPercent) {
     return {
       stroke: "var(--ant-color-error)",
       text: "text-ant-error",
     };
   }
 
-  if (percent >= 80) {
+  if (percent >= targetPercent) {
     return {
       stroke: "var(--ant-color-warning)",
       text: "text-ant-warning",

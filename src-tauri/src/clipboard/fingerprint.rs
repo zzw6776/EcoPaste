@@ -736,6 +736,7 @@ mod tests {
             image_thumbnail_path: None,
             file_entries: None,
             files_preview_kind: None,
+            remote_file_state: None,
             available_actions: Vec::new(),
             color_preview: None,
             display_created_at: String::new(),

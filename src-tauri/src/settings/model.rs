@@ -2,6 +2,7 @@
 //!
 //! 每个字段都 `#[serde(default)]`，缺字段时回落到 `Default`，这样新增字段不破坏旧配置文件。
 
+use ecopaste_sync_protocol::{DEFAULT_QUOTA_TARGET_PERCENT, DEFAULT_QUOTA_TRIGGER_PERCENT};
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,8 @@ pub struct SyncSettings {
     pub auto_write_clipboard: bool,
     /// 文件卡片原始总大小小于等于该值时自动上传，0 表示文件只允许手动上传。
     pub auto_upload_max_mb: u32,
+    /// 远端文件卡片原始总大小小于等于该值时自动下载到托管缓存，0 表示只同步元数据。
+    pub auto_download_max_mb: u32,
     /// 敏感内容默认不参与同步，用户必须显式开启。
     pub sync_sensitive: bool,
     /// 云端 Relay 策略。默认关闭；公共模式使用 Iroh 免费公共 Relay，自定义模式使用下方地址。
@@ -54,6 +57,7 @@ impl Default for SyncSettings {
             cloud_enabled: false,
             auto_write_clipboard: false,
             auto_upload_max_mb: 10,
+            auto_download_max_mb: 100,
             sync_sensitive: false,
             cloud_relay_mode: CloudRelayMode::Off,
             server_endpoint_id: String::new(),
@@ -591,7 +595,7 @@ pub enum PreviewHoverDelayMs {
     Ms1000,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct History {
     pub retention: Retention,
@@ -599,8 +603,31 @@ pub struct History {
     pub max_count: u32,
     /// 本地数据目录容量上限，单位字节。旧配置缺失或 0 表示不限。
     pub max_storage_bytes: u64,
+    /// 剪贴板变更触发的容量检查最短间隔，单位分钟。
+    pub storage_check_min_interval_minutes: u32,
+    /// 没有剪贴板变更时的容量兜底检查间隔，单位分钟。
+    pub storage_fallback_interval_minutes: u32,
+    /// 超过容量上限的该百分比后触发清理。
+    pub storage_cleanup_trigger_percent: u32,
+    /// 容量清理持续到上限的该百分比。
+    pub storage_cleanup_target_percent: u32,
     /// 自动清理周期（小时）。`0` = 关闭周期清理，但启动时仍清理一次。
     pub cleanup_interval_hours: u32,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            retention: Retention::default(),
+            max_count: 0,
+            max_storage_bytes: 0,
+            storage_check_min_interval_minutes: 10,
+            storage_fallback_interval_minutes: 60,
+            storage_cleanup_trigger_percent: DEFAULT_QUOTA_TRIGGER_PERCENT,
+            storage_cleanup_target_percent: DEFAULT_QUOTA_TARGET_PERCENT,
+            cleanup_interval_hours: 0,
+        }
+    }
 }
 
 /// 历史保留时长。`unit = Forever` 时忽略 `value`。

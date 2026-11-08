@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +16,10 @@ use chacha20poly1305::{
 };
 use ecopaste_sync_protocol::{EncryptedEvent, RetentionMapping, SyncEventKind};
 use rand::RngCore;
+use tokio::io::{
+    AsyncRead as TokioAsyncRead, AsyncReadExt as TokioAsyncReadExt, AsyncWrite as TokioAsyncWrite,
+    AsyncWriteExt as TokioAsyncWriteExt,
+};
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
@@ -25,6 +30,7 @@ const STREAM_NONCE_LEN: usize = 19;
 const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
 const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
+const STREAM_BLOB_ID_DOMAIN: &[u8] = b"ecopaste/stream-blob-id/v1\0";
 
 /// Advance only when the event decoder gains support for previously deferred formats.
 pub const RETENTION_DECODER_REVISION: u32 = 1;
@@ -36,12 +42,131 @@ struct TemporaryFileCleanup {
 
 pub struct FingerprintedBlob {
     pub blob: StoredBlob,
+    #[cfg(test)]
     pub plaintext_hash: String,
 }
 
 pub struct ArchivedDirectory {
     pub content_size: u64,
     pub fingerprint: String,
+}
+
+/// Incremental file encryptor used by direct uploads without a staged ciphertext file.
+pub struct BlobStreamEncryptor {
+    encryptor: Option<EncryptorBE32<XChaCha20Poly1305>>,
+    remaining: u64,
+    plaintext_hasher: blake3::Hasher,
+    stream_nonce: [u8; STREAM_NONCE_LEN],
+}
+
+impl BlobStreamEncryptor {
+    pub fn new(key: &[u8; 32], stream_nonce: &[u8], original_size: u64) -> Result<Self> {
+        let stream_nonce: [u8; STREAM_NONCE_LEN] = stream_nonce
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid sync stream nonce"))?;
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(key).context("failed to initialize blob cipher")?;
+        Ok(Self {
+            encryptor: Some(EncryptorBE32::from_aead(
+                cipher,
+                stream_nonce.as_slice().into(),
+            )),
+            remaining: original_size,
+            plaintext_hasher: blake3::Hasher::new(),
+            stream_nonce,
+        })
+    }
+
+    pub fn header(&self) -> Vec<u8> {
+        let mut header = Vec::with_capacity(BLOB_MAGIC.len() + STREAM_NONCE_LEN);
+        header.extend_from_slice(BLOB_MAGIC);
+        header.extend_from_slice(&self.stream_nonce);
+        header
+    }
+
+    pub fn encrypt_next(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let expected = if self.remaining == 0 {
+            0
+        } else {
+            usize::try_from(self.remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE)
+        };
+        if plaintext.len() != expected {
+            bail!("sync source size changed during upload");
+        }
+        self.plaintext_hasher.update(plaintext);
+        self.remaining = self.remaining.saturating_sub(plaintext.len() as u64);
+        if self.remaining == 0 {
+            self.encryptor
+                .take()
+                .context("stream encryptor already finalized")?
+                .encrypt_last(plaintext)
+                .map_err(|_| anyhow::anyhow!("failed to encrypt final blob chunk"))
+        } else {
+            self.encryptor
+                .as_mut()
+                .context("stream encryptor already finalized")?
+                .encrypt_next(plaintext)
+                .map_err(|_| anyhow::anyhow!("failed to encrypt blob chunk"))
+        }
+    }
+
+    pub fn finish(self, key: &[u8; 32], expected_blob_id: &str) -> Result<String> {
+        if self.remaining != 0 || self.encryptor.is_some() {
+            bail!("sync source ended before the expected size");
+        }
+        let plaintext_hash = self.plaintext_hasher.finalize().to_hex().to_string();
+        let actual_blob_id = stream_blob_id(key, &self.stream_nonce, &plaintext_hash)?;
+        if actual_blob_id != expected_blob_id {
+            bail!("sync source content changed before upload");
+        }
+        Ok(plaintext_hash)
+    }
+}
+
+pub fn new_stream_nonce() -> Vec<u8> {
+    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
+    stream_nonce.to_vec()
+}
+
+/// Commits a random stream nonce and plaintext digest without exposing either to the Hub.
+pub fn stream_blob_id(key: &[u8; 32], stream_nonce: &[u8], plaintext_hash: &str) -> Result<String> {
+    if stream_nonce.len() != STREAM_NONCE_LEN
+        || plaintext_hash.len() != 64
+        || !plaintext_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("invalid streaming blob identity");
+    }
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(STREAM_BLOB_ID_DOMAIN);
+    hasher.update(stream_nonce);
+    hasher.update(plaintext_hash.as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub fn encrypted_blob_size(original_size: u64) -> Result<u64> {
+    let chunks = if original_size == 0 {
+        1
+    } else {
+        original_size.div_ceil(CHUNK_SIZE as u64)
+    };
+    original_size
+        .checked_add((BLOB_MAGIC.len() + STREAM_NONCE_LEN) as u64)
+        .and_then(|size| size.checked_add(chunks.saturating_mul(TAG_SIZE as u64)))
+        .context("encrypted blob size overflow")
+}
+
+pub fn verify_stream_blob_id(
+    key: &[u8; 32],
+    encrypted_path: &Path,
+    plaintext_hash: &str,
+    expected_blob_id: &str,
+) -> Result<()> {
+    let nonce = blob_stream_nonce(encrypted_path)?;
+    if stream_blob_id(key, &nonce, plaintext_hash)? != expected_blob_id {
+        bail!("streaming blob identity mismatch");
+    }
+    Ok(())
 }
 
 impl TemporaryFileCleanup {
@@ -275,7 +400,32 @@ pub fn encrypt_blob_with_fingerprint(
 ) -> Result<FingerprintedBlob> {
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
-    encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)
+    encrypt_blob_with_nonce(source, blob_root, key, stream_nonce, || false)
+}
+
+/// Encrypts staged content while checking whether its enclosing transfer was canceled.
+pub fn encrypt_blob_with_cancel(
+    source: &Path,
+    blob_root: &Path,
+    key: &[u8; 32],
+    canceled: impl FnMut() -> bool,
+) -> Result<StoredBlob> {
+    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
+    Ok(encrypt_blob_with_nonce(source, blob_root, key, stream_nonce, canceled)?.blob)
+}
+
+/// Recreates a staged ciphertext from its original source and previously persisted nonce.
+pub fn encrypt_blob_with_stream_nonce(
+    source: &Path,
+    blob_root: &Path,
+    key: &[u8; 32],
+    stream_nonce: &[u8],
+) -> Result<StoredBlob> {
+    let stream_nonce: [u8; STREAM_NONCE_LEN] = stream_nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid sync stream nonce"))?;
+    Ok(encrypt_blob_with_nonce(source, blob_root, key, stream_nonce, || false)?.blob)
 }
 
 /// Encrypts a small content-addressed asset deterministically inside one sync space.
@@ -299,7 +449,7 @@ pub fn encrypt_stable_blob(
     let digest = blake3::keyed_hash(key, &nonce_input);
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     stream_nonce.copy_from_slice(&digest.as_bytes()[..STREAM_NONCE_LEN]);
-    Ok(encrypt_blob_with_nonce(source, blob_root, key, stream_nonce)?.blob)
+    Ok(encrypt_blob_with_nonce(source, blob_root, key, stream_nonce, || false)?.blob)
 }
 
 fn encrypt_blob_with_nonce(
@@ -307,6 +457,7 @@ fn encrypt_blob_with_nonce(
     blob_root: &Path,
     key: &[u8; 32],
     stream_nonce: [u8; STREAM_NONCE_LEN],
+    mut canceled: impl FnMut() -> bool,
 ) -> Result<FingerprintedBlob> {
     let _sync_activity = SyncActivityGuard::acquire();
     let source_size = source
@@ -338,6 +489,9 @@ fn encrypt_blob_with_nonce(
     let mut remaining = source_size;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     let mut plaintext_hasher = blake3::Hasher::new();
+    if canceled() {
+        bail!("transfer canceled");
+    }
     if remaining == 0 {
         let ciphertext = encryptor
             .take()
@@ -348,6 +502,9 @@ fn encrypt_blob_with_nonce(
         ciphertext_hasher.update(&ciphertext);
     } else {
         while remaining > 0 {
+            if canceled() {
+                bail!("transfer canceled");
+            }
             let length = usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE);
             reader.read_exact(&mut buffer[..length])?;
             plaintext_hasher.update(&buffer[..length]);
@@ -369,6 +526,9 @@ fn encrypt_blob_with_nonce(
             ciphertext_hasher.update(&ciphertext);
         }
     }
+    if canceled() {
+        bail!("transfer canceled");
+    }
     writer.flush()?;
     drop(writer);
 
@@ -389,7 +549,11 @@ fn encrypt_blob_with_nonce(
             blob_id,
             encrypted_path: destination.to_string_lossy().into_owned(),
             size: encrypted_size,
+            source_path: None,
+            source_is_directory: false,
+            stream_nonce: Some(stream_nonce.to_vec()),
         },
+        #[cfg(test)]
         plaintext_hash: plaintext_hasher.finalize().to_hex().to_string(),
     })
 }
@@ -486,6 +650,139 @@ pub fn decrypt_blob_with_fingerprint(
     Ok(plaintext_hasher.finalize().to_hex().to_string())
 }
 
+/// Immutable authenticated-stream contract shared by desktop and Android destinations.
+pub struct BlobStreamSpec<'a> {
+    pub original_size: u64,
+    pub encrypted_size: u64,
+    pub expected_hash: &'a str,
+    pub stream_commitment: bool,
+    pub key: &'a [u8; 32],
+    pub idle_timeout: Duration,
+}
+
+/// Authenticates and decrypts one network blob directly into the caller's destination stream.
+pub async fn decrypt_blob_stream<R, W, F, C>(
+    reader: &mut R,
+    writer: &mut W,
+    spec: BlobStreamSpec<'_>,
+    mut on_progress: F,
+    canceled: C,
+) -> Result<String>
+where
+    R: TokioAsyncRead + Unpin,
+    W: TokioAsyncWrite + Unpin,
+    F: FnMut(u64),
+    C: Fn() -> bool,
+{
+    let _sync_activity = SyncActivityGuard::acquire();
+    let BlobStreamSpec {
+        original_size,
+        encrypted_size,
+        expected_hash,
+        stream_commitment,
+        key,
+        idle_timeout,
+    } = spec;
+    let header_size = (BLOB_MAGIC.len() + STREAM_NONCE_LEN) as u64;
+    if encrypted_size < header_size.saturating_add(TAG_SIZE as u64) {
+        bail!("invalid encrypted sync blob size");
+    }
+
+    let mut ciphertext_hasher = blake3::Hasher::new();
+    let mut magic = [0_u8; BLOB_MAGIC.len()];
+    tokio::time::timeout(
+        idle_timeout,
+        TokioAsyncReadExt::read_exact(reader, &mut magic),
+    )
+    .await
+    .context("remote blob download idle timeout")??;
+    if &magic != BLOB_MAGIC {
+        bail!("invalid encrypted sync blob");
+    }
+    ciphertext_hasher.update(&magic);
+    let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
+    tokio::time::timeout(
+        idle_timeout,
+        TokioAsyncReadExt::read_exact(reader, &mut stream_nonce),
+    )
+    .await
+    .context("remote blob download idle timeout")??;
+    ciphertext_hasher.update(&stream_nonce);
+    let mut transferred = header_size;
+    on_progress(transferred);
+
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).context("failed to initialize blob cipher")?;
+    let mut decryptor = Some(DecryptorBE32::from_aead(
+        cipher,
+        stream_nonce.as_slice().into(),
+    ));
+    let mut remaining = original_size;
+    let mut buffer = vec![0_u8; CHUNK_SIZE + TAG_SIZE];
+    let mut plaintext_hasher = blake3::Hasher::new();
+    loop {
+        if canceled() {
+            bail!("transfer canceled");
+        }
+        let plaintext_length = if original_size == 0 {
+            0
+        } else {
+            usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE)
+        };
+        let encrypted_length = plaintext_length + TAG_SIZE;
+        tokio::time::timeout(
+            idle_timeout,
+            TokioAsyncReadExt::read_exact(reader, &mut buffer[..encrypted_length]),
+        )
+        .await
+        .context("remote blob download idle timeout")??;
+        ciphertext_hasher.update(&buffer[..encrypted_length]);
+        transferred = transferred.saturating_add(encrypted_length as u64);
+        on_progress(transferred);
+        remaining = remaining.saturating_sub(plaintext_length as u64);
+        let is_last = original_size == 0 || remaining == 0;
+        let plaintext = if is_last {
+            decryptor
+                .take()
+                .expect("stream decryptor available")
+                .decrypt_last(&buffer[..encrypted_length])
+                .map_err(|_| anyhow::anyhow!("final sync blob authentication failed"))?
+        } else {
+            decryptor
+                .as_mut()
+                .expect("stream decryptor available")
+                .decrypt_next(&buffer[..encrypted_length])
+                .map_err(|_| anyhow::anyhow!("sync blob authentication failed"))?
+        };
+        plaintext_hasher.update(&plaintext);
+        tokio::time::timeout(
+            idle_timeout,
+            TokioAsyncWriteExt::write_all(writer, &plaintext),
+        )
+        .await
+        .context("remote destination write idle timeout")??;
+        if is_last {
+            break;
+        }
+    }
+    tokio::time::timeout(idle_timeout, TokioAsyncWriteExt::flush(writer))
+        .await
+        .context("remote destination flush timeout")??;
+    if transferred != encrypted_size {
+        bail!("encrypted sync blob size mismatch");
+    }
+    let plaintext_hash = plaintext_hasher.finalize().to_hex().to_string();
+    let actual_id = if stream_commitment {
+        stream_blob_id(key, &stream_nonce, &plaintext_hash)?
+    } else {
+        ciphertext_hasher.finalize().to_hex().to_string()
+    };
+    if actual_id != expected_hash {
+        bail!("blob hash mismatch");
+    }
+    Ok(plaintext_hash)
+}
+
 pub fn blob_path(root: &Path, blob_id: &str) -> Result<PathBuf> {
     if blob_id.len() != 64 || !blob_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("invalid blob id");
@@ -494,33 +791,76 @@ pub fn blob_path(root: &Path, blob_id: &str) -> Result<PathBuf> {
 }
 
 pub fn hash_file(path: &Path) -> Result<String> {
+    hash_file_with_progress(path, || false, |_| {})
+}
+
+pub fn hash_file_with_progress(
+    path: &Path,
+    mut canceled: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(u64),
+) -> Result<String> {
     let mut file = BufReader::new(File::open(path)?);
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut processed = 0_u64;
     loop {
+        if canceled() {
+            bail!("transfer canceled");
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        processed = processed.saturating_add(read as u64);
+        on_progress(processed);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Reads the authenticated-stream nonce needed to reproduce temporary ciphertext later.
+pub fn blob_stream_nonce(path: &Path) -> Result<Vec<u8>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0_u8; BLOB_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if &magic != BLOB_MAGIC {
+        bail!("invalid encrypted sync blob");
+    }
+    let mut nonce = [0_u8; STREAM_NONCE_LEN];
+    reader.read_exact(&mut nonce)?;
+    Ok(nonce.to_vec())
+}
+
 /// 把目录压缩为 ZIP，并在同一次读取中计算与绝对路径、遍历顺序无关的目录树指纹。
 pub fn archive_directory(source: &Path, destination: &Path) -> Result<ArchivedDirectory> {
+    archive_directory_with_progress(source, destination, || false, |_| {})
+}
+
+/// Archives a directory while reporting logical bytes and honoring transfer cancellation.
+pub fn archive_directory_with_progress(
+    source: &Path,
+    destination: &Path,
+    mut canceled: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(u64),
+) -> Result<ArchivedDirectory> {
     let _sync_activity = SyncActivityGuard::acquire();
     let output = File::create(destination)?;
     let mut archive = ZipWriter::new(BufWriter::new(output));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut original_size = 0_u64;
-    let mut entries = WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(source).follow_links(false) {
+        if canceled() {
+            bail!("transfer canceled");
+        }
+        entries.push(entry?);
+    }
     entries.sort_by_key(|entry| portable_relative_path(entry.path(), source));
     let mut entry_hashes = Vec::new();
     for entry in entries {
+        if canceled() {
+            bail!("transfer canceled");
+        }
         let path = entry.path();
         let relative = path.strip_prefix(source)?;
         if relative.as_os_str().is_empty() {
@@ -536,7 +876,16 @@ pub fn archive_directory(source: &Path, destination: &Path) -> Result<ArchivedDi
         } else if entry.file_type().is_file() {
             archive.start_file(&name, options)?;
             let mut input = File::open(path)?;
-            let (written, content_hash) = copy_with_hash(&mut input, &mut archive)?;
+            let progress_base = original_size;
+            let mut report_file_progress = |written| {
+                on_progress(progress_base.saturating_add(written));
+            };
+            let (written, content_hash) = copy_with_hash_with_hooks(
+                &mut input,
+                &mut archive,
+                &mut canceled,
+                &mut report_file_progress,
+            )?;
             original_size = original_size
                 .checked_add(written)
                 .context("directory content size overflow")?;
@@ -552,11 +901,23 @@ pub fn archive_directory(source: &Path, destination: &Path) -> Result<ArchivedDi
 
 /// 解压目录归档，并在同一次输出中重建与发送端一致的目录树指纹。
 pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Result<String> {
+    extract_directory_archive_with_cancel(archive_path, destination, || false)
+}
+
+/// 解压目录归档，并在复制大文件时响应外部取消请求。
+pub fn extract_directory_archive_with_cancel(
+    archive_path: &Path,
+    destination: &Path,
+    mut canceled: impl FnMut() -> bool,
+) -> Result<String> {
     let input = File::open(archive_path)?;
     let mut archive = ZipArchive::new(BufReader::new(input))?;
     fs::create_dir_all(destination)?;
     let mut entry_hashes = Vec::new();
     for index in 0..archive.len() {
+        if canceled() {
+            bail!("transfer canceled");
+        }
         let mut entry = archive.by_index(index)?;
         let Some(relative) = entry.enclosed_name() else {
             bail!("directory archive contains an unsafe path");
@@ -573,7 +934,7 @@ pub fn extract_directory_archive(archive_path: &Path, destination: &Path) -> Res
             fs::create_dir_all(parent)?;
         }
         let mut file = File::create(output)?;
-        let (_, content_hash) = copy_with_hash(&mut entry, &mut file)?;
+        let (_, content_hash) = copy_with_hash_with_cancel(&mut entry, &mut file, &mut canceled)?;
         entry_hashes.push(file_entry_hash(&name, &content_hash));
     }
     Ok(directory_tree_hash(entry_hashes))
@@ -586,11 +947,27 @@ fn portable_relative_path(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn copy_with_hash(reader: &mut impl Read, writer: &mut impl Write) -> Result<(u64, String)> {
+fn copy_with_hash_with_cancel(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    canceled: &mut impl FnMut() -> bool,
+) -> Result<(u64, String)> {
+    copy_with_hash_with_hooks(reader, writer, canceled, &mut |_| {})
+}
+
+fn copy_with_hash_with_hooks(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    canceled: &mut impl FnMut() -> bool,
+    on_progress: &mut impl FnMut(u64),
+) -> Result<(u64, String)> {
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     let mut written = 0_u64;
     let mut hasher = blake3::Hasher::new();
     loop {
+        if canceled() {
+            bail!("transfer canceled");
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -600,6 +977,7 @@ fn copy_with_hash(reader: &mut impl Read, writer: &mut impl Write) -> Result<(u6
         written = written
             .checked_add(read as u64)
             .context("copied content size overflow")?;
+        on_progress(written);
     }
     Ok((written, hasher.finalize().to_hex().to_string()))
 }
@@ -661,6 +1039,50 @@ mod tests {
     }
 
     #[test]
+    fn directory_extraction_stops_during_file_copy_when_canceled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let archive = temporary.path().join("directory.zip");
+        let destination = temporary.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("large.bin"), vec![1_u8; CHUNK_SIZE * 2]).unwrap();
+        archive_directory(&source, &archive).unwrap();
+        let checks = std::cell::Cell::new(0_u8);
+
+        let error = extract_directory_archive_with_cancel(&archive, &destination, || {
+            let current = checks.get();
+            checks.set(current.saturating_add(1));
+            current > 0
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("transfer canceled"));
+        assert!(checks.get() >= 2);
+    }
+
+    #[test]
+    fn directory_archiving_stops_during_file_copy_when_canceled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let archive = temporary.path().join("directory.zip");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("large.bin"), vec![1_u8; CHUNK_SIZE * 2]).unwrap();
+        let processed = std::cell::Cell::new(0_u64);
+
+        let error = archive_directory_with_progress(
+            &source,
+            &archive,
+            || processed.get() >= CHUNK_SIZE as u64,
+            |bytes| processed.set(bytes),
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("transfer canceled"));
+        assert_eq!(processed.get(), CHUNK_SIZE as u64);
+    }
+
+    #[test]
     fn directory_fingerprint_ignores_absolute_root() {
         let temporary = tempfile::tempdir().unwrap();
         let first = temporary.path().join("first-root");
@@ -672,11 +1094,16 @@ mod tests {
         std::fs::write(first.join("nested/b.txt"), b"tree").unwrap();
         std::fs::write(second.join("nested/b.txt"), b"tree").unwrap();
 
-        let first_archive = archive_directory(&first, &temporary.path().join("first.zip")).unwrap();
-        let second_archive =
-            archive_directory(&second, &temporary.path().join("second.zip")).unwrap();
+        let first_path = temporary.path().join("first.zip");
+        let second_path = temporary.path().join("second.zip");
+        let first_archive = archive_directory(&first, &first_path).unwrap();
+        let second_archive = archive_directory(&second, &second_path).unwrap();
 
         assert_eq!(first_archive.fingerprint, second_archive.fingerprint);
+        assert_eq!(
+            fs::read(first_path).unwrap(),
+            fs::read(second_path).unwrap()
+        );
     }
 
     #[test]
@@ -701,6 +1128,127 @@ mod tests {
 
         assert_eq!(fs::read(destination).unwrap(), bytes);
         assert_eq!(decrypted_hash, blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    #[test]
+    fn staged_ciphertext_can_be_recreated_with_the_original_nonce() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        fs::write(&source, b"reproducible payload").unwrap();
+        let root = directory.path().join("staging");
+        let key = [6_u8; 32];
+        let original = encrypt_blob(&source, &root, &key).unwrap();
+        let nonce = original.stream_nonce.clone().unwrap();
+        fs::remove_file(&original.encrypted_path).unwrap();
+
+        let rebuilt = encrypt_blob_with_stream_nonce(&source, &root, &key, &nonce).unwrap();
+
+        assert_eq!(rebuilt.blob_id, original.blob_id);
+        assert_eq!(rebuilt.size, original.size);
+    }
+
+    #[test]
+    fn staged_encryption_removes_partial_output_when_canceled() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let root = directory.path().join("staging");
+        fs::write(&source, vec![1_u8; CHUNK_SIZE * 2]).unwrap();
+        let checks = std::cell::Cell::new(0_u8);
+
+        let error = encrypt_blob_with_cancel(&source, &root, &[6_u8; 32], || {
+            let current = checks.get();
+            checks.set(current.saturating_add(1));
+            current > 1
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("transfer canceled"));
+        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_blob_stream_decrypts_directly_with_exact_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let bytes = (0..(CHUNK_SIZE * 2 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source, &bytes).unwrap();
+        let key = [5_u8; 32];
+        let encrypted = encrypt_blob(&source, &directory.path().join("blobs"), &key).unwrap();
+        let mut reader = tokio::fs::File::open(&encrypted.encrypted_path)
+            .await
+            .unwrap();
+        let mut writer = tokio::fs::File::create(&destination).await.unwrap();
+        let mut transferred = 0_u64;
+
+        let plaintext_hash = decrypt_blob_stream(
+            &mut reader,
+            &mut writer,
+            BlobStreamSpec {
+                original_size: bytes.len() as u64,
+                encrypted_size: encrypted.size,
+                expected_hash: &encrypted.blob_id,
+                stream_commitment: false,
+                key: &key,
+                idle_timeout: Duration::from_secs(1),
+            },
+            |current| transferred = current,
+            || false,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        assert_eq!(transferred, encrypted.size);
+        assert_eq!(tokio::fs::read(destination).await.unwrap(), bytes);
+        assert_eq!(plaintext_hash, blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    #[test]
+    fn streaming_blob_identity_round_trips_without_ciphertext_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("encrypted.bin");
+        let bytes = (0..(CHUNK_SIZE * 2 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let key = [6_u8; 32];
+        let nonce = new_stream_nonce();
+        let plaintext_hash = blake3::hash(&bytes).to_hex().to_string();
+        let blob_id = stream_blob_id(&key, &nonce, &plaintext_hash).unwrap();
+        let mut encryptor = BlobStreamEncryptor::new(&key, &nonce, bytes.len() as u64).unwrap();
+        let mut encrypted = encryptor.header();
+        for chunk in bytes.chunks(CHUNK_SIZE) {
+            encrypted.extend_from_slice(&encryptor.encrypt_next(chunk).unwrap());
+        }
+        encryptor.finish(&key, &blob_id).unwrap();
+
+        assert_eq!(
+            encrypted.len() as u64,
+            encrypted_blob_size(bytes.len() as u64).unwrap()
+        );
+        fs::write(&destination, encrypted).unwrap();
+        let restored = directory.path().join("restored.bin");
+        let restored_hash =
+            decrypt_blob_with_fingerprint(&destination, &restored, bytes.len() as u64, &key)
+                .unwrap();
+        verify_stream_blob_id(&key, &destination, &restored_hash, &blob_id).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), bytes);
+    }
+
+    #[test]
+    fn streaming_blob_rejects_a_source_changed_after_identity_creation() {
+        let key = [7_u8; 32];
+        let original = b"original";
+        let changed = b"modified";
+        let nonce = new_stream_nonce();
+        let blob_id =
+            stream_blob_id(&key, &nonce, blake3::hash(original).to_hex().as_str()).unwrap();
+        let mut encryptor = BlobStreamEncryptor::new(&key, &nonce, changed.len() as u64).unwrap();
+        let _ = encryptor.encrypt_next(changed).unwrap();
+
+        assert!(encryptor.finish(&key, &blob_id).is_err());
     }
 
     /// 独立按 ECOSBL01 格式组装 AEAD nonce，固定格式并避免复用被测 STREAM 写入路径。
@@ -752,7 +1300,8 @@ mod tests {
             let expected_id = blake3::hash(&reference).to_hex().to_string();
             let expected_plaintext_hash = blake3::hash(&bytes).to_hex().to_string();
 
-            let encrypted = encrypt_blob_with_nonce(&source, &blob_root, &key, nonce).unwrap();
+            let encrypted =
+                encrypt_blob_with_nonce(&source, &blob_root, &key, nonce, || false).unwrap();
             let encrypted_path = Path::new(&encrypted.blob.encrypted_path);
 
             assert_eq!(fs::read(encrypted_path).unwrap(), reference, "size={size}");
@@ -944,6 +1493,7 @@ mod tests {
                 role: super::super::model::BlobRole::Image,
                 file_index: None,
                 is_directory_archive: false,
+                stream_commitment: false,
             }],
             source_app: Some(super::super::model::SourceAppRef {
                 version: 1,

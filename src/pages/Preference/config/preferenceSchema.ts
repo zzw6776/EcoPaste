@@ -194,6 +194,52 @@ export const preferenceTabs: PreferenceTab[] = [
             },
           },
           {
+            control: {
+              max: 100,
+              min: 2,
+              suffixKey: "percent",
+              type: "number",
+            },
+            id: "history.storageCleanupTriggerPercent",
+            keywords: ["storage", "quota", "trigger", "percent"],
+            path: ["clipboard", "history", "storageCleanupTriggerPercent"],
+            value: (settings) => {
+              return settings.clipboard.history.storageCleanupTriggerPercent;
+            },
+          },
+          {
+            control: {
+              max: 99,
+              min: 1,
+              suffixKey: "percent",
+              type: "number",
+            },
+            id: "history.storageCleanupTargetPercent",
+            keywords: ["storage", "quota", "target", "percent"],
+            path: ["clipboard", "history", "storageCleanupTargetPercent"],
+            value: (settings) => {
+              return settings.clipboard.history.storageCleanupTargetPercent;
+            },
+          },
+          {
+            control: { min: 1, suffixKey: "minutes", type: "number" },
+            id: "history.storageCheckMinIntervalMinutes",
+            keywords: ["storage", "check", "throttle", "interval"],
+            path: ["clipboard", "history", "storageCheckMinIntervalMinutes"],
+            value: (settings) => {
+              return settings.clipboard.history.storageCheckMinIntervalMinutes;
+            },
+          },
+          {
+            control: { min: 1, suffixKey: "minutes", type: "number" },
+            id: "history.storageFallbackIntervalMinutes",
+            keywords: ["storage", "fallback", "interval"],
+            path: ["clipboard", "history", "storageFallbackIntervalMinutes"],
+            value: (settings) => {
+              return settings.clipboard.history.storageFallbackIntervalMinutes;
+            },
+          },
+          {
             control: { min: 0, suffixKey: "hours", type: "number" },
             id: "history.cleanupIntervalHours",
             keywords: ["cleanup", "interval", "schedule"],
@@ -956,12 +1002,21 @@ export const preferenceTabs: PreferenceTab[] = [
             },
           },
           {
-            control: { max: 2048, min: 0, suffixKey: "mb", type: "number" },
+            control: { min: 0, suffixKey: "mb", type: "number" },
             id: "sync.autoUploadMaxMb",
             keywords: ["sync", "file", "upload", "size"],
             path: ["sync", "autoUploadMaxMb"],
             value: (settings) => {
               return settings.sync.autoUploadMaxMb;
+            },
+          },
+          {
+            control: { min: 0, suffixKey: "mb", type: "number" },
+            id: "sync.autoDownloadMaxMb",
+            keywords: ["sync", "file", "download", "size", "metadata"],
+            path: ["sync", "autoDownloadMaxMb"],
+            value: (settings) => {
+              return settings.sync.autoDownloadMaxMb;
             },
           },
           {

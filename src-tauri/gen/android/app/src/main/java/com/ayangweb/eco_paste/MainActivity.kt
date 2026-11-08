@@ -11,6 +11,7 @@ class MainActivity : TauriActivity() {
     override val handleBackNavigation: Boolean = false
 
     private var createDocumentCallback: ((Uri?) -> Unit)? = null
+    private var openDocumentTreeCallback: ((Uri?) -> Unit)? = null
     private val createDocumentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -19,6 +20,18 @@ class MainActivity : TauriActivity() {
         val targetUri = result.data?.data.takeIf { result.resultCode == RESULT_OK }
         EcoPasteBridge.logFileAction(
             "native.save.result",
+            "resultCode=${result.resultCode} uri=$targetUri callback=${callback != null}",
+        )
+        callback?.invoke(targetUri)
+    }
+    private val openDocumentTreeLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val callback = openDocumentTreeCallback
+        openDocumentTreeCallback = null
+        val targetUri = result.data?.data.takeIf { result.resultCode == RESULT_OK }
+        EcoPasteBridge.logFileAction(
+            "native.save.tree.result",
             "resultCode=${result.resultCode} uri=$targetUri callback=${callback != null}",
         )
         callback?.invoke(targetUri)
@@ -72,13 +85,15 @@ class MainActivity : TauriActivity() {
     override fun onDestroy() {
         createDocumentCallback?.invoke(null)
         createDocumentCallback = null
+        openDocumentTreeCallback?.invoke(null)
+        openDocumentTreeCallback = null
         super.onDestroy()
         EcoPasteBridge.setCurrentActivity(null)
     }
 
     /** Opens Android's document destination picker for one exported clipboard file. */
     fun createDocument(fileName: String, mimeType: String, callback: (Uri?) -> Unit) {
-        if (createDocumentCallback != null) {
+        if (createDocumentCallback != null || openDocumentTreeCallback != null) {
             EcoPasteBridge.logFileAction("native.save.busy", "another picker is active")
             callback(null)
             return
@@ -101,6 +116,36 @@ class MainActivity : TauriActivity() {
             android.util.Log.e(
                 "EcoPasteFileAction",
                 "native.save.launch.failed | ${error.message}",
+                error,
+            )
+        }
+    }
+
+    /** Opens Android's document-tree picker for a remote file download. */
+    fun openDocumentTree(callback: (Uri?) -> Unit) {
+        if (createDocumentCallback != null || openDocumentTreeCallback != null) {
+            EcoPasteBridge.logFileAction("native.save.tree.busy", "another picker is active")
+            callback(null)
+            return
+        }
+        openDocumentTreeCallback = callback
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            )
+        }
+        try {
+            EcoPasteBridge.logFileAction("native.save.tree.launch", "open document tree")
+            openDocumentTreeLauncher.launch(intent)
+        } catch (error: Throwable) {
+            openDocumentTreeCallback = null
+            callback(null)
+            android.util.Log.e(
+                "EcoPasteFileAction",
+                "native.save.tree.launch.failed | ${error.message}",
                 error,
             )
         }

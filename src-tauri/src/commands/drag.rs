@@ -65,6 +65,7 @@ pub async fn start_drag_clipboard_item(
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    super::clipboard::reject_remote_file_write(&app, &item)?;
     let resources = crate::core::paths::resources_dir(&app)?;
     crate::clipboard::shared_files::resolve_item_content(&resources, &mut item)?;
 

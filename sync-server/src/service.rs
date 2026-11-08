@@ -10,9 +10,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    ErrorCode, FrameError, HubStatus, MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, Request, Response,
-    limit_events_page, limit_retention_plan, limit_sync_response, quota_low_watermark, read_frame,
-    write_frame,
+    ErrorCode, FrameError, HubStatus, MAX_EVENTS_PER_BATCH, QuotaPolicy, Request, Response,
+    limit_events_page, limit_retention_plan, limit_sync_response, read_frame, write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -42,12 +41,31 @@ const HUB_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HUB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_ORPHAN_GRACE: Duration = Duration::from_secs(5 * 60);
 const HUB_CLEANUP_BATCH_SIZE: u32 = 500;
+const HUB_DISK_SAFETY_MIN_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ActiveWatch {
     generation: u64,
     cancel: oneshot::Sender<()>,
 }
+
+#[derive(Debug)]
+struct InsufficientStorage {
+    required_bytes: u64,
+    available_bytes: u64,
+}
+
+impl std::fmt::Display for InsufficientStorage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Hub disk space is insufficient: required {} bytes, available {} bytes",
+            self.required_bytes, self.available_bytes
+        )
+    }
+}
+
+impl std::error::Error for InsufficientStorage {}
 
 type ActiveWatchRegistry = Arc<Mutex<HashMap<(String, String, u8), ActiveWatch>>>;
 
@@ -69,6 +87,24 @@ struct BlobQuotaReservation {
     states: Arc<StdMutex<HashMap<String, BlobQuotaState>>>,
     cleanup_targets: Arc<StdMutex<HashMap<String, u64>>>,
     cleanup_wake: Arc<Notify>,
+}
+
+impl BlobQuotaReservation {
+    /// Moves written bytes from the in-memory reservation into actual disk usage.
+    fn consume(&mut self, written: u64) {
+        let consumed = written.min(self.bytes);
+        if consumed == 0 {
+            return;
+        }
+        let mut states = self
+            .states
+            .lock()
+            .expect("Hub blob quota reservations poisoned");
+        if let Some(state) = states.get_mut(&self.group_id) {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(consumed);
+        }
+        self.bytes = self.bytes.saturating_sub(consumed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -115,8 +151,8 @@ impl Drop for TemporaryFileCleanup {
 pub struct HubService {
     repository: Repository,
     blob_root: Arc<PathBuf>,
-    max_blob_bytes: u64,
     max_group_bytes: u64,
+    quota_policy: QuotaPolicy,
     event_retention_days: u32,
     max_events_per_group: u64,
     blob_quota_states: Arc<StdMutex<HashMap<String, BlobQuotaState>>>,
@@ -135,16 +171,16 @@ impl HubService {
     pub fn new(
         repository: Repository,
         blob_root: PathBuf,
-        max_blob_bytes: u64,
         max_group_bytes: u64,
+        quota_policy: QuotaPolicy,
         event_retention_days: u32,
         max_events_per_group: u64,
     ) -> Self {
         Self {
             repository,
             blob_root: Arc::new(blob_root),
-            max_blob_bytes,
             max_group_bytes,
+            quota_policy,
             event_retention_days,
             max_events_per_group,
             blob_quota_states: Arc::new(StdMutex::new(HashMap::new())),
@@ -166,7 +202,7 @@ impl HubService {
         tokio::spawn(async move {
             loop {
                 let retry_pending = match service.cleanup_all_groups().await {
-                    Ok(()) => false,
+                    Ok(retry_pending) => retry_pending,
                     Err(error) => {
                         warn!(?error, "Hub cleanup cycle failed");
                         service.has_pending_quota_cleanup()
@@ -220,15 +256,6 @@ impl HubService {
             .clone()
     }
 
-    fn reserved_blob_bytes(&self, group_id: &str) -> u64 {
-        self.blob_quota_states
-            .lock()
-            .expect("Hub blob quota reservations poisoned")
-            .get(group_id)
-            .map(|state| state.reserved_bytes)
-            .unwrap_or(0)
-    }
-
     fn has_active_blob_upload(&self, group_id: &str) -> bool {
         self.blob_quota_states
             .lock()
@@ -239,10 +266,6 @@ impl HubService {
 
     /// Coalesces quota pressure into the strictest requested target without blocking the request.
     fn request_quota_cleanup(&self, group_id: &str, target_bytes: u64) {
-        if self.max_group_bytes == 0 {
-            return;
-        }
-        let target_bytes = target_bytes.min(quota_low_watermark(self.max_group_bytes));
         let mut targets = self
             .quota_cleanup_targets
             .lock()
@@ -281,54 +304,87 @@ impl HubService {
             .is_empty()
     }
 
+    async fn request_policy_cleanup_if_needed(&self, group_id: &str) {
+        if self.max_group_bytes == 0 {
+            return;
+        }
+        match self.repository.group_used_bytes(group_id).await {
+            Ok(used_bytes) => {
+                if let Some(target_bytes) = self
+                    .quota_policy
+                    .cleanup_target_bytes(self.max_group_bytes, used_bytes)
+                {
+                    self.request_quota_cleanup(group_id, target_bytes);
+                }
+            }
+            Err(error) => warn!(?error, "measure Hub group after write failed"),
+        }
+    }
+
     /// Reserves blob capacity while the caller holds the group's sync lock.
     async fn reserve_blob_quota_locked(
         &self,
         group_id: &str,
-        bytes: u64,
+        disk_bytes: u64,
+        logical_bytes: u64,
     ) -> Result<BlobQuotaReservation> {
         let used_bytes = self.repository.group_used_bytes(group_id).await?;
         let mut states = self
             .blob_quota_states
             .lock()
             .expect("Hub blob quota reservations poisoned");
-        let reserved_bytes = states
-            .get(group_id)
-            .map(|state| state.reserved_bytes)
-            .unwrap_or(0);
-        if self.max_group_bytes > 0 {
-            let required_capacity = reserved_bytes.saturating_add(bytes);
-            if required_capacity > self.max_group_bytes {
-                return Err(QuotaExceeded.into());
+        let all_reserved_bytes = states.values().fold(0_u64, |total, state| {
+            total.saturating_add(state.reserved_bytes)
+        });
+        let safety_bytes = HUB_DISK_SAFETY_MIN_BYTES.max(disk_bytes / 20);
+        let required_disk_bytes = all_reserved_bytes
+            .saturating_add(disk_bytes)
+            .saturating_add(safety_bytes);
+        let disk_probe_path = if self.blob_root.exists() {
+            self.blob_root.as_path()
+        } else {
+            self.blob_root
+                .parent()
+                .context("Hub blob root has no parent")?
+        };
+        let available_disk_bytes =
+            fs2::available_space(disk_probe_path).context("measure Hub available disk space")?;
+        if required_disk_bytes > available_disk_bytes {
+            drop(states);
+            self.request_quota_cleanup(
+                group_id,
+                disk_pressure_cleanup_target(used_bytes, required_disk_bytes, available_disk_bytes),
+            );
+            return Err(InsufficientStorage {
+                required_bytes: required_disk_bytes,
+                available_bytes: available_disk_bytes,
             }
-            if used_bytes.saturating_add(required_capacity) > self.max_group_bytes {
-                drop(states);
-                self.request_quota_cleanup(
-                    group_id,
-                    self.max_group_bytes.saturating_sub(required_capacity),
-                );
-                return Err(QuotaExceeded.into());
-            }
+            .into());
         }
         let state = states.entry(group_id.to_owned()).or_default();
-        state.reserved_bytes = state.reserved_bytes.saturating_add(bytes);
+        state.reserved_bytes = state.reserved_bytes.saturating_add(disk_bytes);
         state.active_uploads = state.active_uploads.saturating_add(1);
         drop(states);
+        if self.max_group_bytes > 0
+            && self
+                .quota_policy
+                .cleanup_target_bytes(
+                    self.max_group_bytes,
+                    used_bytes.saturating_add(logical_bytes),
+                )
+                .is_some()
+        {
+            self.request_quota_cleanup(
+                group_id,
+                self.quota_policy.target_bytes(self.max_group_bytes),
+            );
+        }
         Ok(BlobQuotaReservation {
             group_id: group_id.to_owned(),
-            bytes,
+            bytes: disk_bytes,
             states: self.blob_quota_states.clone(),
             cleanup_targets: self.quota_cleanup_targets.clone(),
             cleanup_wake: self.cleanup_wake.clone(),
-        })
-    }
-
-    /// Leaves one bounded request frame of slack so a completed blob upload can still be referenced.
-    fn event_quota_limit(&self, group_id: &str) -> Option<u64> {
-        (self.max_group_bytes > 0).then(|| {
-            self.max_group_bytes
-                .saturating_add(MAX_FRAME_BYTES as u64)
-                .saturating_sub(self.reserved_blob_bytes(group_id))
         })
     }
 
@@ -337,23 +393,137 @@ impl HubService {
         group_id: &str,
         events: &[ecopaste_sync_protocol::EncryptedEvent],
     ) -> Result<Vec<String>> {
-        let result = self
-            .repository
-            .insert_events(group_id, events, self.event_quota_limit(group_id))
-            .await;
-        if let Err(error) = &result
-            && error.chain().any(|cause| cause.is::<QuotaExceeded>())
-        {
-            self.request_quota_cleanup(group_id, quota_low_watermark(self.max_group_bytes));
+        let result = self.repository.insert_events(group_id, events, None).await;
+        if matches!(&result, Ok(accepted_event_ids) if !accepted_event_ids.is_empty()) {
+            self.request_policy_cleanup_if_needed(group_id).await;
         }
         result
     }
 
-    async fn cleanup_all_groups(&self) -> Result<()> {
+    /// Reconciles blob files with durable metadata while no upload can publish a new path.
+    async fn reconcile_blob_storage(&self) -> Result<bool> {
+        let known_groups = self
+            .repository
+            .list_group_ids()
+            .await?
+            .into_iter()
+            .map(|group_id| {
+                let directory = blake3::hash(group_id.as_bytes()).to_hex().to_string();
+                (directory, group_id)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut groups = match tokio::fs::read_dir(self.blob_root.as_path()).await {
+            Ok(groups) => groups,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("read Hub blob root"),
+        };
+        let mut retry_pending = false;
+        while let Some(group_entry) = groups.next_entry().await? {
+            let group_path = group_entry.path();
+            let group_type = group_entry.file_type().await?;
+            if !group_type.is_dir() {
+                if let Err(error) = tokio::fs::remove_file(&group_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    retry_pending = true;
+                    warn!(path = %group_path.display(), ?error, "remove unexpected Hub blob entry failed");
+                }
+                continue;
+            }
+            let group_directory = group_entry.file_name();
+            let Some(group_id) = group_directory
+                .to_str()
+                .and_then(|directory| known_groups.get(directory))
+                .cloned()
+            else {
+                // A group can be created after the directory snapshot. Unknown directories are
+                // left untouched; every valid group's contents are reconciled on the next pass.
+                continue;
+            };
+            let group_lock = self.group_sync_lock(&group_id).await;
+            let _group_guard = group_lock.lock().await;
+            if self.has_active_blob_upload(&group_id) {
+                continue;
+            }
+            let live_blob_ids = self.repository.blob_ids(&group_id).await?;
+            let mut prefixes = match tokio::fs::read_dir(&group_path).await {
+                Ok(prefixes) => prefixes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    retry_pending = true;
+                    warn!(group_ref = %group_log_ref(&group_id), ?error, "read Hub group blob directory failed");
+                    continue;
+                }
+            };
+            while let Some(prefix_entry) = prefixes.next_entry().await? {
+                let prefix_path = prefix_entry.path();
+                if !prefix_entry.file_type().await?.is_dir() {
+                    if let Err(error) = tokio::fs::remove_file(&prefix_path).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        retry_pending = true;
+                        warn!(path = %prefix_path.display(), ?error, "remove unexpected Hub blob prefix entry failed");
+                    }
+                    continue;
+                }
+                let mut blobs = match tokio::fs::read_dir(&prefix_path).await {
+                    Ok(blobs) => blobs,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        retry_pending = true;
+                        warn!(path = %prefix_path.display(), ?error, "read Hub blob prefix directory failed");
+                        continue;
+                    }
+                };
+                while let Some(blob_entry) = blobs.next_entry().await? {
+                    let blob_name = blob_entry.file_name();
+                    let path = blob_entry.path();
+                    if blob_name.to_str().is_some_and(|blob_id| {
+                        live_blob_ids.contains(blob_id)
+                            && path == blob_path(&self.blob_root, &group_id, blob_id)
+                    }) {
+                        continue;
+                    }
+                    let file_type = blob_entry.file_type().await?;
+                    let removed = if file_type.is_dir() {
+                        tokio::fs::remove_dir_all(&path).await
+                    } else {
+                        tokio::fs::remove_file(&path).await
+                    };
+                    if let Err(error) = removed
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        retry_pending = true;
+                        warn!(path = %path.display(), ?error, "remove orphaned Hub blob failed");
+                    }
+                }
+                if let Err(error) = tokio::fs::remove_dir(&prefix_path).await
+                    && !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    )
+                {
+                    retry_pending = true;
+                    warn!(path = %prefix_path.display(), ?error, "remove empty Hub blob prefix failed");
+                }
+            }
+        }
+        Ok(retry_pending)
+    }
+
+    async fn cleanup_all_groups(&self) -> Result<bool> {
+        let mut physical_cleanup_pending = self.reconcile_blob_storage().await?;
         for group_id in self.repository.list_group_ids().await? {
             let requested_quota_target = self.pending_quota_cleanup_target(&group_id);
-            let cleanup_target = requested_quota_target
-                .or((self.max_group_bytes > 0).then_some(self.max_group_bytes));
+            let policy_target = if self.max_group_bytes > 0 {
+                self.quota_policy.cleanup_target_bytes(
+                    self.max_group_bytes,
+                    self.repository.group_used_bytes(&group_id).await?,
+                )
+            } else {
+                None
+            };
+            let cleanup_target = strictest_cleanup_target(requested_quota_target, policy_target);
             let mut blocked_by_upload = false;
             loop {
                 let now = now_ms();
@@ -391,6 +561,7 @@ impl HubService {
                         if let Err(error) = tokio::fs::remove_file(&path).await
                             && error.kind() != std::io::ErrorKind::NotFound
                         {
+                            physical_cleanup_pending = true;
                             warn!(
                                 group_ref = %group_log_ref(&group_id),
                                 blob_ref = %blob_log_ref(blob_id),
@@ -421,7 +592,7 @@ impl HubService {
                 self.complete_quota_cleanup(&group_id, target);
             }
         }
-        Ok(())
+        Ok(physical_cleanup_pending)
     }
 
     async fn register_watch(
@@ -495,6 +666,8 @@ impl HubService {
                 | Request::PutSourceIcon { .. }
                 | Request::PutManagedBlob { .. }
                 | Request::PutManagedSourceIcon { .. }
+                | Request::PutStreamBlob { .. }
+                | Request::PutManagedStreamBlob { .. }
                 | Request::GetBlob { .. }
         ) {
             Some((
@@ -888,14 +1061,22 @@ impl HubService {
             request @ (Request::PutBlob { .. }
             | Request::PutSourceIcon { .. }
             | Request::PutManagedBlob { .. }
-            | Request::PutManagedSourceIcon { .. }) => {
+            | Request::PutManagedSourceIcon { .. }
+            | Request::PutStreamBlob { .. }
+            | Request::PutManagedStreamBlob { .. }) => {
                 let notify_source_icon = matches!(
                     request,
                     Request::PutSourceIcon { .. } | Request::PutManagedSourceIcon { .. }
                 );
                 let managed = matches!(
                     request,
-                    Request::PutManagedBlob { .. } | Request::PutManagedSourceIcon { .. }
+                    Request::PutManagedBlob { .. }
+                        | Request::PutManagedSourceIcon { .. }
+                        | Request::PutManagedStreamBlob { .. }
+                );
+                let streaming = matches!(
+                    request,
+                    Request::PutStreamBlob { .. } | Request::PutManagedStreamBlob { .. }
                 );
                 let (group_id, access_token, blob_id, size) = match request {
                     Request::PutBlob {
@@ -921,6 +1102,18 @@ impl HubService {
                         access_token,
                         blob_id,
                         size,
+                    }
+                    | Request::PutStreamBlob {
+                        group_id,
+                        access_token,
+                        blob_id,
+                        size,
+                    }
+                    | Request::PutManagedStreamBlob {
+                        group_id,
+                        access_token,
+                        blob_id,
+                        size,
                     } => (group_id, access_token, blob_id, size),
                     _ => unreachable!(),
                 };
@@ -930,7 +1123,7 @@ impl HubService {
                     .await?;
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
-                validate_blob(&blob_id, size, self.max_blob_bytes)?;
+                validate_blob(&blob_id, size)?;
                 let destination = blob_path(&self.blob_root, &group_id, &blob_id);
                 let lookup_started_at = Instant::now();
                 let (already_stored, reservation) = {
@@ -945,6 +1138,7 @@ impl HubService {
                         let reservation = self
                             .reserve_blob_quota_locked(
                                 &group_id,
+                                size,
                                 size.saturating_sub(existing_size.unwrap_or(0)),
                             )
                             .await?;
@@ -969,12 +1163,20 @@ impl HubService {
                         "cloud blob request completed"
                     );
                 } else {
-                    let reservation = reservation.expect("missing blob quota reservation");
+                    let mut reservation = reservation.expect("missing blob quota reservation");
                     let readiness_started_at = Instant::now();
                     write_frame(send, &Response::BlobReady { size: 0 }).await?;
                     let readiness_elapsed = readiness_started_at.elapsed();
                     let receive_started_at = Instant::now();
-                    receive_blob(recv, &destination, &blob_id, size).await?;
+                    receive_blob(
+                        recv,
+                        &destination,
+                        &blob_id,
+                        size,
+                        &mut reservation,
+                        streaming,
+                    )
+                    .await?;
                     let receive_elapsed = receive_started_at.elapsed();
                     {
                         let group_lock = self.group_sync_lock(&group_id).await;
@@ -984,6 +1186,7 @@ impl HubService {
                             .await?;
                         drop(reservation);
                     }
+                    self.request_policy_cleanup_if_needed(&group_id).await;
                     if notify_source_icon {
                         self.notify_group_change(&group_id).await;
                     }
@@ -1321,6 +1524,12 @@ impl HubService {
                 }
                 write_frame(send, &Response::RemovedDevices { devices: removed }).await?;
             }
+            Request::PlanLanContent { .. } => {
+                bail!("LAN content planning is not supported by the cloud Hub");
+            }
+            Request::CommitStreamBlob { .. } => {
+                bail!("streaming blob commit requires an active upload");
+            }
         }
         Ok(())
     }
@@ -1382,15 +1591,28 @@ impl ProtocolHandler for HubService {
     }
 }
 
-fn validate_blob(blob_id: &str, size: u64, maximum: u64) -> Result<()> {
+fn validate_blob(blob_id: &str, size: u64) -> Result<()> {
     validate_identifier("blob_id", blob_id)?;
     if blob_id.len() != 64 || !blob_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("invalid blob_id");
     }
-    if size == 0 || size > maximum {
-        bail!("blob is too large");
+    if size == 0 {
+        bail!("blob is empty");
     }
     Ok(())
+}
+
+/// Retains all bytes not needed to cover the current disk-space shortfall.
+fn disk_pressure_cleanup_target(
+    used_bytes: u64,
+    required_disk_bytes: u64,
+    available_disk_bytes: u64,
+) -> u64 {
+    used_bytes.saturating_sub(required_disk_bytes.saturating_sub(available_disk_bytes))
+}
+
+fn strictest_cleanup_target(requested: Option<u64>, policy: Option<u64>) -> Option<u64> {
+    requested.into_iter().chain(policy).min()
 }
 
 fn blob_path(root: &Path, group_id: &str, blob_id: &str) -> PathBuf {
@@ -1403,6 +1625,8 @@ async fn receive_blob(
     destination: &Path,
     expected_hash: &str,
     size: u64,
+    reservation: &mut BlobQuotaReservation,
+    streaming: bool,
 ) -> Result<()> {
     let parent = destination.parent().context("blob path has no parent")?;
     tokio::fs::create_dir_all(parent)
@@ -1431,12 +1655,25 @@ async fn receive_blob(
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
             remaining -= read as u64;
+            reservation.consume(read as u64);
         }
         file.flush().await?;
         drop(file);
         let actual_hash = hasher.finalize().to_hex().to_string();
-        if actual_hash != expected_hash {
+        if !streaming && actual_hash != expected_hash {
             bail!("blob hash mismatch");
+        }
+        if streaming {
+            let commit: Request = tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(recv))
+                .await
+                .context("streaming blob commit timeout")??;
+            if commit
+                != (Request::CommitStreamBlob {
+                    blob_id: expected_hash.to_owned(),
+                })
+            {
+                bail!("invalid streaming blob commit");
+            }
         }
         tokio::fs::rename(&temporary, destination)
             .await
@@ -1478,11 +1715,19 @@ fn response_for_error(error: &anyhow::Error) -> Response {
     let message = error.to_string();
     let code = if error.chain().any(|cause| cause.is::<HistoryGap>()) {
         ErrorCode::HistoryGap
-    } else if error.chain().any(|cause| cause.is::<QuotaExceeded>()) {
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<QuotaExceeded>() || cause.is::<InsufficientStorage>())
+    {
         ErrorCode::QuotaExceeded
     } else if message == "unauthorized" {
         ErrorCode::Unauthorized
-    } else if message.contains("not found") {
+    } else if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }) || message.contains("not found")
+    {
         ErrorCode::NotFound
     } else if message.contains("too large") || message.contains("too many") {
         ErrorCode::TooLarge
@@ -1540,8 +1785,76 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn disk_pressure_requests_only_the_missing_capacity() {
+        assert_eq!(disk_pressure_cleanup_target(1_000, 600, 400), 800);
+        assert_eq!(disk_pressure_cleanup_target(100, 600, 400), 0);
+        assert_eq!(disk_pressure_cleanup_target(1_000, 400, 600), 1_000);
+    }
+
+    #[test]
+    fn quota_cleanup_uses_the_strictest_active_target() {
+        assert_eq!(strictest_cleanup_target(Some(90), Some(70)), Some(70));
+        assert_eq!(strictest_cleanup_target(Some(60), Some(70)), Some(60));
+        assert_eq!(strictest_cleanup_target(None, Some(70)), Some(70));
+    }
+
+    #[test]
+    fn missing_blob_file_maps_to_not_found() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("open encrypted blob");
+
+        assert!(matches!(
+            response_for_error(&error),
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
-    async fn quota_pressure_reclaims_headroom_before_the_next_blob_retry() {
+    async fn successful_event_write_requests_the_shared_quota_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let service = HubService::new(
+            repository.clone(),
+            directory.path().join("blobs"),
+            100,
+            QuotaPolicy::default(),
+            0,
+            0,
+        );
+        let event = EncryptedEvent {
+            event_id: "event_123".into(),
+            origin_device_id: "device_123".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 68],
+            kind: SyncEventKind::Content,
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+            retention_key: Some("a".repeat(64)),
+        };
+
+        service
+            .insert_events_with_quota_recovery("group_123", &[event])
+            .await
+            .unwrap();
+
+        assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 92);
+        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(70));
+    }
+
+    #[tokio::test]
+    async fn soft_quota_allows_upload_and_schedules_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
@@ -1573,27 +1886,68 @@ mod tests {
             repository.clone(),
             directory.path().join("blobs"),
             64,
-            64,
+            QuotaPolicy::default(),
             0,
             0,
         );
 
-        let error = match service.reserve_blob_quota_locked("group_123", 40).await {
-            Ok(_) => panic!("quota reservation unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert!(error.downcast_ref::<QuotaExceeded>().is_some());
-        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(24));
-
-        service.cleanup_all_groups().await.unwrap();
-
-        assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 0);
-        assert_eq!(service.pending_quota_cleanup_target("group_123"), None);
         let reservation = service
-            .reserve_blob_quota_locked("group_123", 40)
+            .reserve_blob_quota_locked("group_123", 40, 40)
+            .await
+            .unwrap();
+        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(44));
+        repository
+            .record_blob("group_123", &"b".repeat(64), 40, true)
             .await
             .unwrap();
         drop(reservation);
+
+        service.cleanup_all_groups().await.unwrap();
+
+        assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 40);
+        assert_eq!(service.pending_quota_cleanup_target("group_123"), None);
+    }
+
+    #[tokio::test]
+    async fn orphaned_blob_files_are_reconciled_after_active_uploads_finish() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7_u8; 32])
+            .await
+            .unwrap();
+        let live_blob = "a".repeat(64);
+        let orphaned_blob = "b".repeat(64);
+        repository
+            .record_blob("group_123", &live_blob, 4, true)
+            .await
+            .unwrap();
+        let blob_root = directory.path().join("blobs");
+        let live_path = blob_path(&blob_root, "group_123", &live_blob);
+        let orphaned_path = blob_path(&blob_root, "group_123", &orphaned_blob);
+        tokio::fs::create_dir_all(live_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(orphaned_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&live_path, b"live").await.unwrap();
+        tokio::fs::write(&orphaned_path, b"orphan").await.unwrap();
+        let service = HubService::new(repository, blob_root, 0, QuotaPolicy::default(), 0, 0);
+
+        let reservation = service
+            .reserve_blob_quota_locked("group_123", 1, 1)
+            .await
+            .unwrap();
+        assert!(!service.reconcile_blob_storage().await.unwrap());
+        assert!(orphaned_path.exists());
+
+        drop(reservation);
+        assert!(!service.reconcile_blob_storage().await.unwrap());
+        assert!(live_path.exists());
+        assert!(!orphaned_path.exists());
     }
 
     #[tokio::test]
@@ -1633,26 +1987,21 @@ mod tests {
         let service = HubService::new(
             repository.clone(),
             directory.path().join("blobs"),
-            64,
             96,
+            QuotaPolicy::default(),
             0,
             0,
         );
 
-        let error = match service.reserve_blob_quota_locked("group_123", 32).await {
-            Ok(_) => panic!("quota reservation unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert!(error.downcast_ref::<QuotaExceeded>().is_some());
+        let reservation = service
+            .reserve_blob_quota_locked("group_123", 32, 32)
+            .await
+            .unwrap();
+        drop(reservation);
         service.cleanup_all_groups().await.unwrap();
 
         assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 0);
         assert_eq!(service.pending_quota_cleanup_target("group_123"), None);
-        let reservation = service
-            .reserve_blob_quota_locked("group_123", 32)
-            .await
-            .unwrap();
-        drop(reservation);
     }
 
     #[tokio::test]
@@ -1673,20 +2022,20 @@ mod tests {
             repository.clone(),
             directory.path().join("blobs"),
             64,
-            64,
+            QuotaPolicy::default(),
             0,
             0,
         );
 
-        let error = match service.reserve_blob_quota_locked("group_123", 32).await {
-            Ok(_) => panic!("quota reservation unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert!(error.downcast_ref::<QuotaExceeded>().is_some());
+        let reservation = service
+            .reserve_blob_quota_locked("group_123", 32, 32)
+            .await
+            .unwrap();
+        drop(reservation);
         service.cleanup_all_groups().await.unwrap();
 
         assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 48);
-        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(32));
+        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(44));
     }
 
     #[tokio::test]
@@ -1723,17 +2072,16 @@ mod tests {
         let service = HubService::new(
             repository.clone(),
             directory.path().join("blobs"),
-            1024,
             used,
+            QuotaPolicy::default(),
             0,
             0,
         );
-        let error = service
-            .reserve_blob_quota_locked("group_123", 64)
+        let reservation = service
+            .reserve_blob_quota_locked("group_123", 64, 64)
             .await
-            .err()
             .unwrap();
-        assert!(error.is::<QuotaExceeded>());
+        drop(reservation);
         repository
             .upsert_device(
                 "group_123",
@@ -1784,10 +2132,10 @@ mod tests {
         assert_eq!(pages, 9);
         assert!(
             repository.group_used_bytes("group_123").await.unwrap()
-                <= quota_low_watermark(service.max_group_bytes)
+                <= service.quota_policy.target_bytes(service.max_group_bytes)
         );
         let reservation = service
-            .reserve_blob_quota_locked("group_123", 64)
+            .reserve_blob_quota_locked("group_123", 64, 64)
             .await
             .unwrap();
         drop(reservation);

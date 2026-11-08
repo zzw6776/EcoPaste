@@ -32,12 +32,25 @@ pub fn label(key: Key) -> &'static str {
             "The original input window could not be restored. Open EcoPaste and try again"
         }
         Key::SaveImage => "Save Image",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileSave => "Save Remote File",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileSaveDirectory => "Choose a Folder for Remote Files",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileInvalidDestination => "The save destination is invalid",
+        #[cfg(not(target_os = "android"))]
+        Key::RemoteFileInvalidDirectory => "The save folder is invalid",
+        Key::RemoteFileNotDownloaded => {
+            "The remote file has not been downloaded; choose a save location first"
+        }
         Key::SyncDisabled => "Enable multi-device sync first",
         Key::SyncGroupRequired => "Create or join a sync group first",
         Key::SyncLanDisabled => "Local network sync is disabled",
         Key::SyncOperationPending => {
             "This item is still waiting for an earlier sync operation. Try again shortly"
         }
+        Key::SyncPreparationFailed => "Unable to prepare the upload",
         Key::SyncSensitiveDisabled => "Sensitive content sync is disabled",
+        Key::SyncTransferCancelFailed => "Unable to cancel the transfer",
     }
 }

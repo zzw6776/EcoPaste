@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use ecopaste_sync_protocol::quota_low_watermark;
+use ecopaste_sync_protocol::QuotaPolicy;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Listener, Manager};
@@ -18,12 +18,58 @@ use super::storage::ImageStore;
 use super::watcher::CLIPBOARD_UPDATED_EVENT;
 use crate::core::paths;
 use crate::db::items::{cleanup_history, evict_oldest_history, CleanupOutcome};
-use crate::settings::{Retention, RetentionUnit, SettingsStore};
+use crate::settings::{History, Retention, RetentionUnit, SettingsStore};
 use crate::sync::SyncManager;
 
 const STORAGE_USAGE_UPDATED_EVENT: &str = "storage://usage-updated";
-const CAPACITY_RECHECK: Duration = Duration::from_secs(300);
 const WRITE_COALESCE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StorageQuota {
+    limit_bytes: u64,
+    policy: QuotaPolicy,
+}
+
+impl StorageQuota {
+    fn from_history(history: &History) -> Self {
+        Self {
+            limit_bytes: history.max_storage_bytes,
+            policy: QuotaPolicy::new(
+                history.storage_cleanup_trigger_percent,
+                history.storage_cleanup_target_percent,
+            )
+            .unwrap_or_default(),
+        }
+    }
+
+    fn target_bytes(self) -> u64 {
+        self.policy.target_bytes(self.limit_bytes)
+    }
+
+    fn cleanup_target_bytes(self, used_bytes: u64) -> Option<u64> {
+        self.policy
+            .cleanup_target_bytes(self.limit_bytes, used_bytes)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CapacityPolicy {
+    quota: StorageQuota,
+    check_min_interval: Duration,
+    fallback_interval: Duration,
+}
+
+impl CapacityPolicy {
+    fn from_history(history: &History) -> Self {
+        let check_minutes = history.storage_check_min_interval_minutes.max(1);
+        let fallback_minutes = history.storage_fallback_interval_minutes.max(check_minutes);
+        Self {
+            quota: StorageQuota::from_history(history),
+            check_min_interval: Duration::from_secs(u64::from(check_minutes) * 60),
+            fallback_interval: Duration::from_secs(u64::from(fallback_minutes) * 60),
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CleanupTrigger {
@@ -32,7 +78,7 @@ pub(crate) enum CleanupTrigger {
     CloudBootstrap,
 }
 
-/// Coalesces clipboard writes and checks quiet growth (e.g. sync blobs) only with an active limit.
+/// Coalesces clipboard writes and checks quiet growth from downloads only with an active limit.
 /// Capacity checks run independently of the time/count cleanup interval.
 pub fn spawn(app: AppHandle) {
     let writes = Arc::new(Notify::new());
@@ -43,51 +89,72 @@ pub fn spawn(app: AppHandle) {
         let store = app.state::<SettingsStore>();
         let manager = app.state::<Arc<SyncManager>>();
         let mut changes = store.subscribe_changes();
-        let mut limit = store.snapshot().clipboard.history.max_storage_bytes;
+        let mut capacity = CapacityPolicy::from_history(&store.snapshot().clipboard.history);
         manager
             .run_local_retention_cleanup(CleanupTrigger::Scheduled)
             .await;
         let mut last_scheduled = Instant::now();
         let mut last_check = last_scheduled;
+        let mut write_pending = false;
         loop {
             let history = store.snapshot().clipboard.history;
             let interval = Duration::from_secs(u64::from(history.cleanup_interval_hours) * 3600);
-            let limit_changed = history.max_storage_bytes != limit;
-            limit = history.max_storage_bytes;
+            let next_capacity = CapacityPolicy::from_history(&history);
+            let quota_changed = next_capacity.quota != capacity.quota;
+            capacity = next_capacity;
 
-            if !(limit_changed && limit > 0) {
-                tokio::select! {
-                    changed = changes.changed() => {
-                        if changed.is_err() { return; }
-                        continue;
-                    }
-                    _ = tokio::time::sleep_until(last_scheduled + interval), if !interval.is_zero() => {
-                        manager.run_local_retention_cleanup(CleanupTrigger::Scheduled).await;
-                        last_scheduled = Instant::now();
-                        last_check = last_scheduled;
-                        continue;
-                    }
-                    _ = writes.notified(), if limit > 0 => {
-                        tokio::time::sleep(WRITE_COALESCE).await;
-                    }
-                    _ = tokio::time::sleep_until(last_check + CAPACITY_RECHECK), if limit > 0 => {}
+            if quota_changed {
+                write_pending = false;
+                if capacity.quota.limit_bytes > 0 {
+                    run_capacity_check(&app, manager.inner(), capacity.quota).await;
+                    last_check = Instant::now();
                 }
+                continue;
             }
 
-            match storage_bytes(&app).await {
-                Ok(bytes) if bytes > limit => {
-                    manager
-                        .run_local_retention_cleanup(CleanupTrigger::Capacity)
-                        .await;
+            let write_due = last_check + capacity.check_min_interval;
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() { return; }
+                    continue;
                 }
-                Ok(bytes) => {
-                    publish_usage(&app, bytes);
+                _ = tokio::time::sleep_until(last_scheduled + interval), if !interval.is_zero() => {
+                    manager.run_local_retention_cleanup(CleanupTrigger::Scheduled).await;
+                    last_scheduled = Instant::now();
+                    last_check = last_scheduled;
+                    write_pending = false;
+                    continue;
                 }
-                Err(error) => log::warn!("measure local data directory failed: {error:#}"),
+                _ = writes.notified(), if capacity.quota.limit_bytes > 0 => {
+                    write_pending = true;
+                    if Instant::now() < write_due {
+                        continue;
+                    }
+                    tokio::time::sleep(WRITE_COALESCE).await;
+                }
+                _ = tokio::time::sleep_until(write_due),
+                    if capacity.quota.limit_bytes > 0 && write_pending => {}
+                _ = tokio::time::sleep_until(last_check + capacity.fallback_interval),
+                    if capacity.quota.limit_bytes > 0 => {}
             }
+
+            run_capacity_check(&app, manager.inner(), capacity.quota).await;
+            write_pending = false;
             last_check = Instant::now();
         }
     });
+}
+
+async fn run_capacity_check(app: &AppHandle, manager: &SyncManager, quota: StorageQuota) {
+    match storage_bytes(app).await {
+        Ok(bytes) if quota.cleanup_target_bytes(bytes).is_some() => {
+            manager
+                .run_local_retention_cleanup(CleanupTrigger::Capacity)
+                .await;
+        }
+        Ok(bytes) => publish_usage(app, bytes),
+        Err(error) => log::warn!("measure local data directory failed: {error:#}"),
+    }
 }
 
 async fn storage_bytes(app: &AppHandle) -> Result<u64> {
@@ -116,10 +183,13 @@ pub(crate) async fn apply_retention(
     }
     let settings = app.state::<SettingsStore>();
     let history = settings.snapshot().clipboard.history;
-    let limit = history.max_storage_bytes;
+    let quota = StorageQuota::from_history(&history);
     let resources = paths::resources_dir(app)?;
-    let quota_triggered =
-        limit > 0 && (trigger == CleanupTrigger::Capacity || storage_bytes(app).await? > limit);
+    let quota_triggered = quota.limit_bytes > 0
+        && (trigger == CleanupTrigger::Capacity
+            || quota
+                .cleanup_target_bytes(storage_bytes(app).await?)
+                .is_some());
     if trigger != CleanupTrigger::Capacity {
         let cutoff = retention_cutoff(&history.retention, Utc::now());
         let max_count = (history.max_count > 0).then_some(history.max_count);
@@ -134,19 +204,21 @@ pub(crate) async fn apply_retention(
     shared_files::cleanup_resources_locked(pool, resources.clone()).await?;
     super::cache::reclaim_unreferenced_images(pool, &resources).await?;
     let measured = storage_bytes(app).await?;
-    if limit == 0 {
+    if quota.limit_bytes == 0 {
         publish_usage(app, measured);
         return Ok(());
     }
 
-    let target = quota_low_watermark(limit);
+    let target = quota.target_bytes();
     if !should_evict_for_quota(quota_triggered, measured, target) {
         publish_usage(app, measured);
         return Ok(());
     }
     let root = paths::app_data_dir(app)?;
     let mut used = compacted_usage(pool, &root, target, false).await?;
-    while used > target && settings.snapshot().clipboard.history.max_storage_bytes == limit {
+    while used > target
+        && StorageQuota::from_history(&settings.snapshot().clipboard.history) == quota
+    {
         let outcome =
             evict_oldest_history(pool, used - target, shared_files::REFERENCE_PREFIX).await?;
         let exhausted = outcome.removed == 0;
@@ -363,12 +435,16 @@ mod tests {
     }
 
     #[test]
-    fn over_limit_episode_continues_below_limit_until_low_watermark() {
+    fn triggered_cleanup_continues_until_the_shared_target() {
         let limit = (0.1_f64 * 1024_f64.powi(3)).round() as u64;
-        let measured_after_orphan_cleanup = 102 * 1024 * 1024;
-        let target = quota_low_watermark(limit);
+        let quota = StorageQuota {
+            limit_bytes: limit,
+            policy: QuotaPolicy::default(),
+        };
+        let measured_after_orphan_cleanup = 80 * 1024 * 1024;
+        let target = quota.target_bytes();
 
-        assert!(measured_after_orphan_cleanup < limit);
+        assert!(measured_after_orphan_cleanup < quota.policy.trigger_bytes(quota.limit_bytes));
         assert!(measured_after_orphan_cleanup > target);
         assert!(should_evict_for_quota(
             true,
@@ -380,5 +456,14 @@ mod tests {
             measured_after_orphan_cleanup,
             target
         ));
+    }
+
+    #[test]
+    fn capacity_policy_uses_configured_intervals_and_shared_quota_defaults() {
+        let policy = CapacityPolicy::from_history(&History::default());
+
+        assert_eq!(policy.check_min_interval, Duration::from_secs(10 * 60));
+        assert_eq!(policy.fallback_interval, Duration::from_secs(60 * 60));
+        assert_eq!(policy.quota.policy, QuotaPolicy::default());
     }
 }

@@ -22,13 +22,77 @@ pub const OPTIONAL_BLOB_REFS_PROTOCOL_VERSION: u16 = 12;
 pub const RETENTION_PROTECTION_PROTOCOL_VERSION: u16 = 13;
 pub const ALL_EVENTS_HISTORY_PROTOCOL_VERSION: u16 = 14;
 pub const RETENTION_PROGRESS_PROTOCOL_VERSION: u16 = 15;
-pub const PROTOCOL_VERSION: u16 = RETENTION_PROGRESS_PROTOCOL_VERSION;
+pub const LAN_CONTENT_PLAN_PROTOCOL_VERSION: u16 = 16;
+pub const STREAMING_BLOB_PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = STREAMING_BLOB_PROTOCOL_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
-/// Target after quota pressure, leaving 20% free for subsequent writes on clients and the Hub.
-pub fn quota_low_watermark(limit_bytes: u64) -> u64 {
-    limit_bytes - limit_bytes.div_ceil(5)
+/// Default usage percentage that starts quota cleanup.
+pub const DEFAULT_QUOTA_TRIGGER_PERCENT: u32 = 90;
+/// Default usage percentage retained after quota cleanup.
+pub const DEFAULT_QUOTA_TARGET_PERCENT: u32 = 70;
+
+/// Shared quota hysteresis for local storage and Hub group storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaPolicy {
+    trigger_percent: u32,
+    target_percent: u32,
+}
+
+impl QuotaPolicy {
+    pub fn new(trigger_percent: u32, target_percent: u32) -> Result<Self, InvalidQuotaPolicy> {
+        if !(2..=100).contains(&trigger_percent)
+            || target_percent == 0
+            || target_percent >= trigger_percent
+        {
+            return Err(InvalidQuotaPolicy);
+        }
+        Ok(Self {
+            trigger_percent,
+            target_percent,
+        })
+    }
+
+    pub const fn trigger_percent(self) -> u32 {
+        self.trigger_percent
+    }
+
+    pub const fn target_percent(self) -> u32 {
+        self.target_percent
+    }
+
+    pub fn trigger_bytes(self, limit_bytes: u64) -> u64 {
+        percent_bytes(limit_bytes, self.trigger_percent)
+    }
+
+    pub fn target_bytes(self, limit_bytes: u64) -> u64 {
+        percent_bytes(limit_bytes, self.target_percent)
+    }
+
+    /// Returns the cleanup target only after usage has crossed the configured trigger.
+    pub fn cleanup_target_bytes(self, limit_bytes: u64, used_bytes: u64) -> Option<u64> {
+        (limit_bytes > 0 && used_bytes > self.trigger_bytes(limit_bytes))
+            .then(|| self.target_bytes(limit_bytes))
+    }
+}
+
+impl Default for QuotaPolicy {
+    fn default() -> Self {
+        Self {
+            trigger_percent: DEFAULT_QUOTA_TRIGGER_PERCENT,
+            target_percent: DEFAULT_QUOTA_TARGET_PERCENT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("quota trigger must be between 2 and 100, and target must be between 1 and trigger - 1")]
+pub struct InvalidQuotaPolicy;
+
+fn percent_bytes(limit_bytes: u64, percent: u32) -> u64 {
+    let scaled = u128::from(limit_bytes) * u128::from(percent) / 100;
+    scaled.min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
@@ -486,6 +550,48 @@ pub enum Request {
         #[n(3)]
         size: u64,
     },
+    /// Lets a LAN receiver choose metadata-only file events before attachment transfer starts.
+    #[n(21)]
+    PlanLanContent {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        device_id: String,
+        #[n(3)]
+        events: Vec<EncryptedEvent>,
+    },
+    /// Streams ciphertext produced directly from a local source without sender-side staging.
+    #[n(22)]
+    PutStreamBlob {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blob_id: String,
+        #[n(3)]
+        size: u64,
+    },
+    /// Streaming counterpart of `PutManagedBlob` for bounded Hub retention.
+    #[n(23)]
+    PutManagedStreamBlob {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blob_id: String,
+        #[n(3)]
+        size: u64,
+    },
+    /// Commits a fully received streaming blob after the sender validates its source hash.
+    #[n(24)]
+    CommitStreamBlob {
+        #[n(0)]
+        blob_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -613,6 +719,11 @@ pub enum Response {
     },
     #[n(16)]
     RetentionUpdated,
+    #[n(17)]
+    LanContentPlan {
+        #[n(0)]
+        deferred_event_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -774,6 +885,23 @@ pub fn limit_sync_request(request: &mut Request) -> Result<usize, FrameError> {
     Ok(count)
 }
 
+/// Keeps a LAN content plan within one frame and returns the selected event prefix length.
+pub fn limit_lan_content_plan(request: &mut Request) -> Result<usize, FrameError> {
+    let mut events = match request {
+        Request::PlanLanContent { events, .. } => std::mem::take(events),
+        _ => return Err(FrameError::Encode("expected a LAN content plan".into())),
+    };
+    let count = fitting_event_count(&events, encoded_size(request)?)?;
+    events.truncate(count);
+    if let Request::PlanLanContent {
+        events: outgoing, ..
+    } = request
+    {
+        *outgoing = events;
+    }
+    Ok(count)
+}
+
 /// Byte-limits responses only for callers that understand explicit continuation.
 /// The cursor advances through returned events only, including when an acknowledgement is replayed.
 pub fn limit_sync_response(
@@ -878,6 +1006,33 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn quota_policy_uses_shared_defaults_and_binary_byte_math() {
+        let policy = QuotaPolicy::default();
+        let limit = 1024 * 1024 * 1024;
+
+        assert_eq!(policy.trigger_percent(), 90);
+        assert_eq!(policy.target_percent(), 70);
+        assert_eq!(policy.trigger_bytes(limit), 966_367_641);
+        assert_eq!(policy.target_bytes(limit), 751_619_276);
+        assert_eq!(policy.cleanup_target_bytes(limit, 966_367_641), None);
+        assert_eq!(
+            policy.cleanup_target_bytes(limit, 966_367_642),
+            Some(751_619_276)
+        );
+        assert_eq!(policy.cleanup_target_bytes(0, u64::MAX), None);
+    }
+
+    #[test]
+    fn quota_policy_rejects_invalid_hysteresis() {
+        assert!(QuotaPolicy::new(1, 0).is_err());
+        assert!(QuotaPolicy::new(101, 70).is_err());
+        assert!(QuotaPolicy::new(90, 0).is_err());
+        assert!(QuotaPolicy::new(90, 90).is_err());
+        assert!(QuotaPolicy::new(90, 91).is_err());
+        assert_eq!(QuotaPolicy::new(90, 70), Ok(QuotaPolicy::default()));
+    }
+
     #[derive(Debug, Encode, Decode)]
     #[cbor(map)]
     struct LegacyRemovedDevice {
@@ -916,6 +1071,32 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn streaming_blob_requests_round_trip() {
+        for request in [
+            Request::PutStreamBlob {
+                group_id: "group".into(),
+                access_token: vec![1; 32],
+                blob_id: "a".repeat(64),
+                size: 1024,
+            },
+            Request::PutManagedStreamBlob {
+                group_id: "group".into(),
+                access_token: vec![1; 32],
+                blob_id: "b".repeat(64),
+                size: 2048,
+            },
+            Request::CommitStreamBlob {
+                blob_id: "c".repeat(64),
+            },
+        ] {
+            let encoded = minicbor::to_vec(&request).unwrap();
+            let decoded: Request = minicbor::decode(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+        assert_eq!(PROTOCOL_VERSION, STREAMING_BLOB_PROTOCOL_VERSION);
     }
 
     #[tokio::test]

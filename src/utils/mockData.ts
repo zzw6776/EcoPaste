@@ -83,6 +83,10 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
         unit: "forever",
         value: 0,
       },
+      storageCheckMinIntervalMinutes: 10,
+      storageCleanupTargetPercent: 70,
+      storageCleanupTriggerPercent: 90,
+      storageFallbackIntervalMinutes: 60,
     },
     preview: {
       hoverDelayMs: "ms500",
@@ -129,6 +133,7 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
     winV: false,
   },
   sync: {
+    autoDownloadMaxMb: 100,
     autoUploadMaxMb: 10,
     autoWriteClipboard: false,
     cloudEnabled: false,

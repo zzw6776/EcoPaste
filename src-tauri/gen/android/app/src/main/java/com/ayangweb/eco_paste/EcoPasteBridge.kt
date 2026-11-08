@@ -21,9 +21,11 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.PersistableBundle
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import android.util.LruCache
@@ -34,13 +36,18 @@ import androidx.core.content.FileProvider
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.FileInputStream
 import java.lang.ref.WeakReference
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
 object EcoPasteBridge {
@@ -93,6 +100,17 @@ object EcoPasteBridge {
     private var rootAuthorizationStatus = ROOT_STATUS_UNKNOWN
     @Volatile
     private var currentEngineMode: String = "foreground" // "root", "foreground"
+    private val remoteDownloadSinks = ConcurrentHashMap<String, RemoteDownloadSink>()
+
+    private data class RemoteDownloadSink(
+        val uri: Uri,
+        val finalName: String,
+        val workerCompleted: CountDownLatch? = null,
+        val workerError: AtomicReference<String?>? = null,
+        val canceled: AtomicBoolean = AtomicBoolean(false),
+        val cleanupRequested: AtomicBoolean = AtomicBoolean(false),
+        val cleanupStarted: AtomicBoolean = AtomicBoolean(false),
+    )
 
     data class GestureConfig(
         val enabled: Boolean,
@@ -316,6 +334,268 @@ object EcoPasteBridge {
         return result.get()
     }
 
+    /** Prompts before a remote download and returns only a Storage Access Framework URI. */
+    @JvmStatic
+    fun pickRemoteDownloadTarget(
+        context: Context,
+    ): String {
+        val activity = getCurrentActivity() as? MainActivity
+            ?: return remoteDownloadTargetResult("unavailable")
+        val result = AtomicReference(remoteDownloadTargetResult("failed"))
+        val completed = CountDownLatch(1)
+        Handler(Looper.getMainLooper()).post {
+            val callback: (Uri?) -> Unit = { targetUri ->
+                if (targetUri == null) {
+                    result.set(remoteDownloadTargetResult("cancelled"))
+                } else {
+                    try {
+                        activity.contentResolver.takePersistableUriPermission(
+                            targetUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        )
+                    } catch (error: SecurityException) {
+                        Log.w(FILE_ACTION_TAG, "persist tree permission failed", error)
+                    }
+                    result.set(
+                        remoteDownloadTargetResult(
+                            "success",
+                            targetUri.toString(),
+                        ),
+                    )
+                }
+                completed.countDown()
+            }
+            activity.openDocumentTree(callback)
+        }
+        if (!completed.await(10, TimeUnit.MINUTES)) {
+            return remoteDownloadTargetResult("failed", message = "document picker timed out")
+        }
+        return result.get()
+    }
+
+    /** Opens a user-selected destination as a raw descriptor for Rust's authenticated stream. */
+    @JvmStatic
+    fun openRemoteDownloadSink(
+        context: Context,
+        targetUriValue: String,
+        fileName: String,
+        mimeType: String,
+        directoryArchive: Boolean,
+    ): String {
+        var temporaryUri: Uri? = null
+        var detachedFd: Int? = null
+        var registeredToken: String? = null
+        var registeredSink: RemoteDownloadSink? = null
+        var directoryWorkerStarted = false
+        var directoryReadPipe: ParcelFileDescriptor? = null
+        var directoryWritePipe: ParcelFileDescriptor? = null
+        return try {
+            val targetUri = Uri.parse(targetUriValue)
+            val finalName = safeRemoteName(fileName)
+            val token = UUID.randomUUID().toString()
+            val parent = DocumentsContract.buildDocumentUriUsingTree(
+                targetUri,
+                DocumentsContract.getTreeDocumentId(targetUri),
+            )
+            val temporaryName = ".${finalName}.ecopaste-${token.take(8)}.part"
+            temporaryUri = requireNotNull(
+                DocumentsContract.createDocument(
+                    context.contentResolver,
+                    parent,
+                    if (directoryArchive) DocumentsContract.Document.MIME_TYPE_DIR else mimeType,
+                    temporaryName,
+                ),
+            ) { "destination document unavailable" }
+            val destinationUri = requireNotNull(temporaryUri)
+
+            if (!directoryArchive) {
+                val descriptor = requireNotNull(
+                    context.contentResolver.openFileDescriptor(destinationUri, "w"),
+                ) { "destination descriptor unavailable" }
+                val fd = descriptor.detachFd()
+                descriptor.close()
+                detachedFd = fd
+                val sink = RemoteDownloadSink(destinationUri, finalName)
+                remoteDownloadSinks[token] = sink
+                registeredToken = token
+                registeredSink = sink
+                val result = remoteDownloadSinkResult("success", fd, token)
+                temporaryUri = null
+                registeredToken = null
+                registeredSink = null
+                detachedFd = null
+                return result
+            }
+
+            val pipe = ParcelFileDescriptor.createPipe()
+            val readPipe = pipe[0]
+            val writePipe = pipe[1]
+            directoryReadPipe = readPipe
+            directoryWritePipe = writePipe
+            val completed = CountDownLatch(1)
+            val workerError = AtomicReference<String?>(null)
+            val sink = RemoteDownloadSink(
+                destinationUri,
+                finalName,
+                completed,
+                workerError,
+            )
+            remoteDownloadSinks[token] = sink
+            registeredToken = token
+            registeredSink = sink
+            thread(name = "EcoPasteRemoteDirectory") {
+                try {
+                    ParcelFileDescriptor.AutoCloseInputStream(readPipe).use { input ->
+                        extractArchiveToTree(context, input, destinationUri, sink.canceled)
+                    }
+                } catch (error: Throwable) {
+                    workerError.set(error.message ?: error.javaClass.simpleName)
+                    if (!sink.canceled.get()) {
+                        Log.e(FILE_ACTION_TAG, "remote directory extraction failed", error)
+                    }
+                } finally {
+                    completed.countDown()
+                    if (sink.cleanupRequested.get()) {
+                        deleteRemoteDownloadSink(context, sink)
+                    }
+                }
+            }
+            directoryWorkerStarted = true
+            val fd = writePipe.detachFd()
+            detachedFd = fd
+            writePipe.close()
+            directoryReadPipe = null
+            directoryWritePipe = null
+            val result = remoteDownloadSinkResult("success", fd, token)
+            temporaryUri = null
+            registeredToken = null
+            registeredSink = null
+            detachedFd = null
+            result
+        } catch (error: Throwable) {
+            registeredToken?.let(remoteDownloadSinks::remove)
+            detachedFd?.let { fd ->
+                try {
+                    ParcelFileDescriptor.adoptFd(fd).close()
+                } catch (_: Throwable) {
+                    // The descriptor may already have been transferred or closed.
+                }
+            }
+            try {
+                directoryWritePipe?.close()
+            } catch (_: Throwable) {
+                // Closing the detached descriptor above is sufficient when ownership moved.
+            }
+            if (!directoryWorkerStarted) {
+                try {
+                    directoryReadPipe?.close()
+                } catch (_: Throwable) {
+                    // The descriptor may already have been closed during failed startup.
+                }
+            }
+            val sink = registeredSink
+            if (sink != null) {
+                if (sink.workerCompleted != null && !directoryWorkerStarted) {
+                    sink.workerCompleted.countDown()
+                }
+                requestRemoteDownloadCleanup(context, sink)
+            } else {
+                temporaryUri?.let { uri ->
+                    try {
+                        DocumentsContract.deleteDocument(context.contentResolver, uri)
+                    } catch (_: Throwable) {
+                        // The provider may already have removed the temporary document.
+                    }
+                }
+            }
+            Log.e(FILE_ACTION_TAG, "open remote download sink failed", error)
+            remoteDownloadSinkResult("failed", message = error.message.orEmpty())
+        }
+    }
+
+    /** Commits an atomic tree download or removes every partial destination on failure. */
+    @JvmStatic
+    fun finishRemoteDownloadSink(context: Context, token: String, success: Boolean): String {
+        val sink = remoteDownloadSinks[token]
+            ?: return fileActionResult("failed", "download destination is no longer available")
+        return try {
+            val workerFinished = sink.workerCompleted?.await(10, TimeUnit.MINUTES) ?: true
+            val canceled = !success || sink.canceled.get()
+            if (!workerFinished) {
+                requestRemoteDownloadCleanup(context, sink)
+                return fileActionResult(
+                    if (canceled) "cancelled" else "failed",
+                    if (canceled) "" else "directory extraction timed out",
+                )
+            }
+            val workerError = sink.workerError?.get()
+            if (canceled || workerError != null) {
+                requestRemoteDownloadCleanup(context, sink)
+                return fileActionResult(
+                    if (canceled) "cancelled" else "failed",
+                    workerError.orEmpty(),
+                )
+            }
+            val committedUri = requireNotNull(
+                DocumentsContract.renameDocument(
+                    context.contentResolver,
+                    sink.uri,
+                    sink.finalName,
+                ),
+            ) { "unable to finalize destination document" }
+            fileActionResult("success", uri = committedUri.toString())
+        } catch (error: Throwable) {
+            requestRemoteDownloadCleanup(context, sink)
+            Log.e(FILE_ACTION_TAG, "finish remote download sink failed", error)
+            fileActionResult("failed", error.message.orEmpty())
+        } finally {
+            remoteDownloadSinks.remove(token, sink)
+        }
+    }
+
+    /** Defers deletion until a directory extraction worker can no longer write to the tree. */
+    private fun requestRemoteDownloadCleanup(context: Context, sink: RemoteDownloadSink) {
+        sink.canceled.set(true)
+        sink.cleanupRequested.set(true)
+        if (sink.workerCompleted == null || sink.workerCompleted.count == 0L) {
+            deleteRemoteDownloadSink(context, sink)
+        }
+    }
+
+    private fun deleteRemoteDownloadSink(context: Context, sink: RemoteDownloadSink) {
+        if (!sink.cleanupStarted.compareAndSet(false, true)) return
+        try {
+            DocumentsContract.deleteDocument(context.contentResolver, sink.uri)
+        } catch (_: FileNotFoundException) {
+            // The provider already removed the temporary document.
+        } catch (error: Throwable) {
+            Log.w(FILE_ACTION_TAG, "delete partial remote download failed", error)
+        }
+    }
+
+    /** Signals a directory extraction worker without waiting for the blocking finalizer. */
+    @JvmStatic
+    fun cancelRemoteDownloadSink(token: String): Boolean {
+        val sink = remoteDownloadSinks[token] ?: return false
+        sink.canceled.set(true)
+        return true
+    }
+
+    /** Removes one completed child document when a multi-file batch is rolled back. */
+    @JvmStatic
+    fun discardRemoteDownloadDocument(context: Context, uriValue: String): String {
+        return try {
+            DocumentsContract.deleteDocument(context.contentResolver, Uri.parse(uriValue))
+            fileActionResult("success")
+        } catch (_: FileNotFoundException) {
+            fileActionResult("success")
+        } catch (error: Throwable) {
+            Log.e(FILE_ACTION_TAG, "discard remote download document failed", error)
+            fileActionResult("failed", error.message.orEmpty())
+        }
+    }
+
     /** Opens the system package installer; Android still requires explicit user confirmation. */
     @JvmStatic
     fun openPackageInstaller(context: Context, path: String): String {
@@ -363,10 +643,119 @@ object EcoPasteBridge {
             ?: "application/octet-stream"
     }
 
-    private fun fileActionResult(status: String, message: String = ""): String {
+    private fun mimeType(fileName: String): String {
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: "application/octet-stream"
+    }
+
+    private fun safeRemoteName(value: String): String {
+        val sanitized = value.map { character ->
+            if (character.isISOControl() || character == '/' || character == '\\') '_' else character
+        }.joinToString("").trim().trimEnd('.')
+        return sanitized.ifEmpty { "download" }
+    }
+
+    private fun extractArchiveToTree(
+        context: Context,
+        input: java.io.InputStream,
+        root: Uri,
+        canceled: AtomicBoolean,
+    ) {
+        val directories = mutableMapOf("" to root)
+        val created = mutableSetOf<String>()
+        ZipInputStream(input.buffered()).use { archive ->
+            while (true) {
+                check(!canceled.get()) { "transfer canceled" }
+                val entry = archive.nextEntry ?: break
+                val normalized = entry.name.replace('\\', '/')
+                val segments = normalized.split('/').filter { it.isNotEmpty() }
+                require(
+                    segments.isNotEmpty() && segments.none { it == "." || it == ".." },
+                ) { "directory archive contains an unsafe path" }
+                var parentPath = ""
+                var parentUri = root
+                val directoryCount = if (entry.isDirectory) segments.size else segments.size - 1
+                for (index in 0 until directoryCount) {
+                    check(!canceled.get()) { "transfer canceled" }
+                    val segment = safeRemoteName(segments[index])
+                    val path = if (parentPath.isEmpty()) segment else "$parentPath/$segment"
+                    parentUri = directories.getOrPut(path) {
+                        requireNotNull(
+                            DocumentsContract.createDocument(
+                                context.contentResolver,
+                                parentUri,
+                                DocumentsContract.Document.MIME_TYPE_DIR,
+                                segment,
+                            ),
+                        ) { "unable to create destination directory" }
+                    }
+                    parentPath = path
+                }
+                if (!entry.isDirectory) {
+                    check(!canceled.get()) { "transfer canceled" }
+                    val name = safeRemoteName(segments.last())
+                    val path = if (parentPath.isEmpty()) name else "$parentPath/$name"
+                    require(created.add(path)) { "directory archive contains duplicate entries" }
+                    val fileUri = requireNotNull(
+                        DocumentsContract.createDocument(
+                            context.contentResolver,
+                            parentUri,
+                            mimeType(name),
+                            name,
+                        ),
+                    ) { "unable to create destination file" }
+                    context.contentResolver.openOutputStream(fileUri, "w").use { output ->
+                        requireNotNull(output) { "destination stream unavailable" }
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            check(!canceled.get()) { "transfer canceled" }
+                            val read = archive.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                }
+                archive.closeEntry()
+            }
+        }
+    }
+
+    private fun remoteDownloadTargetResult(
+        status: String,
+        uri: String = "",
+        message: String = "",
+    ): String {
+        return JSONObject().apply {
+            put("status", status)
+            put("uri", uri)
+            put("message", message)
+        }.toString()
+    }
+
+    private fun remoteDownloadSinkResult(
+        status: String,
+        fd: Int = -1,
+        token: String = "",
+        message: String = "",
+    ): String {
+        return JSONObject().apply {
+            put("status", status)
+            put("fd", fd)
+            put("token", token)
+            put("message", message)
+        }.toString()
+    }
+
+    private fun fileActionResult(
+        status: String,
+        message: String = "",
+        uri: String = "",
+    ): String {
         return JSONObject().apply {
             put("status", status)
             put("message", message)
+            put("uri", uri)
         }.toString()
     }
 

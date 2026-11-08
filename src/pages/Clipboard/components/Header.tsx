@@ -47,6 +47,7 @@ import { formatShortcutDisplay } from "@/utils/shortcut";
 import { listClipboardGroupsShared } from "../dataRequests";
 import SearchInput from "./SearchInput";
 import SyncStatusIcons from "./SyncStatusIcons";
+import TransferCenter from "./TransferCenter";
 
 interface WindowVisibilityPayload {
   label: string;
@@ -376,6 +377,7 @@ const Header: FC = () => {
 
           <div className="flex shrink-0 items-center gap-1">
             <SyncStatusIcons compact />
+            <TransferCenter compact />
 
             <Dropdown
               menu={{ items: moreMenuItems, onClick: handleMoreMenuClick }}
@@ -769,6 +771,7 @@ const Header: FC = () => {
       {/* 右侧：极简 `...` 更多操作 */}
       <div className="z-10 flex items-center gap-1">
         <SyncStatusIcons />
+        <TransferCenter />
         {!isMobile() && (
           <Tooltip title={isPinned ? t("header.unpin") : t("header.pin")}>
             <button

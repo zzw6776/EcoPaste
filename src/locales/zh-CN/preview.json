@@ -9,6 +9,7 @@
     "folder": "文件夹",
     "item": "文件",
     "missingPath": "路径已失效",
+    "remoteNotDownloaded": "远端文件，尚未下载",
     "shownCount": "仅显示前 {{shown}} 项，共 {{total}} 项"
   },
   "image": {

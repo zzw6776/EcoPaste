@@ -12,8 +12,10 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
+  downloadRemoteFiles,
   getClipboardPreviewPayload,
   hideWindow,
+  listSyncTransfers,
   openAndroidClipboardFile,
   openClipboardItemLink,
   pasteClipboardItem,
@@ -21,6 +23,7 @@ import {
   type SyncItemStatus,
   saveAndroidClipboardFile,
   saveClipboardImageToFile,
+  type TransferTask,
   toggleClipboardItemFavorite,
   toggleClipboardItemPinned,
   updateClipboardItemGroup,
@@ -70,6 +73,12 @@ import {
   isSpaceKey,
   useClipboardPreviewController,
 } from "../hooks/useClipboardPreviewController";
+import {
+  aggregateTransferTasks,
+  isTransferActive,
+  mergeTransferTaskSnapshot,
+  upsertTransferTask,
+} from "../utils/transferTasks";
 import AndroidFileDetailsDrawer from "./AndroidFileDetailsDrawer";
 import ClipboardCard from "./cards/ClipboardCard";
 import NoteModal from "./NoteModal";
@@ -183,6 +192,24 @@ const List: FC<ListProps> = (props) => {
   const [syncStatuses, setSyncStatuses] = useState(
     () => new Map<string, SyncItemStatus>(),
   );
+  const [transferTasks, setTransferTasks] = useState(
+    () => new Map<string, TransferTask>(),
+  );
+
+  function requestRemoteFileDownload(item: ClipboardItem) {
+    if (!item.remoteFileState) return false;
+    const activeDownload = [...transferTasks.values()].some((task) => {
+      return (
+        task.itemId === item.id &&
+        task.direction === "download" &&
+        isTransferActive(task)
+      );
+    });
+    if (item.remoteFileState === "available" && !activeDownload) {
+      void downloadRemoteFiles(item.id);
+    }
+    return true;
+  }
   const listContainerRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const isAtTopRef = useRef(true);
@@ -348,6 +375,11 @@ const List: FC<ListProps> = (props) => {
   useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
     void refreshSyncStatuses();
   });
+  useTauriListen<TransferTask>(TAURI_EVENT.SYNC_TRANSFER_UPDATED, (event) => {
+    setTransferTasks((current) => {
+      return upsertTransferTask(current, event.payload);
+    });
+  });
   const {
     closeHoverPreviewForScroll,
     closePreview,
@@ -405,6 +437,14 @@ const List: FC<ListProps> = (props) => {
    */
   useMount(() => {
     void loadGroups();
+    async function loadTransfers() {
+      const tasks = await listSyncTransfers();
+      setTransferTasks((current) => {
+        return mergeTransferTaskSnapshot(current, tasks);
+      });
+    }
+
+    void loadTransfers();
   });
 
   useUnmount(() => {
@@ -960,6 +1000,8 @@ const List: FC<ListProps> = (props) => {
 
       if (!activeItem) return;
 
+      if (requestRemoteFileDownload(activeItem)) return;
+
       closePreview("enterPaste");
       pasteClipboardItem(activeItem.id, eventModifierPressed);
 
@@ -996,6 +1038,7 @@ const List: FC<ListProps> = (props) => {
       const activeItem = getActiveItem();
 
       if (!activeItem) return;
+      if (activeItem.remoteFileState) return;
 
       if (previewSession?.itemId === activeItem.id)
         closePreview("shortcutCopy");
@@ -1203,6 +1246,7 @@ const List: FC<ListProps> = (props) => {
   }
 
   function handleMobileItemSave(item: ClipboardItem) {
+    if (requestRemoteFileDownload(item)) return;
     if (item.kind === "image") {
       void handleSaveAndroidFile(item, 0);
       return;
@@ -1381,6 +1425,7 @@ const List: FC<ListProps> = (props) => {
         : void 0;
 
     const handleQuickPaste = () => {
+      if (requestRemoteFileDownload(item)) return;
       closePreview("quickPaste");
       pasteClipboardItem(item.id, false);
     };
@@ -1460,6 +1505,14 @@ const List: FC<ListProps> = (props) => {
     };
 
     const handleMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (item.remoteFileState) {
+        if (event.button === 1) event.preventDefault();
+        if (event.button === 0) {
+          setSelectedId(item.id);
+          requestRemoteFileDownload(item);
+        }
+        return;
+      }
       if (event.button !== 0) {
         if (event.button !== 1) return;
 
@@ -1511,6 +1564,7 @@ const List: FC<ListProps> = (props) => {
 
     const handleMobileClick = () => {
       setSelectedId(item.id);
+      if (requestRemoteFileDownload(item)) return;
       if (item.kind !== "text") {
         handleMobileItemOpen(item);
         return;
@@ -1527,6 +1581,7 @@ const List: FC<ListProps> = (props) => {
     };
 
     const handleDoubleClick = () => {
+      if (item.remoteFileState) return;
       if (autoPaste === "doubleClickPaste") {
         closePreview("doubleClickPaste");
         pasteClipboardItem(item.id, false);
@@ -1549,6 +1604,14 @@ const List: FC<ListProps> = (props) => {
       item,
       canDeleteItem,
     );
+    const itemTransferTasks = aggregateTransferTasks(
+      [...transferTasks.values()].filter((task) => task.itemId === item.id),
+    ).sort((left, right) => {
+      const leftActive = isTransferActive(left);
+      const rightActive = isTransferActive(right);
+      if (leftActive !== rightActive) return leftActive ? -1 : 1;
+      return left.elapsedMs - right.elapsedMs;
+    });
 
     return (
       <div
@@ -1588,6 +1651,7 @@ const List: FC<ListProps> = (props) => {
           rootRef={registerItemElement(item.id)}
           showOriginalOnHover={showOriginalPreview}
           syncStatus={syncStatuses.get(item.id)}
+          transferTasks={itemTransferTasks}
         />
       </div>
     );

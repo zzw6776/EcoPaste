@@ -8,7 +8,7 @@ use crate::{
     sync::{
         CloudDeviceDirectory, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt,
         NearbySyncSpace, PairingCode, SyncItemStatus, SyncManager, SyncPairingPreview, SyncStatus,
-        SyncTarget,
+        SyncTarget, TransferTask,
     },
 };
 
@@ -208,6 +208,38 @@ pub async fn get_sync_item_statuses(
     item_ids: Vec<String>,
 ) -> Result<Vec<SyncItemStatus>> {
     manager.item_statuses(&item_ids).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_sync_transfers(
+    manager: State<'_, Arc<SyncManager>>,
+) -> Result<Vec<TransferTask>> {
+    Ok(manager.transfer_tasks())
+}
+
+#[tauri::command]
+pub async fn cancel_sync_transfer(
+    manager: State<'_, Arc<SyncManager>>,
+    task_id: String,
+) -> Result<bool> {
+    manager
+        .cancel_transfer(task_id.trim())
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn download_remote_files(
+    manager: State<'_, Arc<SyncManager>>,
+    item_id: String,
+    route: Option<crate::sync::TransferRoute>,
+) -> Result<Option<TransferTask>> {
+    manager
+        .inner()
+        .clone()
+        .download_remote_files(item_id, route)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

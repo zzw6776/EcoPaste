@@ -47,11 +47,22 @@ pub enum CommandKey {
     #[cfg(target_os = "macos")]
     PasteTargetUnavailable,
     SaveImage,
+    #[cfg(not(target_os = "android"))]
+    RemoteFileSave,
+    #[cfg(not(target_os = "android"))]
+    RemoteFileSaveDirectory,
+    #[cfg(not(target_os = "android"))]
+    RemoteFileInvalidDestination,
+    #[cfg(not(target_os = "android"))]
+    RemoteFileInvalidDirectory,
+    RemoteFileNotDownloaded,
     SyncDisabled,
     SyncGroupRequired,
     SyncLanDisabled,
     SyncOperationPending,
+    SyncPreparationFailed,
     SyncSensitiveDisabled,
+    SyncTransferCancelFailed,
 }
 
 #[derive(Debug, Clone, Copy)]
