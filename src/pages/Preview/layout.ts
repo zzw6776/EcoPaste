@@ -9,11 +9,9 @@ import {
   PREVIEW_FILE_MORE_FOOTER_HEIGHT,
   PREVIEW_FILE_ROW_HEIGHT,
   PREVIEW_FILE_VERTICAL_PADDING,
-  PREVIEW_PANEL_GAP,
   PREVIEW_PANEL_HEADER_HEIGHT,
   PREVIEW_PANEL_IMAGE_PADDING_X,
   PREVIEW_PANEL_IMAGE_PADDING_Y,
-  PREVIEW_PANEL_MARGIN,
   PREVIEW_PANEL_MAX_HEIGHT,
   PREVIEW_PANEL_MAX_WIDTH,
   PREVIEW_PANEL_MIN_HEIGHT,
@@ -77,7 +75,7 @@ export function resolveDynamicPanelRect(
   );
   const raw = rawDynamicPanelRect(layout, width, height);
 
-  return clampRect(raw, insetRect(layout.overlayRect, PREVIEW_PANEL_MARGIN));
+  return clampRect(raw, layout.panelRect);
 }
 
 /**
@@ -116,6 +114,7 @@ function rawDynamicPanelRect(
   height: number,
 ) {
   const sourceRect = layout.sourceRect;
+  const bounds = layout.panelRect;
   const centeredTop = sourceRect.top + sourceRect.height / 2 - height / 2;
   const centeredLeft = sourceRect.left + sourceRect.width / 2 - width / 2;
 
@@ -123,29 +122,29 @@ function rawDynamicPanelRect(
     case "right":
       return {
         height,
-        left: sourceRect.left + sourceRect.width + PREVIEW_PANEL_GAP,
-        top: centeredTop,
+        left: bounds.left,
+        top: clamp(centeredTop, bounds.top, rectBottom(bounds) - height),
         width,
       };
     case "left":
       return {
         height,
-        left: sourceRect.left - PREVIEW_PANEL_GAP - width,
-        top: centeredTop,
+        left: rectRight(bounds) - width,
+        top: clamp(centeredTop, bounds.top, rectBottom(bounds) - height),
         width,
       };
     case "bottom":
       return {
         height,
-        left: centeredLeft,
-        top: sourceRect.top + sourceRect.height + PREVIEW_PANEL_GAP,
+        left: clamp(centeredLeft, bounds.left, rectRight(bounds) - width),
+        top: bounds.top,
         width,
       };
     case "top":
       return {
         height,
-        left: centeredLeft,
-        top: sourceRect.top - PREVIEW_PANEL_GAP - height,
+        left: clamp(centeredLeft, bounds.left, rectRight(bounds) - width),
+        top: rectBottom(bounds) - height,
         width,
       };
   }
@@ -296,18 +295,6 @@ function clampRect(rect: ClipboardPreviewRect, bounds: ClipboardPreviewRect) {
     left: clamp(rect.left, bounds.left, maxLeft),
     top: clamp(rect.top, bounds.top, maxTop),
     width: rect.width,
-  };
-}
-
-/**
- * 生成带安全边距的内部边界。
- */
-function insetRect(rect: ClipboardPreviewRect, amount: number) {
-  return {
-    height: Math.max(1, rect.height - amount * 2),
-    left: rect.left + amount,
-    top: rect.top + amount,
-    width: Math.max(1, rect.width - amount * 2),
   };
 }
 

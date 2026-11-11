@@ -11,7 +11,10 @@ import {
 } from "@/commands";
 import AssetImage from "@/components/AssetImage";
 import Highlight from "@/components/Highlight";
-import { transferRouteIconClass } from "@/pages/Clipboard/utils/transferTasks";
+import {
+  isTransferActive,
+  transferRouteIconClass,
+} from "@/pages/Clipboard/utils/transferTasks";
 import { formatBytes } from "@/pages/Preference/utils/storageUsage";
 import { clipboardViewState } from "@/stores/clipboardView";
 import type { ClipboardItem, FileEntry } from "@/types/clipboard";
@@ -19,6 +22,8 @@ import { cn } from "@/utils/cn";
 import ImageCard from "./ImageCard";
 
 type FilesCardProps = ClipboardItem & {
+  downloadedExternally?: boolean;
+  externalFileMissing?: boolean;
   transferTasks?: TransferTask[];
 };
 
@@ -36,10 +41,7 @@ const FilesCard: FC<FilesCardProps> = (props) => {
     return task.direction === "download";
   });
   const uploadTasks = props.transferTasks?.filter((task) => {
-    return (
-      task.direction === "upload" &&
-      !["completed", "canceled"].includes(task.phase)
-    );
+    return task.direction === "upload" && isTransferActive(task);
   });
 
   async function startDownload(event: MouseEvent<HTMLButtonElement>) {
@@ -83,7 +85,9 @@ const FilesCard: FC<FilesCardProps> = (props) => {
     <div className="relative flex flex-col gap-1">
       {props.remoteFileState && (
         <RemoteDownloadStatus
+          downloadedExternally={props.downloadedExternally === true}
           expired={props.remoteFileState === "expired"}
+          externalFileMissing={props.externalFileMissing === true}
           onCancel={cancelTransfer}
           onDownload={startDownload}
           onMouseDown={stopPropagation}
@@ -119,18 +123,21 @@ interface UploadTransferStatusProps {
 
 const UploadTransferStatus: FC<UploadTransferStatusProps> = (props) => {
   const { onCancel, onMouseDown, t, task } = props;
-  const active = !["completed", "failed", "canceled"].includes(task.phase);
   const percent = task.totalBytes
     ? Math.min(100, Math.round((task.transferredBytes / task.totalBytes) * 100))
     : 0;
   const detail = transferDetail(task);
+  const phaseLabel =
+    task.target === "import"
+      ? t(`transfer.import.${task.phase}`)
+      : t(`transfer.upload.${task.phase}`);
 
   return (
     <div className="mb-1 flex flex-col gap-1 text-ant-secondary text-xs">
       <div className="flex items-center gap-1">
         <i className={cn("size-3.5", transferRouteIconClass(task))} />
-        <span>{t(`transfer.upload.${task.phase}`)}</span>
-        {active && task.cancellable && (
+        <span>{phaseLabel}</span>
+        {task.cancellable && (
           <button
             className="ml-auto cursor-pointer border-0 bg-transparent p-0 text-ant-primary text-xs"
             data-task-id={task.id}
@@ -142,28 +149,21 @@ const UploadTransferStatus: FC<UploadTransferStatusProps> = (props) => {
           </button>
         )}
       </div>
-      {active && (
-        <>
-          <Progress percent={percent} showInfo={false} size="small" />
-          <span className="truncate" title={detail}>
-            {detail}
-            {task.etaSeconds !== null
-              ? ` · ${t("remoteFile.eta", { seconds: task.etaSeconds })}`
-              : ""}
-          </span>
-        </>
-      )}
-      {task.phase === "failed" && task.error && (
-        <span className="truncate text-ant-error" title={task.error}>
-          {task.error}
-        </span>
-      )}
+      <Progress percent={percent} showInfo={false} size="small" />
+      <span className="truncate" title={detail}>
+        {detail}
+        {task.etaSeconds !== null
+          ? ` · ${t("remoteFile.eta", { seconds: task.etaSeconds })}`
+          : ""}
+      </span>
     </div>
   );
 };
 
 interface RemoteDownloadStatusProps {
+  downloadedExternally: boolean;
   expired: boolean;
+  externalFileMissing: boolean;
   onCancel: (event: MouseEvent<HTMLButtonElement>) => void;
   onDownload: (event: MouseEvent<HTMLButtonElement>) => void;
   onMouseDown: (event: MouseEvent<HTMLButtonElement>) => void;
@@ -173,8 +173,17 @@ interface RemoteDownloadStatusProps {
 }
 
 const RemoteDownloadStatus: FC<RemoteDownloadStatusProps> = (props) => {
-  const { expired, onCancel, onDownload, onMouseDown, starting, task, t } =
-    props;
+  const {
+    downloadedExternally,
+    expired,
+    externalFileMissing,
+    onCancel,
+    onDownload,
+    onMouseDown,
+    starting,
+    task,
+    t,
+  } = props;
   const active =
     task && !["completed", "failed", "canceled"].includes(task.phase);
   const percent = task?.totalBytes
@@ -184,7 +193,11 @@ const RemoteDownloadStatus: FC<RemoteDownloadStatusProps> = (props) => {
   const canCancel = active && task.cancellable;
   const actionLabel = canCancel
     ? t("remoteFile.cancel")
-    : t("remoteFile.download");
+    : t(
+        downloadedExternally
+          ? "remoteFile.downloadAgain"
+          : "remoteFile.download",
+      );
 
   return (
     <div className="mb-1 flex flex-col gap-1 text-ant-secondary text-xs">
@@ -198,7 +211,11 @@ const RemoteDownloadStatus: FC<RemoteDownloadStatusProps> = (props) => {
         <span>
           {expired
             ? t("remoteFile.expired")
-            : t(`remoteFile.${task?.phase ?? "notDownloaded"}`)}
+            : externalFileMissing && !active
+              ? t("remoteFile.externalMissing")
+              : downloadedExternally && !active
+                ? t("remoteFile.downloadedExternally")
+                : t(`remoteFile.${task?.phase ?? "notDownloaded"}`)}
         </span>
         {!expired && (!active || canCancel) && (
           <button
@@ -241,7 +258,8 @@ function formatDuration(milliseconds: number) {
 }
 
 function transferDetail(task: TransferTask) {
-  return `${formatBytes(task.transferredBytes)} / ${formatBytes(task.totalBytes)} · ${formatBytes(task.speedBytesPerSecond)}/s · ${formatDuration(task.elapsedMs)}`;
+  const total = task.totalBytes > 0 ? ` / ${formatBytes(task.totalBytes)}` : "";
+  return `${formatBytes(task.transferredBytes)}${total} · ${formatBytes(task.speedBytesPerSecond)}/s · ${formatDuration(task.elapsedMs)}`;
 }
 
 interface FileRowProps {

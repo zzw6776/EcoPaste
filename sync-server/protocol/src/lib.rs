@@ -10,21 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 mod batch_tests;
 
-pub const ALPN: &[u8] = b"ecopaste/sync/1";
-pub const SYNC_V2_PROTOCOL_VERSION: u16 = 5;
-pub const ASYNC_SOURCE_ICON_PROTOCOL_VERSION: u16 = 6;
-pub const REDUNDANT_WATCH_PROTOCOL_VERSION: u16 = 7;
-pub const BYTE_LIMITED_SYNC_PROTOCOL_VERSION: u16 = 8;
-pub const TYPED_EVENTS_PROTOCOL_VERSION: u16 = 9;
-pub const CLOUD_DEVICE_DIRECTORY_PROTOCOL_VERSION: u16 = 10;
-pub const BOUNDED_HUB_PROTOCOL_VERSION: u16 = 11;
-pub const OPTIONAL_BLOB_REFS_PROTOCOL_VERSION: u16 = 12;
-pub const RETENTION_PROTECTION_PROTOCOL_VERSION: u16 = 13;
-pub const ALL_EVENTS_HISTORY_PROTOCOL_VERSION: u16 = 14;
-pub const RETENTION_PROGRESS_PROTOCOL_VERSION: u16 = 15;
-pub const LAN_CONTENT_PLAN_PROTOCOL_VERSION: u16 = 16;
-pub const STREAMING_BLOB_PROTOCOL_VERSION: u16 = 17;
-pub const PROTOCOL_VERSION: u16 = STREAMING_BLOB_PROTOCOL_VERSION;
+pub const ALPN: &[u8] = b"ecopaste/sync/2";
+pub const PROTOCOL_VERSION: u16 = 26;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -112,7 +99,6 @@ pub struct DeviceAnnouncement {
     #[n(5)]
     pub relay_urls: Vec<String>,
     #[n(6)]
-    #[cbor(default)]
     pub app_version: String,
 }
 
@@ -168,7 +154,6 @@ pub struct RemovedDevice {
     pub removed_at_ms: i64,
     /// A later restoration supersedes the tombstone while preserving conflict history.
     #[n(3)]
-    #[cbor(default)]
     pub restored_at_ms: Option<i64>,
 }
 
@@ -222,21 +207,18 @@ pub struct EncryptedEvent {
     #[n(5)]
     pub ciphertext: Vec<u8>,
     #[n(6)]
-    #[cbor(default)]
     pub kind: SyncEventKind,
     /// Opaque encrypted blob identifiers referenced by this event.
     /// The Hub uses only this authenticated-group metadata for reference counting.
     #[n(7)]
-    #[cbor(default)]
     pub blob_ids: Vec<String>,
-    /// Upload-time subset of `blob_ids` that may arrive after the event (source icons).
-    /// These references retain the same lifetime as required blobs. Omitted by older clients.
+    /// Upload-time subset of `blob_ids` that may arrive after the event, such as source icons or
+    /// file content above the sender's automatic cloud-upload limit. These references retain the
+    /// same lifetime as required blobs.
     #[n(8)]
-    #[cbor(default)]
     pub optional_blob_ids: Vec<String>,
     /// Group-keyed anonymous item identity used only for cloud retention.
     #[n(9)]
-    #[cbor(default)]
     pub retention_key: Option<String>,
 }
 
@@ -289,6 +271,31 @@ pub struct CloudEvent {
     pub cursor: u64,
     #[n(1)]
     pub event: EncryptedEvent,
+    /// Blob references that are currently readable from the Hub.
+    #[n(2)]
+    pub available_blob_ids: Vec<String>,
+}
+
+/// Durable Hub-side change to the blobs currently readable for one immutable event.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct CloudAvailabilityUpdate {
+    #[n(0)]
+    pub cursor: u64,
+    #[n(1)]
+    pub event_id: String,
+    #[n(2)]
+    pub available_blob_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct CursorEvent {
+    /// Opaque peer-local delivery cursor. It is not used for conflict resolution.
+    #[n(0)]
+    pub cursor: u64,
+    #[n(1)]
+    pub event: EncryptedEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
@@ -328,15 +335,9 @@ pub enum Request {
         events: Vec<EncryptedEvent>,
         #[n(5)]
         limit: u16,
-        /// Opts into byte-limited responses and the explicit continuation flag.
-        #[n(6)]
-        byte_limited: Option<bool>,
         /// Confirms that this request contains the end of the sender's current event outbox.
-        #[n(7)]
-        events_complete: Option<bool>,
-        /// Opts into explicit history-gap errors after bounded Hub pruning.
-        #[n(8)]
-        bounded_hub: Option<bool>,
+        #[n(6)]
+        events_complete: bool,
     },
     #[n(3)]
     PutBlob {
@@ -358,15 +359,6 @@ pub enum Request {
         #[n(2)]
         blob_id: String,
     },
-    #[n(5)]
-    Watch {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        after_cursor: u64,
-    },
     #[n(6)]
     ListEvents {
         #[n(0)]
@@ -379,7 +371,6 @@ pub enum Request {
         limit: u16,
         /// Includes metadata/presence events for delivery verification; history browsing omits it.
         #[n(4)]
-        #[cbor(default)]
         include_states: Option<bool>,
     },
     #[n(7)]
@@ -391,46 +382,11 @@ pub enum Request {
         #[n(2)]
         devices: Vec<RemovedDevice>,
     },
-    #[n(8)]
-    WatchGroup {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        after_cursor: u64,
-        #[n(3)]
-        after_removed_at_ms: i64,
-    },
-    /// Keeps one response stream open and pushes group cursors after every change.
-    #[n(9)]
-    WatchGroupStream {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        after_cursor: u64,
-        #[n(3)]
-        after_removed_at_ms: i64,
-    },
-    /// Keeps a version-aware response stream without changing legacy watch frames.
-    #[n(10)]
-    WatchGroupStreamV2 {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        after_cursor: u64,
-        #[n(3)]
-        after_removed_at_ms: i64,
-    },
     #[n(11)]
-    HealthV2,
+    CloudHealth,
     /// Exchanges membership tombstones and clipboard events in one cloud round trip.
     #[n(12)]
-    SyncV2 {
+    CloudSync {
         #[n(0)]
         group_id: String,
         #[n(1)]
@@ -445,14 +401,9 @@ pub enum Request {
         removed_devices: Vec<RemovedDevice>,
         #[n(6)]
         limit: u16,
+        /// Rejects a cursor that has fallen behind the Hub's retained history window.
         #[n(7)]
-        byte_limited: Option<bool>,
-        /// Confirms that this request contains the end of the sender's current event outbox.
-        #[n(8)]
-        events_complete: Option<bool>,
-        /// Opts into explicit history-gap errors after bounded Hub pruning.
-        #[n(9)]
-        bounded_hub: Option<bool>,
+        bounded_hub: bool,
     },
     /// Stores an optional source application icon and wakes group watchers after a new upload.
     #[n(13)]
@@ -466,9 +417,9 @@ pub enum Request {
         #[n(3)]
         size: u64,
     },
-    /// Keeps one slot of a redundant version-aware response stream open.
+    /// Keeps one cloud change stream open for the current device.
     #[n(14)]
-    WatchGroupStreamV3 {
+    WatchCloud {
         #[n(0)]
         group_id: String,
         #[n(1)]
@@ -477,8 +428,6 @@ pub enum Request {
         after_cursor: u64,
         #[n(3)]
         after_removed_at_ms: i64,
-        #[n(4)]
-        watch_slot: u8,
     },
     /// Lists active group members and their current Hub presence.
     #[n(15)]
@@ -550,7 +499,7 @@ pub enum Request {
         #[n(3)]
         size: u64,
     },
-    /// Lets a LAN receiver choose metadata-only file events before attachment transfer starts.
+    /// Lets a LAN receiver choose metadata-only or already available content before transfer.
     #[n(21)]
     PlanLanContent {
         #[n(0)]
@@ -592,6 +541,32 @@ pub enum Request {
         #[n(0)]
         blob_id: String,
     },
+    /// Confirms durable LAN events and identifies routes with complete content.
+    #[n(25)]
+    AcknowledgeLan {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        device: DeviceAnnouncement,
+        #[n(3)]
+        event_ids: Vec<String>,
+        #[n(4)]
+        complete_event_ids: Vec<String>,
+    },
+    /// Reads durable blob-availability changes independently from immutable event delivery.
+    #[n(26)]
+    SyncCloudAvailability {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        after_cursor: u64,
+        #[n(3)]
+        limit: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -610,14 +585,13 @@ pub enum Response {
         #[n(0)]
         accepted_event_ids: Vec<String>,
         #[n(1)]
-        events: Vec<CloudEvent>,
+        events: Vec<CursorEvent>,
         #[n(2)]
         peers: Vec<PeerAnnouncement>,
         #[n(3)]
         latest_cursor: u64,
-        /// None preserves the legacy count-based completion rule.
         #[n(4)]
-        has_more: Option<bool>,
+        has_more: bool,
     },
     #[n(3)]
     BlobReady {
@@ -633,11 +607,6 @@ pub enum Response {
         #[n(1)]
         message: String,
     },
-    #[n(6)]
-    Changed {
-        #[n(0)]
-        latest_cursor: u64,
-    },
     #[n(7)]
     EventsPage {
         #[n(0)]
@@ -652,24 +621,19 @@ pub enum Response {
         #[n(0)]
         devices: Vec<RemovedDevice>,
     },
-    #[n(9)]
-    GroupChanged {
-        #[n(0)]
-        latest_cursor: u64,
-        #[n(1)]
-        latest_removed_at_ms: i64,
-    },
     #[n(10)]
-    GroupChangedV2 {
+    CloudChanged {
         #[n(0)]
         latest_cursor: u64,
         #[n(1)]
         latest_removed_at_ms: i64,
         #[n(2)]
         server_version: String,
+        #[n(3)]
+        latest_availability_cursor: u64,
     },
     #[n(11)]
-    HealthV2 {
+    CloudHealth {
         #[n(0)]
         protocol_version: u16,
         #[n(1)]
@@ -678,7 +642,7 @@ pub enum Response {
         server_version: String,
     },
     #[n(12)]
-    SyncedV2 {
+    CloudSynced {
         #[n(0)]
         accepted_event_ids: Vec<String>,
         #[n(1)]
@@ -690,14 +654,13 @@ pub enum Response {
         #[n(4)]
         removed_devices: Vec<RemovedDevice>,
         #[n(5)]
-        has_more: Option<bool>,
+        has_more: bool,
     },
     #[n(13)]
     Devices {
         #[n(0)]
         devices: Vec<CloudDevice>,
         #[n(1)]
-        #[cbor(default)]
         hub_status: Option<HubStatus>,
     },
     #[n(14)]
@@ -722,7 +685,20 @@ pub enum Response {
     #[n(17)]
     LanContentPlan {
         #[n(0)]
-        deferred_event_ids: Vec<String>,
+        metadata_only_event_ids: Vec<String>,
+        #[n(1)]
+        available_event_ids: Vec<String>,
+    },
+    #[n(18)]
+    LanAcknowledged,
+    #[n(19)]
+    CloudAvailabilitySynced {
+        #[n(0)]
+        updates: Vec<CloudAvailabilityUpdate>,
+        #[n(1)]
+        latest_cursor: u64,
+        #[n(2)]
+        has_more: bool,
     },
 }
 
@@ -866,7 +842,7 @@ pub fn limit_events_page(response: &mut Response) -> Result<(), FrameError> {
 /// Keeps only the outgoing prefix that fits in one frame. Remaining events stay in the outbox.
 pub fn limit_sync_request(request: &mut Request) -> Result<usize, FrameError> {
     let mut events = match request {
-        Request::Sync { events, .. } | Request::SyncV2 { events, .. } => std::mem::take(events),
+        Request::Sync { events, .. } | Request::CloudSync { events, .. } => std::mem::take(events),
         _ => return Err(FrameError::Encode("expected a sync request".into())),
     };
     let count = fitting_event_count(&events, encoded_size(request)?)?;
@@ -875,7 +851,7 @@ pub fn limit_sync_request(request: &mut Request) -> Result<usize, FrameError> {
         Request::Sync {
             events: outgoing, ..
         }
-        | Request::SyncV2 {
+        | Request::CloudSync {
             events: outgoing, ..
         } => {
             *outgoing = events;
@@ -902,65 +878,76 @@ pub fn limit_lan_content_plan(request: &mut Request) -> Result<usize, FrameError
     Ok(count)
 }
 
-/// Byte-limits responses only for callers that understand explicit continuation.
+/// Byte-limits current sync responses and records whether another page remains.
 /// The cursor advances through returned events only, including when an acknowledgement is replayed.
 pub fn limit_sync_response(
     response: &mut Response,
     after_cursor: u64,
     limit: u16,
-    byte_limited: bool,
 ) -> Result<(), FrameError> {
-    if !byte_limited {
-        return Ok(());
-    }
-    let mut events = match response {
-        Response::Synced {
-            events,
-            latest_cursor,
-            has_more,
-            ..
-        }
-        | Response::SyncedV2 {
-            events,
-            latest_cursor,
-            has_more,
-            ..
-        } => {
-            *latest_cursor = u64::MAX;
-            *has_more = Some(false);
-            std::mem::take(events)
-        }
-        _ => return Err(FrameError::Encode("expected a sync response".into())),
-    };
-    // Reserve the largest cursor representation before selecting the returned prefix.
-    let count = fitting_event_count(&events, encoded_size(response)?)?;
-    let has_more =
-        count < events.len() || events.len() >= usize::from(limit.clamp(1, MAX_EVENTS_PER_BATCH));
-    events.truncate(count);
-    let latest_cursor = events
-        .last()
-        .map(|event| event.cursor)
-        .unwrap_or(after_cursor);
     match response {
         Response::Synced {
-            events: outgoing,
-            latest_cursor: cursor,
-            has_more: more,
-            ..
-        }
-        | Response::SyncedV2 {
-            events: outgoing,
-            latest_cursor: cursor,
-            has_more: more,
+            events,
+            latest_cursor,
+            has_more,
             ..
         } => {
-            *outgoing = events;
-            *cursor = latest_cursor;
-            *more = Some(has_more);
+            let mut events = std::mem::take(events);
+            *latest_cursor = u64::MAX;
+            *has_more = false;
+            let count = fitting_event_count(&events, encoded_size(response)?)?;
+            let has_more = count < events.len()
+                || events.len() >= usize::from(limit.clamp(1, MAX_EVENTS_PER_BATCH));
+            events.truncate(count);
+            let latest_cursor = events
+                .last()
+                .map(|event| event.cursor)
+                .unwrap_or(after_cursor);
+            if let Response::Synced {
+                events: target,
+                latest_cursor: target_cursor,
+                has_more: target_has_more,
+                ..
+            } = response
+            {
+                *target = events;
+                *target_cursor = latest_cursor;
+                *target_has_more = has_more;
+            }
+            Ok(())
         }
-        _ => unreachable!(),
+        Response::CloudSynced {
+            events,
+            latest_cursor,
+            has_more,
+            ..
+        } => {
+            let mut events = std::mem::take(events);
+            *latest_cursor = u64::MAX;
+            *has_more = false;
+            let count = fitting_event_count(&events, encoded_size(response)?)?;
+            let has_more = count < events.len()
+                || events.len() >= usize::from(limit.clamp(1, MAX_EVENTS_PER_BATCH));
+            events.truncate(count);
+            let latest_cursor = events
+                .last()
+                .map(|event| event.cursor)
+                .unwrap_or(after_cursor);
+            if let Response::CloudSynced {
+                events: target,
+                latest_cursor: target_cursor,
+                has_more: target_has_more,
+                ..
+            } = response
+            {
+                *target = events;
+                *target_cursor = latest_cursor;
+                *target_has_more = has_more;
+            }
+            Ok(())
+        }
+        _ => Err(FrameError::Encode("expected a sync response".into())),
     }
-    Ok(())
 }
 
 /// Writes one length-delimited CBOR message.
@@ -1033,17 +1020,6 @@ mod tests {
         assert_eq!(QuotaPolicy::new(90, 70), Ok(QuotaPolicy::default()));
     }
 
-    #[derive(Debug, Encode, Decode)]
-    #[cbor(map)]
-    struct LegacyRemovedDevice {
-        #[n(0)]
-        device_id: String,
-        #[n(1)]
-        endpoint_id: String,
-        #[n(2)]
-        removed_at_ms: i64,
-    }
-
     #[tokio::test]
     async fn request_round_trip() {
         let request = Request::Sync {
@@ -1061,9 +1037,7 @@ mod tests {
             after_cursor: 7,
             events: Vec::new(),
             limit: 100,
-            byte_limited: None,
-            events_complete: Some(true),
-            bounded_hub: Some(true),
+            events_complete: true,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
@@ -1096,7 +1070,7 @@ mod tests {
             let decoded: Request = minicbor::decode(&encoded).unwrap();
             assert_eq!(decoded, request);
         }
-        assert_eq!(PROTOCOL_VERSION, STREAMING_BLOB_PROTOCOL_VERSION);
+        assert_eq!(PROTOCOL_VERSION, 26);
     }
 
     #[tokio::test]
@@ -1114,6 +1088,37 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn cloud_availability_round_trip() {
+        let request = Request::SyncCloudAvailability {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            after_cursor: 42,
+            limit: 30,
+        };
+        let response = Response::CloudAvailabilitySynced {
+            updates: vec![CloudAvailabilityUpdate {
+                cursor: 43,
+                event_id: "event_123".into(),
+                available_blob_ids: vec!["a".repeat(64)],
+            }],
+            latest_cursor: 43,
+            has_more: false,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Request>(&mut server).await.unwrap(),
+            request
+        );
+        write_frame(&mut server, &response).await.unwrap();
+        assert_eq!(
+            read_frame::<_, Response>(&mut client).await.unwrap(),
+            response
+        );
     }
 
     #[tokio::test]
@@ -1202,13 +1207,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redundant_watch_request_round_trip() {
-        let request = Request::WatchGroupStreamV3 {
+    async fn watch_request_round_trip() {
+        let request = Request::WatchCloud {
             group_id: "group_123".into(),
             access_token: vec![7; 32],
             after_cursor: 42,
             after_removed_at_ms: 84,
-            watch_slot: 1,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
@@ -1216,27 +1220,5 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn restored_device_field_is_backward_compatible() {
-        let current = RemovedDevice {
-            device_id: "device_123".into(),
-            endpoint_id: "endpoint_123".into(),
-            removed_at_ms: 42,
-            restored_at_ms: Some(84),
-        };
-        let encoded = minicbor::to_vec(&current).unwrap();
-        let legacy: LegacyRemovedDevice = minicbor::decode(&encoded).unwrap();
-        assert_eq!(legacy.device_id, current.device_id);
-
-        let legacy = LegacyRemovedDevice {
-            device_id: "device_123".into(),
-            endpoint_id: "endpoint_123".into(),
-            removed_at_ms: 42,
-        };
-        let encoded = minicbor::to_vec(&legacy).unwrap();
-        let decoded: RemovedDevice = minicbor::decode(&encoded).unwrap();
-        assert_eq!(decoded.restored_at_ms, None);
     }
 }

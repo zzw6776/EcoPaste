@@ -42,6 +42,7 @@ pub enum CommandKey {
     #[cfg(not(target_os = "android"))]
     UpdateInstallRequiresRelease,
     ExternalUrlUnsupported,
+    FileImportInProgress,
     #[cfg(target_os = "macos")]
     PasteAccessibilityRequired,
     #[cfg(target_os = "macos")]
@@ -59,7 +60,7 @@ pub enum CommandKey {
     SyncDisabled,
     SyncGroupRequired,
     SyncLanDisabled,
-    SyncOperationPending,
+    SyncNoLanDevice,
     SyncPreparationFailed,
     SyncSensitiveDisabled,
     SyncTransferCancelFailed,

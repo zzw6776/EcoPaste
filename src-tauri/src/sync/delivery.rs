@@ -20,8 +20,8 @@ use crate::db;
 use super::{
     model::{StoredBlob, StoredSyncEvent},
     progress::{
-        MetadataOnlyDeliveryStart, PreparationClaim, TransferDirection, TransferHandle,
-        TransferPhase, TransferRegistry, TransferRoute, TransferTask,
+        LocalImportPromotion, MetadataOnlyDeliveryStart, PreparationClaim, TransferDirection,
+        TransferHandle, TransferPhase, TransferRegistry, TransferRoute, TransferTask,
     },
     repository,
     transfer::TransferQueue,
@@ -42,11 +42,11 @@ pub(super) enum UploadTransferStart {
 }
 
 enum DurableDeliveryTransition<'a> {
-    Queued,
-    Syncing,
-    Confirming,
+    Attempted,
     Failed(&'a str),
-    Completed,
+    Completed {
+        metadata_only_event_ids: &'a HashSet<String>,
+    },
 }
 
 pub(super) struct PreparedReadyEvents {
@@ -347,6 +347,45 @@ impl DeliveryCoordinator {
         self.registry.start(task)
     }
 
+    pub fn start_transient(&self, task: TransferTask) -> TransferHandle {
+        self.registry.start_transient(task)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn start_local_import(&self, task: TransferTask) -> TransferHandle {
+        self.registry.start_local_import(task)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn local_import_canceled(&self, task_id: &str) -> bool {
+        self.registry.local_import_canceled(task_id)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn update_local_import(&self, task_id: &str, bytes: u64) {
+        self.registry.update_local_import(task_id, bytes);
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn finish_local_import(&self, task_id: &str, total_bytes: u64) {
+        self.registry.finish_local_import(task_id, total_bytes);
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn bind_local_import(&self, task_id: &str, operation_order: i64, source_revision: String) {
+        self.registry
+            .bind_local_import(task_id, operation_order, source_revision);
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn fail_local_import(&self, task_id: &str, bytes: u64, error: String) {
+        self.registry.fail_local_import(task_id, bytes, error);
+    }
+
+    pub fn promote_local_import(&self, promotion: LocalImportPromotion) -> Option<TransferHandle> {
+        self.registry.promote_local_import(promotion)
+    }
+
     pub fn start_preparation(
         &self,
         task: TransferTask,
@@ -377,6 +416,10 @@ impl DeliveryCoordinator {
         claim_remote_download(&self.remote_download_claims, item_id)
     }
 
+    pub fn item_has_active_local_import(&self, item_id: &str) -> bool {
+        self.registry.item_has_active_local_import(item_id)
+    }
+
     /// Cancels preparation or delivery while serializing the transition to confirmation.
     pub async fn cancel(&self, pool: &SqlitePool, task_id: &str) -> Result<DeliveryCancel> {
         if let Some(preparation) = self.registry.request_preparation_cancel(task_id) {
@@ -404,10 +447,10 @@ impl DeliveryCoordinator {
         } else {
             None
         };
-        let Some(task) = self.registry.cancellable_task(task_id) else {
+        let Some((task, transient)) = self.registry.cancellable_task(task_id) else {
             return Ok(DeliveryCancel::NotFound);
         };
-        if task.direction == TransferDirection::Upload {
+        if task.direction == TransferDirection::Upload && !transient {
             repository::cancel_delivery(pool, &task.target, &task.operation_id).await?;
         }
         Ok(if self.registry.cancel(task_id).is_some() {
@@ -463,6 +506,7 @@ impl DeliveryCoordinator {
         target: &str,
         route: TransferRoute,
         event_id: &str,
+        operation_total_bytes: u64,
         blob: &StoredBlob,
     ) -> Result<UploadTransferStart> {
         if !repository::canceled_delivery_ids(pool, target, &[event_id.to_owned()])
@@ -471,18 +515,15 @@ impl DeliveryCoordinator {
         {
             return Ok(UploadTransferStart::Canceled);
         }
-        let Some((item_id, operation_total_bytes)) =
-            repository::transfer_item_for_event(pool, event_id).await?
-        else {
+        let Some(item_id) = repository::transfer_item_id_for_event(pool, event_id).await? else {
             return Ok(UploadTransferStart::Ready(None));
         };
-        match self.registry.claim_preparation(
-            event_id,
-            route,
-            target,
-            blob.size,
-            operation_total_bytes,
-        ) {
+        let task_key = format!("{event_id}\0{target}\0{}", blob.blob_id);
+        let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
+        match self
+            .registry
+            .claim_preparation(event_id, route, target, operation_total_bytes)
+        {
             PreparationClaim::Claimed(transfer) => {
                 return Ok(UploadTransferStart::Ready(Some(transfer)));
             }
@@ -490,11 +531,10 @@ impl DeliveryCoordinator {
             PreparationClaim::Missing => {}
         }
 
-        let task_key = format!("{event_id}\0{target}\0{}", blob.blob_id);
-        let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
         Ok(UploadTransferStart::Ready(Some(self.registry.start(
             TransferTask {
                 id: task_id,
+                revision: 0,
                 operation_id: event_id.to_owned(),
                 item_id,
                 direction: TransferDirection::Upload,
@@ -503,8 +543,7 @@ impl DeliveryCoordinator {
                 file_name: None,
                 phase: TransferPhase::Queued,
                 transferred_bytes: 0,
-                total_bytes: blob.size,
-                operation_total_bytes,
+                total_bytes: operation_total_bytes,
                 speed_bytes_per_second: 0,
                 elapsed_ms: 0,
                 eta_seconds: None,
@@ -519,22 +558,19 @@ impl DeliveryCoordinator {
         pool: &SqlitePool,
         target: &str,
         event_ids: &[String],
+        metadata_only_event_ids: &HashSet<String>,
     ) -> Result<()> {
-        self.transition_active(pool, target, event_ids, DurableDeliveryTransition::Queued)
-            .await
+        let _transition_guard = self.transition_lock.lock().await;
+        let canceled = self.canceled_event_ids(pool, target, event_ids).await?;
+        let active = event_ids
+            .iter()
+            .filter(|event_id| !canceled.contains(*event_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        repository::plan_deliveries(pool, target, &active, metadata_only_event_ids).await
     }
 
-    pub async fn syncing(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-    ) -> Result<()> {
-        self.transition_active(pool, target, event_ids, DurableDeliveryTransition::Syncing)
-            .await
-    }
-
-    pub async fn confirming(
+    pub async fn attempted(
         &self,
         pool: &SqlitePool,
         target: &str,
@@ -544,7 +580,7 @@ impl DeliveryCoordinator {
             pool,
             target,
             event_ids,
-            DurableDeliveryTransition::Confirming,
+            DurableDeliveryTransition::Attempted,
         )
         .await
     }
@@ -570,17 +606,20 @@ impl DeliveryCoordinator {
         pool: &SqlitePool,
         target: &str,
         event_ids: &[String],
+        metadata_only_event_ids: &HashSet<String>,
     ) -> Result<()> {
         self.transition_active(
             pool,
             target,
             event_ids,
-            DurableDeliveryTransition::Completed,
+            DurableDeliveryTransition::Completed {
+                metadata_only_event_ids,
+            },
         )
         .await
     }
 
-    /// Serializes every durable phase change with cancellation and ignores canceled operations.
+    /// Serializes durable delivery outcomes with cancellation and ignores canceled operations.
     async fn transition_active(
         &self,
         pool: &SqlitePool,
@@ -600,20 +639,22 @@ impl DeliveryCoordinator {
         }
 
         match transition {
-            DurableDeliveryTransition::Queued => {
-                repository::mark_delivery_queued(pool, target, &active).await
-            }
-            DurableDeliveryTransition::Syncing => {
-                repository::mark_delivery_syncing(pool, target, &active).await
-            }
-            DurableDeliveryTransition::Confirming => {
-                repository::mark_delivery_confirming(pool, target, &active).await
+            DurableDeliveryTransition::Attempted => {
+                repository::record_delivery_attempt(pool, target, &active).await
             }
             DurableDeliveryTransition::Failed(error) => {
                 repository::mark_delivery_error(pool, target, &active, error).await
             }
-            DurableDeliveryTransition::Completed => {
-                repository::mark_delivered(pool, target, &active).await
+            DurableDeliveryTransition::Completed {
+                metadata_only_event_ids,
+            } => {
+                repository::complete_outbound_delivery(
+                    pool,
+                    target,
+                    &active,
+                    metadata_only_event_ids,
+                )
+                .await
             }
         }
     }
@@ -624,7 +665,7 @@ impl DeliveryCoordinator {
         pool: &SqlitePool,
         target: &str,
         route: TransferRoute,
-        deferred_event_ids: &HashSet<String>,
+        metadata_only_event_ids: &HashSet<String>,
         queue: &mut TransferQueue,
     ) -> Result<PreparedReadyEvents> {
         let _transition_guard = self.transition_lock.lock().await;
@@ -633,7 +674,7 @@ impl DeliveryCoordinator {
         let mut metadata_only_operations = Vec::new();
         let mut canceled_metadata = HashSet::new();
         events.retain(|stored| {
-            if !deferred_event_ids.contains(&stored.event.event_id) {
+            if !metadata_only_event_ids.contains(&stored.event.event_id) {
                 return true;
             }
             match self

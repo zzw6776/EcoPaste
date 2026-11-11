@@ -1,24 +1,31 @@
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import type { PluginListener } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useEventListener, useMount, useUnmount } from "ahooks";
+import { useMount, useUnmount } from "ahooks";
 import type { ConfigProviderProps } from "antd";
 import { App as AntdApp, ConfigProvider } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
 import type { FC } from "react";
-import { use, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { RouterProvider } from "react-router";
 import { useSnapshot } from "valtio";
 import { minimizeAndroidApp } from "@/commands/android";
+import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
+import { closeAppOverlays } from "@/hooks/useCloseAppOverlay";
+import { useTauriListen } from "@/hooks/useTauriListen";
 import { router } from "./router";
-import { settingsReady, settingsState } from "./stores/settings";
+import { settingsInitializationState, settingsState } from "./stores/settings";
 import type { Language } from "./types/settings";
 import { handleAndroidBack } from "./utils/androidBack";
-import { setMessageApi, setModalApi } from "./utils/feedback";
+import {
+  closeModalDialogs,
+  setMessageApi,
+  setModalApi,
+} from "./utils/feedback";
 import { isAndroid, isTauri } from "./utils/is";
 import { log } from "./utils/log";
 
@@ -51,6 +58,23 @@ const ANTD_MODAL_CONFIG = {
 const ANTD_MESSAGE_TOP = isAndroid
   ? "calc(var(--mobile-safe-area-top) + 1rem)"
   : 56;
+const APP_OVERLAY_ROOT_ID = "app-overlay-root";
+
+interface WindowVisibilityPayload {
+  label: string;
+  visible: boolean;
+}
+
+interface AppContentProps {
+  windowLabel: string;
+}
+
+/** 将临时浮层限制在固定的应用视口内。 */
+const getPopupContainer: NonNullable<
+  ConfigProviderProps["getPopupContainer"]
+> = () => {
+  return document.getElementById(APP_OVERLAY_ROOT_ID) ?? document.body;
+};
 
 /**
  * 把设置语言映射到 Ant Design 内置 locale。
@@ -69,7 +93,8 @@ import {
   closeAndroidPermissionsModal,
 } from "@/stores/android";
 
-const AppContent: FC = () => {
+const AppContent: FC<AppContentProps> = (props) => {
+  const { windowLabel } = props;
   const { message, modal } = AntdApp.useApp();
   const androidSnapshot = useSnapshot(androidState);
   const androidBackListenerRef = useRef<PluginListener | null>(null);
@@ -119,6 +144,23 @@ const AppContent: FC = () => {
     void listener.unregister();
   });
 
+  useTauriListen<WindowVisibilityPayload>(
+    TAURI_EVENT.WINDOW_VISIBILITY,
+    (event) => {
+      if (
+        windowLabel !== WINDOW_LABEL.CLIPBOARD ||
+        event.payload.label !== WINDOW_LABEL.CLIPBOARD ||
+        event.payload.visible
+      ) {
+        return;
+      }
+
+      closeAppOverlays();
+      message.destroy();
+      closeModalDialogs();
+    },
+  );
+
   return (
     <>
       <RouterProvider router={router} />
@@ -133,15 +175,10 @@ const AppContent: FC = () => {
   );
 };
 
-/**
- * 等待 Rust 设置首屏快照灌入后再渲染，避免组件读到空对象闪烁默认值。
- * `use()` 在 promise pending 时抛出，由父级（`main.tsx`）的 Suspense 接住。
- */
 const App: FC = () => {
-  use(settingsReady);
-
   const { i18n } = useTranslation();
   const settings = useSnapshot(settingsState);
+  const settingsInitialization = useSnapshot(settingsInitializationState);
   const windowLabel = isTauri
     ? getCurrentWebviewWindow().label
     : WINDOW_LABEL.CLIPBOARD;
@@ -152,6 +189,7 @@ const App: FC = () => {
   const language = settings.appearance.language;
   const antdTheme = useAppTheme(mode);
   const locale = resolveAntdLocale(language);
+  const androidInitializationRef = useRef(false);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -161,42 +199,39 @@ const App: FC = () => {
     void i18n.changeLanguage(language);
   }, [i18n, language]);
 
-  useMount(() => {
-    if (isAndroid) {
-      if (!settings.onboarding.completed) {
-        void router.navigate("/onboarding", { replace: true });
-        return;
-      }
-      void checkAndAutoPromptAndroidPermissions();
+  useEffect(() => {
+    if (!isAndroid || settingsInitialization.status !== "ready") return;
+    if (!settings.onboarding.completed) {
+      void router.navigate("/onboarding", { replace: true });
+      return;
     }
-  });
+    if (androidInitializationRef.current) return;
 
-  // 兜底未捕获的 Promise rejection：统一进日志通道，避免只在 devtools 红字闪过、生产环境完全无痕。
-  useEventListener("unhandledrejection", (event) => {
-    const { reason } = event;
-
-    log.error(
-      "unhandled promise rejection",
-      reason instanceof Error ? reason : { reason },
-    );
-  });
-
-  // 兜底未捕获的同步异常（含资源加载错误）。React 渲染错误由 ErrorBoundary 接，不会走到这里。
-  useEventListener("error", (event) => {
-    const { error, ...rest } = event;
-
-    log.error("uncaught error", error instanceof Error ? error : rest);
-  });
+    androidInitializationRef.current = true;
+    void checkAndAutoPromptAndroidPermissions();
+  }, [settings.onboarding.completed, settingsInitialization.status]);
 
   return (
     <ConfigProvider
       drawer={ANTD_DRAWER_CONFIG}
+      getPopupContainer={getPopupContainer}
       locale={locale}
       modal={ANTD_MODAL_CONFIG}
       theme={antdTheme}
     >
       <AntdApp message={{ duration: 1.5, maxCount: 2, top: ANTD_MESSAGE_TOP }}>
-        <AppContent />
+        <div id={APP_OVERLAY_ROOT_ID} />
+        {settingsInitialization.status === "loading" ? (
+          <div
+            aria-label="EcoPaste 正在启动"
+            className="app-startup-shell flex size-full min-h-screen items-center justify-center"
+            role="status"
+          >
+            <div className="size-8 animate-pulse rounded-2 bg-ant-primary" />
+          </div>
+        ) : (
+          <AppContent windowLabel={windowLabel} />
+        )}
       </AntdApp>
     </ConfigProvider>
   );

@@ -29,7 +29,7 @@ const BLOB_MAGIC: &[u8; 8] = b"ECOSBL01";
 const STREAM_NONCE_LEN: usize = 19;
 const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
-const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
+pub(crate) const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
 const STREAM_BLOB_ID_DOMAIN: &[u8] = b"ecopaste/stream-blob-id/v1\0";
 
 /// Advance only when the event decoder gains support for previously deferred formats.
@@ -1392,6 +1392,7 @@ mod tests {
             },
             blobs: Vec::new(),
             source_app: None,
+            content_identity: Some("a".repeat(64)),
         };
         let event = encrypt_event(
             &key,
@@ -1509,6 +1510,7 @@ mod tests {
                 accent_start: None,
                 accent_end: None,
             }),
+            content_identity: Some("c".repeat(64)),
         };
         let mut event =
             encrypt_event(&key, "image-event".into(), "device".into(), 1, 1, &envelope).unwrap();

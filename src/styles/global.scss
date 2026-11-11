@@ -4,6 +4,27 @@ body,
 .ant-app {
   background: transparent !important;
   background-color: transparent !important;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+#app-overlay-root {
+  position: fixed;
+  z-index: 2000;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+#app-overlay-root > * {
+  pointer-events: auto;
+}
+
+#app-overlay-root .ant-popover-inner,
+#app-overlay-root .ant-dropdown-menu {
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
 }
 
 html {
@@ -12,6 +33,7 @@ html {
   --mobile-system-inset-bottom: env(safe-area-inset-bottom, 0px);
   --mobile-safe-area-top: max(var(--mobile-system-inset-top), 2rem);
   --mobile-safe-area-bottom: max(var(--mobile-system-inset-bottom), 0.75rem);
+  --clipboard-card-selection-frame: 2px;
 
   &.dark {
     --uno: scheme-dark;
@@ -35,6 +57,53 @@ html {
       outline: none;
     }
   }
+}
+
+/* ConfigProvider 尚未挂载时也必须有不透明首帧，避免透明 Android Activity 露出黑底。 */
+.app-startup-shell {
+  background-color: var(--ant-color-bg-layout, #f2f2f7) !important;
+}
+
+html.dark .app-startup-shell {
+  background-color: var(--ant-color-bg-layout, #121212) !important;
+}
+
+.clipboard-card-selection-shell {
+  padding: var(--clipboard-card-selection-frame);
+  border-radius: calc(1rem + var(--clipboard-card-selection-frame));
+}
+
+.clipboard-card {
+  container-name: clipboard-card;
+  container-type: inline-size;
+}
+
+.clipboard-card__desktop-actions {
+  display: none;
+}
+
+.clipboard-card__status-row:hover {
+  .clipboard-card__desktop-actions {
+    display: flex;
+  }
+
+  .clipboard-card__hint {
+    display: none;
+  }
+}
+
+@container clipboard-card (min-width: 19rem) {
+  .clipboard-card__desktop-actions {
+    display: flex;
+  }
+
+  .clipboard-card__status-row:hover .clipboard-card__hint {
+    display: flex;
+  }
+}
+
+.clipboard-header-content {
+  transform: translateY(calc(var(--clipboard-card-selection-frame) / 2));
 }
 
 .mobile-safe-area-top {

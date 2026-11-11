@@ -38,6 +38,13 @@ pub(super) fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
     if !is_hex_identifier(&envelope.item.sync_key) {
         bail!("invalid synchronized item key");
     }
+    if envelope
+        .content_identity
+        .as_deref()
+        .is_some_and(|identity| !is_hex_identifier(identity))
+    {
+        bail!("invalid synchronized content identity");
+    }
     let kind = parse_kind(&envelope.item.kind)?;
     envelope
         .item

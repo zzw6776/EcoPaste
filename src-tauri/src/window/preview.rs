@@ -46,9 +46,13 @@ const PREVIEW_PANEL_WIDTH: f64 = 680.0;
 #[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_HEIGHT: f64 = 600.0;
 #[cfg(not(target_os = "android"))]
-const PREVIEW_PANEL_GAP: f64 = 40.0;
+const PREVIEW_PANEL_GAP: f64 = 24.0;
 #[cfg(not(target_os = "android"))]
 const PREVIEW_PANEL_MARGIN: f64 = 32.0;
+#[cfg(not(target_os = "android"))]
+const PREVIEW_PANEL_MIN_WIDTH: f64 = 460.0;
+#[cfg(not(target_os = "android"))]
+const PREVIEW_PANEL_MIN_HEIGHT: f64 = 260.0;
 #[cfg(not(target_os = "android"))]
 const PREVIEW_POINTER_ANCHOR_SIZE: f64 = 1.0;
 #[cfg(not(target_os = "android"))]
@@ -806,7 +810,12 @@ fn build_preview_layout(
         clipboard_window,
         overlay_rect,
     );
-    let (panel_rect, placement) = resolve_panel_rect(source_rect, overlay_rect);
+    let clipboard_rect = clipboard_window.map(|window| {
+        let rect = resolve_clipboard_overlay_rect(window, scale_factor, work_area);
+
+        intersect_rect(rect, overlay_rect).unwrap_or_else(|| clamp_rect(rect, overlay_rect))
+    });
+    let (panel_rect, placement) = resolve_panel_rect(source_rect, overlay_rect, clipboard_rect);
 
     PreviewLayout {
         overlay_rect,
@@ -825,12 +834,7 @@ fn resolve_source_rect(
     overlay_rect: PreviewRect,
 ) -> PreviewRect {
     let source = if let Some(clipboard_window) = clipboard_window {
-        let main_rect = PreviewRect {
-            left: (clipboard_window.x - work_area.position.x) as f64 / scale_factor,
-            top: (clipboard_window.y - work_area.position.y) as f64 / scale_factor,
-            width: clipboard_window.width as f64 / scale_factor,
-            height: clipboard_window.height as f64 / scale_factor,
-        };
+        let main_rect = resolve_clipboard_overlay_rect(clipboard_window, scale_factor, work_area);
         let source = PreviewRect {
             left: main_rect.left + anchor.left,
             top: main_rect.top + anchor.top,
@@ -856,6 +860,20 @@ fn resolve_source_rect(
 }
 
 #[cfg(not(target_os = "android"))]
+fn resolve_clipboard_overlay_rect(
+    clipboard_window: &PreviewClipboardWindowRect,
+    scale_factor: f64,
+    work_area: &PhysicalRect<i32, u32>,
+) -> PreviewRect {
+    PreviewRect {
+        left: (clipboard_window.x - work_area.position.x) as f64 / scale_factor,
+        top: (clipboard_window.y - work_area.position.y) as f64 / scale_factor,
+        width: clipboard_window.width as f64 / scale_factor,
+        height: clipboard_window.height as f64 / scale_factor,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn resolve_pointer_anchor_rect(source: PreviewRect, pointer_y: Option<f64>) -> PreviewRect {
     let Some(pointer_y) = pointer_y else {
         return source;
@@ -875,74 +893,145 @@ fn resolve_pointer_anchor_rect(source: PreviewRect, pointer_y: Option<f64>) -> P
 fn resolve_panel_rect(
     source_rect: PreviewRect,
     overlay_rect: PreviewRect,
+    clipboard_rect: Option<PreviewRect>,
 ) -> (PreviewRect, PreviewPlacement) {
-    let panel_size = (PREVIEW_PANEL_WIDTH, PREVIEW_PANEL_HEIGHT);
+    let avoid_rect = clipboard_rect.unwrap_or(source_rect);
+    let bounds = inset_rect(overlay_rect, PREVIEW_PANEL_MARGIN);
     let candidates = [
         (
             PreviewPlacement::Top,
-            source_rect.top - PREVIEW_PANEL_GAP - PREVIEW_PANEL_HEIGHT - PREVIEW_PANEL_MARGIN
-                >= overlay_rect.top,
+            available_panel_rect(bounds, avoid_rect, PreviewPlacement::Top),
         ),
         (
             PreviewPlacement::Right,
-            source_rect.right() + PREVIEW_PANEL_GAP + PREVIEW_PANEL_WIDTH + PREVIEW_PANEL_MARGIN
-                <= overlay_rect.right(),
+            available_panel_rect(bounds, avoid_rect, PreviewPlacement::Right),
         ),
         (
             PreviewPlacement::Left,
-            source_rect.left - PREVIEW_PANEL_GAP - PREVIEW_PANEL_WIDTH - PREVIEW_PANEL_MARGIN
-                >= overlay_rect.left,
+            available_panel_rect(bounds, avoid_rect, PreviewPlacement::Left),
         ),
         (
             PreviewPlacement::Bottom,
-            source_rect.bottom() + PREVIEW_PANEL_GAP + PREVIEW_PANEL_HEIGHT + PREVIEW_PANEL_MARGIN
-                <= overlay_rect.bottom(),
+            available_panel_rect(bounds, avoid_rect, PreviewPlacement::Bottom),
         ),
     ];
 
-    let placement = candidates
+    let (placement, available) = candidates
         .iter()
-        .find_map(|(placement, fits)| fits.then_some(*placement))
-        .unwrap_or(PreviewPlacement::Top);
-    let raw = raw_panel_rect(source_rect, placement, panel_size);
+        .copied()
+        .find(|(_, rect)| rect.width >= PREVIEW_PANEL_WIDTH && rect.height >= PREVIEW_PANEL_HEIGHT)
+        .or_else(|| {
+            candidates.iter().copied().find(|(_, rect)| {
+                rect.width >= PREVIEW_PANEL_MIN_WIDTH && rect.height >= PREVIEW_PANEL_MIN_HEIGHT
+            })
+        })
+        .unwrap_or_else(|| {
+            candidates
+                .into_iter()
+                .max_by(|(_, left), (_, right)| {
+                    available_panel_score(*left).total_cmp(&available_panel_score(*right))
+                })
+                .unwrap_or((PreviewPlacement::Top, bounds))
+        });
+    let panel_rect = panel_rect_inside_available(source_rect, placement, available);
 
-    (
-        clamp_rect(raw, inset_rect(overlay_rect, PREVIEW_PANEL_MARGIN)),
-        placement,
-    )
+    (panel_rect, placement)
 }
 
 #[cfg(not(target_os = "android"))]
-fn raw_panel_rect(
+fn available_panel_rect(
+    bounds: PreviewRect,
+    avoid_rect: PreviewRect,
+    placement: PreviewPlacement,
+) -> PreviewRect {
+    match placement {
+        PreviewPlacement::Top => {
+            let bottom = (avoid_rect.top - PREVIEW_PANEL_GAP).clamp(bounds.top, bounds.bottom());
+
+            PreviewRect {
+                left: bounds.left,
+                top: bounds.top,
+                width: bounds.width,
+                height: (bottom - bounds.top).max(1.0),
+            }
+        }
+        PreviewPlacement::Right => {
+            let left = (avoid_rect.right() + PREVIEW_PANEL_GAP).clamp(bounds.left, bounds.right());
+
+            PreviewRect {
+                left,
+                top: bounds.top,
+                width: (bounds.right() - left).max(1.0),
+                height: bounds.height,
+            }
+        }
+        PreviewPlacement::Left => {
+            let right = (avoid_rect.left - PREVIEW_PANEL_GAP).clamp(bounds.left, bounds.right());
+
+            PreviewRect {
+                left: bounds.left,
+                top: bounds.top,
+                width: (right - bounds.left).max(1.0),
+                height: bounds.height,
+            }
+        }
+        PreviewPlacement::Bottom => {
+            let top = (avoid_rect.bottom() + PREVIEW_PANEL_GAP).clamp(bounds.top, bounds.bottom());
+
+            PreviewRect {
+                left: bounds.left,
+                top,
+                width: bounds.width,
+                height: (bounds.bottom() - top).max(1.0),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn available_panel_score(rect: PreviewRect) -> f64 {
+    rect.width.min(PREVIEW_PANEL_WIDTH) * rect.height.min(PREVIEW_PANEL_HEIGHT)
+}
+
+#[cfg(not(target_os = "android"))]
+fn panel_rect_inside_available(
     source_rect: PreviewRect,
     placement: PreviewPlacement,
-    (width, height): (f64, f64),
+    available: PreviewRect,
 ) -> PreviewRect {
-    let centered_top = source_rect.center_y() - height / 2.0;
-    let centered_left = source_rect.center_x() - width / 2.0;
+    let width = PREVIEW_PANEL_WIDTH.min(available.width);
+    let height = PREVIEW_PANEL_HEIGHT.min(available.height);
+    let centered_top = (source_rect.center_y() - height / 2.0).clamp(
+        available.top,
+        (available.bottom() - height).max(available.top),
+    );
+    let centered_left = (source_rect.center_x() - width / 2.0).clamp(
+        available.left,
+        (available.right() - width).max(available.left),
+    );
 
     match placement {
         PreviewPlacement::Right => PreviewRect {
-            left: source_rect.right() + PREVIEW_PANEL_GAP,
+            left: available.left,
             top: centered_top,
             width,
             height,
         },
         PreviewPlacement::Left => PreviewRect {
-            left: source_rect.left - PREVIEW_PANEL_GAP - width,
+            left: available.right() - width,
             top: centered_top,
             width,
             height,
         },
         PreviewPlacement::Bottom => PreviewRect {
             left: centered_left,
-            top: source_rect.bottom() + PREVIEW_PANEL_GAP,
+            top: available.top,
             width,
             height,
         },
         PreviewPlacement::Top => PreviewRect {
             left: centered_left,
-            top: source_rect.top - PREVIEW_PANEL_GAP - height,
+            top: available.bottom() - height,
             width,
             height,
         },
@@ -1108,7 +1197,7 @@ mod tests {
             width: 120.0,
             height: 40.0,
         };
-        let (panel, placement) = resolve_panel_rect(source, overlay());
+        let (panel, placement) = resolve_panel_rect(source, overlay(), None);
 
         assert!(matches!(placement, PreviewPlacement::Right));
         assert!(panel.left > source.right());
@@ -1122,7 +1211,7 @@ mod tests {
             width: 120.0,
             height: 40.0,
         };
-        let (panel, placement) = resolve_panel_rect(source, overlay());
+        let (panel, placement) = resolve_panel_rect(source, overlay(), None);
 
         assert!(matches!(placement, PreviewPlacement::Left));
         assert!(panel.right() < source.left);
@@ -1136,7 +1225,7 @@ mod tests {
             width: 80.0,
             height: 40.0,
         };
-        let (panel, _) = resolve_panel_rect(source, overlay());
+        let (panel, _) = resolve_panel_rect(source, overlay(), None);
 
         assert!(panel.left >= PREVIEW_PANEL_MARGIN);
         assert!(panel.top >= PREVIEW_PANEL_MARGIN);

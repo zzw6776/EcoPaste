@@ -33,14 +33,13 @@ impl BlobDownloadProgress<'_> {
 pub(super) enum BlobUploadKind {
     Content,
     SourceIcon,
-    PublishedSourceIcon,
 }
 
 impl BlobUploadKind {
     fn label(self) -> &'static str {
         match self {
             Self::Content => "content",
-            Self::SourceIcon | Self::PublishedSourceIcon => "source-icon",
+            Self::SourceIcon => "source-icon",
         }
     }
 }
@@ -109,10 +108,10 @@ pub(super) async fn check_stalled_cloud_upload(connection: &Connection) -> &'sta
     }
     let health = tokio::time::timeout(
         CLOUD_UPLOAD_PROBE_TIMEOUT,
-        call(connection, Request::HealthV2),
+        call(connection, Request::CloudHealth),
     )
     .await;
-    if matches!(health, Ok(Ok(Response::HealthV2 { .. }))) {
+    if matches!(health, Ok(Ok(Response::CloudHealth { .. }))) {
         return "healthy";
     }
     log::warn!(
@@ -166,35 +165,31 @@ pub(super) async fn upload_blob_inner(
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
             },
-            (BlobUploadKind::PublishedSourceIcon, true, false) => Request::PutManagedSourceIcon {
+            (BlobUploadKind::SourceIcon, true, false) => Request::PutManagedSourceIcon {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
             },
-            (BlobUploadKind::PublishedSourceIcon, false, false) => Request::PutSourceIcon {
+            (BlobUploadKind::SourceIcon, false, false) => Request::PutSourceIcon {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
             },
-            (BlobUploadKind::Content | BlobUploadKind::SourceIcon, true, false) => {
-                Request::PutManagedBlob {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    blob_id: blob.blob_id.clone(),
-                    size: blob.size,
-                }
-            }
-            (BlobUploadKind::Content | BlobUploadKind::SourceIcon, false, false) => {
-                Request::PutBlob {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    blob_id: blob.blob_id.clone(),
-                    size: blob.size,
-                }
-            }
-            (BlobUploadKind::SourceIcon | BlobUploadKind::PublishedSourceIcon, _, true) => {
+            (BlobUploadKind::Content, true, false) => Request::PutManagedBlob {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                blob_id: blob.blob_id.clone(),
+                size: blob.size,
+            },
+            (BlobUploadKind::Content, false, false) => Request::PutBlob {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                blob_id: blob.blob_id.clone(),
+                size: blob.size,
+            },
+            (BlobUploadKind::SourceIcon, _, true) => {
                 bail!("source icons cannot use streaming upload")
             }
         };
@@ -307,9 +302,6 @@ pub(super) async fn upload_blob_inner(
         send.finish()?;
         let transfer_elapsed = transfer_started_at.elapsed();
         let confirmation_started_at = Instant::now();
-        if let Some(transfer) = &options.transfer {
-            transfer.confirming(blob.size);
-        }
         progress.phase = UploadPhase::WaitForConfirmation;
         match upload::timed(
             idle_timeout,
@@ -407,7 +399,7 @@ pub(super) fn source_icon_blob_ids(events: &[StoredSyncEvent], key: &[u8; 32]) -
         .collect()
 }
 
-/// Marks only source icons as deferrable; content manifests always require stored blobs.
+/// Marks source icons as deferrable so metadata delivery does not wait for decorative assets.
 pub(super) fn mark_optional_source_icon_refs(events: &mut [StoredSyncEvent], key: &[u8; 32]) {
     for stored in events {
         let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
@@ -423,6 +415,35 @@ pub(super) fn mark_optional_source_icon_refs(events: &mut [StoredSyncEvent], key
                 .any(|blob| blob.blob_id == icon.blob_id)
         {
             stored.event.optional_blob_ids.push(icon.blob_id);
+        }
+    }
+}
+
+/// Makes oversized file payloads optional for the Hub while retaining their encrypted metadata.
+pub(super) fn mark_deferred_file_blob_refs(
+    events: &mut [StoredSyncEvent],
+    key: &[u8; 32],
+    deferred_event_ids: &HashSet<String>,
+) {
+    for stored in events {
+        if !deferred_event_ids.contains(&stored.event.event_id) {
+            continue;
+        }
+        let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
+            continue;
+        };
+        let file_blob_ids = envelope
+            .blobs
+            .iter()
+            .filter(|blob| blob.role == BlobRole::File)
+            .map(|blob| blob.blob_id.as_str())
+            .collect::<HashSet<_>>();
+        for blob_id in &stored.event.blob_ids {
+            if file_blob_ids.contains(blob_id.as_str())
+                && !stored.event.optional_blob_ids.contains(blob_id)
+            {
+                stored.event.optional_blob_ids.push(blob_id.clone());
+            }
         }
     }
 }
@@ -648,6 +669,10 @@ pub(super) struct ExternalDownloadCommit {
 
 #[cfg(not(target_os = "android"))]
 impl ExternalDownloadCommit {
+    pub(super) fn destination(&self) -> &Path {
+        &self.destination
+    }
+
     pub(super) async fn finalize(self) {
         let Some(backup) = self.backup else {
             return;
@@ -963,31 +988,4 @@ impl Drop for TemporaryDirectoryCleanup {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
-}
-
-pub(super) async fn copy_with_idle_timeout<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    idle_timeout: Duration,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut copied = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = tokio::time::timeout(idle_timeout, reader.read(&mut buffer))
-            .await
-            .context("blob read idle timeout")??;
-        if read == 0 {
-            break;
-        }
-        tokio::time::timeout(idle_timeout, writer.write_all(&buffer[..read]))
-            .await
-            .context("blob write idle timeout")??;
-        copied += read as u64;
-    }
-    writer.flush().await?;
-    Ok(copied)
 }

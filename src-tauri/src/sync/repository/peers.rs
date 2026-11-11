@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
     let mut connection = pool
         .acquire()
@@ -8,18 +9,18 @@ pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<(
     upsert_peer_on(&mut connection, peer).await
 }
 
-/// Updates cloud-visible peer identity without importing Hub-cached network routes.
-pub async fn upsert_cloud_peer_identity(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
+/// Updates peer identity without importing routes announced outside local discovery.
+pub async fn upsert_peer_identity(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
     let mut transaction = pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .context("begin cloud sync peer identity transaction")?;
+        .context("begin sync peer identity transaction")?;
     let previous_endpoint: Option<String> =
         sqlx::query_scalar("SELECT endpoint_id FROM sync_peers WHERE device_id = ?")
             .bind(&peer.device_id)
             .fetch_optional(&mut *transaction)
             .await
-            .context("read existing cloud sync peer identity")?;
+            .context("read existing sync peer identity")?;
     let endpoint_changed = previous_endpoint
         .as_deref()
         .is_some_and(|endpoint_id| endpoint_id != peer.endpoint_id);
@@ -69,7 +70,7 @@ pub async fn upsert_cloud_peer_identity(pool: &SqlitePool, peer: &PeerAnnounceme
     .bind(&peer.endpoint_id)
     .execute(&mut *transaction)
     .await
-    .context("upsert cloud sync peer identity")?;
+    .context("upsert sync peer identity")?;
 
     if endpoint_changed {
         sqlx::query(
@@ -84,13 +85,13 @@ pub async fn upsert_cloud_peer_identity(pool: &SqlitePool, peer: &PeerAnnounceme
         .bind(&peer.device_id)
         .execute(&mut *transaction)
         .await
-        .context("invalidate routes for changed cloud peer identity")?;
+        .context("invalidate routes for changed sync peer identity")?;
     }
 
     transaction
         .commit()
         .await
-        .context("commit cloud sync peer identity")?;
+        .context("commit sync peer identity")?;
     Ok(())
 }
 
@@ -298,16 +299,11 @@ pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice])
             .is_none_or(|restored_at_ms| stored_removed_at_ms > restored_at_ms);
         if effectively_removed {
             let target_id = format!("peer:{}", device.device_id);
-            for statement in [
-                "DELETE FROM sync_delivery_states WHERE target_id = ?",
-                "DELETE FROM sync_deliveries WHERE target_id = ?",
-            ] {
-                sqlx::query(statement)
-                    .bind(&target_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .with_context(|| format!("run {statement}"))?;
-            }
+            sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
+                .bind(&target_id)
+                .execute(&mut *transaction)
+                .await
+                .context("clear removed peer deliveries")?;
             sqlx::query("DELETE FROM sync_peers WHERE device_id = ? OR endpoint_id = ?")
                 .bind(&device.device_id)
                 .bind(&device.endpoint_id)
@@ -368,16 +364,11 @@ pub async fn remove_peer(pool: &SqlitePool, device_id: &str) -> Result<Option<Re
     .context("remember removed sync peer")?;
 
     let target_id = format!("peer:{device_id}");
-    for statement in [
-        "DELETE FROM sync_delivery_states WHERE target_id = ?",
-        "DELETE FROM sync_deliveries WHERE target_id = ?",
-    ] {
-        sqlx::query(statement)
-            .bind(&target_id)
-            .execute(&mut *transaction)
-            .await
-            .with_context(|| format!("run {statement}"))?;
-    }
+    sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
+        .bind(&target_id)
+        .execute(&mut *transaction)
+        .await
+        .context("clear forgotten peer deliveries")?;
     sqlx::query("DELETE FROM sync_peers WHERE device_id = ?")
         .bind(device_id)
         .execute(&mut *transaction)
@@ -520,21 +511,6 @@ pub async fn mark_peer_online(
         true,
     )
     .await
-}
-
-/// Returns the last direct route that completed a synchronization with this peer.
-pub async fn preferred_peer_address(pool: &SqlitePool, device_id: &str) -> Result<Option<String>> {
-    sqlx::query_scalar(
-        r#"
-        SELECT connected_address
-        FROM sync_peer_connections
-        WHERE device_id = ? AND transport = 'direct' AND connected_address IS NOT NULL
-        "#,
-    )
-    .bind(device_id)
-    .fetch_optional(pool)
-    .await
-    .context("load preferred sync peer address")
 }
 
 async fn set_peer_connection(

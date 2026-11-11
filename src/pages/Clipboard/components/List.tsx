@@ -6,24 +6,23 @@ import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useSnapshot } from "valtio";
 import {
   deleteClipboardItem,
   downloadRemoteFiles,
+  getClipboardItem,
+  getClipboardItemIndex,
   getClipboardPreviewPayload,
   hideWindow,
-  listSyncTransfers,
   openAndroidClipboardFile,
   openClipboardItemLink,
   pasteClipboardItem,
   revealClipboardItem,
-  type SyncItemStatus,
   saveAndroidClipboardFile,
   saveClipboardImageToFile,
-  type TransferTask,
   toggleClipboardItemFavorite,
   toggleClipboardItemPinned,
   updateClipboardItemGroup,
@@ -48,6 +47,12 @@ import {
 } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { useWindowReady } from "@/hooks/useWindowReady";
+import { hasActiveClipboardItemDownload } from "@/stores/clipboardItemActivity";
+import {
+  type ClipboardItemLocationRequest,
+  clipboardItemLocationState,
+  consumeClipboardItemLocation,
+} from "@/stores/clipboardItemLocation";
 import { toggleClipboardWindowPinned } from "@/stores/clipboardPin";
 import { clipboardStatsState } from "@/stores/clipboardStats";
 import { clipboardViewState } from "@/stores/clipboardView";
@@ -63,22 +68,13 @@ import type {
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
-import { log } from "@/utils/log";
-import {
-  getSyncItemStatusesShared,
-  listClipboardGroupsShared,
-} from "../dataRequests";
+import { listClipboardGroupsShared } from "../dataRequests";
 import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
   isSpaceKey,
   useClipboardPreviewController,
 } from "../hooks/useClipboardPreviewController";
-import {
-  aggregateTransferTasks,
-  isTransferActive,
-  mergeTransferTaskSnapshot,
-  upsertTransferTask,
-} from "../utils/transferTasks";
+import { useClipboardSyncStatuses } from "../hooks/useClipboardSyncStatuses";
 import AndroidFileDetailsDrawer from "./AndroidFileDetailsDrawer";
 import ClipboardCard from "./cards/ClipboardCard";
 import NoteModal from "./NoteModal";
@@ -88,64 +84,6 @@ const KEY_HINTS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 
 /** 隐藏窗口内的更新短暂合并，避免连续复制扇出多次整页查询。 */
 const HIDDEN_RANGE_REFRESH_DEBOUNCE_MS = 120;
-const SLOW_CLIPBOARD_SHOW_MS = 100;
-
-/** 记录原生显示完成、JS 事件投递、同步处理与连续两帧之间的分段耗时。 */
-function startClipboardShowFrameTrace(payload: WindowVisibilityPayload) {
-  const { showNativeTiming, showRequestId, showRequestedAtMs } = payload;
-  if (showRequestId === void 0 || showRequestedAtMs === void 0) return;
-
-  const receivedAtMs = Date.now();
-  const receivedAtPerformanceMs = performance.now();
-  const visibilityStateAtReceive = document.visibilityState;
-  const focusedAtReceive = document.hasFocus();
-  let handlerCompletedAtPerformanceMs = receivedAtPerformanceMs;
-
-  window.requestAnimationFrame(() => {
-    const firstFrameAtMs = Date.now();
-    const firstFrameAtPerformanceMs = performance.now();
-    window.requestAnimationFrame(() => {
-      const secondFrameAtMs = Date.now();
-      const secondFrameAtPerformanceMs = performance.now();
-      const nativeCompletedMs = showNativeTiming?.nativeCompletedMs ?? 0;
-      const timing = {
-        eventDeliveryMs: Math.max(
-          0,
-          receivedAtMs - showRequestedAtMs - nativeCompletedMs,
-        ),
-        firstFrameMs: Math.max(0, firstFrameAtMs - showRequestedAtMs),
-        firstToSecondFrameMs: Math.max(
-          0,
-          secondFrameAtPerformanceMs - firstFrameAtPerformanceMs,
-        ),
-        focusedAtReceive,
-        handlerMs: Math.max(
-          0,
-          handlerCompletedAtPerformanceMs - receivedAtPerformanceMs,
-        ),
-        handlerToFirstFrameMs: Math.max(
-          0,
-          firstFrameAtPerformanceMs - handlerCompletedAtPerformanceMs,
-        ),
-        native: showNativeTiming,
-        requestId: showRequestId,
-        totalMs: Math.max(0, secondFrameAtMs - showRequestedAtMs),
-        visibilityStateAtFirstFrame: document.visibilityState,
-        visibilityStateAtReceive,
-      };
-
-      if (timing.totalMs >= SLOW_CLIPBOARD_SHOW_MS) {
-        log.warn("slow clipboard show trace", timing);
-      } else {
-        log.info("clipboard show trace", timing);
-      }
-    });
-  });
-
-  return () => {
-    handlerCompletedAtPerformanceMs = performance.now();
-  };
-}
 
 interface ClipboardUpdatedPayload {
   cleanup?: number;
@@ -154,6 +92,10 @@ interface ClipboardUpdatedPayload {
   imported?: boolean;
   kind?: ClipboardKind;
   reconciled?: boolean;
+}
+
+interface SourceAppUpdatedPayload {
+  appId?: string;
 }
 
 interface ClipboardMenuActionPayload {
@@ -189,22 +131,9 @@ const List: FC<ListProps> = (props) => {
     useState<ClipboardItem | null>(null);
   const [fileDetailsEntries, setFileDetailsEntries] = useState<FileEntry[]>([]);
   const [fileActionKey, setFileActionKey] = useState<string | null>(null);
-  const [syncStatuses, setSyncStatuses] = useState(
-    () => new Map<string, SyncItemStatus>(),
-  );
-  const [transferTasks, setTransferTasks] = useState(
-    () => new Map<string, TransferTask>(),
-  );
-
   function requestRemoteFileDownload(item: ClipboardItem) {
     if (!item.remoteFileState) return false;
-    const activeDownload = [...transferTasks.values()].some((task) => {
-      return (
-        task.itemId === item.id &&
-        task.direction === "download" &&
-        isTransferActive(task)
-      );
-    });
+    const activeDownload = hasActiveClipboardItemDownload(item.id);
     if (item.remoteFileState === "available" && !activeDownload) {
       void downloadRemoteFiles(item.id);
     }
@@ -261,6 +190,7 @@ const List: FC<ListProps> = (props) => {
   });
 
   const snapshot = useSnapshot(clipboardViewState);
+  const itemLocationSnapshot = useSnapshot(clipboardItemLocationState);
   const settings = useSnapshot(settingsState);
   const { keyword } = snapshot;
   const category = view ? view.category : snapshot.category;
@@ -291,10 +221,12 @@ const List: FC<ListProps> = (props) => {
     loading,
     loadedItems,
     patchItemById,
+    patchSourceApp,
     reload,
     reloadCurrentRange,
     removeItemById,
     total,
+    upsertItem,
   } = useClipboardItems({
     favorite: range === "favorite" ? true : void 0,
     groupId: groupId ?? void 0,
@@ -302,84 +234,82 @@ const List: FC<ListProps> = (props) => {
     kind: category ?? void 0,
     sort,
   });
+  const locatingRequestRef = useRef<number | null>(null);
 
-  useWindowReady(active && loadedInitial);
-
-  const syncStatusItemsRef = useRef(loadedItems);
-  const syncStatusActiveRef = useRef(active);
-  const syncStatusPendingRef = useRef(false);
-  const syncStatusInFlightRef = useRef(false);
-  const syncStatusMountedRef = useRef(true);
-  syncStatusItemsRef.current = loadedItems;
-  syncStatusActiveRef.current = active;
-
-  /** 查询期间只记录一次补刷，结果过期时直接读取最新列表。 */
-  async function refreshSyncStatuses() {
-    syncStatusPendingRef.current = true;
-    if (!syncStatusActiveRef.current || !clipboardWindowVisibleRef.current)
-      return;
-    if (syncStatusInFlightRef.current) return;
-
-    syncStatusInFlightRef.current = true;
+  /** 按后端权威排序定位记录，虚拟列表只加载目标附近的一页。 */
+  async function locateRequestedItem(request: ClipboardItemLocationRequest) {
+    locatingRequestRef.current = request.requestId;
     try {
-      while (
-        syncStatusPendingRef.current &&
-        syncStatusMountedRef.current &&
-        syncStatusActiveRef.current &&
-        clipboardWindowVisibleRef.current
-      ) {
-        syncStatusPendingRef.current = false;
-        const items = syncStatusItemsRef.current;
-        const itemIds = [...items.values()].map((item) => {
-          return item.id;
-        });
-        try {
-          const statuses = await getSyncItemStatusesShared(itemIds);
-          if (!syncStatusMountedRef.current) return;
-          if (
-            !syncStatusActiveRef.current ||
-            !clipboardWindowVisibleRef.current
-          ) {
-            syncStatusPendingRef.current = true;
-            return;
-          }
-          if (items !== syncStatusItemsRef.current) {
-            syncStatusPendingRef.current = true;
-            continue;
-          }
-          setSyncStatuses(
-            new Map(
-              statuses.map((status) => {
-                return [status.itemId, status];
-              }),
-            ),
-          );
-        } catch {
-          // 命令层处理错误；查询期间的后续更新仍需消费。
-        }
-      }
+      const index = await getClipboardItemIndex(request.itemId, {
+        favorite: request.range === "favorite" ? true : void 0,
+        groupId: request.groupId ?? void 0,
+        kind: request.category ?? void 0,
+        sort,
+      });
+      if (clipboardItemLocationState.request?.requestId !== request.requestId)
+        return;
+      if (
+        clipboardViewState.groupId !== request.groupId ||
+        clipboardViewState.category !== request.category ||
+        clipboardViewState.range !== request.range ||
+        clipboardViewState.keyword !== ""
+      )
+        return;
+      if (index === null) return;
+
+      setSelectedId(request.itemId);
+      loadRange(index, index);
+      virtuosoRef.current?.scrollToIndex({ behavior: "auto", index });
+      focusClipboardCard(request.itemId);
+    } catch {
+      // 命令层已统一显示错误；定位请求在 finally 中结束。
     } finally {
-      syncStatusInFlightRef.current = false;
+      consumeClipboardItemLocation(request.requestId);
+      if (locatingRequestRef.current === request.requestId) {
+        locatingRequestRef.current = null;
+      }
     }
   }
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 列表更新触发状态读取，ref 提供最新快照。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 请求内容由共享状态携带，函数读取当前列表句柄。
   useEffect(() => {
-    syncStatusMountedRef.current = true;
-    if (active) void refreshSyncStatuses();
-    return () => {
-      syncStatusMountedRef.current = false;
-    };
-  }, [active, loadedItems]);
+    const request = clipboardItemLocationState.request;
+    if (!active || !loadedInitial || !request) return;
+    if (locatingRequestRef.current === request.requestId) return;
+    if (
+      request.requestId !== itemLocationSnapshot.request?.requestId ||
+      request.groupId !== groupId ||
+      request.category !== category ||
+      request.range !== range ||
+      keyword !== ""
+    )
+      return;
 
-  useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
-    void refreshSyncStatuses();
-  });
-  useTauriListen<TransferTask>(TAURI_EVENT.SYNC_TRANSFER_UPDATED, (event) => {
-    setTransferTasks((current) => {
-      return upsertTransferTask(current, event.payload);
-    });
-  });
+    void locateRequestedItem(request);
+  }, [
+    active,
+    category,
+    groupId,
+    itemLocationSnapshot.request?.requestId,
+    keyword,
+    loadedInitial,
+    range,
+    sort,
+  ]);
+  const computeClipboardItemKey = useCallback(
+    (index: number) => {
+      return getItem(index)?.id ?? `placeholder-${index}`;
+    },
+    [getItem],
+  );
+
+  useWindowReady(active && loadedInitial);
+
+  const refreshSyncStatuses = useClipboardSyncStatuses(
+    loadedItems,
+    active,
+    clipboardWindowVisibleRef,
+  );
   const {
     closeHoverPreviewForScroll,
     closePreview,
@@ -437,14 +367,6 @@ const List: FC<ListProps> = (props) => {
    */
   useMount(() => {
     void loadGroups();
-    async function loadTransfers() {
-      const tasks = await listSyncTransfers();
-      setTransferTasks((current) => {
-        return mergeTransferTaskSnapshot(current, tasks);
-      });
-    }
-
-    void loadTransfers();
   });
 
   useUnmount(() => {
@@ -529,21 +451,35 @@ const List: FC<ListProps> = (props) => {
       return;
     }
 
-    if (payload.deduplicated) {
-      if (!shouldRefreshCurrentGroup(range, category, groupId, payload.kind)) {
-        return;
-      }
+    if (!isAtTopRef.current) {
+      invalidate();
+      deferredReloadRef.current = true;
+      return;
+    }
 
+    if (!payload.id || keyword.trim()) {
       requestReloadAtTop();
       return;
     }
 
-    if (!shouldRefreshCurrentGroup(range, category, groupId, payload.kind)) {
-      return;
-    }
-
-    requestReloadAtTop();
+    void refreshClipboardItem(payload);
   };
+
+  async function refreshClipboardItem(payload: ClipboardUpdatedPayload) {
+    if (!payload.id) return;
+
+    try {
+      const item = await getClipboardItem(payload.id);
+      if (!item) {
+        requestReloadAtTop();
+        return;
+      }
+
+      upsertItem(item, { existing: payload.deduplicated === true });
+    } catch {
+      requestReloadAtTop();
+    }
+  }
 
   useTauriListen<ClipboardUpdatedPayload>(
     TAURI_EVENT.CLIPBOARD_UPDATED,
@@ -552,14 +488,36 @@ const List: FC<ListProps> = (props) => {
     },
   );
 
-  useTauriListen(TAURI_EVENT.SOURCE_APP_UPDATED, () => {
-    if (!clipboardWindowVisibleRef.current) {
-      scheduleHiddenRangeRefresh();
-      return;
-    }
+  useTauriListen<SourceAppUpdatedPayload>(
+    TAURI_EVENT.SOURCE_APP_UPDATED,
+    (event) => {
+      if (!clipboardWindowVisibleRef.current) {
+        scheduleHiddenRangeRefresh();
+        return;
+      }
 
-    reloadCurrentRangeRef.current();
-  });
+      if (!event.payload?.appId) {
+        void reloadCurrentRangeRef.current();
+        return;
+      }
+
+      const sourceItem = [...loadedItems.values()].find((item) => {
+        return item.sourceAppId === event.payload.appId;
+      });
+      if (!sourceItem) return;
+
+      void refreshSourceApp(event.payload.appId, sourceItem.id);
+    },
+  );
+
+  async function refreshSourceApp(appId: string, itemId: string) {
+    try {
+      const item = await getClipboardItem(itemId);
+      if (item) patchSourceApp(appId, item);
+    } catch {
+      // 单条来源应用补丁失败不影响当前列表，下次正常列表查询会自动校正。
+    }
+  }
 
   /**
    * 剪贴板窗口显隐变化：更新可见性镜像；显示时按偏好重置分组与滚动位置。
@@ -627,11 +585,7 @@ const List: FC<ListProps> = (props) => {
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
     (event) => {
-      const completeTrace = event.payload.visible
-        ? startClipboardShowFrameTrace(event.payload)
-        : void 0;
       handleWindowVisibility(event);
-      completeTrace?.();
     },
   );
 
@@ -1367,7 +1321,8 @@ const List: FC<ListProps> = (props) => {
       <Virtuoso
         atTopStateChange={handleAtTopStateChange}
         className="no-scrollbar"
-        computeItemKey={computeItemKey}
+        computeItemKey={computeClipboardItemKey}
+        context={loadedItems}
         horizontalDirection={!isMobile()}
         itemContent={renderItemContent}
         rangeChanged={handleRangeChanged}
@@ -1496,14 +1451,6 @@ const List: FC<ListProps> = (props) => {
       }
     };
 
-    const handleSyncStatusChange = (status: SyncItemStatus) => {
-      setSyncStatuses((current) => {
-        const next = new Map(current);
-        next.set(status.itemId, status);
-        return next;
-      });
-    };
-
     const handleMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
       if (item.remoteFileState) {
         if (event.button === 1) event.preventDefault();
@@ -1604,55 +1551,57 @@ const List: FC<ListProps> = (props) => {
       item,
       canDeleteItem,
     );
-    const itemTransferTasks = aggregateTransferTasks(
-      [...transferTasks.values()].filter((task) => task.itemId === item.id),
-    ).sort((left, right) => {
-      const leftActive = isTransferActive(left);
-      const rightActive = isTransferActive(right);
-      if (leftActive !== rightActive) return leftActive ? -1 : 1;
-      return left.elapsedMs - right.elapsedMs;
-    });
+    const cardSelected =
+      selectedId === null
+        ? index === firstVisibleIndex
+        : item.id === selectedId;
+    const mobileCard = isMobile();
 
     return (
       <div
         className={cn(
-          isMobile()
+          mobileCard
             ? "w-full px-3 py-1"
-            : "flex aspect-square h-full min-w-0 shrink-0 items-center px-[6px] py-2.5",
+            : "flex aspect-square h-full min-w-0 shrink-0 items-center px-[6px] pt-0 pb-2.5",
         )}
       >
-        <ClipboardCard
-          availableActions={availableActions}
-          hintKey={hintKey}
-          isLinkActive={isModifierPressed}
-          isSelected={
-            selectedId === null
-              ? index === firstVisibleIndex
-              : item.id === selectedId
-          }
-          item={item}
-          mobileSaveLabel={t("fileAccess.saveAs")}
-          onAuxClick={handleAuxClick}
-          onClick={isMobile() ? handleMobileClick : void 0}
-          onDoubleClick={handleDoubleClick}
-          onMobileSave={() => {
-            handleMobileItemSave(item);
-          }}
-          onMouseDown={isMobile() ? void 0 : handleMouseDown}
-          onOpenLink={handleOpenLink}
-          onPointerEnter={handlePointerEnter}
-          onPointerLeave={handlePointerLeave}
-          onPointerMove={handlePointerMove}
-          onQuickAction={handleQuickAction}
-          onQuickPaste={hintKey ? handleQuickPaste : void 0}
-          onSyncStatusChange={handleSyncStatusChange}
-          quickActionLabels={quickActionLabels}
-          quickActions={visibleQuickActions}
-          rootRef={registerItemElement(item.id)}
-          showOriginalOnHover={showOriginalPreview}
-          syncStatus={syncStatuses.get(item.id)}
-          transferTasks={itemTransferTasks}
-        />
+        <div
+          className={cn(
+            mobileCard
+              ? "w-full"
+              : "clipboard-card-selection-shell relative size-full transition-all duration-150",
+            !mobileCard &&
+              (cardSelected
+                ? "z-10 bg-[#007AFF] shadow-[0_3px_16px_rgba(0,122,255,0.22)]"
+                : "bg-transparent"),
+          )}
+        >
+          <ClipboardCard
+            availableActions={availableActions}
+            hintKey={hintKey}
+            isLinkActive={isModifierPressed}
+            isSelected={cardSelected}
+            item={item}
+            mobileSaveLabel={t("fileAccess.saveAs")}
+            onAuxClick={handleAuxClick}
+            onClick={mobileCard ? handleMobileClick : void 0}
+            onDoubleClick={handleDoubleClick}
+            onMobileSave={() => {
+              handleMobileItemSave(item);
+            }}
+            onMouseDown={mobileCard ? void 0 : handleMouseDown}
+            onOpenLink={handleOpenLink}
+            onPointerEnter={handlePointerEnter}
+            onPointerLeave={handlePointerLeave}
+            onPointerMove={handlePointerMove}
+            onQuickAction={handleQuickAction}
+            onQuickPaste={hintKey ? handleQuickPaste : void 0}
+            quickActionLabels={quickActionLabels}
+            quickActions={visibleQuickActions}
+            rootRef={registerItemElement(item.id)}
+            showOriginalOnHover={showOriginalPreview}
+          />
+        </div>
       </div>
     );
   }
@@ -1661,13 +1610,20 @@ const List: FC<ListProps> = (props) => {
     return (
       <div
         aria-hidden="true"
-        className="flex aspect-square h-full shrink-0 items-center px-[6px] py-2.5"
+        className="flex aspect-square h-full shrink-0 items-center px-[6px] pt-0 pb-2.5"
       >
-        <div className="flex size-full animate-pulse flex-col justify-between rounded-[16px] bg-white/70 p-3.5 shadow-xs">
-          <div className="h-[60px] w-full rounded-xl bg-slate-200/60" />
-          <div className="mt-3 flex flex-1 flex-col gap-2">
-            <span className="h-3 w-9/12 rounded-xs bg-slate-200/60" />
-            <span className="h-3 w-6/12 rounded-xs bg-slate-200/60" />
+        <div
+          className={cn(
+            "size-full",
+            !isMobile() && "clipboard-card-selection-shell",
+          )}
+        >
+          <div className="flex size-full animate-pulse flex-col justify-between rounded-[16px] bg-white/70 p-3.5 shadow-xs">
+            <div className="h-[60px] w-full rounded-xl bg-slate-200/60" />
+            <div className="mt-3 flex flex-1 flex-col gap-2">
+              <span className="h-3 w-9/12 rounded-xs bg-slate-200/60" />
+              <span className="h-3 w-6/12 rounded-xs bg-slate-200/60" />
+            </div>
           </div>
         </div>
       </div>
@@ -1995,10 +1951,6 @@ function shouldUseNativeCopy(event: KeyboardEvent) {
 
   return Boolean(selection && !selection.isCollapsed);
 }
-
-const computeItemKey = (index: number, item?: ClipboardItem) => {
-  return item?.id ?? `placeholder-${index}`;
-};
 
 /**
  * 判断普通剪贴板更新是否会出现在当前分组列表中。

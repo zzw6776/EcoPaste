@@ -13,6 +13,7 @@ pub struct AndroidPermissionsStatus {
     pub overlay_granted: bool,
     pub notification_granted: bool,
     pub battery_ignored: bool,
+    pub storage_granted: bool,
     pub root_status: String,
     pub overlay_service_running: bool,
     pub clipboard_monitor_running: bool,
@@ -454,7 +455,7 @@ fn reconnect_overlay_cloud() -> Result<()> {
 fn paste_overlay_item(id: String) -> Result<()> {
     use std::sync::Arc;
 
-    use crate::clipboard::WritebackGuard;
+    use crate::clipboard::ClipboardFingerprintState;
     use crate::core::AppError;
     use crate::db::items::{find_item_by_id, increment_item_use_count};
 
@@ -469,10 +470,11 @@ fn paste_overlay_item(id: String) -> Result<()> {
         let mut item = find_item_by_id(&pool, &id)
             .await?
             .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+        crate::commands::clipboard::reject_incomplete_local_file(&app, &item)?;
         let resources = crate::core::paths::resources_dir(&app)?;
         crate::clipboard::shared_files::resolve_item_content(&resources, &mut item)?;
-        let guard = app.state::<Arc<WritebackGuard>>();
-        crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
+        let fingerprints = app.state::<Arc<ClipboardFingerprintState>>();
+        crate::clipboard::write_to_clipboard_app(&app, fingerprints.inner().as_ref(), &item)?;
 
         let settings = app.state::<crate::settings::SettingsStore>().snapshot();
         if settings.clipboard.content.update_on_reuse {
@@ -1347,6 +1349,33 @@ mod jni_bridge {
         })
     }
 
+    pub fn is_remote_download_document_available(
+        uri: &str,
+        expected_size: u64,
+        directory: bool,
+    ) -> Result<bool> {
+        with_jni_env(|env, context, bridge_class| {
+            let uri = env
+                .new_string(uri)
+                .map_err(|error| anyhow!("encode remote document URI failed: {error}"))?;
+            let expected_size = i64::try_from(expected_size)
+                .map_err(|_| anyhow!("remote document size exceeds Android range"))?;
+            env.call_static_method(
+                bridge_class,
+                "isRemoteDownloadDocumentAvailable",
+                "(Landroid/content/Context;Ljava/lang/String;JZ)Z",
+                &[
+                    JValue::Object(context),
+                    JValue::Object(&uri),
+                    JValue::Long(expected_size),
+                    JValue::Bool(directory as u8),
+                ],
+            )
+            .and_then(|value| value.z())
+            .map_err(|error| anyhow!("check remote document failed: {error}").into())
+        })
+    }
+
     pub fn open_package_installer(path: &std::path::Path) -> Result<()> {
         let result = file_action("openPackageInstaller", path)?;
         if result.status == "success" {
@@ -1575,6 +1604,16 @@ pub fn discard_android_remote_download_document(uri: &str) -> Result<()> {
     jni_bridge::discard_remote_download_document(uri)
 }
 
+/// Checks whether a previously committed SAF destination still resolves to the expected content.
+#[cfg(target_os = "android")]
+pub fn is_android_remote_download_document_available(
+    uri: &str,
+    expected_size: u64,
+    directory: bool,
+) -> Result<bool> {
+    jni_bridge::is_remote_download_document_available(uri, expected_size, directory)
+}
+
 /// Opens Android's package installer for an APK downloaded into app-private storage.
 #[cfg(target_os = "android")]
 pub fn open_android_package_installer(path: &std::path::Path) -> Result<()> {
@@ -1680,6 +1719,7 @@ pub async fn get_android_permissions_status() -> Result<AndroidPermissionsStatus
             overlay_granted: true,
             notification_granted: true,
             battery_ignored: true,
+            storage_granted: true,
             root_status: "unavailable".to_string(),
             overlay_service_running: false,
             clipboard_monitor_running: false,

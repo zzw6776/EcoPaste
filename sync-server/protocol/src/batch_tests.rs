@@ -1,96 +1,5 @@
 use super::*;
 
-#[derive(Debug, Encode, Decode)]
-#[cbor(map)]
-struct LegacyEncryptedEvent {
-    #[n(0)]
-    event_id: String,
-    #[n(1)]
-    origin_device_id: String,
-    #[n(2)]
-    origin_sequence: u64,
-    #[n(3)]
-    created_at_ms: i64,
-    #[n(4)]
-    nonce: Vec<u8>,
-    #[n(5)]
-    ciphertext: Vec<u8>,
-}
-
-/// Keeps the pre-batching wire shape independent of the current protocol types.
-#[derive(Debug, Encode, Decode)]
-enum LegacyRequest {
-    #[n(2)]
-    Sync {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        device: DeviceAnnouncement,
-        #[n(3)]
-        after_cursor: u64,
-        #[n(4)]
-        events: Vec<EncryptedEvent>,
-        #[n(5)]
-        limit: u16,
-    },
-    #[n(12)]
-    SyncV2 {
-        #[n(0)]
-        group_id: String,
-        #[n(1)]
-        access_token: Vec<u8>,
-        #[n(2)]
-        device: DeviceAnnouncement,
-        #[n(3)]
-        after_cursor: u64,
-        #[n(4)]
-        events: Vec<EncryptedEvent>,
-        #[n(5)]
-        removed_devices: Vec<RemovedDevice>,
-        #[n(6)]
-        limit: u16,
-    },
-}
-
-#[derive(Debug, Encode, Decode)]
-enum LegacyResponse {
-    #[n(2)]
-    Synced {
-        #[n(0)]
-        accepted_event_ids: Vec<String>,
-        #[n(1)]
-        events: Vec<CloudEvent>,
-        #[n(2)]
-        peers: Vec<PeerAnnouncement>,
-        #[n(3)]
-        latest_cursor: u64,
-    },
-    #[n(12)]
-    SyncedV2 {
-        #[n(0)]
-        accepted_event_ids: Vec<String>,
-        #[n(1)]
-        events: Vec<CloudEvent>,
-        #[n(2)]
-        peers: Vec<PeerAnnouncement>,
-        #[n(3)]
-        latest_cursor: u64,
-        #[n(4)]
-        removed_devices: Vec<RemovedDevice>,
-    },
-}
-
-#[derive(Debug, Encode, Decode)]
-enum LegacyDirectoryResponse {
-    #[n(13)]
-    Devices {
-        #[n(0)]
-        devices: Vec<CloudDevice>,
-    },
-}
-
 fn event(index: u64, size: usize) -> EncryptedEvent {
     EncryptedEvent {
         event_id: format!("event-{index}"),
@@ -137,6 +46,7 @@ fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
         .map(|cursor| CloudEvent {
             cursor,
             event: event(cursor, 3 * 1024 * 1024),
+            available_blob_ids: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut response = Response::RetentionPlan {
@@ -164,6 +74,7 @@ fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
         events: vec![CloudEvent {
             cursor: 1,
             event: event(1, MAX_FRAME_BYTES),
+            available_blob_ids: Vec::new(),
         }],
         has_more: false,
     };
@@ -171,121 +82,6 @@ fn retention_plan_pages_fit_the_frame_without_skipping_legacy_events() {
         limit_retention_plan(&mut oversized),
         Err(FrameError::TooLarge { .. })
     ));
-}
-
-#[test]
-fn retention_progress_fields_are_backward_compatible() {
-    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-    enum LegacyRetentionRequest {
-        #[n(19)]
-        RetentionPlan {
-            #[n(0)]
-            group_id: String,
-            #[n(1)]
-            access_token: Vec<u8>,
-        },
-        #[n(20)]
-        SetRetention {
-            #[n(0)]
-            group_id: String,
-            #[n(1)]
-            access_token: Vec<u8>,
-            #[n(2)]
-            device: Box<DeviceAnnouncement>,
-            #[n(3)]
-            generation: u64,
-            #[n(4)]
-            protected_keys: Option<Vec<String>>,
-            #[n(5)]
-            mappings: Vec<RetentionMapping>,
-        },
-    }
-
-    let legacy_plan = LegacyRetentionRequest::RetentionPlan {
-        group_id: "group".into(),
-        access_token: vec![7; 32],
-    };
-    let mut plan: Request = minicbor::decode(&minicbor::to_vec(&legacy_plan).unwrap()).unwrap();
-    let Request::RetentionPlan {
-        decoder_revision, ..
-    } = &mut plan
-    else {
-        panic!("expected retention plan")
-    };
-    assert_eq!(*decoder_revision, None);
-    *decoder_revision = Some(1);
-    let decoded: LegacyRetentionRequest =
-        minicbor::decode(&minicbor::to_vec(&plan).unwrap()).unwrap();
-    assert_eq!(decoded, legacy_plan);
-
-    let Request::Sync { device, .. } = request(false, Vec::new()) else {
-        panic!("expected sync request")
-    };
-    let legacy_update = LegacyRetentionRequest::SetRetention {
-        group_id: "group".into(),
-        access_token: vec![7; 32],
-        device: Box::new(device),
-        generation: 1,
-        protected_keys: None,
-        mappings: Vec::new(),
-    };
-    let mut update: Request = minicbor::decode(&minicbor::to_vec(&legacy_update).unwrap()).unwrap();
-    let Request::SetRetention { deferred, .. } = &mut update else {
-        panic!("expected retention update")
-    };
-    assert!(deferred.is_none());
-    *deferred = Some(DeferredRetentionEvents {
-        decoder_revision: 1,
-        event_ids: vec!["event_123".into()],
-    });
-    let encoded = minicbor::to_vec(&update).unwrap();
-    assert_eq!(minicbor::decode::<Request>(&encoded).unwrap(), update);
-    assert_eq!(
-        minicbor::decode::<LegacyRetentionRequest>(&encoded).unwrap(),
-        legacy_update
-    );
-}
-
-#[test]
-fn history_state_filter_is_opt_in_and_backward_compatible() {
-    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-    enum LegacyHistoryRequest {
-        #[n(6)]
-        ListEvents {
-            #[n(0)]
-            group_id: String,
-            #[n(1)]
-            access_token: Vec<u8>,
-            #[n(2)]
-            before_cursor: Option<u64>,
-            #[n(3)]
-            limit: u16,
-        },
-    }
-    let legacy = LegacyHistoryRequest::ListEvents {
-        group_id: "group".into(),
-        access_token: vec![7; 32],
-        before_cursor: Some(5),
-        limit: 100,
-    };
-    let decoded: Request = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
-    assert!(matches!(
-        decoded,
-        Request::ListEvents {
-            include_states: None,
-            ..
-        }
-    ));
-    let current = Request::ListEvents {
-        group_id: "group".into(),
-        access_token: vec![7; 32],
-        before_cursor: Some(5),
-        limit: 100,
-        include_states: Some(true),
-    };
-    let decoded: LegacyHistoryRequest =
-        minicbor::decode(&minicbor::to_vec(&current).unwrap()).unwrap();
-    assert_eq!(decoded, legacy);
 }
 
 #[test]
@@ -298,6 +94,7 @@ fn verification_pages_keep_large_state_events_in_order_with_a_resumable_cursor()
             CloudEvent {
                 cursor,
                 event: encrypted,
+                available_blob_ids: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
@@ -343,7 +140,7 @@ fn verification_pages_keep_large_state_events_in_order_with_a_resumable_cursor()
     ));
 }
 
-fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
+fn request(cloud: bool, events: Vec<EncryptedEvent>) -> Request {
     let device = DeviceAnnouncement {
         device_id: "device".into(),
         device_name: "test".into(),
@@ -353,8 +150,8 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
         relay_urls: Vec::new(),
         app_version: "1.1.154".into(),
     };
-    if v2 {
-        Request::SyncV2 {
+    if cloud {
+        Request::CloudSync {
             group_id: "group".into(),
             access_token: vec![1; 32],
             device,
@@ -362,9 +159,7 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             events,
             removed_devices: Vec::new(),
             limit: MAX_EVENTS_PER_BATCH,
-            byte_limited: Some(true),
-            events_complete: Some(true),
-            bounded_hub: Some(true),
+            bounded_hub: true,
         }
     } else {
         Request::Sync {
@@ -374,111 +169,41 @@ fn request(v2: bool, events: Vec<EncryptedEvent>) -> Request {
             after_cursor: 0,
             events,
             limit: MAX_EVENTS_PER_BATCH,
-            byte_limited: Some(true),
-            events_complete: Some(true),
-            bounded_hub: Some(true),
+            events_complete: true,
         }
     }
 }
 
-fn response(v2: bool, events: Vec<CloudEvent>, after_cursor: u64) -> Response {
+fn response(cloud: bool, events: Vec<CloudEvent>, after_cursor: u64) -> Response {
     let latest_cursor = events
         .last()
         .map(|event| event.cursor)
         .unwrap_or(after_cursor);
-    if v2 {
-        Response::SyncedV2 {
+    if cloud {
+        Response::CloudSynced {
             accepted_event_ids: vec!["accepted".into()],
             events,
             peers: Vec::new(),
             latest_cursor,
             removed_devices: Vec::new(),
-            has_more: None,
+            has_more: false,
         }
     } else {
+        let events = events
+            .into_iter()
+            .map(|event| CursorEvent {
+                cursor: event.cursor,
+                event: event.event,
+            })
+            .collect();
         Response::Synced {
             accepted_event_ids: vec!["accepted".into()],
             events,
             peers: Vec::new(),
             latest_cursor,
-            has_more: None,
+            has_more: false,
         }
     }
-}
-
-#[test]
-fn optional_batch_fields_are_compatible_in_both_directions() {
-    for v2 in [false, true] {
-        let current = request(v2, vec![event(1, 100)]);
-        let legacy: LegacyRequest = minicbor::decode(&minicbor::to_vec(&current).unwrap()).unwrap();
-        let restored: Request = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
-        let mut expected = current;
-        match &mut expected {
-            Request::Sync {
-                byte_limited,
-                events_complete,
-                bounded_hub,
-                ..
-            }
-            | Request::SyncV2 {
-                byte_limited,
-                events_complete,
-                bounded_hub,
-                ..
-            } => {
-                *byte_limited = None;
-                *events_complete = None;
-                *bounded_hub = None;
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(restored, expected);
-
-        let mut current = response(
-            v2,
-            vec![CloudEvent {
-                cursor: 1,
-                event: event(1, 100),
-            }],
-            0,
-        );
-        let expected = current.clone();
-        limit_sync_response(&mut current, 0, MAX_EVENTS_PER_BATCH, true).unwrap();
-        let legacy: LegacyResponse =
-            minicbor::decode(&minicbor::to_vec(&current).unwrap()).unwrap();
-        let restored: Response = minicbor::decode(&minicbor::to_vec(&legacy).unwrap()).unwrap();
-        assert_eq!(restored, expected);
-    }
-}
-
-#[test]
-fn legacy_event_without_kind_decodes_as_content() {
-    let legacy = LegacyEncryptedEvent {
-        event_id: "legacy".into(),
-        origin_device_id: "device".into(),
-        origin_sequence: 1,
-        created_at_ms: 100,
-        nonce: vec![1; 24],
-        ciphertext: vec![2; 32],
-    };
-
-    let decoded: EncryptedEvent = minicbor::decode(&minicbor::to_vec(legacy).unwrap()).unwrap();
-
-    assert_eq!(decoded.kind, SyncEventKind::Content);
-    assert!(decoded.blob_ids.is_empty());
-    assert!(decoded.optional_blob_ids.is_empty());
-}
-
-#[test]
-fn legacy_event_decoder_ignores_blob_references() {
-    let mut current = event(1, 32);
-    current.blob_ids = vec!["a".repeat(64)];
-    current.optional_blob_ids = current.blob_ids.clone();
-
-    let decoded: LegacyEncryptedEvent =
-        minicbor::decode(&minicbor::to_vec(current).unwrap()).unwrap();
-
-    assert_eq!(decoded.event_id, "event-1");
 }
 
 #[test]
@@ -493,44 +218,8 @@ fn optional_blob_references_round_trip() {
 }
 
 #[test]
-fn legacy_device_directory_decodes_without_hub_status() {
-    let legacy = LegacyDirectoryResponse::Devices {
-        devices: Vec::new(),
-    };
-
-    let decoded: Response = minicbor::decode(&minicbor::to_vec(legacy).unwrap()).unwrap();
-
-    assert_eq!(
-        decoded,
-        Response::Devices {
-            devices: Vec::new(),
-            hub_status: None,
-        }
-    );
-
-    let current = Response::Devices {
-        devices: Vec::new(),
-        hub_status: Some(HubStatus {
-            used_bytes: 1,
-            max_bytes: 2,
-            event_count: 3,
-            blob_count: 4,
-            oldest_event_received_at_ms: Some(5),
-            retention_days: 90,
-            max_events: 100_000,
-        }),
-    };
-    let legacy: LegacyDirectoryResponse =
-        minicbor::decode(&minicbor::to_vec(current).unwrap()).unwrap();
-    assert!(matches!(
-        legacy,
-        LegacyDirectoryResponse::Devices { devices } if devices.is_empty()
-    ));
-}
-
-#[test]
 fn request_prefix_fits_real_encoding_including_array_header_boundaries() {
-    for v2 in [false, true] {
+    for cloud in [false, true] {
         for (count, size) in [
             (0, 0),
             (23, 1),
@@ -542,16 +231,16 @@ fn request_prefix_fits_real_encoding_including_array_header_boundaries() {
             let events = (0..count)
                 .map(|index| event(index, size))
                 .collect::<Vec<_>>();
-            let mut outgoing = request(v2, events.clone());
+            let mut outgoing = request(cloud, events.clone());
             let kept = limit_sync_request(&mut outgoing).unwrap();
             assert!(minicbor::to_vec(&outgoing).unwrap().len() <= MAX_FRAME_BYTES);
             let included = match &outgoing {
-                Request::Sync { events, .. } | Request::SyncV2 { events, .. } => events,
+                Request::Sync { events, .. } | Request::CloudSync { events, .. } => events,
                 _ => unreachable!(),
             };
             assert_eq!(included, &events[..kept]);
             if kept < events.len() {
-                let extended = request(v2, events[..=kept].to_vec());
+                let extended = request(cloud, events[..=kept].to_vec());
                 assert!(minicbor::to_vec(&extended).unwrap().len() > MAX_FRAME_BYTES);
             }
         }
@@ -564,15 +253,16 @@ fn response_continuation_drains_many_short_batches_without_skipping_cursors() {
         .map(|cursor| CloudEvent {
             cursor,
             event: event(cursor, 2 * 1024 * 1024 + 64),
+            available_blob_ids: Vec::new(),
         })
         .collect::<Vec<_>>();
-    for v2 in [false, true] {
+    for cloud in [false, true] {
         let mut cursor = 0;
         let mut received = Vec::new();
         let mut batches = 0;
         loop {
             let mut outgoing = response(
-                v2,
+                cloud,
                 events
                     .iter()
                     .filter(|event| event.cursor > cursor)
@@ -580,7 +270,7 @@ fn response_continuation_drains_many_short_batches_without_skipping_cursors() {
                     .collect(),
                 cursor,
             );
-            limit_sync_response(&mut outgoing, cursor, MAX_EVENTS_PER_BATCH, true).unwrap();
+            limit_sync_response(&mut outgoing, cursor, MAX_EVENTS_PER_BATCH).unwrap();
             let encoded = minicbor::to_vec(&outgoing).unwrap();
             assert!(encoded.len() <= MAX_FRAME_BYTES);
             let decoded: Response = minicbor::decode(&encoded).unwrap();
@@ -590,47 +280,58 @@ fn response_continuation_drains_many_short_batches_without_skipping_cursors() {
                     latest_cursor,
                     has_more,
                     ..
-                }
-                | Response::SyncedV2 {
+                } => (
+                    events
+                        .into_iter()
+                        .map(|event| event.cursor)
+                        .collect::<Vec<_>>(),
+                    latest_cursor,
+                    has_more,
+                ),
+                Response::CloudSynced {
                     events,
                     latest_cursor,
                     has_more,
                     ..
-                } => (events, latest_cursor, has_more),
+                } => (
+                    events
+                        .into_iter()
+                        .map(|event| event.cursor)
+                        .collect::<Vec<_>>(),
+                    latest_cursor,
+                    has_more,
+                ),
                 _ => unreachable!(),
             };
-            assert_eq!(
-                latest,
-                page.last().map(|event| event.cursor).unwrap_or(cursor)
-            );
+            assert_eq!(latest, page.last().copied().unwrap_or(cursor));
             assert!(latest > cursor);
-            received.extend(page.into_iter().map(|event| event.cursor));
+            received.extend(page);
             cursor = latest;
             batches += 1;
-            if more == Some(false) {
+            if !more {
                 break;
             }
-            assert_eq!(more, Some(true));
+            assert!(more);
             assert!(batches < 20);
         }
         assert!(batches > 8);
         assert_eq!(received, (1..=10).collect::<Vec<_>>());
 
-        let mut empty = response(v2, Vec::new(), cursor);
-        limit_sync_response(&mut empty, cursor, MAX_EVENTS_PER_BATCH, true).unwrap();
+        let mut empty = response(cloud, Vec::new(), cursor);
+        limit_sync_response(&mut empty, cursor, MAX_EVENTS_PER_BATCH).unwrap();
         match empty {
             Response::Synced {
                 latest_cursor,
                 has_more,
                 ..
             }
-            | Response::SyncedV2 {
+            | Response::CloudSynced {
                 latest_cursor,
                 has_more,
                 ..
             } => {
                 assert_eq!(latest_cursor, cursor);
-                assert_eq!(has_more, Some(false));
+                assert!(!has_more);
             }
             _ => unreachable!(),
         }
@@ -638,10 +339,10 @@ fn response_continuation_drains_many_short_batches_without_skipping_cursors() {
 }
 
 #[test]
-fn legacy_response_is_not_shortened_and_oversized_first_event_is_not_skipped() {
-    for v2 in [false, true] {
+fn oversized_first_event_is_not_skipped() {
+    for cloud in [false, true] {
         let oversized = event(1, MAX_FRAME_BYTES / 2);
-        let mut outgoing = request(v2, vec![oversized.clone(), event(2, 1)]);
+        let mut outgoing = request(cloud, vec![oversized.clone(), event(2, 1)]);
         assert!(matches!(
             limit_sync_request(&mut outgoing),
             Err(FrameError::TooLarge { .. })
@@ -649,13 +350,11 @@ fn legacy_response_is_not_shortened_and_oversized_first_event_is_not_skipped() {
         let events = vec![CloudEvent {
             cursor: 1,
             event: oversized,
+            available_blob_ids: Vec::new(),
         }];
-        let mut outgoing = response(v2, events, 0);
-        let original = outgoing.clone();
-        limit_sync_response(&mut outgoing, 0, MAX_EVENTS_PER_BATCH, false).unwrap();
-        assert_eq!(outgoing, original);
+        let mut outgoing = response(cloud, events, 0);
         assert!(matches!(
-            limit_sync_response(&mut outgoing, 0, MAX_EVENTS_PER_BATCH, true),
+            limit_sync_response(&mut outgoing, 0, MAX_EVENTS_PER_BATCH),
             Err(FrameError::TooLarge { .. })
         ));
     }

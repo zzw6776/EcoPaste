@@ -16,6 +16,9 @@ pub struct ClipboardEnvelope {
     #[n(3)]
     #[cbor(default)]
     pub source_app: Option<SourceAppRef>,
+    #[n(4)]
+    #[cbor(default)]
+    pub content_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -216,6 +219,15 @@ pub struct StoredBlob {
     pub stream_nonce: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContentObject {
+    pub plaintext_hash: String,
+    pub blob_id: String,
+    pub stream_nonce: Vec<u8>,
+    pub original_size: u64,
+    pub encrypted_size: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -305,29 +317,78 @@ pub enum SyncTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum SyncItemState {
+pub enum SyncItemOrigin {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncContentAvailability {
+    None,
+    MetadataOnly,
+    Partial,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncLocalContentState {
+    Managed,
+    External,
+    ExternalMissing,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncItemActivity {
     Idle,
     Queued,
-    Syncing,
-    Confirming,
-    Success,
-    Manual,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncItemAction {
+    None,
+    Upload,
+    Download,
+    Retry,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncItemChannelStatus {
-    pub state: SyncItemState,
+    pub availability: SyncContentAvailability,
+    pub activity: SyncItemActivity,
+    pub action: SyncItemAction,
     pub delivered_targets: u64,
+    pub content_targets: u64,
     pub total_targets: u64,
     pub last_error: Option<String>,
+}
+
+impl SyncItemChannelStatus {
+    pub fn idle() -> Self {
+        Self {
+            availability: SyncContentAvailability::None,
+            activity: SyncItemActivity::Idle,
+            action: SyncItemAction::None,
+            delivered_targets: 0,
+            content_targets: 0,
+            total_targets: 0,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncItemStatus {
     pub item_id: String,
+    pub origin: SyncItemOrigin,
+    pub local_state: SyncLocalContentState,
     pub lan: SyncItemChannelStatus,
     pub cloud: SyncItemChannelStatus,
 }
@@ -501,6 +562,7 @@ mod tests {
 
         assert_eq!(decoded.item.content, "hello");
         assert_eq!(decoded.source_app, None);
+        assert_eq!(decoded.content_identity, None);
     }
 
     #[test]
@@ -534,6 +596,7 @@ mod tests {
                 accent_start: Some("#112233".into()),
                 accent_end: Some("#445566".into()),
             }),
+            content_identity: Some("b".repeat(64)),
         };
 
         let encoded = minicbor::to_vec(current).unwrap();
@@ -546,14 +609,11 @@ mod tests {
 
 impl SyncItemStatus {
     pub fn idle(item_id: String) -> Self {
-        let idle = SyncItemChannelStatus {
-            state: SyncItemState::Idle,
-            delivered_targets: 0,
-            total_targets: 0,
-            last_error: None,
-        };
+        let idle = SyncItemChannelStatus::idle();
         Self {
             item_id,
+            origin: SyncItemOrigin::Local,
+            local_state: SyncLocalContentState::Managed,
             lan: idle.clone(),
             cloud: idle,
         }

@@ -18,7 +18,8 @@ use crate::clipboard::{
 };
 use crate::core::{AppError, Result};
 use crate::db::items::{
-    clear_items, find_item_by_id, find_item_for_list_by_id, increment_item_use_count,
+    clear_items, find_item_by_id, find_item_for_list_by_id, find_item_index,
+    increment_item_use_count,
 };
 use crate::db::models::{
     ClipboardAction, ClipboardApp, ClipboardGroup, ClipboardItem, ClipboardItemPage,
@@ -337,6 +338,7 @@ async fn android_clipboard_file_path(
             return Err(error);
         }
     };
+    reject_incomplete_local_file(app, &item)?;
     resolve_managed_file_content(app, &mut item)?;
     let (path, path_count) = match item.kind {
         ClipboardKind::Image if index == 0 => {
@@ -518,6 +520,7 @@ pub async fn get_clipboard_preview_payload(
     let Some(mut item) = find_item_by_id(&pool, &item_id).await? else {
         return Ok(None);
     };
+    reject_incomplete_local_file(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
     let redact_sensitive = app
@@ -558,10 +561,13 @@ pub async fn write_to_clipboard(
     id: String,
     _plain: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "android")]
+    let _ = &guard;
     let pool = db.pool().await;
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    reject_incomplete_local_file(&app, &item)?;
     reject_remote_file_write(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
@@ -574,7 +580,13 @@ pub async fn write_to_clipboard(
     #[cfg(not(target_os = "android"))]
     crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
     #[cfg(target_os = "android")]
-    crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
+    crate::clipboard::write_to_clipboard_app(
+        &app,
+        app.state::<Arc<crate::clipboard::ClipboardFingerprintState>>()
+            .inner()
+            .as_ref(),
+        &item,
+    )?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
     if hide_after_copy {
@@ -600,6 +612,8 @@ pub async fn paste_clipboard_item(
     id: String,
     _plain: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "android")]
+    let _ = &guard;
     #[cfg(target_os = "macos")]
     let paste_target_pid = window::macos::clipboard_paste_target_pid()?;
 
@@ -610,6 +624,7 @@ pub async fn paste_clipboard_item(
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    reject_incomplete_local_file(&app, &item)?;
     reject_remote_file_write(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
@@ -626,7 +641,13 @@ pub async fn paste_clipboard_item(
     #[cfg(not(target_os = "android"))]
     crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
     #[cfg(target_os = "android")]
-    crate::clipboard::write_to_clipboard_app(&app, guard.inner().as_ref(), &item)?;
+    crate::clipboard::write_to_clipboard_app(
+        &app,
+        app.state::<Arc<crate::clipboard::ClipboardFingerprintState>>()
+            .inner()
+            .as_ref(),
+        &item,
+    )?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
     #[cfg(target_os = "android")]
@@ -827,6 +848,17 @@ pub async fn list_clipboard_items(
         total,
         has_more,
     })
+}
+
+/// 返回记录在指定列表视图中的零基索引，供虚拟列表直接定位。
+#[tauri::command]
+pub async fn get_clipboard_item_index(
+    db: State<'_, DatabaseState>,
+    id: String,
+    query: Option<ClipboardItemQuery>,
+) -> Result<Option<i64>> {
+    let pool = db.pool().await;
+    find_item_index(&pool, &id, &query.unwrap_or_default()).await
 }
 
 /// 单条查询命令：监听到 `clipboard://updated` 后前端按 id 拉单条，
@@ -1864,6 +1896,7 @@ pub async fn reveal_clipboard_item(
     let mut item = find_item_by_id(&pool, &id)
         .await?
         .ok_or_else(|| AppError::Clipboard(format!("clipboard item not found: {id}")))?;
+    reject_incomplete_local_file(&app, &item)?;
     resolve_managed_file_content(&app, &mut item)?;
 
     let target = if item.kind == ClipboardKind::Files {
@@ -1891,6 +1924,26 @@ fn resolve_managed_file_content(app: &AppHandle, item: &mut ClipboardItem) -> Re
     Ok(crate::clipboard::shared_files::resolve_item_content(
         &resources, item,
     )?)
+}
+
+/// Android share cards become visible before their private files finish atomic import.
+/// File actions must not observe the zero-byte destinations reserved for those cards.
+pub(super) fn reject_incomplete_local_file(app: &AppHandle, item: &ClipboardItem) -> Result<()> {
+    if item.kind != ClipboardKind::Files
+        || !app
+            .try_state::<Arc<crate::sync::SyncManager>>()
+            .is_some_and(|manager| manager.item_has_active_local_import(&item.id))
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Clipboard(
+        crate::i18n::commands::label(
+            crate::i18n::current_language(app),
+            crate::i18n::commands::Key::FileImportInProgress,
+        )
+        .to_owned(),
+    ))
 }
 
 /// Metadata-only remote files cannot be copied or pasted as if their display names were paths.

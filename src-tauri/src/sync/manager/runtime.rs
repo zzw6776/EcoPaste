@@ -1,24 +1,23 @@
 use super::*;
 
 impl SyncManager {
-    pub(super) async fn run_cycle(
+    pub(super) async fn run_cloud_cycle(self: &Arc<Self>) -> Result<()> {
+        let _guard = self.runtime_state.cloud_cycle_lock.lock().await;
+        self.run_cycle_locked(SyncTarget::Cloud, None, Duration::ZERO)
+            .await?;
+        Ok(())
+    }
+
+    /// Runs one actor-owned peer cycle and preserves the transport failure category.
+    pub(super) async fn run_lan_peer_actor_cycle(
         self: &Arc<Self>,
-        target: SyncTarget,
-        peer_device_id: Option<&str>,
-        lan_connect_timeout: Duration,
-    ) -> Result<()> {
-        match target {
-            SyncTarget::Lan => {
-                let _guard = self.runtime_state.lan_cycle_lock.read().await;
-                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout)
-                    .await
-            }
-            SyncTarget::Cloud => {
-                let _guard = self.runtime_state.cloud_cycle_lock.lock().await;
-                self.run_cycle_locked(target, peer_device_id, lan_connect_timeout)
-                    .await
-            }
-        }
+        device_id: &str,
+        connect_timeout: Duration,
+    ) -> Result<LanPeerSyncOutcome> {
+        let _guard = self.runtime_state.lan_cycle_lock.read().await;
+        self.run_cycle_locked(SyncTarget::Lan, Some(device_id), connect_timeout)
+            .await?
+            .context("LAN peer cycle produced no outcome")
     }
 
     pub(super) async fn run_cycle_locked(
@@ -26,20 +25,20 @@ impl SyncManager {
         target: SyncTarget,
         peer_device_id: Option<&str>,
         lan_connect_timeout: Duration,
-    ) -> Result<()> {
+    ) -> Result<Option<LanPeerSyncOutcome>> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
         if !settings.enabled {
             self.set_channel_status(SyncTarget::Lan, SyncChannelState::Disabled, None, false);
             self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Disabled, None, false);
             self.stop_runtime().await?;
-            return Ok(());
+            return Ok(None);
         }
         let Some(group) = identity.group else {
             self.set_channel_status(SyncTarget::Lan, SyncChannelState::Disabled, None, false);
             self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Disabled, None, false);
             self.stop_runtime().await?;
-            return Ok(());
+            return Ok(None);
         };
         if !settings.lan_enabled {
             self.set_channel_status(SyncTarget::Lan, SyncChannelState::Disabled, None, false);
@@ -51,7 +50,7 @@ impl SyncManager {
             if target == SyncTarget::Cloud {
                 bail!("云端同步未配置");
             }
-            return Ok(());
+            return Ok(None);
         }
         let endpoint = self.ensure_endpoint(&settings).await?;
         let pool = self.pool().await;
@@ -81,23 +80,14 @@ impl SyncManager {
         let mut lan_connection_error = None;
         let mut lan_attempted = false;
         let mut lan_failed = false;
+        let mut requested_lan_outcome = None;
         if settings.lan_enabled && cycle.target != SyncTarget::Cloud {
-            let suspended_peers = self
-                .runtime_state
-                .lan_suspended_peers
-                .read()
-                .expect("LAN suspended peers poisoned")
-                .clone();
             let peers = repository::list_peers(&pool)
                 .await?
                 .into_iter()
                 .filter(|peer| peer.announcement.device_id != identity.device_id)
                 .filter(|peer| {
                     peer_device_id.is_none_or(|device_id| peer.announcement.device_id == device_id)
-                })
-                .filter(|peer| {
-                    peer_device_id.is_some()
-                        || !suspended_peers.contains(&peer.announcement.device_id)
                 })
                 .collect::<Vec<_>>();
             if peer_device_id.is_some() && peers.is_empty() {
@@ -123,7 +113,11 @@ impl SyncManager {
                     ));
                 }
                 while let Some(result) = tasks.join_next().await {
-                    match result.context("LAN peer sync task failed")?? {
+                    let outcome = result.context("LAN peer sync task failed")??;
+                    if peer_device_id.is_some() {
+                        requested_lan_outcome = Some(outcome.clone());
+                    }
+                    match outcome {
                         LanPeerSyncOutcome::Succeeded => lan_succeeded = true,
                         LanPeerSyncOutcome::ConnectionFailed(message) => {
                             lan_failed = true;
@@ -164,15 +158,6 @@ impl SyncManager {
                     let result = async {
                         let initialized_group =
                             self.ensure_cloud_group(&connection, &group).await?;
-                        self.sync_removed_devices(
-                            &connection,
-                            &pool,
-                            &group,
-                            &cycle.device_id,
-                            &cycle.device.endpoint_id,
-                            true,
-                        )
-                        .await?;
                         let group_elapsed = group_started_at.elapsed();
                         let transfer_started_at = Instant::now();
                         let (cursor, bootstrap_target) = self
@@ -283,6 +268,9 @@ impl SyncManager {
             repository::mark_success(&pool).await?;
         }
         self.emit_updated();
+        if requested_lan_outcome.is_some() {
+            return Ok(requested_lan_outcome);
+        }
         if settings.lan_enabled && cycle.target == SyncTarget::Lan && !lan_succeeded {
             bail!(
                 "{}",
@@ -313,7 +301,7 @@ impl SyncManager {
                 bail!(error);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(super) async fn sync_lan_peer(
@@ -328,23 +316,33 @@ impl SyncManager {
         let peer_lock = self.lan_peer_lock(&device_id);
         let _peer_guard = peer_lock.lock().await;
         let target = SyncConnectionTarget::peer(device_id.clone());
-        let preferred = repository::preferred_peer_address(&pool, &device_id).await?;
-        let address =
-            match peer_endpoint_addr_with_preferred(&peer.announcement, preferred.as_deref()) {
-                Ok(value) => value,
-                Err(error) => {
-                    log::debug!("ignore invalid cached peer route: {error}");
-                    let message = error.to_string();
-                    repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                    return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
-                }
-            };
-        let connection = match self.cached_lan_connection(&device_id) {
+        let address = match peer_endpoint_addr(&peer.announcement) {
+            Ok(value) => value,
+            Err(error) => {
+                log::debug!("ignore invalid discovered peer route: {error}");
+                let message = error.to_string();
+                repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
+                return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
+            }
+        };
+        let cached_connection = self.cached_lan_connection(&device_id).filter(|connection| {
+            if lan_connection_matches_discovery(connection, &address) {
+                return true;
+            }
+            self.invalidate_lan_connection(&device_id, connection.stable_id());
+            connection.close(0_u32.into(), b"LAN route no longer discovered");
+            false
+        });
+        let connection = match cached_connection {
             Some(connection) => connection,
             None => {
                 repository::mark_peer_connecting(&pool, &device_id).await?;
                 match connect_peer(&endpoint, address, connect_timeout).await {
                     Ok(connection) => {
+                        super::protocol_handlers::spawn_peer_connection_service(
+                            self.clone(),
+                            connection.clone(),
+                        );
                         self.store_lan_connection(&device_id, connection.clone());
                         connection
                     }
@@ -370,7 +368,6 @@ impl SyncManager {
                     transport,
                 )
                 .await?;
-                self.clear_peer_suspension(&device_id);
                 if latest.has_more {
                     if let Some(actor) = self
                         .runtime_state
@@ -379,7 +376,7 @@ impl SyncManager {
                         .expect("LAN peer actors poisoned")
                         .get(&device_id)
                     {
-                        actor.notify();
+                        actor.queue_work();
                     } else {
                         self.wake_lan_transfer();
                     }
@@ -483,9 +480,7 @@ impl SyncManager {
         if !self.invalidate_lan_connection(device_id, stable_id) {
             return;
         }
-        self.suspend_peer(device_id);
         if self.cached_lan_connection(device_id).is_some() {
-            self.clear_peer_suspension(device_id);
             return;
         }
 
@@ -505,9 +500,10 @@ impl SyncManager {
             {
                 log::debug!("restore replaced LAN peer status failed: {error}");
             }
-            self.clear_peer_suspension(device_id);
+            self.peer_connection_ready(device_id);
             self.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
         } else {
+            self.peer_connection_closed(device_id);
             match repository::list_peer_statuses(&pool).await {
                 Ok(peers)
                     if peers
@@ -565,40 +561,8 @@ impl SyncManager {
             .clear();
     }
 
-    pub(super) fn clear_peer_suspension(&self, device_id: &str) {
-        self.runtime_state
-            .lan_suspended_peers
-            .write()
-            .expect("LAN suspended peers poisoned")
-            .remove(device_id);
-    }
-
-    pub(super) fn suspend_peer(&self, device_id: &str) {
-        self.runtime_state
-            .lan_suspended_peers
-            .write()
-            .expect("LAN suspended peers poisoned")
-            .insert(device_id.to_owned());
-    }
-
-    pub(super) fn resume_peer(&self, device_id: &str) {
-        self.clear_peer_suspension(device_id);
-        if let Some(actor) = self
-            .runtime_state
-            .lan_peer_actors
-            .read()
-            .expect("LAN peer actors poisoned")
-            .get(device_id)
-        {
-            actor.resume();
-        }
-    }
-
-    /// Reconnects a suspended peer once when mDNS proves that it is reachable again.
-    pub(super) fn resume_peer_from_discovery(&self, device_id: &str) {
-        if self.cached_lan_connection(device_id).is_some() {
-            return;
-        }
+    /// Delivers discovery evidence to the peer actor that owns reconnect decisions.
+    pub(super) fn peer_route_available(&self, device_id: &str, changed: bool) {
         let actor = self
             .runtime_state
             .lan_peer_actors
@@ -610,13 +574,11 @@ impl SyncManager {
             self.wake_lan_transfer();
             return;
         };
-        self.clear_peer_suspension(device_id);
-        actor.resume();
+        actor.route_available(changed);
     }
 
     /// Records a proven live inbound connection without starting a reciprocal empty sync.
     pub(super) fn peer_connection_ready(&self, device_id: &str) {
-        self.clear_peer_suspension(device_id);
         if let Some(actor) = self
             .runtime_state
             .lan_peer_actors
@@ -628,20 +590,16 @@ impl SyncManager {
         }
     }
 
-    pub(super) fn resume_all_peers(&self) {
-        self.runtime_state
-            .lan_suspended_peers
-            .write()
-            .expect("LAN suspended peers poisoned")
-            .clear();
-        for actor in self
+    /// Moves one peer actor to offline until discovery or a manual reconnect arrives.
+    pub(super) fn peer_connection_closed(&self, device_id: &str) {
+        if let Some(actor) = self
             .runtime_state
             .lan_peer_actors
             .read()
             .expect("LAN peer actors poisoned")
-            .values()
+            .get(device_id)
         {
-            actor.resume();
+            actor.connection_closed();
         }
     }
 
@@ -659,49 +617,40 @@ impl SyncManager {
         }
 
         let language = crate::i18n::current_language(&self.app);
-        let create_group = call_cloud(
-            connection,
-            Request::CreateGroup {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-            },
-            language,
-        );
-        let read_metadata = call_cloud(connection, Request::HealthV2, language);
-        let (group_response, metadata_response) = tokio::join!(create_group, read_metadata);
-        match group_response? {
-            Response::GroupCreated => {}
-            Response::Error { message, .. } => bail!(message),
-            _ => bail!("云端返回了无效的建组响应"),
-        }
+        let metadata_response = call_cloud(connection, Request::CloudHealth, language).await?;
         let protocol_version = match metadata_response {
-            Ok(Response::HealthV2 {
+            Response::CloudHealth {
                 protocol_version,
                 server_version,
                 ..
-            }) => {
+            } => {
                 log::info!(
                     "cloud Hub metadata received: protocolVersion={protocol_version} serverVersion={server_version}"
                 );
                 self.update_cloud_server_version(Some(server_version));
                 protocol_version
             }
-            Ok(_) => {
-                log::debug!("cloud Hub returned an invalid health response; using legacy sync");
-                0
-            }
-            Err(error)
-                if is_cloud_attempt_timeout(&error) || connection.close_reason().is_some() =>
-            {
-                return Err(error);
-            }
-            Err(error) => {
-                log::debug!("query cloud Hub metadata failed; using legacy sync: {error}");
-                0
-            }
+            Response::Error { message, .. } => bail!(message),
+            _ => bail!("云端返回了无效的协议响应"),
         };
-        if protocol_version < STREAMING_BLOB_PROTOCOL_VERSION {
-            bail!("同步服务版本过低，请升级到支持新版同步协议的版本");
+        if protocol_version != PROTOCOL_VERSION {
+            bail!(
+                "同步协议版本不一致：客户端 {PROTOCOL_VERSION}，服务端 {protocol_version}，请同时升级客户端和 Hub"
+            );
+        }
+        match call_cloud(
+            connection,
+            Request::CreateGroup {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+            },
+            language,
+        )
+        .await?
+        {
+            Response::GroupCreated => {}
+            Response::Error { message, .. } => bail!(message),
+            _ => bail!("云端返回了无效的建组响应"),
         }
         *self
             .runtime_state
@@ -710,8 +659,6 @@ impl SyncManager {
             .expect("cloud session state poisoned") = Some(CloudSessionState {
             connection_id: connection.stable_id(),
             group_id: group.group_id.clone(),
-            protocol_version,
-            sync_v2_supported: protocol_version >= SYNC_V2_PROTOCOL_VERSION,
         });
         self.runtime_state.source_asset_wake.notify_one();
         Ok(true)
@@ -728,78 +675,6 @@ impl SyncManager {
             })
     }
 
-    pub(super) fn cloud_sync_v2_supported(&self, connection: &Connection, group_id: &str) -> bool {
-        self.runtime_state
-            .cloud_session
-            .read()
-            .expect("cloud session state poisoned")
-            .as_ref()
-            .filter(|session| {
-                session.connection_id == connection.stable_id() && session.group_id == group_id
-            })
-            .is_some_and(|session| session.sync_v2_supported)
-    }
-
-    pub(super) fn cloud_async_source_icons_supported(
-        &self,
-        connection: &Connection,
-        group_id: &str,
-    ) -> bool {
-        self.runtime_state
-            .cloud_session
-            .read()
-            .expect("cloud session state poisoned")
-            .as_ref()
-            .filter(|session| {
-                session.connection_id == connection.stable_id() && session.group_id == group_id
-            })
-            .is_some_and(|session| session.protocol_version >= ASYNC_SOURCE_ICON_PROTOCOL_VERSION)
-    }
-
-    pub(super) fn cloud_redundant_watch_supported(
-        &self,
-        connection: &Connection,
-        group_id: &str,
-    ) -> bool {
-        self.runtime_state
-            .cloud_session
-            .read()
-            .expect("cloud session state poisoned")
-            .as_ref()
-            .filter(|session| {
-                session.connection_id == connection.stable_id() && session.group_id == group_id
-            })
-            .is_some_and(|session| session.protocol_version >= REDUNDANT_WATCH_PROTOCOL_VERSION)
-    }
-
-    pub(super) fn bounded_hub_supported(&self, connection: &Connection, group_id: &str) -> bool {
-        self.runtime_state
-            .cloud_session
-            .read()
-            .expect("cloud session state poisoned")
-            .as_ref()
-            .filter(|session| {
-                session.connection_id == connection.stable_id() && session.group_id == group_id
-            })
-            .is_some_and(|session| session.protocol_version >= BOUNDED_HUB_PROTOCOL_VERSION)
-    }
-
-    pub(super) fn cloud_optional_blob_refs_supported(
-        &self,
-        connection: &Connection,
-        group_id: &str,
-    ) -> bool {
-        self.runtime_state
-            .cloud_session
-            .read()
-            .expect("cloud session state poisoned")
-            .as_ref()
-            .filter(|session| {
-                session.connection_id == connection.stable_id() && session.group_id == group_id
-            })
-            .is_some_and(|session| session.protocol_version >= OPTIONAL_BLOB_REFS_PROTOCOL_VERSION)
-    }
-
     pub(super) async fn prepare_cloud_cursor(
         &self,
         connection: &Connection,
@@ -808,9 +683,6 @@ impl SyncManager {
         force: bool,
     ) -> Result<(u64, Option<u64>)> {
         let current = repository::cloud_cursor(pool).await?;
-        if !self.bounded_hub_supported(connection, &group.group_id) {
-            return Ok((current, None));
-        }
         if !force && repository::cloud_bootstrap_completed(pool, &group.group_id).await? {
             return Ok((current, None));
         }
@@ -849,56 +721,74 @@ impl SyncManager {
         Ok((start_cursor, Some(latest_cursor)))
     }
 
-    /// Exchanges group-wide removal tombstones before normal events so a removed device leaves
-    /// before it can upload another clipboard batch.
-    pub(super) async fn sync_removed_devices(
+    /// Exchanges removal tombstones with one LAN peer before its normal event batch.
+    pub(super) async fn sync_lan_removed_devices(
         &self,
         connection: &Connection,
         pool: &SqlitePool,
         group: &GroupSecrets,
         own_device_id: &str,
         own_endpoint_id: &str,
-        cloud: bool,
     ) -> Result<()> {
         let local = repository::removed_devices(pool).await?;
-        let request = Request::SyncRemovedDevices {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            devices: local,
-        };
-        let result = if cloud {
-            call_cloud(
-                connection,
-                request,
-                crate::i18n::current_language(&self.app),
-            )
-            .await
-        } else {
-            call_lan(connection, request).await
-        };
-        let response = match result {
-            Ok(response) => response,
-            Err(error) if cloud && is_cloud_attempt_timeout(&error) => return Err(error),
-            Err(error)
-                if !cloud
-                    && (is_lan_attempt_timeout(&error) || connection.close_reason().is_some()) =>
-            {
-                return Err(error);
-            }
-            Err(error) => {
-                // 旧版对端不识别新请求时仍保留原有剪贴板同步能力。
-                log::debug!("peer does not support removed-device exchange: {error}");
-                return Ok(());
-            }
-        };
+        let response = call_lan(
+            connection,
+            Request::SyncRemovedDevices {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                devices: local,
+            },
+        )
+        .await?;
         let Response::RemovedDevices { devices } = response else {
             if let Response::Error { message, .. } = response {
-                log::debug!("removed-device exchange was rejected: {message}");
+                bail!(message);
             }
-            return Ok(());
+            bail!("局域网设备返回了无效的成员状态响应");
         };
         self.apply_removed_devices(pool, devices, own_device_id, own_endpoint_id)
             .await
+    }
+
+    /// Publishes an approved membership change through the current combined cloud request.
+    pub(super) async fn publish_cloud_membership(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        device: &DeviceAnnouncement,
+    ) -> Result<()> {
+        let response = call_cloud(
+            connection,
+            Request::CloudSync {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                device: self.cloud_device_announcement_for(device),
+                after_cursor: repository::cloud_cursor(pool).await?,
+                events: Vec::new(),
+                removed_devices: repository::removed_devices(pool).await?,
+                limit: 1,
+                bounded_hub: false,
+            },
+            crate::i18n::current_language(&self.app),
+        )
+        .await?;
+        let Response::CloudSynced {
+            removed_devices, ..
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("云端返回了无效的成员状态响应");
+        };
+        self.apply_removed_devices(
+            pool,
+            removed_devices,
+            &device.device_id,
+            &device.endpoint_id,
+        )
+        .await
     }
 
     pub(super) async fn apply_removed_devices(
@@ -908,12 +798,15 @@ impl SyncManager {
         own_device_id: &str,
         own_endpoint_id: &str,
     ) -> Result<()> {
-        let removed_self = devices.iter().any(|device| {
-            device.is_removed()
-                && (device.device_id == own_device_id || device.endpoint_id == own_endpoint_id)
-        });
         repository::merge_removed_devices(pool, &devices).await?;
-        // The full membership ledger is replayed on every cloud cycle; it is not a LAN online event.
+        let removed_self = repository::removed_devices(pool)
+            .await?
+            .iter()
+            .any(|device| {
+                device.is_removed()
+                    && (device.device_id == own_device_id || device.endpoint_id == own_endpoint_id)
+            });
+        // Membership history is not evidence that a LAN route is currently reachable.
         self.emit_updated();
         if removed_self {
             self.leave_after_removal(pool).await?;

@@ -27,7 +27,7 @@ use super::activity::SyncActivityGuard;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -36,19 +36,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(not(target_os = "android"), test))]
-use std::net::IpAddr;
-
 use crate::clipboard::cleanup::CleanupTrigger;
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{
     limit_lan_content_plan, limit_sync_request, limit_sync_response, read_frame, write_frame,
-    CloudEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent, ErrorCode,
-    PeerAnnouncement, RemovedDevice, Request, Response, SyncEventKind, ALPN,
-    ASYNC_SOURCE_ICON_PROTOCOL_VERSION, BOUNDED_HUB_PROTOCOL_VERSION, MAX_EVENTS_PER_BATCH,
-    MAX_FRAME_BYTES, OPTIONAL_BLOB_REFS_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    REDUNDANT_WATCH_PROTOCOL_VERSION, STREAMING_BLOB_PROTOCOL_VERSION, SYNC_V2_PROTOCOL_VERSION,
+    CloudEvent, CursorEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent,
+    ErrorCode, PeerAnnouncement, RemovedDevice, Request, Response, SyncEventKind, ALPN,
+    MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -76,7 +71,7 @@ use crate::{
     clipboard::{
         calculate_current_file_item_size, fallback_accent_colors, AppIconStore,
         ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation,
-        FileEntryFingerprint, ImageStore, WritebackGuard,
+        FileEntryFingerprint, ImageStore,
     },
     db::{
         self,
@@ -85,22 +80,29 @@ use crate::{
     settings::{CloudRelayMode, Language, SettingsStore, SyncSettings},
 };
 
+#[cfg(not(target_os = "android"))]
+use crate::clipboard::WritebackGuard;
+
 use super::{
     crypto,
     delivery::{
         DeliveryCancel, DeliveryCoordinator, OutgoingStagingLease, PreparationCommitGuard,
         PreparationProgress, PreparationTarget, TaskStagingCleanup, UploadTransferStart,
     },
+    delivery_plan::{
+        permits_automatic_file_upload, should_defer_remote_file_download, should_defer_remote_files,
+    },
     identity::{
-        is_lan_ip, peer_endpoint_addr, peer_endpoint_addr_with_preferred, server_endpoint_addr,
-        server_is_configured, GroupSecrets, IdentityStore, PairingCode,
+        is_lan_ip, peer_endpoint_addr, server_endpoint_addr, server_is_configured, GroupSecrets,
+        IdentityStore, PairingCode,
     },
     model::{
         BlobManifest, BlobRole, ClipboardEnvelope, CloudDeviceDirectory, CloudDeviceStatus,
         CloudHubStatus, CloudRecord, CloudRecordPage, DecryptedSyncEvent, IncomingJoinRequest,
         LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice, NearbySyncSpace,
-        SourceAppRef, SourceIconRef, StoredBlob, StoredSyncEvent, SyncChannelState,
-        SyncChannelStatus, SyncItemStatus, SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget,
+        SourceAppRef, SourceIconRef, StoredBlob, StoredContentObject, StoredSyncEvent,
+        SyncChannelState, SyncChannelStatus, SyncContentAvailability, SyncItemStatus,
+        SyncLocalContentState, SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget,
         SyncedClipboardItem, SyncedItemStatePatch,
     },
     pairing::{
@@ -117,6 +119,7 @@ const JOIN_REQUESTED_EVENT: &str = "sync://join-requested";
 const JOIN_ATTEMPT_UPDATED_EVENT: &str = "sync://join-attempt-updated";
 const NEARBY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const JOIN_COMMIT_TIMEOUT: Duration = Duration::from_secs(20);
 const LAN_EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const LAN_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -124,8 +127,6 @@ const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_WATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
-const PRIMARY_CLOUD_WATCH_SLOT: u8 = 0;
-const BACKUP_CLOUD_WATCH_SLOT: u8 = 1;
 const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -137,49 +138,36 @@ const CLOUD_RECORD_CACHE_DIR: &str = "cloud-records";
 pub(crate) const SYNC_STAGING_DIR: &str = "sync-staging";
 pub(crate) const LEGACY_SYNC_BLOB_DIR: &str = "sync-blobs";
 
-/// 自动文件同步只看整张卡片的原始总大小；0 明确表示全部手动。
-fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {
-    limit_mb > 0 && total_size <= u64::from(limit_mb) * 1024 * 1024
-}
-
-/// Keeps oversized remote file cards useful without consuming the managed local cache.
-fn should_defer_remote_files(envelope: &ClipboardEnvelope, limit_mb: u32) -> bool {
-    if envelope.item.kind != "files" {
-        return false;
-    }
-    let total_size = envelope
-        .item
-        .size
-        .and_then(|size| u64::try_from(size).ok())
-        .unwrap_or_else(|| {
-            envelope
-                .blobs
-                .iter()
-                .filter(|blob| blob.role == BlobRole::File)
-                .fold(0_u64, |total, blob| {
-                    total.saturating_add(blob.original_size)
-                })
-        });
-    limit_mb == 0 || total_size > u64::from(limit_mb) * 1024 * 1024
-}
-
 /// Reuses a same-content local file record only while every referenced path is still available.
 async fn available_materialized_file_item(
     pool: &SqlitePool,
     resources: &Path,
     sync_key: &str,
     source_revision: &str,
+    content_identity: Option<&str>,
 ) -> Result<Option<ClipboardItem>> {
     let Some(item) = db::items::find_item_by_sync_key(pool, sync_key)
         .await?
-        .filter(|item| {
-            item.kind == ClipboardKind::Files
-                && item.remote_file_state.is_none()
-                && item.source_revision == source_revision
-        })
+        .filter(|item| item.kind == ClipboardKind::Files && item.remote_file_state.is_none())
     else {
         return Ok(None);
     };
+    let same_content = if item.source_revision == source_revision {
+        true
+    } else if let Some(content_identity) = content_identity {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM sync_item_events WHERE item_id = ? AND content_identity = ?)",
+        )
+        .bind(&item.id)
+        .bind(content_identity)
+        .fetch_one(pool)
+        .await?
+    } else {
+        false
+    };
+    if !same_content {
+        return Ok(None);
+    }
     let values = item
         .content
         .lines()
@@ -257,6 +245,41 @@ fn remove_unreferenced_sync_staging(root: &Path, live_blob_ids: &HashSet<String>
     Ok(removed)
 }
 
+#[cfg(not(target_os = "android"))]
+async fn external_download_target_available(target: &repository::ExternalDownloadTarget) -> bool {
+    if target.destination_kind != "path" {
+        return false;
+    }
+    let Ok(metadata) = tokio::fs::metadata(&target.destination).await else {
+        return false;
+    };
+    if target.is_directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file() && metadata.len() == target.expected_size
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn external_download_target_available(target: &repository::ExternalDownloadTarget) -> bool {
+    if target.destination_kind != "uri" {
+        return false;
+    }
+    let destination = target.destination.clone();
+    let expected_size = target.expected_size;
+    let is_directory = target.is_directory;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::commands::android::is_android_remote_download_document_available(
+            &destination,
+            expected_size,
+            is_directory,
+        )
+        .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 pub struct SyncManager {
     app: AppHandle,
     identity: Arc<IdentityStore>,
@@ -313,8 +336,6 @@ struct EndpointRuntime {
 struct CloudSessionState {
     connection_id: usize,
     group_id: String,
-    protocol_version: u16,
-    sync_v2_supported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +368,13 @@ impl SyncConnectionTarget {
         }
     }
 
+    fn peer_device_id(&self) -> Option<&str> {
+        match self {
+            Self::Cloud => None,
+            Self::Peer { device_id, .. } => Some(device_id),
+        }
+    }
+
     fn remote_batch_source(&self) -> repository::RemoteBatchSource<'_> {
         match self {
             Self::Cloud => repository::RemoteBatchSource::Cloud,
@@ -355,98 +383,63 @@ impl SyncConnectionTarget {
     }
 }
 
-/// Coalesces optional source icons already acknowledged or queued on the current Hub connection.
-#[derive(Default)]
-struct ConfirmedCloudSourceIcons {
-    connection_id: Option<usize>,
-    group_id: Option<String>,
-    blob_ids: HashSet<String>,
-}
-
-impl ConfirmedCloudSourceIcons {
-    /// Drops confirmations whenever either the connection or encrypted sync space changes.
-    fn reset_for(&mut self, connection_id: usize, group_id: &str) {
-        if self.connection_id == Some(connection_id) && self.group_id.as_deref() == Some(group_id) {
-            return;
-        }
-
-        self.connection_id = Some(connection_id);
-        self.group_id = Some(group_id.to_owned());
-        self.blob_ids.clear();
-    }
-
-    /// Returns only icons that still require a remote existence check or upload.
-    fn retain_unconfirmed(
-        &mut self,
-        connection_id: usize,
-        group_id: &str,
-        blobs: Vec<StoredBlob>,
-    ) -> (Vec<StoredBlob>, usize) {
-        self.reset_for(connection_id, group_id);
-        let original_count = blobs.len();
-        let unconfirmed = blobs
-            .into_iter()
-            .filter(|blob| !self.blob_ids.contains(&blob.blob_id))
-            .collect::<Vec<_>>();
-        let cache_hits = original_count.saturating_sub(unconfirmed.len());
-        (unconfirmed, cache_hits)
-    }
-
-    fn confirm(&mut self, connection_id: usize, group_id: &str, blob_ids: &[String]) {
-        self.reset_for(connection_id, group_id);
-        self.blob_ids.extend(blob_ids.iter().cloned());
-    }
-
-    fn clear_connection(&mut self, connection_id: usize) {
-        if self.connection_id != Some(connection_id) {
-            return;
-        }
-
-        *self = Self::default();
-    }
+enum LanPeerSignal {
+    WorkQueued,
+    RetryElapsed,
+    RouteAvailable { changed: bool },
+    ConnectionReady,
+    ConnectionClosed,
+    ManualReconnect(oneshot::Sender<std::result::Result<(), String>>),
+    Stop,
 }
 
 struct LanPeerActor {
-    wake: Notify,
-    pending_work: AtomicBool,
-    force_connect: AtomicBool,
-    connection_ready: AtomicBool,
-    stopped: AtomicBool,
+    signals: mpsc::UnboundedSender<LanPeerSignal>,
 }
 
 impl LanPeerActor {
-    fn new() -> Self {
-        Self {
-            wake: Notify::new(),
-            pending_work: AtomicBool::new(false),
-            force_connect: AtomicBool::new(false),
-            connection_ready: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-        }
+    fn new() -> (Self, mpsc::UnboundedReceiver<LanPeerSignal>) {
+        let (signals, receiver) = mpsc::unbounded_channel();
+        (Self { signals }, receiver)
     }
 
-    fn notify(&self) {
-        self.pending_work.store(true, Ordering::Release);
-        self.wake.notify_one();
+    fn queue_work(&self) {
+        let _ = self.signals.send(LanPeerSignal::WorkQueued);
     }
 
-    fn resume(&self) {
-        self.force_connect.store(true, Ordering::Release);
-        self.wake.notify_one();
+    fn route_available(&self, changed: bool) {
+        let _ = self.signals.send(LanPeerSignal::RouteAvailable { changed });
     }
 
     fn connection_ready(&self) {
-        self.force_connect.store(false, Ordering::Release);
-        self.connection_ready.store(true, Ordering::Release);
-        self.wake.notify_one();
+        let _ = self.signals.send(LanPeerSignal::ConnectionReady);
+    }
+
+    fn connection_closed(&self) {
+        let _ = self.signals.send(LanPeerSignal::ConnectionClosed);
+    }
+
+    async fn reconnect(&self) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        if self
+            .signals
+            .send(LanPeerSignal::ManualReconnect(reply))
+            .is_err()
+        {
+            bail!("局域网同步任务已停止");
+        }
+        match response.await.context("wait for LAN peer reconnect")? {
+            Ok(()) => Ok(()),
+            Err(message) => bail!(message),
+        }
     }
 
     fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.wake.notify_one();
+        let _ = self.signals.send(LanPeerSignal::Stop);
     }
 }
 
+#[derive(Clone)]
 enum LanPeerSyncOutcome {
     Succeeded,
     ConnectionFailed(String),
@@ -486,11 +479,34 @@ struct SyncReadyOutcome {
 }
 
 struct SyncBatchResponse {
-    events: Vec<CloudEvent>,
+    events: Vec<ReceivedSyncEvent>,
     peers: Vec<PeerAnnouncement>,
     latest_cursor: u64,
     removed_devices: Vec<RemovedDevice>,
-    has_more: Option<bool>,
+    has_more: bool,
+}
+
+struct ReceivedSyncEvent {
+    event: EncryptedEvent,
+    cloud_blob_ids: Option<Vec<String>>,
+}
+
+impl From<CursorEvent> for ReceivedSyncEvent {
+    fn from(value: CursorEvent) -> Self {
+        Self {
+            event: value.event,
+            cloud_blob_ids: None,
+        }
+    }
+}
+
+impl From<CloudEvent> for ReceivedSyncEvent {
+    fn from(value: CloudEvent) -> Self {
+        Self {
+            event: value.event,
+            cloud_blob_ids: Some(value.available_blob_ids),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -545,7 +561,7 @@ struct RemoteBlobUnavailable;
 
 impl std::fmt::Display for RemoteBlobUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("远端文件已不可用")
+        formatter.write_str("远端文件内容暂不可用，请稍后重试")
     }
 }
 
@@ -714,27 +730,7 @@ impl Drop for AndroidLanDiscoveryGuard {
     }
 }
 
-pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
-    match app.path().app_cache_dir() {
-        Ok(cache) => {
-            let cloud_record_cache = cache.join(CLOUD_RECORD_CACHE_DIR);
-            if cloud_record_cache.exists() {
-                let result = tauri::async_runtime::spawn_blocking(move || {
-                    fs::remove_dir_all(cloud_record_cache)
-                        .context("clear cloud record preview cache")
-                })
-                .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        log::warn!("clear cloud record preview cache failed: {error:#}")
-                    }
-                    Err(error) => log::warn!("cloud record cache cleanup task failed: {error}"),
-                }
-            }
-        }
-        Err(error) => log::warn!("resolve cloud record preview cache failed: {error}"),
-    }
+pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     let identity = Arc::new(IdentityStore::load_or_create(app)?);
     let mut presence_nonce = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut presence_nonce);
@@ -753,17 +749,48 @@ pub async fn init(app: &AppHandle) -> crate::core::Result<()> {
         join_rate_limits: RwLock::new(HashMap::new()),
         pairing_sessions: AtomicUsize::new(0),
     });
-    remove_legacy_sync_blob_directory(app).await;
-    let pool = manager.pool().await;
-    repository::clear_stale_transfer_locks(&pool).await?;
     app.manage(manager.clone());
+    tauri::async_runtime::spawn(start_runtime(manager));
+    Ok(())
+}
+
+/** 启动不影响首屏命令的维护任务，再拉起长驻同步工作线程。 */
+async fn start_runtime(manager: Arc<SyncManager>) {
+    clear_cloud_record_cache(&manager.app).await;
+    remove_legacy_sync_blob_directory(&manager.app).await;
+    let pool = manager.pool().await;
+    if let Err(error) = repository::clear_stale_transfer_locks(&pool).await {
+        log::warn!("clear stale sync transfer locks failed: {error:#}");
+    }
     tauri::async_runtime::spawn(lan_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
     tauri::async_runtime::spawn(source_asset_worker(manager.clone()));
     tauri::async_runtime::spawn(local_outbox_worker(manager.clone()));
     manager.wake();
-    Ok(())
+}
+
+async fn clear_cloud_record_cache(app: &AppHandle) {
+    let cache = match app.path().app_cache_dir() {
+        Ok(cache) => cache.join(CLOUD_RECORD_CACHE_DIR),
+        Err(error) => {
+            log::warn!("resolve cloud record preview cache failed: {error}");
+            return;
+        }
+    };
+    if !cache.exists() {
+        return;
+    }
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        fs::remove_dir_all(cache).context("clear cloud record preview cache")
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("clear cloud record preview cache failed: {error:#}"),
+        Err(error) => log::warn!("cloud record cache cleanup task failed: {error}"),
+    }
 }
 
 /// Deletes the retired durable ciphertext directory without delaying application startup.
@@ -803,9 +830,13 @@ fn remove_legacy_sync_blob_path(legacy: &Path) -> Result<()> {
 }
 
 impl SyncManager {
-    /// Android shares use LAN only when a peer already has a live direct connection.
+    /// Android shares use LAN only while synchronization and a direct peer are both available.
     #[cfg(target_os = "android")]
     pub fn has_connected_lan_peer(&self) -> bool {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !settings.lan_enabled || self.identity.snapshot().group.is_none() {
+            return false;
+        }
         self.runtime_state
             .lan_connections
             .read()
@@ -814,8 +845,75 @@ impl SyncManager {
             .any(|connection| connection.close_reason().is_none())
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn start_shared_file_import(
+        &self,
+        item_id: &str,
+        total_bytes: u64,
+        route: super::progress::TransferRoute,
+    ) -> String {
+        let task_id = blake3::hash(format!("android-share-import\0{item_id}").as_bytes())
+            .to_hex()
+            .to_string();
+        self.delivery
+            .start_local_import(super::progress::TransferTask {
+                id: task_id.clone(),
+                revision: 0,
+                operation_id: format!("android-share:{item_id}"),
+                item_id: item_id.to_owned(),
+                direction: super::progress::TransferDirection::Upload,
+                route,
+                target: "import".to_owned(),
+                file_name: None,
+                phase: super::progress::TransferPhase::Preparing,
+                transferred_bytes: 0,
+                total_bytes,
+                speed_bytes_per_second: 0,
+                elapsed_ms: 0,
+                eta_seconds: None,
+                error: None,
+                cancellable: true,
+            });
+        task_id
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn shared_file_import_canceled(&self, task_id: &str) -> bool {
+        self.delivery.local_import_canceled(task_id)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn update_shared_file_import(&self, task_id: &str, bytes: u64) {
+        self.delivery.update_local_import(task_id, bytes);
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn finish_shared_file_import(&self, task_id: &str, total_bytes: u64) {
+        self.delivery.finish_local_import(task_id, total_bytes);
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn bind_shared_file_import(
+        &self,
+        task_id: &str,
+        operation_order: i64,
+        source_revision: String,
+    ) {
+        self.delivery
+            .bind_local_import(task_id, operation_order, source_revision);
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn fail_shared_file_import(&self, task_id: &str, bytes: u64, error: String) {
+        self.delivery.fail_local_import(task_id, bytes, error);
+    }
+
     pub fn transfer_tasks(&self) -> Vec<super::progress::TransferTask> {
         self.delivery.tasks()
+    }
+
+    pub(crate) fn item_has_active_local_import(&self, item_id: &str) -> bool {
+        self.delivery.item_has_active_local_import(item_id)
     }
 
     pub async fn cancel_transfer(&self, task_id: &str) -> Result<bool> {
@@ -844,8 +942,21 @@ impl SyncManager {
 
     /// Reconnects LAN peers after an endpoint address or mDNS presence change.
     fn notify_lan_connectivity_changed(&self) {
-        self.resume_all_peers();
-        self.wake_lan_transfer();
+        let actors = self
+            .runtime_state
+            .lan_peer_actors
+            .read()
+            .expect("LAN peer actors poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if actors.is_empty() {
+            self.wake_lan_transfer();
+            return;
+        }
+        for actor in actors {
+            actor.route_available(true);
+        }
     }
 
     /// Bypasses cloud backoff and restarts both transfer and persistent watch workers.
@@ -1015,7 +1126,7 @@ impl SyncManager {
                         if device_id == own_device_id {
                             continue;
                         }
-                        manager.suspend_peer(&device_id);
+                        manager.peer_connection_closed(&device_id);
                         if let Err(error) =
                             repository::mark_peer_offline(&pool, &device_id, None).await
                         {
@@ -1084,7 +1195,7 @@ impl SyncManager {
     }
 
     fn wake_transfer(&self) {
-        self.runtime_state.lan_transfer_wake.notify_one();
+        self.wake_lan_transfer();
         self.runtime_state.cloud_transfer_wake.notify_one();
     }
 
@@ -1100,6 +1211,17 @@ impl SyncManager {
     }
 
     fn wake_lan_transfer(&self) {
+        let actors = self
+            .runtime_state
+            .lan_peer_actors
+            .read()
+            .expect("LAN peer actors poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for actor in actors {
+            actor.queue_work();
+        }
         self.runtime_state.lan_transfer_wake.notify_one();
     }
 
@@ -1285,20 +1407,12 @@ impl SyncManager {
         }
         match (cloud_enabled, settings.lan_enabled) {
             (true, true) => {
-                let (cloud, lan) = tokio::join!(
-                    self.run_cycle(SyncTarget::Cloud, None, Duration::from_secs(8)),
-                    self.run_cycle(SyncTarget::Lan, None, Duration::from_secs(8)),
-                );
+                let (cloud, lan) =
+                    tokio::join!(self.run_cloud_cycle(), self.run_lan_peer_actors(None),);
                 cloud.and(lan)
             }
-            (true, false) => {
-                self.run_cycle(SyncTarget::Cloud, None, Duration::from_secs(8))
-                    .await
-            }
-            (false, true) => {
-                self.run_cycle(SyncTarget::Lan, None, Duration::from_secs(8))
-                    .await
-            }
+            (true, false) => self.run_cloud_cycle().await,
+            (false, true) => self.run_lan_peer_actors(None).await,
             (false, false) => Ok(()),
         }
     }
@@ -1314,19 +1428,63 @@ impl SyncManager {
         {
             bail!("局域网同步已关闭");
         }
-        if let Some(device_id) = device_id.as_deref() {
-            self.resume_peer(device_id);
-        } else {
-            self.resume_all_peers();
-        }
         #[cfg(target_os = "android")]
         self.refresh_android_lan_routes().await;
-        self.run_cycle(
-            SyncTarget::Lan,
-            device_id.as_deref(),
-            Duration::from_secs(8),
-        )
-        .await
+        self.run_lan_peer_actors(device_id.as_deref()).await
+    }
+
+    /// Sends an explicit reconnect request through each selected peer actor.
+    async fn run_lan_peer_actors(self: &Arc<Self>, device_id: Option<&str>) -> Result<()> {
+        let _ = reconcile_lan_peer_actors(self).await?;
+        let actors = {
+            let actors = self
+                .runtime_state
+                .lan_peer_actors
+                .read()
+                .expect("LAN peer actors poisoned");
+            match device_id {
+                Some(device_id) => vec![actors
+                    .get(device_id)
+                    .cloned()
+                    .context("未找到指定的已配对设备")?],
+                None => actors.values().cloned().collect::<Vec<_>>(),
+            }
+        };
+        if actors.is_empty() {
+            bail!(crate::i18n::commands::label(
+                crate::i18n::current_language(&self.app),
+                crate::i18n::commands::Key::SyncNoLanDevice,
+            ));
+        }
+
+        let mut first_error = None;
+        let mut succeeded = false;
+        for batch in actors.chunks(3) {
+            let mut tasks = tokio::task::JoinSet::new();
+            for actor in batch {
+                let actor = actor.clone();
+                tasks.spawn(async move { actor.reconnect().await });
+            }
+            while let Some(result) = tasks.join_next().await {
+                match result.context("LAN reconnect task failed")? {
+                    Ok(()) => succeeded = true,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        if succeeded {
+            return Ok(());
+        }
+        match (device_id, first_error) {
+            (Some(_), Some(error)) => Err(error),
+            (None, Some(_)) => bail!(crate::i18n::commands::label(
+                crate::i18n::current_language(&self.app),
+                crate::i18n::commands::Key::SyncNoLanDevice,
+            )),
+            (_, None) => Ok(()),
+        }
     }
 
     /// Bypasses cloud backoff and starts fresh transfer and watch attempts.
@@ -1378,13 +1536,20 @@ impl SyncManager {
                 .insert((item.id.clone(), item.source_revision.clone()), observation);
         }
         if ready {
-            self.wake_local_outbox();
+            self.wake_content_outbox();
         }
     }
 
-    pub fn wake_local_outbox(&self) {
+    /// Content is materialized inside an active route cycle, so both the ordering worker and
+    /// transport workers must wake after a durable content operation becomes ready.
+    pub fn wake_content_outbox(&self) {
         self.runtime_state.local_outbox_wake.notify_one();
         self.wake_transfer();
+    }
+
+    /// Item-state events can be materialized without opening a content transfer route.
+    pub fn wake_local_outbox(&self) {
+        self.runtime_state.local_outbox_wake.notify_one();
     }
 
     pub async fn sync_item_now(
@@ -1395,12 +1560,24 @@ impl SyncManager {
         use crate::i18n::commands::Key;
 
         let lang = crate::i18n::current_language(&self.app);
+        if self.item_has_active_local_import(&item.id) {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::FileImportInProgress
+            ));
+        }
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled {
             bail!(crate::i18n::commands::label(lang, Key::SyncDisabled));
         }
         if self.identity.snapshot().group.is_none() {
             bail!(crate::i18n::commands::label(lang, Key::SyncGroupRequired));
+        }
+        if item.remote_file_state.is_some() {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::RemoteFileNotDownloaded,
+            ));
         }
         if item.is_sensitive && !settings.sync_sensitive {
             bail!(crate::i18n::commands::label(
@@ -1411,9 +1588,15 @@ impl SyncManager {
         if target == SyncTarget::Lan && !settings.lan_enabled {
             bail!(crate::i18n::commands::label(lang, Key::SyncLanDisabled));
         }
+        if target == SyncTarget::Cloud && !server_is_configured(&settings) {
+            bail!("云端同步未配置");
+        }
         let pool = self.pool().await;
+        if target == SyncTarget::Lan && repository::list_peers(&pool).await?.is_empty() {
+            bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
+        }
         repository::resume_item_delivery(&pool, &item.id, target == SyncTarget::Cloud).await?;
-        let operation_order = db::sync_queue::stage_existing_content(
+        db::sync_queue::stage_existing_content(
             &pool,
             &item.id,
             &item.sync_key,
@@ -1430,17 +1613,11 @@ impl SyncManager {
         )
         .await?;
         if target == SyncTarget::Cloud {
-            self.request_cloud_connection(Duration::from_secs(8))
-                .await?;
+            self.wake_cloud_transfer();
+        } else {
+            self.wake_lan_transfer();
         }
-        self.run_cycle(target, None, Duration::from_secs(8)).await?;
-        if db::sync_queue::content_operation_exists(&pool, operation_order).await? {
-            bail!(crate::i18n::commands::label(
-                lang,
-                Key::SyncOperationPending
-            ));
-        }
-        repository::item_statuses(&pool, &[item.id])
+        self.item_statuses(&[item.id])
             .await?
             .into_iter()
             .next()
@@ -1448,7 +1625,37 @@ impl SyncManager {
     }
 
     pub async fn item_statuses(&self, item_ids: &[String]) -> Result<Vec<SyncItemStatus>> {
-        repository::item_statuses(&self.pool().await, item_ids).await
+        let pool = self.pool().await;
+        let mut statuses = repository::item_statuses(&pool, item_ids).await?;
+        let sessions = repository::external_download_sessions(&pool, item_ids).await?;
+        let mut known_external_items = HashSet::new();
+        let mut valid_items = HashSet::new();
+        for session in sessions {
+            known_external_items.insert(session.item_id.clone());
+            let mut valid = !session.targets.is_empty();
+            for target in &session.targets {
+                if !external_download_target_available(target).await {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                valid_items.insert(session.item_id);
+            }
+        }
+        for status in &mut statuses {
+            if status.origin != super::model::SyncItemOrigin::Remote
+                || status.local_state == SyncLocalContentState::Managed
+            {
+                continue;
+            }
+            if valid_items.contains(&status.item_id) {
+                status.local_state = SyncLocalContentState::External;
+            } else if known_external_items.contains(&status.item_id) {
+                status.local_state = SyncLocalContentState::ExternalMissing;
+            }
+        }
+        Ok(statuses)
     }
 
     /// Reads the Hub member directory without affecting synchronization cursors.
@@ -2128,11 +2335,11 @@ mod tests {
             let (mut send, mut recv) = incoming.accept_bi().await.unwrap();
             assert!(matches!(
                 read_frame(&mut recv).await.unwrap(),
-                Request::HealthV2
+                Request::CloudHealth
             ));
             write_frame(
                 &mut send,
-                &Response::HealthV2 {
+                &Response::CloudHealth {
                     protocol_version: PROTOCOL_VERSION,
                     server_version: "test".into(),
                     server_time_ms: 0,
@@ -2184,7 +2391,7 @@ mod tests {
             let (_send, mut recv) = incoming.accept_bi().await.unwrap();
             assert!(matches!(
                 read_frame(&mut recv).await.unwrap(),
-                Request::HealthV2
+                Request::CloudHealth
             ));
             incoming.closed().await;
         });
@@ -2269,7 +2476,7 @@ mod tests {
         let (mut writer, _reader) = tokio::io::duplex(1);
         let error = write_cloud_request(
             &mut writer,
-            &Request::HealthV2,
+            &Request::CloudHealth,
             Duration::from_millis(20),
             Language::ZhCN,
         )
@@ -2486,53 +2693,66 @@ mod tests {
     #[test]
     fn unchanged_cloud_group_watch_heartbeat_schedules_no_work() {
         let mut cursor = 42;
+        let mut availability_cursor = 7;
         let mut removed_at_ms = 1_000;
 
-        let changes = advance_cloud_watch_watermarks(42, 1_000, &mut cursor, &mut removed_at_ms);
+        let changes = advance_cloud_watch_watermarks(
+            42,
+            7,
+            1_000,
+            &mut cursor,
+            &mut availability_cursor,
+            &mut removed_at_ms,
+        );
 
         assert_eq!(changes, None);
         assert_eq!(cursor, 42);
+        assert_eq!(availability_cursor, 7);
         assert_eq!(removed_at_ms, 1_000);
     }
 
     #[test]
     fn cloud_group_watch_reports_only_advanced_watermarks() {
         let mut cursor = 42;
+        let mut availability_cursor = 7;
         let mut removed_at_ms = 1_000;
 
         assert_eq!(
-            advance_cloud_watch_watermarks(43, 900, &mut cursor, &mut removed_at_ms),
+            advance_cloud_watch_watermarks(
+                43,
+                7,
+                900,
+                &mut cursor,
+                &mut availability_cursor,
+                &mut removed_at_ms,
+            ),
             Some(CloudWatchChanges {
                 events_changed: true,
+                availability_changed: false,
                 removals_changed: false,
             })
         );
         assert_eq!(cursor, 43);
+        assert_eq!(availability_cursor, 7);
         assert_eq!(removed_at_ms, 1_000);
         assert_eq!(
-            advance_cloud_watch_watermarks(40, 1_001, &mut cursor, &mut removed_at_ms),
+            advance_cloud_watch_watermarks(
+                40,
+                8,
+                1_001,
+                &mut cursor,
+                &mut availability_cursor,
+                &mut removed_at_ms,
+            ),
             Some(CloudWatchChanges {
                 events_changed: false,
+                availability_changed: true,
                 removals_changed: true,
             })
         );
         assert_eq!(cursor, 43);
+        assert_eq!(availability_cursor, 8);
         assert_eq!(removed_at_ms, 1_001);
-    }
-
-    #[test]
-    fn redundant_cloud_watch_restarts_the_earliest_failed_slot() {
-        let now = Instant::now();
-        let retry_at = [
-            Some(now + Duration::from_secs(30)),
-            Some(now + Duration::from_secs(2)),
-        ];
-
-        assert_eq!(
-            next_cloud_watch_slot_retry(&retry_at).map(|(slot, _)| slot),
-            Some(1)
-        );
-        assert!(next_cloud_watch_slot_retry(&[None, None]).is_none());
     }
 
     #[test]
@@ -2586,7 +2806,7 @@ mod tests {
         let transport = TransportAddr::Ip("192.168.50.84:56786".parse().unwrap());
 
         assert_eq!(transport.to_string(), "ip:192.168.50.84:56786");
-        ensure_lan_transport_addr(&transport).unwrap();
+        ensure_lan_transport_addr(&transport, None).unwrap();
     }
 
     #[test]
@@ -2595,11 +2815,15 @@ mod tests {
         let public = TransportAddr::Ip("8.8.8.8:443".parse().unwrap());
 
         assert_eq!(
-            ensure_lan_transport_addr(&relay).unwrap_err().to_string(),
+            ensure_lan_transport_addr(&relay, None)
+                .unwrap_err()
+                .to_string(),
             "局域网同步禁止使用 Relay"
         );
         assert_eq!(
-            ensure_lan_transport_addr(&public).unwrap_err().to_string(),
+            ensure_lan_transport_addr(&public, None)
+                .unwrap_err()
+                .to_string(),
             "局域网同步禁止使用公网地址"
         );
     }
@@ -2611,7 +2835,7 @@ mod tests {
             TransportAddr::Ip("10.0.0.8:56786".parse().unwrap()),
         ];
 
-        assert!(lan_path_snapshot_is_usable(None, private).unwrap());
+        assert!(lan_path_snapshot_is_usable(None, private, None).unwrap());
     }
 
     #[test]
@@ -2622,9 +2846,9 @@ mod tests {
         ];
         let public = [TransportAddr::Ip("8.8.8.8:443".parse().unwrap())];
 
-        assert!(!lan_path_snapshot_is_usable(None, mixed).unwrap());
-        assert!(!lan_path_snapshot_is_usable(None, public).unwrap());
-        assert!(!lan_path_snapshot_is_usable(None, []).unwrap());
+        assert!(!lan_path_snapshot_is_usable(None, mixed, None).unwrap());
+        assert!(!lan_path_snapshot_is_usable(None, public, None).unwrap());
+        assert!(!lan_path_snapshot_is_usable(None, [], None).unwrap());
     }
 
     #[test]
@@ -2632,7 +2856,7 @@ mod tests {
         let relay = TransportAddr::Relay("https://relay.example.com".parse().unwrap());
 
         assert_eq!(
-            lan_path_snapshot_is_usable(Some(relay.clone()), [relay])
+            lan_path_snapshot_is_usable(Some(relay.clone()), [relay], None)
                 .unwrap_err()
                 .to_string(),
             "局域网同步禁止使用 Relay"
@@ -2640,11 +2864,33 @@ mod tests {
     }
 
     #[test]
-    fn suspended_lan_peer_requires_an_explicit_wake_event() {
-        assert!(!should_run_lan_peer_cycle(false, true, true));
-        assert!(should_run_lan_peer_cycle(true, false, true));
-        assert!(should_run_lan_peer_cycle(false, true, false));
-        assert!(!should_run_lan_peer_cycle(false, false, false));
+    fn lan_path_snapshot_rejects_an_unannounced_private_path() {
+        let discovered = "192.168.182.147".parse().unwrap();
+        let vpn = TransportAddr::Ip("10.159.23.179:55916".parse().unwrap());
+
+        assert_eq!(
+            lan_path_snapshot_is_usable(
+                Some(vpn.clone()),
+                [vpn],
+                Some(&HashSet::from([discovered])),
+            )
+            .unwrap_err()
+            .to_string(),
+            "局域网连接未使用当前发现地址"
+        );
+    }
+
+    #[test]
+    fn lan_path_snapshot_allows_a_new_port_on_the_discovered_ip() {
+        let discovered = "192.168.182.147".parse().unwrap();
+        let migrated = TransportAddr::Ip("192.168.182.147:51403".parse().unwrap());
+
+        assert!(lan_path_snapshot_is_usable(
+            Some(migrated.clone()),
+            [migrated],
+            Some(&HashSet::from([discovered])),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2758,6 +3004,7 @@ mod tests {
                 accent_start: None,
                 accent_end: None,
             }),
+            content_identity: Some("c".repeat(64)),
         };
         let mut manifest = envelope.blobs[0].clone();
         for (index, kind) in ["text", "image", "files"].into_iter().enumerate() {
@@ -2819,33 +3066,6 @@ mod tests {
     }
 
     #[test]
-    fn source_icon_confirmation_cache_is_scoped_to_cloud_connection_and_group() {
-        let source_icon = StoredBlob {
-            blob_id: "source-icon".into(),
-            encrypted_path: "source-icon.bin".into(),
-            size: 20,
-            source_path: None,
-            source_is_directory: false,
-            stream_nonce: None,
-        };
-        let mut cache = ConfirmedCloudSourceIcons::default();
-        cache.confirm(7, "group-a", std::slice::from_ref(&source_icon.blob_id));
-
-        let (unconfirmed, hits) = cache.retain_unconfirmed(7, "group-a", vec![source_icon.clone()]);
-        assert!(unconfirmed.is_empty());
-        assert_eq!(hits, 1);
-
-        let (unconfirmed, hits) = cache.retain_unconfirmed(8, "group-a", vec![source_icon.clone()]);
-        assert_eq!(unconfirmed.len(), 1);
-        assert_eq!(hits, 0);
-
-        cache.confirm(8, "group-a", std::slice::from_ref(&source_icon.blob_id));
-        let (unconfirmed, hits) = cache.retain_unconfirmed(8, "group-b", vec![source_icon]);
-        assert_eq!(unconfirmed.len(), 1);
-        assert_eq!(hits, 0);
-    }
-
-    #[test]
     fn cloud_record_keeps_complete_sensitive_content_and_image_path() {
         let content = "secret-token-".repeat(20);
         let event = EncryptedEvent {
@@ -2881,6 +3101,7 @@ mod tests {
             },
             blobs: Vec::new(),
             source_app: None,
+            content_identity: Some("a".repeat(64)),
         };
 
         let record = cloud_record(

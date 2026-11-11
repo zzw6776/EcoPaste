@@ -1,7 +1,7 @@
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { TableColumnsType, TableProps } from "antd";
-import { Button, Space, Table, Tooltip } from "antd";
+import { Button, Space, Table } from "antd";
 import type { TFunction } from "i18next";
 import type { FC } from "react";
 import { useState } from "react";
@@ -28,6 +28,7 @@ import {
 } from "@/commands";
 import CustomIconButton from "@/components/CustomIconButton";
 import Modal from "@/components/Modal";
+import Tooltip from "@/components/Tooltip";
 import { GITHUB_URL } from "@/constants/urls";
 import { WINDOW_LABEL } from "@/constants/windows";
 import { router } from "@/router";

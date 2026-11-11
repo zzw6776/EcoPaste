@@ -8,7 +8,7 @@ use crate::settings::CloudRelayMode;
 use super::identity::GroupSecrets;
 
 pub const JOIN_ALPN: &[u8] = b"ecopaste/pair/2";
-pub const JOIN_PROTOCOL_VERSION: u16 = 3;
+pub const JOIN_PROTOCOL_VERSION: u16 = 4;
 pub const JOIN_TIMEOUT_SECS: u64 = 60;
 pub const PAIRING_INVITATION_TTL_SECS: u64 = 5 * 60;
 const DISCOVERY_PREFIX: &str = "ecopaste-discovery-v1:";
@@ -95,10 +95,8 @@ pub struct JoinRequest {
     #[n(8)]
     pub relay_urls: Vec<String>,
     #[n(9)]
-    #[cbor(default)]
     pub invitation_id: Option<String>,
     #[n(10)]
-    #[cbor(default)]
     pub invitation_secret: Option<Vec<u8>>,
 }
 
@@ -147,7 +145,6 @@ pub struct JoinAcknowledgement {
     #[n(2)]
     pub accepted: bool,
     #[n(3)]
-    #[cbor(default)]
     pub error: Option<String>,
 }
 
@@ -224,63 +221,6 @@ mod tests {
         assert!(decoded.device_name.len() < metadata.device_name.len());
         assert!(metadata.device_name.starts_with(&decoded.device_name));
         assert!(encoded.as_ref().len() <= UserData::MAX_LENGTH);
-    }
-
-    #[test]
-    fn discovery_presence_nonce_is_backward_compatible() {
-        #[derive(Debug, PartialEq, Eq, Encode, Decode)]
-        #[cbor(map)]
-        struct LegacyDiscoveryMetadata {
-            #[n(0)]
-            version: u16,
-            #[n(1)]
-            space_id: String,
-            #[n(2)]
-            device_name: String,
-            #[n(3)]
-            platform: String,
-        }
-
-        let legacy = LegacyDiscoveryMetadata {
-            version: JOIN_PROTOCOL_VERSION,
-            space_id: "space".into(),
-            device_name: "Android".into(),
-            platform: "android".into(),
-        };
-        let legacy_payload = minicbor::to_vec(&legacy).unwrap();
-        let legacy_value = UserData::try_from(format!(
-            "{DISCOVERY_PREFIX}{}",
-            BASE64URL_NOPAD.encode(&legacy_payload)
-        ))
-        .unwrap();
-        assert_eq!(
-            DiscoveryMetadata::decode(&legacy_value)
-                .unwrap()
-                .presence_nonce,
-            None
-        );
-
-        let current = DiscoveryMetadata {
-            version: JOIN_PROTOCOL_VERSION,
-            space_id: legacy.space_id.clone(),
-            device_name: legacy.device_name.clone(),
-            platform: legacy.platform.clone(),
-            presence_nonce: Some(7),
-        };
-        let encoded = current.encode().unwrap();
-        let payload = BASE64URL_NOPAD
-            .decode(
-                encoded
-                    .as_ref()
-                    .strip_prefix(DISCOVERY_PREFIX)
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .unwrap();
-        assert_eq!(
-            minicbor::decode::<LegacyDiscoveryMetadata>(&payload).unwrap(),
-            legacy
-        );
     }
 
     #[test]

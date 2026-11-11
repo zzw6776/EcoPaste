@@ -39,6 +39,7 @@ const INITIAL_STATUS: AndroidPermissionsStatus = {
   overlayGranted: false,
   overlayServiceRunning: false,
   rootStatus: "unknown",
+  storageGranted: false,
 };
 
 export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
@@ -98,7 +99,7 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
   }, [fetchStatus, open]);
 
   const handleRequest = async (
-    kind: "overlay" | "battery" | "notification",
+    kind: "overlay" | "battery" | "notification" | "storage",
   ) => {
     await requestAndroidPermission(kind);
     void fetchStatus();
@@ -439,6 +440,25 @@ export const AndroidPermissionsModal: FC<AndroidPermissionsModalProps> = (
               onChange={handleKeepAliveChange}
             />
           </div>
+
+          <PermissionCard
+            action={
+              <Button
+                disabled={status.storageGranted || busy}
+                onClick={() => void handleRequest("storage")}
+                size="small"
+              >
+                {status.storageGranted
+                  ? t("androidPermissions.actions.ready")
+                  : t("androidPermissions.actions.openSettings")}
+              </Button>
+            }
+            description={t(
+              "androidPermissions.permissions.storage.description",
+            )}
+            ready={status.storageGranted}
+            title={t("androidPermissions.permissions.storage.title")}
+          />
 
           <PermissionCard
             action={

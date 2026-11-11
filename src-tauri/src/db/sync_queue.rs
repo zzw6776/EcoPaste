@@ -190,17 +190,6 @@ pub async fn next_ready_content(
     .context("load next clipboard content sync operation")
 }
 
-pub async fn content_operation_exists(pool: &SqlitePool, operation_order: i64) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(SELECT 1 FROM sync_content_outbox WHERE operation_order = ?)",
-    )
-    .bind(operation_order)
-    .fetch_one(pool)
-    .await
-    .context("check clipboard content sync operation")?
-        != 0)
-}
-
 pub async fn complete_content(pool: &SqlitePool, operation_order: i64) -> Result<()> {
     sqlx::query("DELETE FROM sync_content_outbox WHERE operation_order = ?")
         .bind(operation_order)

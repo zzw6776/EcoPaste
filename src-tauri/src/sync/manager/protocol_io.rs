@@ -222,7 +222,7 @@ pub(super) fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<LanAttemptTimeout>().is_some()
 }
 
-/// Confirms both the approval response and its durable commit before returning it to the UI.
+/// Validates an approval, waits for the approver's durable commit, then changes the local space.
 pub(super) async fn call_join(
     connection: &Connection,
     request: JoinRequest,
@@ -232,15 +232,15 @@ pub(super) async fn call_join(
     let request_id = request.request_id.clone();
     write_frame(&mut send, &request).await?;
     let response: JoinResponse = read_frame(&mut recv).await.context("读取加入申请结果")?;
-    let apply_error = match (&response, apply) {
-        (
-            JoinResponse::Approved { bootstrap },
-            Some((manager, replace_existing, preserve_runtime)),
-        ) => manager
-            .apply_pairing_bootstrap(bootstrap, replace_existing, preserve_runtime)
-            .await
-            .err()
-            .map(|error| error.to_string()),
+    let validation_error = match (&response, apply) {
+        (JoinResponse::Approved { bootstrap }, Some((manager, replace_existing, _))) => {
+            let result = if bootstrap.inviter.endpoint_id != connection.remote_id().to_string() {
+                Err(anyhow::anyhow!("批准设备身份与加密连接不一致"))
+            } else {
+                manager.validate_pairing_bootstrap(bootstrap, replace_existing)
+            };
+            result.err().map(|error| error.to_string())
+        }
         _ => None,
     };
     write_frame(
@@ -248,16 +248,35 @@ pub(super) async fn call_join(
         &JoinAcknowledgement {
             version: JOIN_PROTOCOL_VERSION,
             request_id,
-            accepted: apply_error.is_none(),
-            error: apply_error.clone(),
+            accepted: validation_error.is_none(),
+            error: validation_error.clone(),
         },
     )
     .await?;
     let completion: JoinCompletion =
-        tokio::time::timeout(JOIN_HANDSHAKE_TIMEOUT, read_frame(&mut recv))
+        tokio::time::timeout(JOIN_COMMIT_TIMEOUT, read_frame(&mut recv))
             .await
             .context("确认加入申请结果超时")?
             .context("确认加入申请结果")?;
+    let outcome = if let Some(message) = validation_error {
+        Err(anyhow::anyhow!(message))
+    } else {
+        match completion {
+            JoinCompletion::Committed => {
+                if let (
+                    JoinResponse::Approved { bootstrap },
+                    Some((manager, replace_existing, preserve_runtime)),
+                ) = (&response, apply)
+                {
+                    manager
+                        .apply_pairing_bootstrap(bootstrap, replace_existing, preserve_runtime)
+                        .await?;
+                }
+                Ok(response)
+            }
+            JoinCompletion::Error { message } => Ok(JoinResponse::Error { message }),
+        }
+    };
     send.finish()?;
     let stopped = tokio::time::timeout(JOIN_HANDSHAKE_TIMEOUT, send.stopped())
         .await
@@ -265,11 +284,5 @@ pub(super) async fn call_join(
     if stopped.is_some() {
         bail!("批准设备中止了加入确认");
     }
-    if let Some(message) = apply_error {
-        bail!(message);
-    }
-    match completion {
-        JoinCompletion::Committed => Ok(response),
-        JoinCompletion::Error { message } => Ok(JoinResponse::Error { message }),
-    }
+    outcome
 }

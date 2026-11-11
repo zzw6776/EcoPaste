@@ -6,8 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    CloudDevice, CloudEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent,
-    MAX_EVENTS_PER_BATCH, PeerAnnouncement, RemovedDevice, RetentionMapping, SyncEventKind,
+    CloudAvailabilityUpdate, CloudDevice, CloudEvent, DeferredRetentionEvents, DeviceAnnouncement,
+    EncryptedEvent, MAX_EVENTS_PER_BATCH, PeerAnnouncement, RemovedDevice, RetentionMapping,
+    SyncEventKind,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -745,13 +746,14 @@ impl Repository {
         u64::try_from(cursor).context("negative event cursor")
     }
 
-    /// 同一快照读取事件与成员变更水位，减少长连接唤醒时的数据库往返。
-    pub async fn group_watermarks(&self, group_id: &str) -> Result<(u64, i64)> {
-        let (cursor, removed): (i64, i64) = sqlx::query_as(
+    /// Reads all durable group change watermarks from one database snapshot.
+    pub async fn group_watermarks(&self, group_id: &str) -> Result<(u64, i64, u64)> {
+        let (cursor, removed, availability): (i64, i64, i64) = sqlx::query_as(
             "SELECT MAX(pruned_through_cursor, \
                      COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0)), \
              COALESCE((SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0))) \
-             FROM removed_devices WHERE group_id = ?), 0) \
+             FROM removed_devices WHERE group_id = ?), 0), \
+             availability_cursor \
              FROM sync_groups WHERE group_id = ?",
         )
         .bind(group_id)
@@ -763,6 +765,7 @@ impl Repository {
         Ok((
             u64::try_from(cursor).context("negative event cursor")?,
             removed,
+            u64::try_from(availability).context("negative availability cursor")?,
         ))
     }
 
@@ -932,8 +935,140 @@ impl Repository {
         .execute(&mut *transaction)
         .await
         .context("update sync group blob usage")?;
+
+        let event_ids = sqlx::query_scalar::<_, String>(
+            "SELECT event_id FROM event_blob_refs \
+             WHERE group_id = ? AND blob_id = ? ORDER BY event_id",
+        )
+        .bind(group_id)
+        .bind(blob_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .context("list events affected by blob availability")?;
+        if !event_ids.is_empty() {
+            let cursor_count = i64::try_from(event_ids.len())
+                .context("too many events affected by blob availability")?;
+            let last_cursor: i64 = sqlx::query_scalar(
+                "UPDATE sync_groups SET availability_cursor = availability_cursor + ? \
+                 WHERE group_id = ? RETURNING availability_cursor",
+            )
+            .bind(cursor_count)
+            .bind(group_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("advance cloud availability cursor")?;
+            let first_cursor = last_cursor
+                .checked_sub(cursor_count - 1)
+                .context("cloud availability cursor overflow")?;
+            for (offset, event_id) in event_ids.into_iter().enumerate() {
+                let offset = i64::try_from(offset)
+                    .context("too many events affected by blob availability")?;
+                let cursor = first_cursor
+                    .checked_add(offset)
+                    .context("cloud availability cursor overflow")?;
+                sqlx::query(
+                    "UPDATE events SET availability_cursor = ? \
+                     WHERE group_id = ? AND event_id = ?",
+                )
+                .bind(cursor)
+                .bind(group_id)
+                .bind(event_id)
+                .execute(&mut *transaction)
+                .await
+                .context("publish event blob availability")?;
+            }
+        }
         transaction.commit().await.context("commit recorded blob")?;
         Ok(())
+    }
+
+    /// Reads the latest durable availability revision for each changed event.
+    pub async fn cloud_availability_updates(
+        &self,
+        group_id: &str,
+        after_cursor: u64,
+        limit: u16,
+    ) -> Result<(Vec<CloudAvailabilityUpdate>, u64, bool)> {
+        let limit = limit.clamp(1, MAX_EVENTS_PER_BATCH);
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT availability_cursor, event_id
+            FROM events
+            WHERE group_id = ? AND availability_cursor > ?
+            ORDER BY availability_cursor ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(group_id)
+        .bind(i64::try_from(after_cursor).unwrap_or(i64::MAX))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&mut *transaction)
+        .await
+        .context("list cloud availability updates")?;
+        let has_more = rows.len() > usize::from(limit);
+        let mut updates = rows
+            .into_iter()
+            .take(usize::from(limit))
+            .map(|row| {
+                Ok(CloudAvailabilityUpdate {
+                    cursor: u64::try_from(row.try_get::<i64, _>("availability_cursor")?)
+                        .context("negative cloud availability cursor")?,
+                    event_id: row.try_get("event_id")?,
+                    available_blob_ids: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !updates.is_empty() {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT refs.event_id, refs.blob_id FROM event_blob_refs refs \
+                 JOIN blobs ON blobs.group_id = refs.group_id AND blobs.blob_id = refs.blob_id \
+                 WHERE refs.group_id = ",
+            );
+            query.push_bind(group_id).push(" AND refs.event_id IN (");
+            let mut separated = query.separated(", ");
+            for update in &updates {
+                separated.push_bind(&update.event_id);
+            }
+            query.push(") ORDER BY refs.event_id, refs.blob_id");
+            let rows = query
+                .build()
+                .fetch_all(&mut *transaction)
+                .await
+                .context("list available blobs for cloud availability updates")?;
+            let mut available_by_event: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                available_by_event
+                    .entry(row.try_get("event_id")?)
+                    .or_default()
+                    .push(row.try_get("blob_id")?);
+            }
+            for update in &mut updates {
+                update.available_blob_ids = available_by_event
+                    .remove(&update.event_id)
+                    .unwrap_or_default();
+            }
+        }
+        let latest_cursor = if has_more {
+            updates
+                .last()
+                .map(|update| update.cursor)
+                .unwrap_or(after_cursor)
+        } else {
+            let cursor: i64 = sqlx::query_scalar(
+                "SELECT availability_cursor FROM sync_groups WHERE group_id = ?",
+            )
+            .bind(group_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("read latest cloud availability cursor")?;
+            u64::try_from(cursor).context("negative latest cloud availability cursor")?
+        };
+        transaction
+            .commit()
+            .await
+            .context("commit cloud availability snapshot")?;
+        Ok((updates, latest_cursor, has_more))
     }
 
     pub async fn blob_size(&self, group_id: &str, blob_id: &str) -> Result<Option<u64>> {
@@ -1409,28 +1544,40 @@ impl Repository {
             return Ok(());
         }
         let mut query = sqlx::QueryBuilder::new(
-            "SELECT event_id, blob_id FROM event_blob_refs WHERE group_id = ",
+            "SELECT refs.event_id, refs.blob_id, blobs.blob_id IS NOT NULL AS available \
+             FROM event_blob_refs refs LEFT JOIN blobs \
+             ON blobs.group_id = refs.group_id AND blobs.blob_id = refs.blob_id \
+             WHERE refs.group_id = ",
         );
         query.push_bind(group_id).push(" AND event_id IN (");
         let mut separated = query.separated(", ");
         for event in events.iter() {
             separated.push_bind(&event.event.event_id);
         }
-        query.push(") ORDER BY event_id, blob_id");
+        query.push(") ORDER BY refs.event_id, refs.blob_id");
         let rows = query
             .build()
             .fetch_all(&self.pool)
             .await
             .context("list encrypted event blob references")?;
         let mut by_event: HashMap<String, Vec<String>> = HashMap::new();
+        let mut available_by_event: HashMap<String, Vec<String>> = HashMap::new();
         for row in rows {
-            by_event
-                .entry(row.try_get("event_id")?)
-                .or_default()
-                .push(row.try_get("blob_id")?);
+            let event_id: String = row.try_get("event_id")?;
+            let blob_id: String = row.try_get("blob_id")?;
+            if row.try_get::<bool, _>("available")? {
+                available_by_event
+                    .entry(event_id.clone())
+                    .or_default()
+                    .push(blob_id.clone());
+            }
+            by_event.entry(event_id).or_default().push(blob_id);
         }
         for event in events {
             event.event.blob_ids = by_event.remove(&event.event.event_id).unwrap_or_default();
+            event.available_blob_ids = available_by_event
+                .remove(&event.event.event_id)
+                .unwrap_or_default();
         }
         Ok(())
     }
@@ -1476,6 +1623,7 @@ fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
     let sequence: i64 = row.try_get("origin_sequence")?;
     Ok(CloudEvent {
         cursor: u64::try_from(cursor).context("negative event cursor")?,
+        available_blob_ids: Vec::new(),
         event: EncryptedEvent {
             event_id: row.try_get("event_id")?,
             origin_device_id: row.try_get("origin_device_id")?,
@@ -1511,7 +1659,7 @@ mod tests {
         }
         assert_eq!(
             repository.group_watermarks("group_123").await.unwrap(),
-            (0, 0)
+            (0, 0, 0)
         );
         let event = EncryptedEvent {
             event_id: "event_123".into(),
@@ -1549,14 +1697,66 @@ mod tests {
             )
             .await
             .unwrap();
-        let (cursor, removed) = repository.group_watermarks("group_123").await.unwrap();
+        let (cursor, removed, availability) =
+            repository.group_watermarks("group_123").await.unwrap();
         assert_eq!(cursor, repository.latest_cursor("group_123").await.unwrap());
         assert!(cursor > 0);
         assert_eq!(removed, 200);
+        assert_eq!(availability, 0);
         assert_eq!(
             repository.group_watermarks("group_456").await.unwrap(),
-            (0, 999)
+            (0, 999, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn later_blob_upload_publishes_resumable_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+        let blob_id = "a".repeat(64);
+        let event = EncryptedEvent {
+            event_id: "event_123".into(),
+            origin_device_id: "device_123".into(),
+            origin_sequence: 1,
+            created_at_ms: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![1],
+            kind: SyncEventKind::Content,
+            blob_ids: vec![blob_id.clone()],
+            optional_blob_ids: vec![blob_id.clone()],
+            retention_key: None,
+        };
+        repository
+            .insert_events("group_123", &[event], None)
+            .await
+            .unwrap();
+        let (before, cursor, has_more) = repository
+            .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
+            .await
+            .unwrap();
+        assert!(before.is_empty());
+        assert_eq!(cursor, 0);
+        assert!(!has_more);
+
+        repository
+            .record_blob("group_123", &blob_id, 128, true)
+            .await
+            .unwrap();
+        let (updates, cursor, has_more) = repository
+            .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].event_id, "event_123");
+        assert_eq!(updates[0].available_blob_ids, [blob_id]);
+        assert_eq!(updates[0].cursor, cursor);
+        assert!(!has_more);
     }
 
     #[tokio::test]

@@ -84,10 +84,7 @@ pub(super) async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
             manager.emit_updated();
             continue;
         }
-        match manager
-            .run_cycle(SyncTarget::Cloud, None, Duration::from_secs(8))
-            .await
-        {
+        match manager.run_cloud_cycle().await {
             Ok(()) => {
                 cloud_failure_count = 0;
                 cloud_next_at = None;
@@ -133,8 +130,19 @@ pub(super) async fn lan_transfer_worker(manager: Arc<SyncManager>) {
     }
 }
 
-/// Reconciles long-lived per-peer actors and fans out one event-driven synchronization wake.
+/// Reconciles peer actors and schedules only newly created workers.
 pub(super) async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Result<()> {
+    let started = reconcile_lan_peer_actors(manager).await?;
+    for actor in started {
+        actor.queue_work();
+    }
+    Ok(())
+}
+
+/// Keeps the actor registry aligned with paired devices without scheduling duplicate work.
+pub(super) async fn reconcile_lan_peer_actors(
+    manager: &Arc<SyncManager>,
+) -> Result<Vec<Arc<LanPeerActor>>> {
     let pool = manager.pool().await;
     let own_device_id = manager.identity.snapshot().device_id;
     let device_ids = repository::list_peers(&pool)
@@ -144,7 +152,7 @@ pub(super) async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Resu
         .filter(|device_id| device_id != &own_device_id)
         .collect::<HashSet<_>>();
     let mut started = Vec::new();
-    let (actors, removed) = {
+    let removed = {
         let mut actors = manager
             .runtime_state
             .lan_peer_actors
@@ -162,95 +170,185 @@ pub(super) async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Resu
         }
         for device_id in device_ids {
             if !actors.contains_key(&device_id) {
-                let actor = Arc::new(LanPeerActor::new());
+                let (actor, receiver) = LanPeerActor::new();
+                let actor = Arc::new(actor);
                 actors.insert(device_id.clone(), actor.clone());
-                started.push((device_id, actor));
+                started.push((device_id, actor, receiver));
             }
         }
-        (actors.values().cloned().collect::<Vec<_>>(), removed)
+        removed
     };
     for device_id in removed {
         manager.invalidate_lan_connection_by_device(&device_id);
     }
-    for (device_id, actor) in started {
-        tauri::async_runtime::spawn(lan_peer_worker(manager.clone(), device_id, actor.clone()));
-        actor.resume();
+    let mut started_actors = Vec::with_capacity(started.len());
+    for (device_id, actor, receiver) in started {
+        tauri::async_runtime::spawn(lan_peer_worker(manager.clone(), device_id, receiver));
+        started_actors.push(actor);
     }
-    for actor in actors {
-        actor.notify();
-    }
-    Ok(())
+    Ok(started_actors)
+}
+
+#[derive(Clone, Copy)]
+enum LanPeerPhase {
+    Idle,
+    Offline,
+    Backoff { retry_at: Instant },
 }
 
 pub(super) async fn lan_peer_worker(
     manager: Arc<SyncManager>,
     device_id: String,
-    actor: Arc<LanPeerActor>,
+    mut signals: mpsc::UnboundedReceiver<LanPeerSignal>,
 ) {
+    let mut phase = LanPeerPhase::Idle;
+    let mut pending_work = false;
+    let mut failure_count = 0_usize;
     loop {
-        actor.wake.notified().await;
-        let force_connect = actor.force_connect.swap(false, Ordering::AcqRel);
-        let connection_ready = actor.connection_ready.swap(false, Ordering::AcqRel);
-        let pending_work = actor.pending_work.swap(false, Ordering::AcqRel);
-        if actor.stopped.load(Ordering::Acquire) {
-            break;
-        }
-        if connection_ready && !force_connect && !pending_work {
+        let retry_at = match phase {
+            LanPeerPhase::Backoff { retry_at } => Some(retry_at),
+            LanPeerPhase::Idle | LanPeerPhase::Offline => None,
+        };
+        let signal = if let Some(retry_at) = retry_at {
+            tokio::select! {
+                signal = signals.recv() => signal,
+                _ = tokio::time::sleep_until(retry_at.into()) => Some(LanPeerSignal::RetryElapsed),
+            }
+        } else {
+            signals.recv().await
+        };
+        let Some(signal) = signal else { break };
+
+        let mut reconnect_reply = None;
+        let should_run = match signal {
+            LanPeerSignal::WorkQueued => {
+                pending_work = true;
+                matches!(phase, LanPeerPhase::Idle)
+            }
+            LanPeerSignal::RetryElapsed => {
+                phase = LanPeerPhase::Idle;
+                pending_work = true;
+                true
+            }
+            LanPeerSignal::RouteAvailable { changed } => {
+                let should_run = changed || matches!(phase, LanPeerPhase::Offline);
+                if should_run {
+                    phase = LanPeerPhase::Idle;
+                }
+                should_run
+            }
+            LanPeerSignal::ConnectionReady => {
+                phase = LanPeerPhase::Idle;
+                failure_count = 0;
+                pending_work
+            }
+            LanPeerSignal::ConnectionClosed => {
+                phase = LanPeerPhase::Offline;
+                failure_count = 0;
+                false
+            }
+            LanPeerSignal::ManualReconnect(reply) => {
+                phase = LanPeerPhase::Idle;
+                failure_count = 0;
+                pending_work = true;
+                reconnect_reply = Some(reply);
+                true
+            }
+            LanPeerSignal::Stop => break,
+        };
+        if !should_run {
             continue;
         }
-        let suspended = manager
-            .runtime_state
-            .lan_suspended_peers
-            .read()
-            .expect("LAN suspended peers poisoned")
-            .contains(&device_id);
-        if !should_run_lan_peer_cycle(force_connect, pending_work, suspended) {
-            continue;
-        }
+
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled {
+            if let Some(reply) = reconnect_reply {
+                let _ = reply.send(Err("局域网同步已关闭".to_owned()));
+            }
             continue;
         }
-        if force_connect {
-            manager.clear_peer_suspension(&device_id);
-        }
-        match manager
-            .run_cycle(SyncTarget::Lan, Some(&device_id), LAN_EVENT_CONNECT_TIMEOUT)
-            .await
-        {
-            Ok(()) => {
-                actor.force_connect.store(false, Ordering::Release);
+
+        pending_work = false;
+        let outcome = manager
+            .run_lan_peer_actor_cycle(&device_id, LAN_EVENT_CONNECT_TIMEOUT)
+            .await;
+        let response = match outcome {
+            Ok(LanPeerSyncOutcome::Succeeded) => {
+                phase = LanPeerPhase::Idle;
+                failure_count = 0;
+                Ok(())
+            }
+            Ok(LanPeerSyncOutcome::ConnectionFailed(message)) => {
+                phase = LanPeerPhase::Offline;
+                failure_count = 0;
+                pending_work = true;
+                log::debug!(
+                    "LAN peer {device_id} is offline; wait for a discovery event: {message}"
+                );
+                manager.emit_updated();
+                Err(message)
+            }
+            Ok(LanPeerSyncOutcome::TransferFailed(message)) => {
+                failure_count = failure_count.saturating_add(1);
+                let delay = retry_delay(failure_count);
+                phase = LanPeerPhase::Backoff {
+                    retry_at: Instant::now() + delay,
+                };
+                pending_work = true;
+                log::warn!(
+                    "LAN peer transfer failed: deviceId={device_id} attempt={failure_count} retryInSecs={} error={message}",
+                    delay.as_secs(),
+                );
+                manager.emit_updated();
+                Err(message)
             }
             Err(error) => {
-                manager.suspend_peer(&device_id);
-                log::debug!("LAN peer {device_id} is offline; wait for an online event: {error}");
+                let pool = manager.pool().await;
+                let message = error.to_string();
+                if let Err(state_error) =
+                    repository::mark_peer_error(&pool, &device_id, &message).await
+                {
+                    log::warn!(
+                        "record retryable LAN peer failure: deviceId={device_id} error={state_error:#}"
+                    );
+                }
+                failure_count = failure_count.saturating_add(1);
+                let delay = retry_delay(failure_count);
+                phase = LanPeerPhase::Backoff {
+                    retry_at: Instant::now() + delay,
+                };
+                pending_work = true;
+                log::warn!(
+                    "LAN peer cycle failed: deviceId={device_id} attempt={failure_count} retryInSecs={} error={error:#}",
+                    delay.as_secs(),
+                );
                 manager.emit_updated();
+                Err(message)
             }
+        };
+        if let Some(reply) = reconnect_reply {
+            let _ = reply.send(response);
         }
     }
 }
 
-/// Pending clipboard work must not turn an offline peer back into a polling loop.
-pub(super) fn should_run_lan_peer_cycle(
-    force_connect: bool,
-    pending_work: bool,
-    suspended: bool,
-) -> bool {
-    (force_connect || pending_work) && (!suspended || force_connect)
-}
-
-/// Connects only to the explicit LAN routes supplied by mDNS/cached peer metadata.
+/// Connects only to the explicit LAN routes supplied by current discovery metadata.
 pub(super) async fn connect_peer(
     endpoint: &Endpoint,
-    cached_address: EndpointAddr,
+    discovered_address: EndpointAddr,
     total_timeout: Duration,
 ) -> Result<Connection> {
-    if cached_address.is_empty() {
+    if discovered_address.is_empty() {
         bail!("当前没有可用的局域网地址");
     }
+    let discovered_ips = discovered_address
+        .ip_addrs()
+        .map(SocketAddr::ip)
+        .collect::<HashSet<_>>();
     match tokio::time::timeout(total_timeout, async {
-        let connection = endpoint.connect(cached_address, ALPN).await?;
-        ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await?;
+        let connection = endpoint.connect(discovered_address, ALPN).await?;
+        ensure_discovered_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT, &discovered_ips)
+            .await?;
         Ok::<_, anyhow::Error>(connection)
     })
     .await
@@ -407,11 +505,10 @@ pub(super) async fn process_mdns_event(manager: &Arc<SyncManager>, event: Pendin
             {
                 Ok(routes_changed) => {
                     match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
-                        Ok(Some(device_id))
-                            if routes_changed || newly_discovered || presence_changed =>
-                        {
-                            manager.resume_peer_from_discovery(&device_id);
-                        }
+                        Ok(Some(device_id)) => manager.peer_route_available(
+                            &device_id,
+                            routes_changed || newly_discovered || presence_changed,
+                        ),
                         Ok(_) => {}
                         Err(error) => log::debug!("resolve discovered LAN peer failed: {error}"),
                     }
@@ -619,7 +716,7 @@ pub(super) async fn cloud_watch_worker(manager: Arc<SyncManager>) {
     }
 }
 
-/// Watches one cloud group on a persistent response stream and falls back for older hubs.
+/// Watches one cloud group through a persistent change stream.
 pub(super) async fn watch_cloud_group(
     manager: &SyncManager,
     connection: &Connection,
@@ -627,441 +724,53 @@ pub(super) async fn watch_cloud_group(
     pool: &SqlitePool,
     watch_ready: &mut bool,
 ) -> Result<()> {
-    let mut cursor = repository::cloud_cursor(pool).await?;
-    let mut removed_at_ms = repository::latest_removed_at_ms(pool).await?;
-    let access_token = group.access_token_bytes()?;
-    if manager.cloud_redundant_watch_supported(connection, &group.group_id) {
-        return watch_cloud_group_redundant(
-            manager,
-            connection,
-            group,
-            access_token,
-            cursor,
-            removed_at_ms,
-            watch_ready,
-        )
-        .await;
-    }
-
-    let (mut send, mut recv) = connection.open_bi().await?;
-    write_frame(
-        &mut send,
-        &Request::WatchGroupStreamV2 {
-            group_id: group.group_id.clone(),
-            access_token: access_token.clone(),
-            after_cursor: cursor,
-            after_removed_at_ms: removed_at_ms,
-        },
-    )
-    .await?;
-    send.finish()?;
-
-    let first_response = tokio::select! {
+    let cursor = repository::cloud_cursor(pool).await?;
+    let availability_cursor = repository::cloud_availability_cursor(pool).await?;
+    let removed_at_ms = repository::latest_removed_at_ms(pool).await?;
+    let mut cursor = cursor;
+    let mut availability_cursor = availability_cursor;
+    let mut removed_at_ms = removed_at_ms;
+    let request = Request::WatchCloud {
+        group_id: group.group_id.clone(),
+        access_token: group.access_token_bytes()?,
+        after_cursor: cursor,
+        after_removed_at_ms: removed_at_ms,
+    };
+    let (mut recv, initial_response) = tokio::select! {
         _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-        response = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv)) => {
-            response
-        },
+        result = tokio::time::timeout(FIRST_FRAME_TIMEOUT, async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_frame(&mut send, &request).await?;
+            send.finish()?;
+            let response = read_frame(&mut recv).await?;
+            Ok::<_, anyhow::Error>((recv, response))
+        }) => result.context("读取云端订阅首帧超时")??,
     };
-    let first_response = match first_response {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            log::debug!("Hub does not support versioned stream watch: {error}");
-            return watch_cloud_group_legacy(
-                manager,
-                connection,
-                group,
-                access_token,
-                cursor,
-                removed_at_ms,
-                watch_ready,
-            )
-            .await;
-        }
-        Err(error) => return Err(error).context("读取云端持续订阅首帧超时"),
-    };
-    if matches!(first_response, Response::Error { .. }) {
-        return watch_cloud_group_legacy(
-            manager,
-            connection,
-            group,
-            access_token,
-            cursor,
-            removed_at_ms,
-            watch_ready,
-        )
-        .await;
-    }
-    apply_cloud_watch_response(manager, first_response, &mut cursor, &mut removed_at_ms)?;
+    apply_cloud_watch_response(
+        manager,
+        initial_response,
+        &mut cursor,
+        &mut availability_cursor,
+        &mut removed_at_ms,
+    )?;
     mark_cloud_watch_ready(manager, watch_ready);
+    log::info!("cloud watch ready: connectionId={}", connection.stable_id(),);
 
     loop {
         let response = tokio::select! {
             _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-            response = tokio::time::timeout(CLOUD_WATCH_RESPONSE_TIMEOUT, read_frame(&mut recv)) => {
-                response.context("等待云端持续订阅心跳超时")??
-            },
+            result = tokio::time::timeout(
+                CLOUD_WATCH_RESPONSE_TIMEOUT,
+                read_frame(&mut recv),
+            ) => result.context("等待云端持续订阅心跳超时")??,
         };
-        apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
-    }
-}
-
-/// Keeps two independently framed watch streams so one delayed packet does not gate wake-up.
-pub(super) async fn watch_cloud_group_redundant(
-    manager: &SyncManager,
-    connection: &Connection,
-    group: &GroupSecrets,
-    access_token: Vec<u8>,
-    mut cursor: u64,
-    mut removed_at_ms: i64,
-    watch_ready: &mut bool,
-) -> Result<()> {
-    let (responses, mut response_rx) = mpsc::channel(4);
-    let mut readers = CloudWatchReaderGuard::new(Vec::new());
-    let mut active_slots = [false; 2];
-    let mut slot_failure_counts = [0_usize; 2];
-    let mut slot_retry_at = [None; 2];
-    let mut last_initial_error = None;
-    let initial_streams = tokio::select! {
-        _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-        streams = async {
-            tokio::join!(
-                open_cloud_watch_stream(
-                    connection,
-                    group,
-                    &access_token,
-                    cursor,
-                    removed_at_ms,
-                    PRIMARY_CLOUD_WATCH_SLOT,
-                ),
-                open_cloud_watch_stream(
-                    connection,
-                    group,
-                    &access_token,
-                    cursor,
-                    removed_at_ms,
-                    BACKUP_CLOUD_WATCH_SLOT,
-                ),
-            )
-        } => streams,
-    };
-    for (watch_slot, stream) in [
-        (PRIMARY_CLOUD_WATCH_SLOT, initial_streams.0),
-        (BACKUP_CLOUD_WATCH_SLOT, initial_streams.1),
-    ] {
-        let slot_index = usize::from(watch_slot);
-        match stream {
-            Ok((recv, response)) => {
-                match apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)
-                {
-                    Ok(()) => {
-                        active_slots[slot_index] = true;
-                        readers.push(
-                            watch_slot,
-                            spawn_cloud_watch_reader(watch_slot, recv, responses.clone()),
-                        );
-                    }
-                    Err(error) => {
-                        slot_failure_counts[slot_index] = 1;
-                        let delay = retry_delay(slot_failure_counts[slot_index]);
-                        slot_retry_at[slot_index] = Some(Instant::now() + delay);
-                        log::warn!(
-                            "cloud watch slot initial response invalid: slot={} retryInSecs={} error={error:#}",
-                            watch_slot,
-                            delay.as_secs(),
-                        );
-                        last_initial_error = Some(error);
-                    }
-                }
-            }
-            Err(error) => {
-                slot_failure_counts[slot_index] = 1;
-                let delay = retry_delay(slot_failure_counts[slot_index]);
-                slot_retry_at[slot_index] = Some(Instant::now() + delay);
-                log::warn!(
-                    "cloud watch slot initial connection failed: slot={} retryInSecs={} error={error:#}",
-                    watch_slot,
-                    delay.as_secs(),
-                );
-                last_initial_error = Some(error);
-            }
-        }
-    }
-    if !active_slots.iter().any(|active| *active) {
-        let error = last_initial_error.context("云端冗余订阅未返回错误原因")?;
-        return Err(error.context("云端冗余持续订阅均不可用"));
-    }
-
-    mark_cloud_watch_ready(manager, watch_ready);
-    log::info!(
-        "redundant cloud watch ready: connectionId={} activeSlots={}",
-        connection.stable_id(),
-        active_slots.iter().filter(|active| **active).count(),
-    );
-
-    loop {
-        let next_retry = next_cloud_watch_slot_retry(&slot_retry_at);
-        tokio::select! {
-            _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-            response = response_rx.recv() => {
-                let (watch_slot, response) =
-                    response.context("云端持续订阅读取任务已结束")?;
-                let slot_index = usize::from(watch_slot);
-                let response = response.and_then(|response| {
-                    log::debug!("cloud watch frame received: slot={watch_slot}");
-                    apply_cloud_watch_response(
-                        manager,
-                        response,
-                        &mut cursor,
-                        &mut removed_at_ms,
-                    )
-                });
-                if let Err(error) = response {
-                    readers.abort_slot(watch_slot);
-                    active_slots[slot_index] = false;
-                    if connection.close_reason().is_some()
-                        || !active_slots.iter().any(|active| *active)
-                    {
-                        return Err(error.context("云端冗余持续订阅均不可用"));
-                    }
-
-                    slot_failure_counts[slot_index] =
-                        slot_failure_counts[slot_index].saturating_add(1);
-                    let delay = retry_delay(slot_failure_counts[slot_index]);
-                    slot_retry_at[slot_index] = Some(Instant::now() + delay);
-                    log::warn!(
-                        "cloud watch slot failed; surviving slot remains online: slot={} retryInSecs={} error={error:#}",
-                        watch_slot,
-                        delay.as_secs(),
-                    );
-                }
-            }
-            _ = wait_for_cloud_watch_slot_retry(next_retry.map(|(_, retry_at)| retry_at)) => {
-                let (slot_index, _) = next_retry.context("云端订阅重试状态不存在")?;
-                let watch_slot = slot_index as u8;
-                let restored_stream = tokio::select! {
-                    _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-                    stream = open_cloud_watch_stream(
-                        connection,
-                        group,
-                        &access_token,
-                        cursor,
-                        removed_at_ms,
-                        watch_slot,
-                    ) => stream,
-                };
-                match restored_stream {
-                    Ok((recv, response)) => {
-                        match apply_cloud_watch_response(
-                            manager,
-                            response,
-                            &mut cursor,
-                            &mut removed_at_ms,
-                        ) {
-                            Ok(()) => {
-                                active_slots[slot_index] = true;
-                                slot_failure_counts[slot_index] = 0;
-                                slot_retry_at[slot_index] = None;
-                                readers.push(
-                                    watch_slot,
-                                    spawn_cloud_watch_reader(
-                                        watch_slot,
-                                        recv,
-                                        responses.clone(),
-                                    ),
-                                );
-                                log::info!("cloud watch slot restored: slot={watch_slot}");
-                            }
-                            Err(error) => {
-                                slot_failure_counts[slot_index] =
-                                    slot_failure_counts[slot_index].saturating_add(1);
-                                let delay = retry_delay(slot_failure_counts[slot_index]);
-                                slot_retry_at[slot_index] = Some(Instant::now() + delay);
-                                log::warn!(
-                                    "cloud watch slot restore response invalid: slot={} attempt={} retryInSecs={} error={error:#}",
-                                    watch_slot,
-                                    slot_failure_counts[slot_index],
-                                    delay.as_secs(),
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        if connection.close_reason().is_some() {
-                            return Err(error.context("云端共享连接已失效"));
-                        }
-
-                        slot_failure_counts[slot_index] =
-                            slot_failure_counts[slot_index].saturating_add(1);
-                        let delay = retry_delay(slot_failure_counts[slot_index]);
-                        slot_retry_at[slot_index] = Some(Instant::now() + delay);
-                        log::warn!(
-                            "cloud watch slot restore failed: slot={} attempt={} retryInSecs={} error={error:#}",
-                            watch_slot,
-                            slot_failure_counts[slot_index],
-                            delay.as_secs(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub(super) fn next_cloud_watch_slot_retry(
-    retry_at: &[Option<Instant>; 2],
-) -> Option<(usize, Instant)> {
-    retry_at
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, retry_at)| retry_at.map(|retry_at| (slot, retry_at)))
-        .min_by_key(|(_, retry_at)| *retry_at)
-}
-
-pub(super) async fn wait_for_cloud_watch_slot_retry(retry_at: Option<Instant>) {
-    let Some(retry_at) = retry_at else {
-        std::future::pending::<()>().await;
-        return;
-    };
-
-    tokio::time::sleep_until(retry_at.into()).await;
-}
-
-/// Opens one fixed watch slot and confirms that its initial response is readable.
-pub(super) async fn open_cloud_watch_stream(
-    connection: &Connection,
-    group: &GroupSecrets,
-    access_token: &[u8],
-    after_cursor: u64,
-    after_removed_at_ms: i64,
-    watch_slot: u8,
-) -> Result<(RecvStream, Response)> {
-    let (mut send, mut recv) = connection.open_bi().await?;
-    write_frame(
-        &mut send,
-        &Request::WatchGroupStreamV3 {
-            group_id: group.group_id.clone(),
-            access_token: access_token.to_vec(),
-            after_cursor,
-            after_removed_at_ms,
-            watch_slot,
-        },
-    )
-    .await?;
-    send.finish()?;
-    let response = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv))
-        .await
-        .context("读取云端冗余订阅首帧超时")??;
-    if let Response::Error { message, .. } = &response {
-        bail!("{message}");
-    }
-    Ok((recv, response))
-}
-
-/// Owns watch reader tasks and stops both whenever their shared consumer exits.
-struct CloudWatchReaderGuard {
-    handles: Vec<(u8, tokio::task::JoinHandle<()>)>,
-}
-
-impl CloudWatchReaderGuard {
-    fn new(handles: Vec<(u8, tokio::task::JoinHandle<()>)>) -> Self {
-        Self { handles }
-    }
-
-    fn push(&mut self, watch_slot: u8, handle: tokio::task::JoinHandle<()>) {
-        self.handles.retain(|(_, handle)| !handle.is_finished());
-        self.handles.push((watch_slot, handle));
-    }
-
-    fn abort_slot(&mut self, watch_slot: u8) {
-        self.handles.retain(|(slot, handle)| {
-            if *slot != watch_slot {
-                return true;
-            }
-
-            handle.abort();
-            false
-        });
-    }
-}
-
-impl Drop for CloudWatchReaderGuard {
-    fn drop(&mut self) {
-        for (_, handle) in &self.handles {
-            handle.abort();
-        }
-    }
-}
-
-/// Reads one framed watch stream without cancellation corrupting its frame boundary.
-pub(super) fn spawn_cloud_watch_reader(
-    watch_slot: u8,
-    mut recv: RecvStream,
-    responses: mpsc::Sender<(u8, Result<Response>)>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let response =
-                match tokio::time::timeout(CLOUD_WATCH_RESPONSE_TIMEOUT, read_frame(&mut recv))
-                    .await
-                {
-                    Ok(response) => response.context("读取云端持续订阅响应"),
-                    Err(error) => {
-                        Err(anyhow::Error::new(error).context("等待云端持续订阅心跳超时"))
-                    }
-                };
-            let should_stop = response.is_err();
-            if responses.send((watch_slot, response)).await.is_err() || should_stop {
-                return;
-            }
-        }
-    })
-}
-
-/// Retains event-driven long watches when connecting to a hub without stream-watch support.
-pub(super) async fn watch_cloud_group_legacy(
-    manager: &SyncManager,
-    connection: &Connection,
-    group: &GroupSecrets,
-    access_token: Vec<u8>,
-    mut cursor: u64,
-    mut removed_at_ms: i64,
-    watch_ready: &mut bool,
-) -> Result<()> {
-    loop {
-        let response = tokio::select! {
-            _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-            response = call(
-                connection,
-                Request::WatchGroup {
-                    group_id: group.group_id.clone(),
-                    access_token: access_token.clone(),
-                    after_cursor: cursor,
-                    after_removed_at_ms: removed_at_ms,
-                },
-            ) => response,
-        };
-        match response {
-            Ok(response @ Response::GroupChanged { .. }) => {
-                apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
-                mark_cloud_watch_ready(manager, watch_ready);
-            }
-            Ok(Response::Error { .. }) | Err(_) => {
-                let response = tokio::select! {
-                    _ = manager.runtime_state.watch_wake.notified() => return Ok(()),
-                    response = call(
-                        connection,
-                        Request::Watch {
-                            group_id: group.group_id.clone(),
-                            access_token: access_token.clone(),
-                            after_cursor: cursor,
-                        },
-                    ) => response?,
-                };
-                apply_cloud_watch_response(manager, response, &mut cursor, &mut removed_at_ms)?;
-                mark_cloud_watch_ready(manager, watch_ready);
-            }
-            Ok(_) => bail!("云端返回了无效的订阅响应"),
-        }
+        apply_cloud_watch_response(
+            manager,
+            response,
+            &mut cursor,
+            &mut availability_cursor,
+            &mut removed_at_ms,
+        )?;
     }
 }
 
@@ -1078,44 +787,58 @@ pub(super) fn mark_cloud_watch_ready(manager: &SyncManager, watch_ready: &mut bo
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct CloudWatchChanges {
     pub(super) events_changed: bool,
+    pub(super) availability_changed: bool,
     pub(super) removals_changed: bool,
 }
 
 /// Advances the local watch watermarks and reports work only when the Hub moved either one.
 pub(super) fn advance_cloud_watch_watermarks(
     latest_cursor: u64,
+    latest_availability_cursor: u64,
     latest_removed_at_ms: i64,
     cursor: &mut u64,
+    availability_cursor: &mut u64,
     removed_at_ms: &mut i64,
 ) -> Option<CloudWatchChanges> {
     let changes = CloudWatchChanges {
         events_changed: latest_cursor > *cursor,
+        availability_changed: latest_availability_cursor > *availability_cursor,
         removals_changed: latest_removed_at_ms > *removed_at_ms,
     };
     *cursor = (*cursor).max(latest_cursor);
+    *availability_cursor = (*availability_cursor).max(latest_availability_cursor);
     *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
 
-    (changes.events_changed || changes.removals_changed).then_some(changes)
+    (changes.events_changed || changes.availability_changed || changes.removals_changed)
+        .then_some(changes)
 }
 
 /// Wakes change-driven workers only for a real event or removal watermark advance.
 pub(super) fn apply_cloud_watch_watermarks(
     manager: &SyncManager,
     latest_cursor: u64,
+    latest_availability_cursor: u64,
     latest_removed_at_ms: i64,
     cursor: &mut u64,
+    availability_cursor: &mut u64,
     removed_at_ms: &mut i64,
 ) {
-    let Some(changes) =
-        advance_cloud_watch_watermarks(latest_cursor, latest_removed_at_ms, cursor, removed_at_ms)
-    else {
+    let Some(changes) = advance_cloud_watch_watermarks(
+        latest_cursor,
+        latest_availability_cursor,
+        latest_removed_at_ms,
+        cursor,
+        availability_cursor,
+        removed_at_ms,
+    ) else {
         return;
     };
     let received_at_ms = Utc::now().timestamp_millis();
     let events_changed = changes.events_changed;
+    let availability_changed = changes.availability_changed;
     let removals_changed = changes.removals_changed;
     log::info!(
-        "cloud watch change received: eventsChanged={events_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
+        "cloud watch change received: eventsChanged={events_changed} availabilityChanged={availability_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestAvailabilityCursor={latest_availability_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
     );
     manager.runtime_state.source_asset_wake.notify_one();
     manager.wake_cloud_transfer();
@@ -1125,46 +848,26 @@ pub(super) fn apply_cloud_watch_response(
     manager: &SyncManager,
     response: Response,
     cursor: &mut u64,
+    availability_cursor: &mut u64,
     removed_at_ms: &mut i64,
 ) -> Result<()> {
     match response {
-        Response::GroupChanged {
-            latest_cursor,
-            latest_removed_at_ms,
-        } => {
-            apply_cloud_watch_watermarks(
-                manager,
-                latest_cursor,
-                latest_removed_at_ms,
-                cursor,
-                removed_at_ms,
-            );
-            Ok(())
-        }
-        Response::GroupChangedV2 {
+        Response::CloudChanged {
             latest_cursor,
             latest_removed_at_ms,
             server_version,
+            latest_availability_cursor,
         } => {
             manager.update_cloud_server_version(Some(server_version));
             apply_cloud_watch_watermarks(
                 manager,
                 latest_cursor,
+                latest_availability_cursor,
                 latest_removed_at_ms,
                 cursor,
+                availability_cursor,
                 removed_at_ms,
             );
-            Ok(())
-        }
-        Response::Changed { latest_cursor } => {
-            if latest_cursor > *cursor {
-                log::info!(
-                    "cloud watch change received: eventsChanged=true removalsChanged=false latestCursor={latest_cursor} receivedAtMs={}",
-                    Utc::now().timestamp_millis()
-                );
-                manager.wake_cloud_transfer();
-            }
-            *cursor = (*cursor).max(latest_cursor);
             Ok(())
         }
         Response::Error { message, .. } => bail!(message),

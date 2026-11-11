@@ -17,6 +17,7 @@ import type {
   ClipboardApp,
   ClipboardGroupInput,
   ClipboardGroupRecord,
+  ClipboardItem,
   ClipboardItemPage,
   ClipboardItemQuery,
   ClipboardKind,
@@ -200,6 +201,7 @@ export type TransferPhase =
 
 export interface TransferTask {
   id: string;
+  revision: number;
   operationId: string;
   itemId: string;
   direction: TransferDirection;
@@ -209,7 +211,6 @@ export interface TransferTask {
   phase: TransferPhase;
   transferredBytes: number;
   totalBytes: number;
-  operationTotalBytes: number;
   speedBytesPerSecond: number;
   elapsedMs: number;
   etaSeconds: number | null;
@@ -293,24 +294,37 @@ export interface SyncPeerStatus {
   lastError: string | null;
 }
 
-export type SyncItemState =
-  | "idle"
-  | "queued"
-  | "syncing"
-  | "confirming"
-  | "success"
-  | "manual"
-  | "error";
+export type SyncContentAvailability =
+  | "none"
+  | "metadataOnly"
+  | "partial"
+  | "complete";
+
+export type SyncLocalContentState =
+  | "managed"
+  | "external"
+  | "externalMissing"
+  | "missing";
+
+export type SyncItemActivity = "idle" | "queued" | "error";
+
+export type SyncItemAction = "none" | "upload" | "download" | "retry";
+export type SyncItemOrigin = "local" | "remote";
 
 export interface SyncItemChannelStatus {
-  state: SyncItemState;
+  availability: SyncContentAvailability;
+  activity: SyncItemActivity;
+  action: SyncItemAction;
   deliveredTargets: number;
+  contentTargets: number;
   totalTargets: number;
   lastError: string | null;
 }
 
 export interface SyncItemStatus {
   itemId: string;
+  origin: SyncItemOrigin;
+  localState: SyncLocalContentState;
   lan: SyncItemChannelStatus;
   cloud: SyncItemChannelStatus;
 }
@@ -736,6 +750,18 @@ const call = async <T>(
     }
     if (command === TAURI_COMMAND.LIST_CLIPBOARD_ITEMS) {
       return MOCK_PAGE as unknown as T;
+    }
+    if (command === TAURI_COMMAND.GET_CLIPBOARD_ITEM) {
+      const id = typeof args?.id === "string" ? args.id : "";
+      return (MOCK_PAGE.list.find((item) => item.id === id) ??
+        null) as unknown as T;
+    }
+    if (command === TAURI_COMMAND.GET_CLIPBOARD_ITEM_INDEX) {
+      const id = typeof args?.id === "string" ? args.id : "";
+      const index = MOCK_PAGE.list.findIndex((item) => {
+        return item.id === id;
+      });
+      return (index >= 0 ? index : null) as unknown as T;
     }
     if (command === TAURI_COMMAND.LIST_CLIPBOARD_GROUPS) {
       return MOCK_GROUPS as unknown as T;
@@ -1261,6 +1287,27 @@ export const listClipboardItems = (query: ClipboardItemQuery) => {
     TAURI_COMMAND.LIST_CLIPBOARD_ITEMS,
     "commands:labels.loadClipboardList",
     { query },
+  );
+};
+
+/** 按 id 拉取一条列表视图记录，供剪贴板事件做增量更新。 */
+export const getClipboardItem = (id: string) => {
+  return call<ClipboardItem | null>(
+    TAURI_COMMAND.GET_CLIPBOARD_ITEM,
+    "commands:labels.loadClipboardList",
+    { id },
+  );
+};
+
+/** 查询记录在指定筛选与排序下的零基索引，供虚拟列表定位。 */
+export const getClipboardItemIndex = (
+  id: string,
+  query: ClipboardItemQuery,
+) => {
+  return call<number | null>(
+    TAURI_COMMAND.GET_CLIPBOARD_ITEM_INDEX,
+    "commands:labels.loadClipboardList",
+    { id, query },
   );
 };
 

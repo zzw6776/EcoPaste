@@ -1,10 +1,12 @@
 import type { DragEvent, FC, MouseEvent, PointerEvent, Ref } from "react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { SyncItemStatus, TransferTask } from "@/commands";
 import { popupClipboardItemMenu, startDragClipboardItem } from "@/commands";
 import AssetImage from "@/components/AssetImage";
 import type { ItemActionLabels } from "@/constants/itemActions";
+import { useClipboardItemActivity } from "@/hooks/useClipboardItemActivity";
+import { isTransferActive } from "@/pages/Clipboard/utils/transferTasks";
+import { updateClipboardItemSyncStatus } from "@/stores/clipboardItemActivity";
 import type { ClipboardAction, ClipboardItem } from "@/types/clipboard";
 import type { ItemAction } from "@/types/settings";
 import {
@@ -48,9 +50,6 @@ interface ClipboardCardProps {
   mobileSaveLabel?: string;
   showOriginalOnHover?: boolean;
   rootRef?: Ref<HTMLDivElement>;
-  syncStatus?: SyncItemStatus;
-  onSyncStatusChange?: (status: SyncItemStatus) => void;
-  transferTasks?: TransferTask[];
 }
 
 /**
@@ -85,10 +84,11 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     mobileSaveLabel,
     showOriginalOnHover = true,
     rootRef,
-    syncStatus,
-    onSyncStatusChange,
-    transferTasks,
   } = props;
+  const { syncStatus, transferTasks } = useClipboardItemActivity(item.id);
+  const importing = transferTasks.some((task) => {
+    return task.target === "import" && isTransferActive(task);
+  });
   const {
     kind,
     subKind,
@@ -107,7 +107,6 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   } = item;
   const { t } = useTranslation("clipboard");
   const [hovered, setHovered] = useState(false);
-  const [footerHovered, setFooterHovered] = useState(false);
 
   const theme = getAppTheme(
     sourceAppName,
@@ -129,11 +128,13 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 
   const handleDragStart = async (event: DragEvent) => {
     event.preventDefault();
+    if (importing) return;
     await startDragClipboardItem(item.id);
   };
 
   const handleContextMenu = async (event: MouseEvent) => {
     event.preventDefault();
+    if (importing) return;
     const actions = availableActions ?? item.availableActions ?? [];
     const { isFavorite, isPinned, note } = item;
     if (actions.length === 0) return;
@@ -148,6 +149,33 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     );
   };
 
+  const handleClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (importing) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    onClick?.(event);
+  };
+
+  const handleAuxClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (importing) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    onAuxClick?.(event);
+  };
+
+  const handleDoubleClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (importing) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    onDoubleClick?.(event);
+  };
+
   const handlePointerEnter = (event: PointerEvent<HTMLDivElement>) => {
     setHovered(true);
     onPointerEnter?.(event);
@@ -160,14 +188,6 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     onPointerMove?.(event);
-  };
-
-  const handleFooterPointerEnter = () => {
-    setFooterHovered(true);
-  };
-
-  const handleFooterPointerLeave = () => {
-    setFooterHovered(false);
   };
 
   const handleMobileActionMouseDown = (
@@ -223,6 +243,26 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
   const metaText = sizeText
     ? `${primaryMetaText} · ${sizeText}`
     : primaryMetaText;
+  const compactMetaText = (() => {
+    if (subKind === "color") return null;
+    if (isUrlCard) return urlInfo?.host || t("types.url");
+    if (isImageCard) {
+      return width && height ? `${width} × ${height}` : t("types.image");
+    }
+    if (kind === "files") {
+      const count = fileCollectionMeta?.count ?? 0;
+      if (count === 1) {
+        return sizeText ?? t("cardMeta.compactItems", { count });
+      }
+
+      const countText = t("cardMeta.compactItems", { count });
+      return sizeText ? `${countText} · ${sizeText}` : countText;
+    }
+
+    return t("cardMeta.compactCharacters", {
+      count: textCharCount ?? summary?.length ?? 0,
+    });
+  })();
 
   const isMob = isMobile();
 
@@ -231,17 +271,17 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     <div
       aria-selected={isSelected}
       className={cn(
-        "relative flex w-full min-w-0 cursor-pointer select-none flex-col overflow-hidden rounded-[16px] border-0 bg-white transition-all duration-150 dark:bg-neutral-800",
+        "clipboard-card relative flex w-full min-w-0 cursor-pointer select-none flex-col overflow-hidden rounded-[16px] border-0 bg-white transition-all duration-150 dark:bg-neutral-800",
         isMob
           ? "mb-1 aspect-video shadow-[0_2px_8px_rgba(0,0,0,0.04)] active:scale-[0.985]"
           : "h-full",
-        isSelected && !isMob ? "z-10" : "hover:shadow-md",
+        isSelected && !isMob ? null : "hover:shadow-md",
       )}
-      draggable={!isMob && !item.remoteFileState}
-      onAuxClick={onAuxClick}
-      onClick={onClick}
+      draggable={!isMob && !item.remoteFileState && !importing}
+      onAuxClick={handleAuxClick}
+      onClick={handleClick}
       onContextMenu={handleContextMenu}
-      onDoubleClick={onDoubleClick}
+      onDoubleClick={handleDoubleClick}
       onDragStart={handleDragStart}
       onMouseDown={onMouseDown}
       onPointerEnter={handlePointerEnter}
@@ -249,14 +289,6 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
       onPointerMove={handlePointerMove}
       ref={rootRef}
       role="option"
-      style={
-        isSelected && !isMob
-          ? {
-              boxShadow:
-                "0 0 0 2.5px #007AFF, 0 4px 16px rgba(0, 122, 255, 0.25)",
-            }
-          : void 0
-      }
       tabIndex={0}
     >
       {/* 1. 顶部色块横幅 */}
@@ -342,7 +374,14 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
               )}
               {kind === "image" && <ImageCard {...item} />}
               {kind === "files" && (
-                <FilesCard {...item} transferTasks={transferTasks} />
+                <FilesCard
+                  {...item}
+                  downloadedExternally={syncStatus?.localState === "external"}
+                  externalFileMissing={
+                    syncStatus?.localState === "externalMissing"
+                  }
+                  transferTasks={transferTasks}
+                />
               )}
             </NoteContentSwitcher>
           ) : (
@@ -357,30 +396,47 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
               )}
               {kind === "image" && <ImageCard {...item} />}
               {kind === "files" && (
-                <FilesCard {...item} transferTasks={transferTasks} />
+                <FilesCard
+                  {...item}
+                  downloadedExternally={syncStatus?.localState === "external"}
+                  externalFileMissing={
+                    syncStatus?.localState === "externalMissing"
+                  }
+                  transferTasks={transferTasks}
+                />
               )}
             </>
           )}
         </div>
 
-        {/* 3. 底部极简元信息与快捷操作 */}
-        <div
-          className="flex h-7 shrink-0 select-none items-center justify-between px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400"
-          onPointerEnter={handleFooterPointerEnter}
-          onPointerLeave={handleFooterPointerLeave}
-        >
-          <div className="flex min-w-0 items-center gap-1">
-            <span className="truncate">{metaText}</span>
-            <SyncItemIndicators
-              itemId={item.id}
-              onChange={onSyncStatusChange}
-              status={syncStatus}
-            />
+        {/* 3. 核心信息可伸缩，使用次数与同步状态固定保留。 */}
+        <div className="clipboard-card__status-row flex h-7 shrink-0 select-none items-center justify-between gap-1 px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400">
+          <div className="flex min-w-0 items-center gap-1 overflow-hidden">
+            {compactMetaText ? (
+              <span className="truncate" title={metaText}>
+                {compactMetaText} ·
+              </span>
+            ) : null}
+            <span
+              className="flex shrink-0 items-center gap-1 whitespace-nowrap"
+              title={t("cardMeta.useCount", { count: item.useCount })}
+            >
+              <i aria-hidden className="i-lucide:copy size-3" />
+              <span>{item.useCount} ·</span>
+            </span>
+            {!importing && (
+              <SyncItemIndicators
+                itemId={item.id}
+                onChange={updateClipboardItemSyncStatus}
+                status={syncStatus}
+                transferTasks={transferTasks}
+              />
+            )}
           </div>
 
-          {/* 右侧：移动端常驻操作按钮，桌面端 hover 时展示 */}
+          {/* 右侧：移动端常驻；桌面宽卡常驻，窄卡 hover 时展示。 */}
           <div className="flex shrink-0 items-center gap-1">
-            {isMob ? (
+            {isMob && !importing ? (
               <div className="flex items-center gap-1">
                 <button
                   className={cn(
@@ -432,17 +488,19 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                   <i className="i-lucide:trash-2 size-3.5" />
                 </button>
               </div>
-            ) : footerHovered && quickActions.length > 0 ? (
-              <ClipboardQuickActions
-                item={item}
-                labels={quickActionLabels}
-                onQuickAction={onQuickAction}
-                quickActions={quickActions}
-                visible={footerHovered}
-              />
+            ) : !isMob && !importing && quickActions.length > 0 ? (
+              <div className="clipboard-card__desktop-actions">
+                <ClipboardQuickActions
+                  item={item}
+                  labels={quickActionLabels}
+                  onQuickAction={onQuickAction}
+                  quickActions={quickActions}
+                  visible
+                />
+              </div>
             ) : null}
             {hintKey ? (
-              <span className="flex items-center gap-1 font-mono text-[10.5px] text-neutral-400 tracking-tight">
+              <span className="clipboard-card__hint flex items-center gap-1 font-mono text-[10.5px] text-neutral-400 tracking-tight">
                 <span className="text-[9px] opacity-75">≡</span>
                 <span>{hintKey}</span>
               </span>

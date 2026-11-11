@@ -12,6 +12,7 @@ import {
 } from "@/commands";
 import { TAURI_EVENT } from "@/constants/events";
 import { WINDOW_LABEL } from "@/constants/windows";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 import { getModalApi } from "@/utils/feedback";
 import { isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
@@ -20,8 +21,21 @@ import { log } from "@/utils/log";
 const SyncJoinApproval: FC = () => {
   const { t } = useTranslation("preferences");
   const activeRef = useRef(new Set<string>());
+  const dialogsRef = useRef(new Map<string, { destroy: () => void }>());
   const unlistenRef = useRef<null | (() => void)>(null);
   const timersRef = useRef(new Set<ReturnType<typeof setTimeout>>());
+
+  function closeRequests() {
+    for (const [requestId, dialog] of dialogsRef.current) {
+      if (!activeRef.current.delete(requestId)) continue;
+
+      dialog.destroy();
+      void respondIncomingSyncJoinRequest(requestId, false);
+    }
+    dialogsRef.current.clear();
+  }
+
+  useCloseAppOverlay(true, closeRequests);
 
   async function showRequest(request: IncomingJoinRequest) {
     if (activeRef.current.has(request.requestId)) return;
@@ -64,18 +78,23 @@ const SyncJoinApproval: FC = () => {
       ),
       okText: t("sync.nearby.approve"),
       onCancel: async () => {
-        activeRef.current.delete(request.requestId);
+        if (!activeRef.current.delete(request.requestId)) return;
+
+        dialogsRef.current.delete(request.requestId);
         await respondIncomingSyncJoinRequest(request.requestId, false);
       },
       onOk: async () => {
         await respondIncomingSyncJoinRequest(request.requestId, true);
         activeRef.current.delete(request.requestId);
+        dialogsRef.current.delete(request.requestId);
       },
       title: t("sync.nearby.approvalTitle", { device: request.deviceName }),
     });
+    dialogsRef.current.set(request.requestId, dialog);
     const timer = setTimeout(() => {
       dialog.destroy();
       activeRef.current.delete(request.requestId);
+      dialogsRef.current.delete(request.requestId);
       timersRef.current.delete(timer);
     }, remaining);
     timersRef.current.add(timer);
@@ -106,6 +125,8 @@ const SyncJoinApproval: FC = () => {
   useUnmount(() => {
     unlistenRef.current?.();
     for (const timer of timersRef.current) clearTimeout(timer);
+    for (const dialog of dialogsRef.current.values()) dialog.destroy();
+    dialogsRef.current.clear();
   });
 
   return null;

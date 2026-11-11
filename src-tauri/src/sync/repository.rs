@@ -7,15 +7,35 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::{EncryptedEvent, PeerAnnouncement, RemovedDevice, SyncEventKind};
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::{
     identity::is_lan_ip,
+    item_status::{ContentLevel, DeliveryFact, DeliveryStatus, ItemStatusFacts},
     model::{
-        LinkedSyncEvent, StoredBlob, StoredSyncEvent, SyncChannelState, SyncItemState,
-        SyncItemStatus, SyncPeer, SyncPeerStatus,
+        LinkedSyncEvent, StoredBlob, StoredContentObject, StoredSyncEvent, SyncChannelState,
+        SyncItemOrigin, SyncItemStatus, SyncLocalContentState, SyncPeer, SyncPeerStatus,
     },
 };
+
+#[cfg(test)]
+use super::model::{SyncContentAvailability, SyncItemAction, SyncItemActivity};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalDownloadTarget {
+    pub destination_kind: String,
+    pub destination: String,
+    pub expected_size: u64,
+    pub is_directory: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalDownloadSession {
+    pub item_id: String,
+    pub targets: Vec<ExternalDownloadTarget>,
+}
 
 mod delivery;
 mod peers;
@@ -26,6 +46,7 @@ pub use peers::*;
 pub use state::*;
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
+const CLOUD_AVAILABILITY_CURSOR_KEY: &str = "cloud_availability_cursor";
 const CLOUD_BOOTSTRAP_GROUP_KEY: &str = "cloud_bootstrap_group_id";
 const CLOUD_BOOTSTRAP_TARGET_KEY: &str = "cloud_bootstrap_target_cursor";
 const CLOUD_TARGET: &str = "cloud";
@@ -33,7 +54,6 @@ const HISTORY_BACKFILL_GROUP_KEY: &str = "history_backfill_group_id";
 const HISTORY_BACKFILL_VERSION: u8 = 2;
 const HISTORY_TIMESTAMP_REPAIR_GROUP_KEY: &str = "history_timestamp_repair_group_id";
 const LAST_SUCCESS_KEY: &str = "last_success_at";
-const CLOUD_CONFIRMATION_REPAIR_KEY: &str = "cloud_confirmation_repair_before";
 const CLOUD_RETENTION_SNAPSHOT_KEY: &str = "cloud_retention_snapshot";
 
 /// Reads protected history identities; flags remain local even when automatic capture is disabled.
@@ -91,6 +111,27 @@ impl RemoteBatchSource<'_> {
             Self::Peer { device_id } => format!("peer:{device_id}"),
         }
     }
+}
+
+/// Describes what one inbound route actually contributed to local content availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundContentOutcome {
+    Metadata,
+    Received,
+    Deduplicated,
+    External,
+}
+
+impl InboundContentOutcome {
+    fn received_bytes(self) -> bool {
+        !matches!(self, Self::Metadata)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteContentAvailability {
+    Metadata,
+    Complete,
 }
 
 #[derive(Debug, Default)]
@@ -327,6 +368,9 @@ pub struct ContentOutboxCommit<'a> {
     pub sync_key: &'a str,
     pub is_sensitive: bool,
     pub delivery_route: Option<&'a str>,
+    pub group_id: &'a str,
+    pub content_objects: &'a [StoredContentObject],
+    pub content_identity: &'a str,
 }
 
 /// Atomically publishes one materialized content event and removes its durable outbox entry.
@@ -342,6 +386,9 @@ pub async fn commit_content_outbox_event(
         sync_key,
         is_sensitive,
         delivery_route,
+        group_id,
+        content_objects,
+        content_identity,
     } = commit;
     let mut transaction = pool.begin().await.context("begin content outbox commit")?;
     let result = insert_event_on(
@@ -356,6 +403,36 @@ pub async fn commit_content_outbox_event(
         bail!("同步事件序号冲突，请重新复制内容");
     }
     let now = Utc::now();
+    for object in content_objects {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_content_objects (
+                group_id, plaintext_hash, blob_id, stream_nonce,
+                original_size, encrypted_size, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, plaintext_hash) DO UPDATE SET
+                blob_id = excluded.blob_id,
+                stream_nonce = excluded.stream_nonce,
+                original_size = excluded.original_size,
+                encrypted_size = excluded.encrypted_size,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(group_id)
+        .bind(&object.plaintext_hash)
+        .bind(&object.blob_id)
+        .bind(&object.stream_nonce)
+        .bind(i64::try_from(object.original_size).context("sync content object is too large")?)
+        .bind(
+            i64::try_from(object.encrypted_size)
+                .context("encrypted sync content object is too large")?,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("store reusable sync content object")?;
+    }
     sqlx::query("UPDATE sync_events SET delivery_route = ?, updated_at = ? WHERE event_id = ?")
         .bind(delivery_route)
         .bind(now)
@@ -366,25 +443,38 @@ pub async fn commit_content_outbox_event(
     sqlx::query(
         r#"
         INSERT OR IGNORE INTO sync_item_events (
-            item_id, event_id, direction, created_at, updated_at
+            item_id, event_id, direction, content_identity, created_at, updated_at
         )
-        SELECT ?, ?, 'local', ?, ?
+        SELECT ?, ?, 'local', ?, ?, ?
         WHERE EXISTS (SELECT 1 FROM clipboard_items WHERE id = ?)
         "#,
     )
     .bind(item_id)
     .bind(&event.event_id)
+    .bind(content_identity)
     .bind(now)
     .bind(now)
     .bind(item_id)
     .execute(&mut *transaction)
     .await
     .context("link content outbox event to clipboard item")?;
-    sqlx::query("DELETE FROM sync_pending_items WHERE item_id = ?")
-        .bind(item_id)
-        .execute(&mut *transaction)
-        .await
-        .context("clear pending clipboard item after content commit")?;
+    sqlx::query(
+        r#"
+        INSERT INTO sync_local_content (
+            event_id, state, destinations_json, created_at, updated_at
+        ) VALUES (?, 'managed', NULL, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            state = 'managed',
+            destinations_json = NULL,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&event.event_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .context("record local content materialization")?;
     sqlx::query("DELETE FROM sync_content_outbox WHERE operation_order = ?")
         .bind(operation_order)
         .execute(&mut *transaction)
@@ -395,6 +485,43 @@ pub async fn commit_content_outbox_event(
         .await
         .context("commit content outbox event")?;
     Ok(result)
+}
+
+/// Returns the random encrypted identity previously assigned to identical content in this space.
+pub async fn reusable_content_object(
+    pool: &SqlitePool,
+    group_id: &str,
+    plaintext_hash: &str,
+    original_size: u64,
+) -> Result<Option<StoredContentObject>> {
+    let original_size = i64::try_from(original_size).context("sync content object is too large")?;
+    let row = sqlx::query(
+        r#"
+        SELECT plaintext_hash, blob_id, stream_nonce, original_size, encrypted_size
+        FROM sync_content_objects
+        WHERE group_id = ? AND plaintext_hash = ? AND original_size = ?
+        "#,
+    )
+    .bind(group_id)
+    .bind(plaintext_hash)
+    .bind(original_size)
+    .fetch_optional(pool)
+    .await
+    .context("find reusable sync content object")?;
+    row.map(|row| {
+        let original_size: i64 = row.try_get("original_size")?;
+        let encrypted_size: i64 = row.try_get("encrypted_size")?;
+        Ok(StoredContentObject {
+            plaintext_hash: row.try_get("plaintext_hash")?,
+            blob_id: row.try_get("blob_id")?,
+            stream_nonce: row.try_get("stream_nonce")?,
+            original_size: u64::try_from(original_size)
+                .context("negative sync content object size")?,
+            encrypted_size: u64::try_from(encrypted_size)
+                .context("negative encrypted sync content object size")?,
+        })
+    })
+    .transpose()
 }
 
 /// Atomically appends one local item-state event and clears only the serialized state revision.
@@ -473,6 +600,37 @@ pub async fn link_event_to_item(
     Ok(())
 }
 
+/// Associates a content event with both its clipboard record and stable plaintext identity.
+pub async fn link_content_event_to_item(
+    pool: &SqlitePool,
+    item_id: &str,
+    event_id: &str,
+    direction: &str,
+    content_identity: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_item_events (
+            item_id, event_id, direction, content_identity, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_id, event_id) DO UPDATE SET
+            content_identity = COALESCE(excluded.content_identity, sync_item_events.content_identity),
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(item_id)
+    .bind(event_id)
+    .bind(direction)
+    .bind(content_identity)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("link clipboard item content to sync event")?;
+    Ok(())
+}
+
 pub async fn event_for_item(pool: &SqlitePool, item_id: &str) -> Result<Option<String>> {
     sqlx::query_scalar(
         "SELECT i.event_id FROM sync_item_events i JOIN sync_events e ON e.event_id = i.event_id \
@@ -508,41 +666,31 @@ pub async fn remote_file_event(
     row.map(event_from_row).transpose()
 }
 
-/// Expires the same event a completed download attempt proved unavailable.
-pub async fn expire_remote_file_item(
+/// Loads locally retained encrypted events for Hub availability projection.
+pub async fn events_by_ids(
     pool: &SqlitePool,
-    item_id: &str,
-    event_id: &str,
-) -> Result<bool> {
-    let mut transaction = pool
-        .begin()
-        .await
-        .context("begin expiring remote file item")?;
-    let result = sqlx::query(
-        "UPDATE sync_remote_file_items SET event_id = NULL, state = 'expired', updated_at = ? \
-         WHERE item_id = ? AND event_id = ? AND state = 'available'",
-    )
-    .bind(Utc::now())
-    .bind(item_id)
-    .bind(event_id)
-    .execute(&mut *transaction)
-    .await
-    .context("expire remote file item")?;
-    if result.rows_affected() > 0 {
-        sqlx::query(
-            "DELETE FROM sync_item_events WHERE item_id = ? AND event_id = ? AND direction = 'remote'",
-        )
-        .bind(item_id)
-        .bind(event_id)
-        .execute(&mut *transaction)
-        .await
-        .context("release expired remote file event")?;
+    event_ids: &[String],
+) -> Result<Vec<StoredSyncEvent>> {
+    if event_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    transaction
-        .commit()
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT cursor, event_id, origin_device_id, origin_sequence, \
+         event_created_at_ms, nonce, ciphertext, event_kind FROM sync_events WHERE event_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for event_id in event_ids {
+        separated.push_bind(event_id);
+    }
+    query.push(")");
+    query
+        .build()
+        .fetch_all(pool)
         .await
-        .context("commit expired remote file item")?;
-    Ok(result.rows_affected() > 0)
+        .context("load events for cloud availability")?
+        .into_iter()
+        .map(event_from_row)
+        .collect()
 }
 
 fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSyncEvent> {
@@ -1052,12 +1200,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(pending_events_for_target(&pool, "peer:android", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            pending_peer_events_for_target(&pool, "peer:android", "android", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            pending_events_for_target(&pool, "cloud", 10)
+            pending_origin_events_for_target(&pool, "cloud", "mac", 10)
                 .await
                 .unwrap()
                 .len(),
@@ -1079,7 +1229,7 @@ mod tests {
             .await
             .unwrap();
 
-        let lan = pending_events_for_target(&pool, "peer:android", 10)
+        let lan = pending_peer_events_for_target(&pool, "peer:android", "android", 10)
             .await
             .unwrap();
         let cloud = pending_origin_events_for_target(&pool, "cloud", "mac", 10)
@@ -1102,6 +1252,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloud_origin_queue_excludes_unsupported_event_formats() {
+        let pool = memory_pool().await;
+        insert_event(&pool, &test_event("current", 1), true, &[])
+            .await
+            .unwrap();
+        insert_event(&pool, &test_event("legacy", 2), true, &[])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sync_events SET ciphertext = X'45434F455641303100' WHERE event_id = 'legacy'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pending = pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|stored| stored.event.event_id)
+                .collect::<Vec<_>>(),
+            ["current"]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_delivery_route_exposes_the_other_transport_as_manual_fallback() {
+        let pool = memory_pool().await;
+        insert_test_event(&pool, "event-1").await;
+        insert_test_item(&pool, "item").await;
+        link_event_to_item(&pool, "item", "event-1", "local")
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE sync_events SET delivery_route = 'lan' WHERE event_id = 'event-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.lan.activity, SyncItemActivity::Queued);
+        assert_eq!(status.cloud.action, SyncItemAction::None);
+
+        sqlx::query("UPDATE sync_events SET delivery_route = 'cloud' WHERE event_id = 'event-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.lan.action, SyncItemAction::None);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Queued);
+    }
+
+    #[tokio::test]
     async fn canceled_delivery_waits_for_explicit_item_retry() {
         let pool = memory_pool().await;
         insert_test_event(&pool, "event-1").await;
@@ -1109,7 +1319,7 @@ mod tests {
         link_event_to_item(&pool, "item", "event-1", "local")
             .await
             .unwrap();
-        mark_delivery_queued(&pool, "cloud", &["event-1".into()])
+        record_delivery_attempt(&pool, "cloud", &["event-1".into()])
             .await
             .unwrap();
 
@@ -1124,7 +1334,7 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(status.cloud.state, SyncItemState::Error);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Error);
         assert_eq!(
             status.cloud.last_error.as_deref(),
             Some("transfer canceled")
@@ -1134,7 +1344,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            pending_events_for_target(&pool, "peer:phone", 10)
+            pending_peer_events_for_target(&pool, "peer:phone", "phone", 10)
                 .await
                 .unwrap()
                 .len(),
@@ -1149,6 +1359,60 @@ mod tests {
                 .len(),
             1
         );
+
+        block_delivery(
+            &pool,
+            "cloud",
+            "event-1",
+            "missing local attachment for sync event",
+        )
+        .await
+        .unwrap();
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Error);
+        assert_eq!(
+            status.cloud.last_error.as_deref(),
+            Some("missing local attachment for sync event")
+        );
+        assert!(pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_terminal_attempt_preserves_confirmed_content() {
+        let pool = memory_pool().await;
+        insert_test_event(&pool, "event-1").await;
+        insert_test_item(&pool, "item").await;
+        link_event_to_item(&pool, "item", "event-1", "local")
+            .await
+            .unwrap();
+        complete_outbound_delivery(&pool, "cloud", &["event-1".into()], &HashSet::new())
+            .await
+            .unwrap();
+
+        cancel_delivery(&pool, "cloud", "event-1").await.unwrap();
+        block_delivery(&pool, "cloud", "event-1", "later attempt failed")
+            .await
+            .unwrap();
+
+        let delivery: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, confirmed_content, last_error FROM sync_delivery_targets WHERE event_id = 'event-1' AND target_id = 'cloud'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(delivery, ("confirmed".into(), "complete".into(), None));
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Idle);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
     }
 
     #[tokio::test]
@@ -1439,61 +1703,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_remote_file_expires_and_releases_its_event_link() {
-        let pool = memory_pool().await;
-        insert_test_item(&pool, "remote-item").await;
-        insert_test_event(&pool, "remote-event").await;
-        link_event_to_item(&pool, "remote-item", "remote-event", "remote")
-            .await
-            .unwrap();
-        let now = Utc::now();
-        sqlx::query(
-            r#"
-            INSERT INTO sync_remote_file_items (
-                item_id, event_id, origin_device_id, state, created_at, updated_at
-            ) VALUES ('remote-item', 'remote-event', 'mac', 'available', ?, ?)
-            "#,
-        )
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        assert!(
-            !expire_remote_file_item(&pool, "remote-item", "replaced-event")
-                .await
-                .unwrap()
-        );
-        assert!(
-            expire_remote_file_item(&pool, "remote-item", "remote-event")
-                .await
-                .unwrap()
-        );
-
-        let marker: (Option<String>, String) = sqlx::query_as(
-            "SELECT event_id, state FROM sync_remote_file_items WHERE item_id = 'remote-item'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let link_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sync_item_events WHERE item_id = 'remote-item'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(marker, (None, "expired".to_owned()));
-        assert_eq!(link_count, 0);
-        assert!(
-            !expire_remote_file_item(&pool, "remote-item", "remote-event")
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
     async fn origin_sequence_allocation_is_atomic_across_wal_connections() {
         let directory =
             tempfile::tempdir_in(std::env::current_dir().unwrap().join("target")).unwrap();
@@ -1637,6 +1846,13 @@ mod tests {
         )
         .await
         .unwrap();
+        let content_object = StoredContentObject {
+            plaintext_hash: "a".repeat(64),
+            blob_id: "b".repeat(64),
+            stream_nonce: vec![7; 19],
+            original_size: 12,
+            encrypted_size: 71,
+        };
 
         commit_content_outbox_event(
             &pool,
@@ -1648,6 +1864,9 @@ mod tests {
                 sync_key: &sync_key,
                 is_sensitive: false,
                 delivery_route: None,
+                group_id: "group-a",
+                content_objects: std::slice::from_ref(&content_object),
+                content_identity: &content_object.plaintext_hash,
             },
         )
         .await
@@ -1665,6 +1884,12 @@ mod tests {
         .unwrap();
         assert_eq!(outbox_count, 0);
         assert_eq!(event_count, 1);
+        assert_eq!(
+            reusable_content_object(&pool, "group-a", &content_object.plaintext_hash, 12)
+                .await
+                .unwrap(),
+            Some(content_object)
+        );
     }
 
     #[tokio::test]
@@ -1746,19 +1971,23 @@ mod tests {
         assert!(result.conflicts.is_empty());
         assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
         let delivery_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sync_deliveries WHERE event_id = 'remote-event' AND target_id IN ('peer:android', 'cloud')",
+            "SELECT COUNT(*) FROM sync_delivery_targets WHERE event_id = 'remote-event' AND target_id IN ('peer:android', 'cloud')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(delivery_count, 1);
-        assert_eq!(sqlx::query_scalar::<_, String>(
-            "SELECT phase FROM sync_delivery_states WHERE event_id = 'remote-event' AND target_id = 'cloud'",
-        ).fetch_one(&pool).await.unwrap(), "queued");
+        let cloud_state_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_delivery_targets WHERE event_id = 'remote-event' AND target_id = 'cloud'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cloud_state_count, 0);
     }
 
     #[tokio::test]
-    async fn cloud_peer_identity_preserves_current_lan_routes() {
+    async fn peer_identity_preserves_current_lan_routes() {
         let pool = memory_pool().await;
         upsert_peer(
             &pool,
@@ -1778,7 +2007,7 @@ mod tests {
             .await
             .unwrap();
 
-        upsert_cloud_peer_identity(
+        upsert_peer_identity(
             &pool,
             &PeerAnnouncement {
                 device_id: "android".into(),
@@ -1798,12 +2027,7 @@ mod tests {
         assert_eq!(peer.direct_addresses, ["192.168.1.2:35555"]);
         assert!(peer.relay_urls.is_empty());
         assert_eq!(peer.last_seen_ms, 100);
-        assert_eq!(
-            preferred_peer_address(&pool, "android").await.unwrap(),
-            Some("192.168.1.2:35555".into())
-        );
-
-        upsert_cloud_peer_identity(
+        upsert_peer_identity(
             &pool,
             &PeerAnnouncement {
                 device_id: "android".into(),
@@ -1822,10 +2046,6 @@ mod tests {
         assert_eq!(peer.endpoint_id, "endpoint-2");
         assert!(peer.direct_addresses.is_empty());
         assert_eq!(peer.last_seen_ms, 300);
-        assert_eq!(
-            preferred_peer_address(&pool, "android").await.unwrap(),
-            None
-        );
     }
 
     #[tokio::test]
@@ -1865,6 +2085,22 @@ mod tests {
         )
         .await
         .unwrap();
+        for index in 0..3 {
+            upsert_peer(
+                &pool,
+                &PeerAnnouncement {
+                    device_id: format!("offline-{index}"),
+                    device_name: format!("Offline {index}"),
+                    platform: "android".into(),
+                    endpoint_id: format!("offline-endpoint-{index}"),
+                    direct_addresses: Vec::new(),
+                    relay_urls: Vec::new(),
+                    last_seen_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        }
         mark_delivery_error(&pool, "cloud", &["event-1".into()], "offline")
             .await
             .unwrap();
@@ -1877,10 +2113,11 @@ mod tests {
             .unwrap()
             .remove(0);
 
-        assert_eq!(status.lan.state, SyncItemState::Success);
+        assert_eq!(status.lan.availability, SyncContentAvailability::Complete);
         assert_eq!(status.lan.delivered_targets, 1);
+        assert_eq!(status.lan.content_targets, 1);
         assert_eq!(status.lan.total_targets, 1);
-        assert_eq!(status.cloud.state, SyncItemState::Error);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Error);
         assert_eq!(status.cloud.last_error.as_deref(), Some("offline"));
     }
 
@@ -1906,7 +2143,7 @@ mod tests {
         assert!(is_peer_removed(&pool, "android", "endpoint").await.unwrap());
         assert!(list_peers(&pool).await.unwrap().is_empty());
         let deliveries: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sync_deliveries WHERE target_id = 'peer:android'",
+            "SELECT COUNT(*) FROM sync_delivery_targets WHERE target_id = 'peer:android'",
         )
         .fetch_one(&pool)
         .await
@@ -1991,7 +2228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_status_tracks_queue_upload_confirmation_and_never_regresses_after_ack() {
+    async fn cloud_status_projects_durable_intent_and_never_regresses_after_ack() {
         let pool = memory_pool().await;
         insert_test_item(&pool, "item").await;
         insert_test_event(&pool, "event-1").await;
@@ -2000,41 +2237,225 @@ mod tests {
             .unwrap();
         let ids = ["event-1".to_owned()];
         let item_ids = ["item".to_owned()];
-        mark_delivery_queued(&pool, "cloud", &ids).await.unwrap();
+        record_delivery_attempt(&pool, "cloud", &ids).await.unwrap();
         assert_eq!(
             item_statuses(&pool, &item_ids).await.unwrap()[0]
                 .cloud
-                .state,
-            SyncItemState::Queued
+                .activity,
+            SyncItemActivity::Queued
         );
-        mark_delivery_syncing(&pool, "cloud", &ids).await.unwrap();
+        record_delivery_attempt(&pool, "cloud", &ids).await.unwrap();
         assert_eq!(
             item_statuses(&pool, &item_ids).await.unwrap()[0]
                 .cloud
-                .state,
-            SyncItemState::Syncing
+                .activity,
+            SyncItemActivity::Queued
         );
-        mark_delivery_confirming(&pool, "cloud", &ids)
-            .await
-            .unwrap();
+        record_delivery_attempt(&pool, "cloud", &ids).await.unwrap();
         assert_eq!(
             item_statuses(&pool, &item_ids).await.unwrap()[0]
                 .cloud
-                .state,
-            SyncItemState::Confirming
+                .activity,
+            SyncItemActivity::Queued
         );
         mark_delivered(&pool, "cloud", &ids).await.unwrap();
         mark_delivery_error(&pool, "cloud", &ids, "another record failed")
             .await
             .unwrap();
-        mark_delivery_queued(&pool, "cloud", &ids).await.unwrap();
+        record_delivery_attempt(&pool, "cloud", &ids).await.unwrap();
         let status = item_statuses(&pool, &item_ids).await.unwrap().remove(0);
-        assert_eq!(status.cloud.state, SyncItemState::Success);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
         assert_eq!(status.cloud.last_error, None);
     }
 
     #[tokio::test]
-    async fn peer_receipt_waits_for_the_same_event_to_be_confirmed_by_the_hub() {
+    async fn complete_delivery_intent_is_not_downgraded_by_metadata_plans_or_receipts() {
+        let pool = memory_pool().await;
+        insert_test_event(&pool, "event-1").await;
+        let ids = ["event-1".to_owned()];
+
+        plan_deliveries(&pool, "peer:phone", &ids, &HashSet::new())
+            .await
+            .unwrap();
+        plan_deliveries(
+            &pool,
+            "peer:phone",
+            &ids,
+            &HashSet::from(["event-1".to_owned()]),
+        )
+        .await
+        .unwrap();
+        confirm_lan_receipts(&pool, "peer:phone", &ids, &HashSet::new())
+            .await
+            .unwrap();
+
+        let state: (String, String, String) = sqlx::query_as(
+            "SELECT desired_content, confirmed_content, status FROM sync_delivery_targets WHERE event_id = 'event-1' AND target_id = 'peer:phone'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            ("complete".into(), "metadata".into(), "pending".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_local_content_keeps_confirmed_availability_during_new_activity() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        insert_event(&pool, &test_event("older", 1), true, &[])
+            .await
+            .unwrap();
+        insert_event(&pool, &test_event("newer", 2), true, &[])
+            .await
+            .unwrap();
+        let identity = "a".repeat(64);
+        link_content_event_to_item(&pool, "item", "older", "local", Some(&identity))
+            .await
+            .unwrap();
+        link_content_event_to_item(&pool, "item", "newer", "local", Some(&identity))
+            .await
+            .unwrap();
+        set_test_event_order(&pool, "older", "newer").await;
+        mark_delivered(&pool, "cloud", &["older".into()])
+            .await
+            .unwrap();
+        record_delivery_attempt(&pool, "cloud", &["newer".into()])
+            .await
+            .unwrap();
+
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Queued);
+
+        sqlx::query("UPDATE sync_item_events SET content_identity = ? WHERE event_id = 'newer'")
+            .bind("b".repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(changed.cloud.availability, SyncContentAvailability::None);
+        assert_eq!(changed.cloud.activity, SyncItemActivity::Queued);
+    }
+
+    #[tokio::test]
+    async fn repeated_remote_content_keeps_availability_from_each_route() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        upsert_peer(
+            &pool,
+            &PeerAnnouncement {
+                device_id: "phone".into(),
+                device_name: "Phone".into(),
+                platform: "android".into(),
+                endpoint_id: "phone-endpoint".into(),
+                direct_addresses: Vec::new(),
+                relay_urls: Vec::new(),
+                last_seen_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let older = test_event("older", 1);
+        let newer = test_event("newer", 2);
+        store_remote_batch(
+            &pool,
+            RemoteBatchSource::Cloud,
+            Some(1),
+            std::slice::from_ref(&older),
+            "local",
+        )
+        .await
+        .unwrap();
+        store_remote_batch(
+            &pool,
+            RemoteBatchSource::Peer { device_id: "phone" },
+            None,
+            std::slice::from_ref(&newer),
+            "local",
+        )
+        .await
+        .unwrap();
+        let identity = "a".repeat(64);
+        link_content_event_to_item(&pool, "item", "older", "remote", Some(&identity))
+            .await
+            .unwrap();
+        link_content_event_to_item(&pool, "item", "newer", "remote", Some(&identity))
+            .await
+            .unwrap();
+        set_test_event_order(&pool, "older", "newer").await;
+        record_inbound_outcome(
+            &pool,
+            RemoteBatchSource::Cloud,
+            "older",
+            InboundContentOutcome::Received,
+        )
+        .await
+        .unwrap();
+
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
+        assert_eq!(
+            status.lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+
+        sqlx::query("UPDATE sync_item_events SET content_identity = ? WHERE event_id = 'newer'")
+            .bind("b".repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(changed.cloud.availability, SyncContentAvailability::None);
+        assert_eq!(
+            changed.lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_batch_commits_availability_with_its_event_cursor() {
+        let pool = memory_pool().await;
+        insert_test_item(&pool, "item").await;
+        let event = test_event("event", 1);
+        store_remote_batch_with_availability(
+            &pool,
+            RemoteBatchSource::Cloud,
+            Some(42),
+            std::slice::from_ref(&event),
+            "local",
+            &[(event.event_id.clone(), RouteContentAvailability::Complete)],
+        )
+        .await
+        .unwrap();
+        link_event_to_item(&pool, "item", &event.event_id, "remote")
+            .await
+            .unwrap();
+
+        let status = item_statuses(&pool, &["item".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
+        assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn peer_receipt_leaves_cloud_ownership_with_the_origin_device() {
         let pool = memory_pool().await;
         upsert_peer(
             &pool,
@@ -2066,8 +2487,11 @@ mod tests {
             .unwrap();
         let ids = ["item".to_owned()];
         let status = item_statuses(&pool, &ids).await.unwrap().remove(0);
-        assert_eq!(status.lan.state, SyncItemState::Success);
-        assert_eq!(status.cloud.state, SyncItemState::Queued);
+        assert_eq!(
+            status.lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(status.cloud.availability, SyncContentAvailability::None);
         assert!(
             pending_origin_events_for_target(&pool, "cloud", "local", 10)
                 .await
@@ -2078,8 +2502,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            item_statuses(&pool, &ids).await.unwrap()[0].cloud.state,
-            SyncItemState::Success
+            item_statuses(&pool, &ids).await.unwrap()[0]
+                .cloud
+                .availability,
+            SyncContentAvailability::MetadataOnly
         );
         assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
     }
@@ -2117,8 +2543,11 @@ mod tests {
             .unwrap();
         let ids = ["item".to_owned()];
         let status = item_statuses(&pool, &ids).await.unwrap().remove(0);
-        assert_eq!(status.lan.state, SyncItemState::Success);
-        assert_eq!(status.cloud.state, SyncItemState::Queued);
+        assert_eq!(
+            status.lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(status.cloud.availability, SyncContentAvailability::None);
         assert_eq!(status.cloud.delivered_targets, 0);
         assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
 
@@ -2128,8 +2557,10 @@ mod tests {
                 .unwrap();
         assert!(duplicate.inserted_event_ids.is_empty());
         assert_eq!(
-            item_statuses(&pool, &ids).await.unwrap()[0].cloud.state,
-            SyncItemState::Queued
+            item_statuses(&pool, &ids).await.unwrap()[0]
+                .cloud
+                .availability,
+            SyncContentAvailability::None
         );
 
         store_remote_batch(
@@ -2145,7 +2576,10 @@ mod tests {
             .await
             .unwrap();
         let status = item_statuses(&pool, &ids).await.unwrap().remove(0);
-        assert_eq!(status.cloud.state, SyncItemState::Success);
+        assert_eq!(
+            status.cloud.availability,
+            SyncContentAvailability::MetadataOnly
+        );
         assert_eq!(status.cloud.delivered_targets, 1);
         assert_eq!(list_peers(&pool).await.unwrap()[0].pull_cursor, 17);
         assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
@@ -2155,7 +2589,7 @@ mod tests {
     async fn inbound_peer_push_rolls_back_events_when_route_acknowledgement_fails() {
         let pool = memory_pool().await;
         sqlx::raw_sql(
-            "CREATE TRIGGER reject_peer_receipt BEFORE INSERT ON sync_deliveries \
+            "CREATE TRIGGER reject_peer_receipt BEFORE INSERT ON sync_delivery_targets \
              WHEN NEW.target_id = 'peer:phone' BEGIN SELECT RAISE(ABORT, 'receipt failure'); END",
         )
         .execute(&pool)
@@ -2180,7 +2614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_migration_rechecks_remote_claims_without_resending_or_advancing_cloud_cursor() {
+    async fn migration_removes_only_false_remote_cloud_upload_states() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2189,125 +2623,131 @@ mod tests {
         let migrations = sqlx::migrate!("./migrations");
         for migration in migrations
             .iter()
-            .filter(|migration| migration.version <= 16)
+            .filter(|migration| migration.version <= 20)
         {
             sqlx::raw_sql(migration.sql.clone())
                 .execute(&pool)
                 .await
                 .unwrap();
         }
-        let own = test_event("own", 1);
-        let mut remote = test_event("real-remote", 2);
-        remote.origin_device_id = "phone".into();
-        let mut absent = test_event("false-remote", 3);
-        absent.origin_device_id = "phone".into();
-        let mut remote_state = test_event("remote-state", 4);
-        remote_state.origin_device_id = "phone".into();
-        remote_state.kind = SyncEventKind::ItemState;
-        for event in [&own, &remote, &absent, &remote_state] {
-            insert_event(&pool, event, true, &[]).await.unwrap();
-            insert_test_item(&pool, &event.event_id).await;
-            link_event_to_item(&pool, &event.event_id, &event.event_id, "remote")
+        for (event_id, direction, sequence) in [("remote", "remote", 1), ("local", "local", 2)] {
+            insert_event(&pool, &test_event(event_id, sequence), true, &[])
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO sync_deliveries(event_id,target_id,created_at,updated_at) VALUES (?,'cloud',?,?)")
-                .bind(&event.event_id).bind(Utc::now()).bind(Utc::now()).execute(&pool).await.unwrap();
-            sqlx::query("INSERT INTO sync_delivery_states(event_id,target_id,state,created_at,updated_at) VALUES (?,'cloud','success',?,?)")
-                .bind(&event.event_id).bind(Utc::now()).bind(Utc::now()).execute(&pool).await.unwrap();
-        }
-        set_state_value(&pool, CLOUD_CURSOR_KEY, "456")
+            insert_test_item(&pool, event_id).await;
+            link_event_to_item(&pool, event_id, event_id, direction)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sync_delivery_states (event_id, target_id, state, created_at, updated_at) VALUES (?, 'cloud', 'syncing', ?, ?)",
+            )
+            .bind(event_id)
+            .bind(Utc::now())
+            .bind(Utc::now())
+            .execute(&pool)
             .await
             .unwrap();
-        for version in [17, 18] {
-            let migration = migrations
-                .iter()
-                .find(|migration| migration.version == version)
-                .unwrap();
+        }
+
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.version == 21)
+            .unwrap();
+        sqlx::raw_sql(migration.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT event_id FROM sync_delivery_states WHERE target_id = 'cloud' ORDER BY event_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, ["local"]);
+    }
+
+    #[tokio::test]
+    async fn migration_replaces_unsupported_sync_history_without_removing_clipboard_items() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let migrations = sqlx::migrate!("./migrations");
+        for migration in migrations
+            .iter()
+            .filter(|migration| migration.version <= 21)
+        {
             sqlx::raw_sql(migration.sql.clone())
                 .execute(&pool)
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            cloud_confirmation_repair_cursor(&pool, "mac")
-                .await
-                .unwrap(),
-            Some(None)
-        );
-        assert_eq!(
-            item_statuses(&pool, &["own".into()]).await.unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Success
-        );
-        assert_eq!(
-            item_statuses(&pool, &["false-remote".into()])
-                .await
-                .unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Confirming
-        );
-        let mut forged = absent.clone();
-        forged.ciphertext[0] ^= 1;
-        repair_cloud_confirmations(&pool, &[remote, remote_state, forged], Some(123))
+        insert_event(&pool, &test_event("current", 1), true, &[])
             .await
             .unwrap();
-        assert_eq!(
-            cloud_confirmation_repair_cursor(&pool, "mac")
-                .await
-                .unwrap(),
-            Some(Some(123))
-        );
-        assert_eq!(
-            item_statuses(&pool, &["real-remote".into()]).await.unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Success
-        );
-        assert_eq!(
-            item_statuses(&pool, &["false-remote".into()])
-                .await
-                .unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Confirming
-        );
-        repair_cloud_confirmations(&pool, &[], None).await.unwrap();
-        assert_eq!(
-            cloud_confirmation_repair_cursor(&pool, "mac")
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            item_statuses(&pool, &["false-remote".into()])
-                .await
-                .unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Queued
-        );
-        assert_eq!(cloud_cursor(&pool).await.unwrap(), 456);
-        assert_eq!(
-            item_statuses(&pool, &["remote-state".into()])
-                .await
-                .unwrap()[0]
-                .cloud
-                .state,
-            SyncItemState::Success
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM clipboard_items")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            4
-        );
-        assert!(pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+        insert_event(&pool, &test_event("legacy", 2), true, &[])
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        insert_test_item(&pool, "current-item").await;
+        insert_test_item(&pool, "legacy-item").await;
+        link_event_to_item(&pool, "current-item", "current", "local")
+            .await
+            .unwrap();
+        link_event_to_item(&pool, "legacy-item", "legacy", "local")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sync_events SET ciphertext = X'45434F455641303100' WHERE event_id = 'legacy'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sync_remote_file_items (item_id, event_id, origin_device_id, state, created_at, updated_at) VALUES ('legacy-item', 'legacy', 'mac', 'available', ?, ?)",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_state_value(&pool, HISTORY_BACKFILL_GROUP_KEY, "2:group")
+            .await
+            .unwrap();
+        set_cloud_retention_snapshot(&pool, "snapshot")
+            .await
+            .unwrap();
+
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.version == 22)
+            .unwrap();
+        sqlx::raw_sql(migration.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let remaining_events: Vec<String> =
+            sqlx::query_scalar("SELECT event_id FROM sync_events ORDER BY event_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining_events, ["current"]);
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM clipboard_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(item_count, 2);
+        let remote_file: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, event_id FROM sync_remote_file_items WHERE item_id = 'legacy-item'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remote_file, ("expired".into(), None));
+        assert!(!history_backfill_completed(&pool, "group").await.unwrap());
+        assert!(cloud_retention_snapshot(&pool).await.unwrap().is_none());
     }
 
     async fn insert_test_item(pool: &SqlitePool, item_id: &str) {
@@ -2332,14 +2772,37 @@ mod tests {
             .unwrap();
     }
 
+    async fn set_test_event_order(pool: &SqlitePool, older: &str, newer: &str) {
+        sqlx::query(
+            r#"
+            UPDATE sync_item_events
+            SET created_at = CASE event_id
+                WHEN ? THEN '2026-01-01T00:00:00Z'
+                WHEN ? THEN '2026-01-02T00:00:00Z'
+                ELSE created_at
+            END
+            WHERE event_id IN (?, ?)
+            "#,
+        )
+        .bind(older)
+        .bind(newer)
+        .bind(older)
+        .bind(newer)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     fn test_event(event_id: &str, origin_sequence: u64) -> EncryptedEvent {
+        let mut ciphertext = crate::sync::crypto::EVENT_AAD_MAGIC.to_vec();
+        ciphertext.extend_from_slice(&[2; 32]);
         EncryptedEvent {
             event_id: event_id.into(),
             origin_device_id: "mac".into(),
             origin_sequence,
             created_at_ms: 100,
             nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
+            ciphertext,
             kind: SyncEventKind::Content,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),

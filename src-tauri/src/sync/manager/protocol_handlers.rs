@@ -66,8 +66,7 @@ async fn handle_join_connection(manager: Arc<SyncManager>, connection: Connectio
             acknowledgement.error.as_deref().unwrap_or("未知错误")
         ))
     } else if let Some(peer) = approved_peer.as_ref() {
-        let pool = manager.pool().await;
-        repository::restore_and_upsert_peer(&pool, peer).await
+        manager.commit_approved_peer(peer).await
     } else {
         Ok(())
     };
@@ -80,7 +79,7 @@ async fn handle_join_connection(manager: Arc<SyncManager>, connection: Connectio
     write_frame(&mut send, &completion).await?;
     send.finish()?;
 
-    let trailing = tokio::time::timeout(JOIN_HANDSHAKE_TIMEOUT, recv.read_to_end(0))
+    let trailing = tokio::time::timeout(JOIN_COMMIT_TIMEOUT, recv.read_to_end(0))
         .await
         .context("等待申请设备完成握手超时")??;
     if !trailing.is_empty() {
@@ -247,51 +246,90 @@ impl ProtocolHandler for PeerService {
         let Some(manager) = self.manager.upgrade() else {
             return Ok(());
         };
-        if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
-            log::warn!("rejected non-LAN sync connection: {error}");
-            return Ok(());
-        }
-        let connection_admission = Arc::new(Semaphore::new(8));
-        let connection_blobs = Arc::new(Semaphore::new(2));
-        loop {
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(value) => value,
-                Err(_) => break,
-            };
-            let global_admission = match manager
-                .runtime_state
-                .inbound_stream_admission
-                .clone()
-                .acquire_owned()
-                .await
-            {
-                Ok(permit) => permit,
-                Err(_) => break,
-            };
-            let connection_admission = match connection_admission.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
-            };
-            let manager = manager.clone();
-            let connection = connection.clone();
-            let connection_blobs = connection_blobs.clone();
-            tokio::spawn(async move {
-                if let Err(error) = handle_peer_stream(
-                    manager,
-                    connection,
-                    send,
-                    recv,
-                    (global_admission, connection_admission),
-                    connection_blobs,
-                )
-                .await
-                {
-                    log::warn!("LAN sync request failed: {error}");
-                }
-            });
+        if let Err(error) = serve_peer_connection(manager, connection).await {
+            log::warn!("LAN peer connection failed: {error}");
         }
         Ok(())
     }
+}
+
+/// Starts the same request server on a locally initiated QUIC connection so either peer can pull.
+pub(super) fn spawn_peer_connection_service(manager: Arc<SyncManager>, connection: Connection) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = serve_peer_connection(manager, connection).await {
+            log::warn!("outgoing LAN peer connection failed: {error}");
+        }
+    });
+}
+
+async fn serve_peer_connection(manager: Arc<SyncManager>, connection: Connection) -> Result<()> {
+    let stable_id = connection.stable_id();
+    let claimed = manager
+        .runtime_state
+        .lan_served_connections
+        .write()
+        .expect("served LAN connections poisoned")
+        .insert(stable_id);
+    if !claimed {
+        return Ok(());
+    }
+    let result = serve_claimed_peer_connection(manager.clone(), connection).await;
+    manager
+        .runtime_state
+        .lan_served_connections
+        .write()
+        .expect("served LAN connections poisoned")
+        .remove(&stable_id);
+    result
+}
+
+async fn serve_claimed_peer_connection(
+    manager: Arc<SyncManager>,
+    connection: Connection,
+) -> Result<()> {
+    if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
+        bail!("rejected non-LAN sync connection: {error}");
+    }
+    let connection_admission = Arc::new(Semaphore::new(8));
+    let connection_blobs = Arc::new(Semaphore::new(2));
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let global_admission = match manager
+            .runtime_state
+            .inbound_stream_admission
+            .clone()
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let connection_admission = match connection_admission.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let manager = manager.clone();
+        let connection = connection.clone();
+        let connection_blobs = connection_blobs.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_peer_stream(
+                manager,
+                connection,
+                send,
+                recv,
+                (global_admission, connection_admission),
+                connection_blobs,
+            )
+            .await
+            {
+                log::warn!("LAN sync request failed: {error}");
+            }
+        });
+    }
+    Ok(())
 }
 
 async fn handle_peer_stream(
@@ -354,8 +392,8 @@ async fn dispatch_peer(
     request: Request,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
-    let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-    if !settings.enabled || !settings.lan_enabled {
+    let settings = manager.app.state::<SettingsStore>().snapshot();
+    if !settings.sync.enabled || !settings.sync.lan_enabled {
         bail!("LAN sync is disabled");
     }
     let streaming_request = matches!(&request, Request::PutStreamBlob { .. });
@@ -386,24 +424,50 @@ async fn dispatch_peer(
                 bail!("device was removed; pair it again before syncing");
             }
             let key = group.content_key_bytes()?;
-            let deferred_event_ids = events
-                .into_iter()
-                .filter_map(|event| {
-                    let decrypted = match crypto::decrypt_sync_event(&key, &event) {
-                        Ok(value) => value,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
-                        return None;
-                    };
-                    if let Err(error) = validate_envelope(&envelope) {
-                        return Some(Err(error));
-                    }
-                    should_defer_remote_files(&envelope, settings.auto_download_max_mb)
-                        .then_some(Ok(event.event_id))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            write_frame(send, &Response::LanContentPlan { deferred_event_ids }).await?;
+            let resources = crate::core::paths::resources_dir(&manager.app)?;
+            let mut metadata_only_event_ids = Vec::new();
+            let mut available_event_ids = Vec::new();
+            for event in events {
+                let decrypted = crypto::decrypt_sync_event(&key, &event)?;
+                let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
+                    continue;
+                };
+                validate_envelope(&envelope)?;
+                if envelope.item.kind != "files" {
+                    continue;
+                }
+                let source_revision = envelope
+                    .item
+                    .source_revision
+                    .as_deref()
+                    .unwrap_or(&event.event_id);
+                if available_materialized_file_item(
+                    &pool,
+                    &resources,
+                    &envelope.item.sync_key,
+                    source_revision,
+                    envelope.content_identity.as_deref(),
+                )
+                .await?
+                .is_some()
+                {
+                    available_event_ids.push(event.event_id);
+                } else if should_defer_remote_file_download(
+                    &envelope,
+                    settings.sync.auto_download_max_mb,
+                    settings.clipboard.history.max_storage_bytes,
+                ) {
+                    metadata_only_event_ids.push(event.event_id);
+                }
+            }
+            write_frame(
+                send,
+                &Response::LanContentPlan {
+                    metadata_only_event_ids,
+                    available_event_ids,
+                },
+            )
+            .await?;
         }
         Request::Sync {
             group_id,
@@ -412,14 +476,9 @@ async fn dispatch_peer(
             after_cursor,
             events,
             limit,
-            byte_limited,
             events_complete,
-            bounded_hub: _,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
-            if events_complete.is_none() {
-                bail!("对端设备版本过低，请先升级后再同步");
-            }
             let remote_endpoint_id = connection.remote_id().to_string();
             if device.endpoint_id != remote_endpoint_id {
                 bail!("device endpoint identity does not match the connection");
@@ -431,7 +490,7 @@ async fn dispatch_peer(
             if repository::is_peer_removed(&pool, &device.device_id, &remote_endpoint_id).await? {
                 bail!("device was removed; pair it again before syncing");
             }
-            repository::upsert_peer(
+            repository::upsert_peer_identity(
                 &pool,
                 &PeerAnnouncement {
                     device_id: device.device_id.clone(),
@@ -453,6 +512,7 @@ async fn dispatch_peer(
                 transport,
             )
             .await?;
+            let source = SyncConnectionTarget::peer(device.device_id.clone());
             manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
@@ -473,53 +533,89 @@ async fn dispatch_peer(
             }
             let accepted = stored.inserted_event_ids;
             let received_new_events = !accepted.is_empty();
-            let outgoing = repository::events_after_cursor(
+            let (outgoing, scanned_cursor) = repository::peer_events_after_cursor(
                 &pool,
+                &device.device_id,
                 after_cursor,
                 limit.clamp(1, MAX_EVENTS_PER_BATCH),
             )
             .await?;
-            let latest_cursor = outgoing
-                .last()
-                .map(|value| value.cursor)
-                .unwrap_or(after_cursor);
-            let cloud_events = outgoing
+            let cursor_events = outgoing
                 .into_iter()
-                .map(|value| CloudEvent {
+                .map(|value| CursorEvent {
                     cursor: value.cursor,
                     event: value.event,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let only_filtered_events = cursor_events.is_empty() && scanned_cursor > after_cursor;
             let mut response = Response::Synced {
                 accepted_event_ids: accepted,
-                events: cloud_events,
+                events: cursor_events,
                 peers: Vec::new(),
-                latest_cursor,
-                has_more: None,
+                latest_cursor: scanned_cursor,
+                has_more: false,
             };
-            limit_sync_response(
-                &mut response,
-                after_cursor,
-                limit,
-                byte_limited == Some(true),
-            )?;
+            limit_sync_response(&mut response, after_cursor, limit)?;
+            if only_filtered_events {
+                let Response::Synced { latest_cursor, .. } = &mut response else {
+                    unreachable!();
+                };
+                *latest_cursor = scanned_cursor;
+            }
             write_frame(send, &response).await?;
-            let source = SyncConnectionTarget::peer(device.device_id.clone());
             let content_has_more = manager
                 .apply_pending_events(
                     connection,
                     &pool,
                     &group,
-                    &settings,
+                    &settings.sync,
                     &source,
-                    events_complete == Some(true),
+                    events_complete,
                 )
                 .await?;
             if received_new_events || content_has_more {
                 manager.wake_lan_transfer();
             }
         }
-        Request::SyncV2 { .. } => {
+        Request::AcknowledgeLan {
+            group_id,
+            access_token,
+            device,
+            event_ids,
+            complete_event_ids,
+        } => {
+            authenticate_local(manager, &group_id, &access_token)?;
+            if event_ids.len() > usize::from(MAX_EVENTS_PER_BATCH) {
+                bail!("too many LAN receipt events");
+            }
+            let complete_event_ids = complete_event_ids.into_iter().collect::<HashSet<_>>();
+            if complete_event_ids.len() > event_ids.len()
+                || !complete_event_ids
+                    .iter()
+                    .all(|event_id| event_ids.contains(event_id))
+            {
+                bail!("LAN content receipt is invalid for the acknowledged batch");
+            }
+            let remote_endpoint_id = connection.remote_id().to_string();
+            if device.endpoint_id != remote_endpoint_id {
+                bail!("device endpoint identity does not match the connection");
+            }
+            let pool = manager.pool().await;
+            if repository::is_peer_removed(&pool, &device.device_id, &remote_endpoint_id).await? {
+                bail!("device was removed; pair it again before syncing");
+            }
+            let target = SyncConnectionTarget::peer(device.device_id);
+            repository::confirm_lan_receipts(
+                &pool,
+                target.delivery_target(),
+                &event_ids,
+                &complete_event_ids,
+            )
+            .await?;
+            manager.emit_updated();
+            write_frame(send, &Response::LanAcknowledged).await?;
+        }
+        Request::CloudSync { .. } => {
             bail!("combined sync is only supported by the cloud Hub");
         }
         Request::SyncRemovedDevices {
@@ -537,7 +633,7 @@ async fn dispatch_peer(
                 repository::is_peer_removed(&pool, "", &remote_endpoint_id).await?;
             if !remote_was_removed {
                 repository::merge_removed_devices(&pool, &devices).await?;
-                // Membership history alone must not revive a suspended LAN connection attempt.
+                // Membership history alone is not evidence that a LAN route is available.
             }
             let removed = repository::removed_devices(&pool).await?;
             let identity = manager.identity.snapshot();
@@ -619,7 +715,7 @@ async fn dispatch_peer(
                 .await?;
                 return Ok(());
             };
-            if blob.encrypted_path.is_empty() {
+            let streaming_source = if blob.encrypted_path.is_empty() {
                 let Some(source) = blob.source_path.as_deref() else {
                     write_frame(
                         send,
@@ -635,57 +731,91 @@ async fn dispatch_peer(
                     .stream_nonce
                     .as_deref()
                     .context("streaming blob nonce is unavailable")?;
-                write_frame(send, &Response::BlobReady { size: blob.size }).await?;
-                let mut progress = super::super::upload::UploadProgress::new(
-                    connection.stable_id(),
-                    blob_log_ref(&blob.blob_id),
-                    None,
-                );
-                super::super::upload::encrypt_file(
-                    Path::new(source),
-                    send,
-                    super::super::upload::FileEncryptionSpec {
-                        expected_encrypted_size: blob.size,
-                        expected_blob_id: &blob.blob_id,
-                        key: group.content_key_bytes()?,
-                        stream_nonce: nonce,
-                        idle_timeout: BLOB_IDLE_TIMEOUT,
-                        language: crate::i18n::current_language(&manager.app),
-                    },
-                    &mut progress,
-                )
-                .await?;
-                return Ok(());
+                Some((PathBuf::from(source), nonce.to_vec()))
+            } else {
+                None
+            };
+            let staged = if streaming_source.is_none() {
+                match manager.lease_outgoing_staging(&group, &blob).await {
+                    Ok(staged) => Some(staged),
+                    Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
+                        write_frame(
+                            send,
+                            &Response::Error {
+                                code: ErrorCode::NotFound,
+                                message: "blob is unavailable".to_owned(),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let upload = begin_lan_pull_upload(manager, connection, &pool, &group, &blob).await?;
+            if let Some(upload) = &upload {
+                upload.handle.connecting();
             }
-            let (staged, _staging_lease) = match manager.lease_outgoing_staging(&group, &blob).await
-            {
-                Ok(staged) => staged,
-                Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
-                    write_frame(
+            let mut progress = super::super::upload::UploadProgress::new(
+                connection.stable_id(),
+                blob_log_ref(&blob.blob_id),
+                upload.as_ref().map(|upload| upload.handle.clone()),
+            );
+            let result = async {
+                if let Some((source, nonce)) = streaming_source {
+                    write_frame(send, &Response::BlobReady { size: blob.size }).await?;
+                    super::super::upload::encrypt_file(
+                        &source,
                         send,
-                        &Response::Error {
-                            code: ErrorCode::NotFound,
-                            message: "blob is unavailable".to_owned(),
+                        super::super::upload::FileEncryptionSpec {
+                            expected_encrypted_size: blob.size,
+                            expected_blob_id: &blob.blob_id,
+                            key: group.content_key_bytes()?,
+                            stream_nonce: &nonce,
+                            idle_timeout: BLOB_IDLE_TIMEOUT,
+                            language: crate::i18n::current_language(&manager.app),
                         },
+                        &mut progress,
                     )
                     .await?;
-                    return Ok(());
+                } else if let Some((staged, _staging_lease)) = staged {
+                    let path = PathBuf::from(&staged.encrypted_path);
+                    let size = path.metadata()?.len();
+                    write_frame(send, &Response::BlobReady { size }).await?;
+                    let mut file = tokio::fs::File::open(path).await?;
+                    super::super::upload::copy(
+                        &mut file,
+                        send,
+                        BLOB_IDLE_TIMEOUT,
+                        crate::i18n::current_language(&manager.app),
+                        &mut progress,
+                    )
+                    .await?;
                 }
-                Err(error) => return Err(error),
-            };
-            let path = PathBuf::from(&staged.encrypted_path);
-            let size = path.metadata()?.len();
-            write_frame(send, &Response::BlobReady { size }).await?;
-            let mut file = tokio::fs::File::open(path).await?;
-            copy_with_idle_timeout(&mut file, send, BLOB_IDLE_TIMEOUT).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Some(upload) = upload {
+                match &result {
+                    Ok(()) => upload.handle.completed(upload.total_bytes),
+                    Err(_) if upload.handle.canceled() => {
+                        upload.handle.mark_canceled(progress.written_bytes);
+                    }
+                    Err(error) => upload
+                        .handle
+                        .failed(progress.written_bytes, error.to_string()),
+                }
+                if let Err(error) = repository::unlock_transfer_item(&pool, &upload.task_id).await {
+                    log::warn!("release LAN pull transfer protection failed: {error:#}");
+                }
+            }
+            result?;
         }
         Request::CreateGroup { .. }
-        | Request::HealthV2
-        | Request::Watch { .. }
-        | Request::WatchGroup { .. }
-        | Request::WatchGroupStream { .. }
-        | Request::WatchGroupStreamV2 { .. }
-        | Request::WatchGroupStreamV3 { .. }
+        | Request::CloudHealth
+        | Request::WatchCloud { .. }
         | Request::ListEvents { .. }
         | Request::ListDevices { .. }
         | Request::BootstrapPlan { .. }
@@ -694,9 +824,87 @@ async fn dispatch_peer(
         | Request::PutManagedBlob { .. }
         | Request::PutManagedSourceIcon { .. }
         | Request::PutManagedStreamBlob { .. }
+        | Request::SyncCloudAvailability { .. }
         | Request::CommitStreamBlob { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
     }
     Ok(())
+}
+
+struct LanPullUpload {
+    handle: super::super::progress::TransferHandle,
+    task_id: String,
+    total_bytes: u64,
+}
+
+/// Registers a receiver-initiated LAN pull in the same sender-side task lifecycle as a push.
+async fn begin_lan_pull_upload(
+    manager: &SyncManager,
+    connection: &Connection,
+    pool: &SqlitePool,
+    group: &GroupSecrets,
+    blob: &StoredBlob,
+) -> Result<Option<LanPullUpload>> {
+    let Some((item_id, stored)) =
+        repository::outgoing_file_event_for_blob(pool, &blob.blob_id).await?
+    else {
+        return Ok(None);
+    };
+    let decrypted = crypto::decrypt_sync_event(&group.content_key_bytes()?, &stored.event)?;
+    let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
+        return Ok(None);
+    };
+    validate_envelope(&envelope)?;
+    let file_manifests = envelope
+        .blobs
+        .iter()
+        .filter(|manifest| manifest.role == BlobRole::File)
+        .collect::<Vec<_>>();
+    let Some(manifest) = file_manifests
+        .iter()
+        .find(|manifest| manifest.blob_id == blob.blob_id)
+    else {
+        return Ok(None);
+    };
+    let Some(peer_device_id) =
+        repository::peer_device_id_by_endpoint(pool, &connection.remote_id().to_string()).await?
+    else {
+        return Ok(None);
+    };
+    let target = format!("peer:{peer_device_id}");
+    let operation_total_bytes = file_manifests.iter().fold(0_u64, |total, manifest| {
+        total.saturating_add(manifest.encrypted_size)
+    });
+    let task_key = format!(
+        "{}\0{}\0{}\0lan-pull",
+        stored.event.event_id, target, blob.blob_id
+    );
+    let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
+    repository::lock_transfer_item(pool, &task_id, &item_id).await?;
+    let handle = manager
+        .delivery
+        .start_transient(super::super::progress::TransferTask {
+            id: task_id.clone(),
+            revision: 0,
+            operation_id: stored.event.event_id,
+            item_id,
+            direction: super::super::progress::TransferDirection::Upload,
+            route: super::super::progress::TransferRoute::Lan,
+            target,
+            file_name: (file_manifests.len() == 1).then(|| manifest.name.clone()),
+            phase: super::super::progress::TransferPhase::Queued,
+            transferred_bytes: 0,
+            total_bytes: operation_total_bytes,
+            speed_bytes_per_second: 0,
+            elapsed_ms: 0,
+            eta_seconds: None,
+            error: None,
+            cancellable: true,
+        });
+    Ok(Some(LanPullUpload {
+        handle,
+        task_id,
+        total_bytes: manifest.encrypted_size,
+    }))
 }

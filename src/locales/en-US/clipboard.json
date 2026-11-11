@@ -1,11 +1,14 @@
 {
   "cardMeta": {
+    "compactCharacters": "{{count}} chars",
+    "compactItems": "{{count}} items",
     "file": "{{count}} file",
     "files": "{{count}} files",
     "folder": "{{count}} folder",
     "folders": "{{count}} folders",
     "item": "{{count}} item",
-    "items": "{{count}} items"
+    "items": "{{count}} items",
+    "useCount": "Used {{count}} times"
   },
   "empty": {
     "categories": {
@@ -102,8 +105,11 @@
     "confirming": "Verifying and saving",
     "connecting": "Connecting",
     "download": "Download",
+    "downloadAgain": "Download again",
+    "downloadedExternally": "Saved to the selected location",
     "eta": "about {{seconds}}s remaining",
     "expired": "Remote file expired",
+    "externalMissing": "The external file is missing; download it again",
     "failed": "Download failed; click to retry",
     "notDownloaded": "Not downloaded",
     "queued": "Waiting to download",
@@ -139,24 +145,36 @@
     "cloud": {
       "activeRoute": "Last successful route ({{transport}}): {{address}}",
       "confirming": "Cloud: awaiting confirmation",
+      "downloading": "Cloud: downloading files",
       "error": "Cloud sync failed; click to retry",
       "errorWithReason": "Cloud: {{reason}}; retrying automatically, or click to retry",
       "idle": "Cloud: not used for this item",
-      "manual": "Cloud: exceeds the automatic limit; click to upload",
+      "manual": "Cloud: exceeds the automatic upload limit; click to upload the file",
+      "metadataOnly": "Cloud: record only synced; click to upload the file",
+      "partial": "Cloud: content ready on {{content}}/{{total}} targets",
       "queued": "Cloud: waiting to sync",
+      "remoteMetadataOnly": "Cloud: record synced; file content is not uploaded",
+      "remoteSuccess": "Cloud: file content is ready",
+      "remoteSyncing": "Cloud: starting file download",
       "started": "Cloud sync started",
-      "success": "Cloud: synced",
+      "success": "Cloud: file content synced",
       "syncing": "Cloud: uploading"
     },
     "lan": {
       "confirming": "LAN: awaiting confirmation",
+      "downloading": "LAN: downloading files",
       "error": "LAN sync failed; click to retry",
       "errorWithReason": "LAN: {{reason}}; retrying automatically, or click to retry",
       "idle": "LAN: no online devices; skipped",
       "manual": "LAN: manual sync required; click to transfer",
+      "metadataOnly": "LAN: record only synced to {{delivered}}/{{total}} devices; download it on the receiving device",
+      "partial": "LAN: file content reached {{content}}/{{total}} devices",
       "queued": "LAN: waiting to sync",
+      "remoteMetadataOnly": "LAN: record synced; file content is not delivered",
+      "remoteSuccess": "LAN: file content is ready",
+      "remoteSyncing": "LAN: starting file download",
       "started": "LAN sync started",
-      "success": "LAN: delivered to {{delivered}}/{{total}} devices",
+      "success": "LAN: complete content delivered to {{delivered}}/{{total}} devices",
       "syncing": "LAN: delivering"
     }
   },
@@ -238,6 +256,16 @@
     }
   },
   "transfer": {
+    "import": {
+      "canceled": "Import canceled",
+      "completed": "Import complete",
+      "confirming": "Finishing import",
+      "connecting": "Preparing import",
+      "failed": "Import failed",
+      "preparing": "Importing",
+      "queued": "Import complete",
+      "transferring": "Importing"
+    },
     "upload": {
       "canceled": "Upload canceled",
       "completed": "Upload complete",
@@ -259,9 +287,27 @@
       "queued": "Waiting to download",
       "transferring": "Downloading"
     },
-    "empty": "No transfers",
+    "empty": "No file transfer activity",
+    "import": {
+      "canceled": "Import canceled",
+      "completed": "Import complete",
+      "confirming": "Finishing import",
+      "connecting": "Preparing import",
+      "failed": "Import failed",
+      "preparing": "Importing",
+      "queued": "Import complete",
+      "transferring": "Importing"
+    },
+    "item": "File transfer",
+    "itemCount": "{{count}} items",
     "retry": "Retry",
-    "title": "Transfers",
+    "route": {
+      "cloud": "Cloud",
+      "lan": "Wi-Fi",
+      "lanDevice": "Wi-Fi · {{device}}",
+      "local": "Local"
+    },
+    "title": "File transfers",
     "upload": {
       "canceled": "Upload canceled",
       "completed": "Upload complete",

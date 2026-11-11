@@ -9,6 +9,8 @@
 //! 登记的指纹不会永久滞留导致后续同内容复制被吞。HTML/RTF 写回会同时写入纯文本回退，
 //! 因此 guard 支持短期登记多个指纹。
 
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

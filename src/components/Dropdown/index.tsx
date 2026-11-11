@@ -6,8 +6,8 @@ import Tooltip, {
   resolveOverlayTooltipProps,
 } from "@/components/Tooltip";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 import { cn } from "@/utils/cn";
-import { isAndroid } from "@/utils/is";
 
 const DEFAULT_MENU_ICON_CLASS = "text-sm! shrink-0";
 
@@ -118,12 +118,15 @@ const Dropdown: FC<AppDropdownProps> = (props) => {
   useAndroidBack(mergedOpen, () => {
     handleOpenChange(false, { source: "trigger" });
   });
+  useCloseAppOverlay(mergedOpen, () => {
+    handleOpenChange(false, { source: "trigger" });
+  });
 
   return (
     <AntdDropdown
       menu={normalizedMenu}
       onOpenChange={handleOpenChange}
-      open={isAndroid ? mergedOpen : open}
+      open={mergedOpen}
       {...rest}
     >
       {renderDropdownTrigger(children, tooltip, mergedOpen)}

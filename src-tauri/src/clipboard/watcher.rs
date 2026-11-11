@@ -288,7 +288,7 @@ pub(crate) async fn persist_and_notify_with_sync(
 }
 
 /// 发出统一的记录刷新通知，并同步唤醒 Android 原生上滑面板。
-fn notify_clipboard_updated(
+pub(super) fn notify_clipboard_updated(
     app: &AppHandle,
     item_id: &str,
     kind: ClipboardKind,
@@ -487,18 +487,16 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
 #[cfg(target_os = "android")]
 pub fn capture_android_text(app: &AppHandle, text: String, source: Option<FrontmostApp>) {
     let app = app.clone();
-    let guard = app.state::<Arc<WritebackGuard>>().inner().clone();
     let store = app.state::<ImageStore>().inner().clone();
     let pause = app.state::<WatcherPause>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        persist_android_text(&app, &guard, &store, &pause, text, source).await;
+        persist_android_text(&app, &store, &pause, text, source).await;
     });
 }
 
 #[cfg(target_os = "android")]
 async fn persist_android_text(
     app: &AppHandle,
-    guard: &WritebackGuard,
     store: &ImageStore,
     pause: &WatcherPause,
     text: String,
@@ -530,13 +528,17 @@ async fn persist_android_text(
         Ok(Some(item)) => item,
         _ => return,
     };
-    if guard.should_skip(&item.content_hash) {
-        if let Some(fingerprint) = ClipboardFingerprint::from_text_item(&item) {
+    let fingerprint = ClipboardFingerprint::from_text_item(&item);
+    let delayed_writeback = fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| observation.matches_pending_writeback(fingerprint));
+    if delayed_writeback {
+        if let Some(fingerprint) = fingerprint {
             fingerprints.commit_observation(&observation, fingerprint);
         }
         return;
     }
-    if let Some(fingerprint) = ClipboardFingerprint::from_text_item(&item) {
+    if let Some(fingerprint) = fingerprint {
         fingerprints.commit_observation(&observation, fingerprint);
     }
     let source_app = source.map(|source| {

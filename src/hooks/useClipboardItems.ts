@@ -5,6 +5,7 @@ import {
   type ClipboardItemsRange,
   getMissingClipboardRanges,
 } from "./clipboardItemRanges";
+import { upsertClipboardItemCache } from "./clipboardItemUpdates";
 
 /**
  * 预加载范围按页对齐，实际请求只读取其中尚未加载的部分。
@@ -16,6 +17,7 @@ const CACHE_KEEP_RADIUS = 90;
 
 interface FetchRangeOptions {
   force?: boolean;
+  replace?: boolean;
   token: number;
 }
 
@@ -120,7 +122,9 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
             if (options.token !== requestTokenRef.current) return;
 
             const nextTotal = Math.max(0, page.total);
-            const nextItems = new Map(itemsRef.current);
+            const nextItems = options.replace
+              ? new Map<number, ClipboardItem>()
+              : new Map(itemsRef.current);
             page.list.forEach((item, offset) => {
               const index = range.start + offset;
               if (index < nextTotal) nextItems.set(index, item);
@@ -235,14 +239,62 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     requestTokenRef.current = token;
     staleRangeRef.current = false;
     resetLoadingRanges();
-    commitItems(new Map());
 
     const { end, start } = viewRangeRef.current;
     await fetchRange(start - PRELOAD_ROWS, end + PRELOAD_ROWS, {
       force: true,
+      replace: true,
       token,
     });
-  }, [commitItems, fetchRange, resetLoadingRanges]);
+  }, [fetchRange, resetLoadingRanges]);
+
+  /**
+   * 在已加载的顶部范围内增量插入或移动一条记录。只保留连续前缀缓存，
+   * 让后续滚动按缺失范围重新读取，避免把旧分页位置与新排序混在一起。
+   */
+  const upsertItem = useCallback(
+    (item: ClipboardItem, options: { existing: boolean }) => {
+      const token = requestTokenRef.current + 1;
+      requestTokenRef.current = token;
+      staleRangeRef.current = false;
+      resetLoadingRanges();
+
+      const next = upsertClipboardItemCache({
+        existing: options.existing,
+        item,
+        items: itemsRef.current,
+        maxItems: CACHE_MAX_ROWS,
+        query: queryRef.current,
+        total: totalRef.current,
+      });
+      commitItems(next.items);
+      commitTotal(next.total);
+    },
+    [commitItems, commitTotal, resetLoadingRanges],
+  );
+
+  /** 使用一条权威记录携带的来源应用元数据，批量修补当前缓存中的同源卡片。 */
+  const patchSourceApp = useCallback(
+    (appId: string, source: ClipboardItem) => {
+      let changed = false;
+      const nextItems = new Map(itemsRef.current);
+      for (const [index, item] of nextItems) {
+        if (item.sourceAppId !== appId) continue;
+
+        nextItems.set(index, {
+          ...item,
+          sourceAppAccentEnd: source.sourceAppAccentEnd,
+          sourceAppAccentStart: source.sourceAppAccentStart,
+          sourceAppIconFile: source.sourceAppIconFile,
+          sourceAppIconPath: source.sourceAppIconPath,
+          sourceAppName: source.sourceAppName,
+        });
+        changed = true;
+      }
+      if (changed) commitItems(nextItems);
+    },
+    [commitItems],
+  );
 
   const loadRange = useCallback(
     (startIndex: number, endIndex: number) => {
@@ -390,10 +442,12 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
     loadingMore: loadingRangeCount > 0 && loadedInitial,
     loadRange,
     patchItemById,
+    patchSourceApp,
     reload,
     reloadCurrentRange,
     removeItemById,
     total,
+    upsertItem,
   };
 };
 

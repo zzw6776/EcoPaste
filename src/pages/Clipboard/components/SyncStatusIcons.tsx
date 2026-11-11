@@ -24,6 +24,7 @@ import { isAndroid, isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
 import CloudDevicesDrawer from "./CloudDevicesDrawer";
 import CloudRecordsDrawer from "./CloudRecordsDrawer";
+import HeaderActionPopoverPanel from "./HeaderActionPopoverPanel";
 import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
 
 interface SyncStatusIconsProps {
@@ -266,11 +267,13 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
           <>
             <Popover
               content={
-                <LanDetails
-                  onReconnect={handleReconnect}
-                  reconnectingKey={reconnectingKey}
-                  status={status}
-                />
+                <HeaderActionPopoverPanel>
+                  <LanDetails
+                    onReconnect={handleReconnect}
+                    reconnectingKey={reconnectingKey}
+                    status={status}
+                  />
+                </HeaderActionPopoverPanel>
               }
               onOpenChange={handleLanDetailsOpenChange}
               open={detailsTarget === "lan"}
@@ -287,7 +290,11 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
             </Popover>
 
             <Popover
-              content={cloudDetails}
+              content={
+                <HeaderActionPopoverPanel>
+                  {cloudDetails}
+                </HeaderActionPopoverPanel>
+              }
               onOpenChange={handleCloudDetailsOpenChange}
               open={detailsTarget === "cloud"}
               placement="bottomRight"
@@ -428,7 +435,7 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
   }
 
   return (
-    <div className="flex w-72 flex-col gap-2 text-sm">
+    <div className="flex h-full min-h-0 w-full flex-col gap-2 text-sm">
       <div className="flex items-center justify-between gap-2">
         <strong>{t("syncStatus.lan.title")}</strong>
         <Tooltip title={t("syncStatus.lan.reconnectAll")}>
@@ -448,7 +455,7 @@ const LanDetails: FC<LanDetailsProps> = (props) => {
         </Tooltip>
       </div>
       <ScrollArea
-        className="max-h-[calc(100vh-8rem)] overscroll-contain"
+        className="min-h-0 flex-1 overscroll-contain"
         contentClassName="flex flex-col gap-2 pr-2"
       >
         {peerContent}
@@ -604,7 +611,7 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
     <div
       className={cn(
         "flex flex-col gap-2 text-sm",
-        showTitle ? "w-72" : "w-full",
+        showTitle ? "h-full min-h-0 w-full overflow-y-auto" : "w-full",
       )}
     >
       {showTitle ? <strong>{t("syncStatus.cloud.title")}</strong> : null}

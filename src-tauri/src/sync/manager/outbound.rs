@@ -87,13 +87,18 @@ impl SyncManager {
                             materialized_content += 1;
                         }
                         Err(error) => {
-                            db::sync_queue::fail_content(
+                            let retry_delay = db::sync_queue::fail_content(
                                 &pool,
                                 operation.operation_order,
                                 &error.to_string(),
                             )
                             .await?;
-                            return Err(error);
+                            log::warn!(
+                                "defer local sync content preparation: operationOrder={} retryInSecs={} error={error:#}",
+                                operation.operation_order,
+                                retry_delay.num_seconds(),
+                            );
+                            self.schedule_transfer_wake(retry_delay);
                         }
                     }
                     if materialized_content >= max_content {
@@ -157,8 +162,9 @@ impl SyncManager {
             return Ok(ContentMaterialization::Completed);
         }
         if let Some(stored) = repository::latest_local_event_for_item(pool, &item.id).await? {
-            if event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item) {
-                repository::clear_pending_item(pool, &item.id).await?;
+            if !operation.manual_share
+                && event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item)
+            {
                 db::sync_queue::complete_content(pool, operation.operation_order).await?;
                 self.discard_pending_observation(&operation.item_id, &operation.source_revision);
                 return Ok(ContentMaterialization::Completed);
@@ -166,7 +172,6 @@ impl SyncManager {
         } else if operation.history_backfill
             && repository::event_for_item(pool, &item.id).await?.is_some()
         {
-            repository::clear_pending_item(pool, &item.id).await?;
             db::sync_queue::complete_content(pool, operation.operation_order).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
             return Ok(ContentMaterialization::Completed);
@@ -175,7 +180,6 @@ impl SyncManager {
             return Ok(ContentMaterialization::Deferred);
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
-        let force_files = operation.force_files || operation.manual_share;
         let preparation = if item.kind == ClipboardKind::Files {
             match preparation_target {
                 Some(target)
@@ -198,16 +202,9 @@ impl SyncManager {
             None
         };
         let envelope_result = self
-            .build_envelope(
-                &event_id,
-                &item,
-                settings,
-                group,
-                force_files,
-                preparation.as_ref(),
-            )
+            .build_envelope(pool, &event_id, &item, group, preparation.as_ref())
             .await;
-        let (envelope, blobs, fingerprint, staging) = match envelope_result {
+        let (envelope, blobs, content_objects, fingerprint, staging) = match envelope_result {
             Err(error) => {
                 if let Some(preparation) = &preparation {
                     if preparation.handle.canceled() {
@@ -226,18 +223,7 @@ impl SyncManager {
                 }
                 return Err(error);
             }
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                if let Some(preparation) = &preparation {
-                    preparation.handle.completed(0);
-                }
-                repository::mark_pending_item(pool, &item.id, "文件卡片总大小超过自动同步阈值")
-                    .await?;
-                db::sync_queue::complete_content(pool, operation.operation_order).await?;
-                self.discard_pending_observation(&operation.item_id, &operation.source_revision);
-                self.emit_updated();
-                return Ok(ContentMaterialization::Completed);
-            }
+            Ok(value) => value,
         };
         let preparation_failure = crate::i18n::commands::label(
             crate::i18n::current_language(&self.app),
@@ -294,6 +280,12 @@ impl SyncManager {
                 sync_key: &item.sync_key,
                 is_sensitive: item.is_sensitive,
                 delivery_route: operation.delivery_route.as_deref(),
+                group_id: &group.group_id,
+                content_objects: &content_objects,
+                content_identity: envelope
+                    .content_identity
+                    .as_deref()
+                    .context("missing synchronized content identity")?,
             },
         )
         .await?;
@@ -329,20 +321,18 @@ impl SyncManager {
 
     async fn build_envelope(
         &self,
+        pool: &SqlitePool,
         _event_id: &str,
         item: &ClipboardItem,
-        settings: &SyncSettings,
         group: &GroupSecrets,
-        force_files: bool,
         preparation: Option<&PreparationProgress>,
-    ) -> Result<
-        Option<(
-            ClipboardEnvelope,
-            Vec<StoredBlob>,
-            Option<ClipboardFingerprint>,
-            TaskStagingCleanup,
-        )>,
-    > {
+    ) -> Result<(
+        ClipboardEnvelope,
+        Vec<StoredBlob>,
+        Vec<StoredContentObject>,
+        Option<ClipboardFingerprint>,
+        TaskStagingCleanup,
+    )> {
         let _sync_activity = SyncActivityGuard::acquire();
         let _resource_guard = if item.kind == ClipboardKind::Text {
             None
@@ -354,6 +344,7 @@ impl SyncManager {
         let blob_root = resources.join(SYNC_STAGING_DIR);
         let mut manifests = Vec::new();
         let mut stored_blobs = Vec::new();
+        let mut content_objects = Vec::new();
         let mut staging = self.delivery.new_staging_cleanup();
         let mut envelope_size = item.size;
         let mut clipboard_fingerprint = None;
@@ -392,25 +383,6 @@ impl SyncManager {
                 if paths.is_empty() {
                     bail!("没有可同步的文件");
                 }
-                if !force_files {
-                    if settings.auto_upload_max_mb == 0 {
-                        return Ok(None);
-                    }
-                    let resources = crate::core::paths::resources_dir(&self.app)?;
-                    let total_size =
-                        calculate_current_file_item_size(&self.pool().await, item, &resources)
-                            .await;
-                    let total_size = match total_size {
-                        Ok(Some(size)) => {
-                            u64::try_from(size).context("invalid clipboard file size")?
-                        }
-                        Ok(None) => return Ok(None),
-                        Err(error) => return Err(error),
-                    };
-                    if !permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
-                        return Ok(None);
-                    }
-                }
                 let mut packed_total_size = 0_u64;
                 let mut file_fingerprints = Vec::with_capacity(paths.len());
                 for (index, source) in paths.into_iter().enumerate() {
@@ -420,91 +392,123 @@ impl SyncManager {
                     let progress_base = preparation
                         .map(PreparationProgress::processed)
                         .unwrap_or(packed_total_size);
-                    let (mut blob, original_size, content_size, content_hash) = if is_directory {
-                        let root_for_task = blob_root.clone();
-                        let key_for_task = key;
-                        let preparation_for_task = preparation.cloned();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            let temporary = tempfile::tempdir()?;
-                            let archive_path = temporary.path().join("directory.zip");
-                            let archived = crypto::archive_directory_with_progress(
-                                &source_for_task,
-                                &archive_path,
-                                || {
-                                    preparation_for_task
-                                        .as_ref()
-                                        .is_some_and(|progress| progress.handle.canceled())
-                                },
-                                |processed| {
-                                    if let Some(progress) = &preparation_for_task {
-                                        progress.report(progress_base.saturating_add(processed));
-                                    }
-                                },
-                            )?;
-                            let archive_size = archive_path.metadata()?.len();
-                            let blob = crypto::encrypt_blob_with_cancel(
-                                &archive_path,
-                                &root_for_task,
-                                &key_for_task,
-                                || {
-                                    preparation_for_task
-                                        .as_ref()
-                                        .is_some_and(|progress| progress.handle.canceled())
-                                },
-                            )?;
-                            Ok::<_, anyhow::Error>((
-                                blob,
-                                archive_size,
-                                archived.content_size,
-                                archived.fingerprint,
-                            ))
-                        })
-                        .await
-                        .context("directory encryption task failed")??
-                    } else {
-                        let key_for_task = key;
-                        let preparation_for_task = preparation.cloned();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            let size = source_for_task.metadata()?.len();
-                            let content_hash = crypto::hash_file_with_progress(
-                                &source_for_task,
-                                || {
-                                    preparation_for_task
-                                        .as_ref()
-                                        .is_some_and(|progress| progress.handle.canceled())
-                                },
-                                |processed| {
-                                    if let Some(progress) = &preparation_for_task {
-                                        progress.report(progress_base.saturating_add(processed));
-                                    }
-                                },
-                            )?;
-                            let stream_nonce = crypto::new_stream_nonce();
-                            let blob_id = crypto::stream_blob_id(
-                                &key_for_task,
-                                &stream_nonce,
-                                &content_hash,
-                            )?;
+                    let (mut blob, original_size, content_size, content_hash, content_object) =
+                        if is_directory {
+                            let root_for_task = blob_root.clone();
+                            let key_for_task = key;
+                            let preparation_for_task = preparation.cloned();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let temporary = tempfile::tempdir()?;
+                                let archive_path = temporary.path().join("directory.zip");
+                                let archived = crypto::archive_directory_with_progress(
+                                    &source_for_task,
+                                    &archive_path,
+                                    || {
+                                        preparation_for_task
+                                            .as_ref()
+                                            .is_some_and(|progress| progress.handle.canceled())
+                                    },
+                                    |processed| {
+                                        if let Some(progress) = &preparation_for_task {
+                                            progress
+                                                .report(progress_base.saturating_add(processed));
+                                        }
+                                    },
+                                )?;
+                                let archive_size = archive_path.metadata()?.len();
+                                let blob = crypto::encrypt_blob_with_cancel(
+                                    &archive_path,
+                                    &root_for_task,
+                                    &key_for_task,
+                                    || {
+                                        preparation_for_task
+                                            .as_ref()
+                                            .is_some_and(|progress| progress.handle.canceled())
+                                    },
+                                )?;
+                                Ok::<_, anyhow::Error>((
+                                    blob,
+                                    archive_size,
+                                    archived.content_size,
+                                    archived.fingerprint,
+                                    None,
+                                ))
+                            })
+                            .await
+                            .context("directory encryption task failed")??
+                        } else {
+                            let preparation_for_task = preparation.cloned();
+                            let (size, content_hash) =
+                                tauri::async_runtime::spawn_blocking(move || {
+                                    let size = source_for_task.metadata()?.len();
+                                    let content_hash = crypto::hash_file_with_progress(
+                                        &source_for_task,
+                                        || {
+                                            preparation_for_task
+                                                .as_ref()
+                                                .is_some_and(|progress| progress.handle.canceled())
+                                        },
+                                        |processed| {
+                                            if let Some(progress) = &preparation_for_task {
+                                                progress.report(
+                                                    progress_base.saturating_add(processed),
+                                                );
+                                            }
+                                        },
+                                    )?;
+                                    Ok::<_, anyhow::Error>((size, content_hash))
+                                })
+                                .await
+                                .context("file hashing task failed")??;
                             let encrypted_size = crypto::encrypted_blob_size(size)?;
-                            Ok::<_, anyhow::Error>((
+                            let reusable = repository::reusable_content_object(
+                                pool,
+                                &group.group_id,
+                                &content_hash,
+                                size,
+                            )
+                            .await?
+                            .filter(|object| {
+                                object.encrypted_size == encrypted_size
+                                    && crypto::stream_blob_id(
+                                        &key,
+                                        &object.stream_nonce,
+                                        &content_hash,
+                                    )
+                                    .is_ok_and(|blob_id| blob_id == object.blob_id)
+                            });
+                            let object = match reusable {
+                                Some(object) => object,
+                                None => {
+                                    let stream_nonce = crypto::new_stream_nonce();
+                                    StoredContentObject {
+                                        blob_id: crypto::stream_blob_id(
+                                            &key,
+                                            &stream_nonce,
+                                            &content_hash,
+                                        )?,
+                                        plaintext_hash: content_hash.clone(),
+                                        stream_nonce,
+                                        original_size: size,
+                                        encrypted_size,
+                                    }
+                                }
+                            };
+                            (
                                 StoredBlob {
-                                    blob_id,
+                                    blob_id: object.blob_id.clone(),
                                     encrypted_path: String::new(),
-                                    size: encrypted_size,
-                                    source_path: Some(
-                                        source_for_task.to_string_lossy().into_owned(),
-                                    ),
+                                    size: object.encrypted_size,
+                                    source_path: Some(source.to_string_lossy().into_owned()),
                                     source_is_directory: false,
-                                    stream_nonce: Some(stream_nonce),
+                                    stream_nonce: Some(object.stream_nonce.clone()),
                                 },
                                 size,
                                 size,
                                 content_hash,
-                            ))
-                        })
-                        .await
-                        .context("file hashing task failed")??
-                    };
+                                Some(object),
+                            )
+                        };
                     staging.track(&blob);
                     if preparation.is_some_and(|progress| progress.handle.canceled()) {
                         bail!("transfer canceled");
@@ -524,6 +528,9 @@ impl SyncManager {
                         is_directory,
                         content_hash,
                     });
+                    if let Some(content_object) = content_object {
+                        content_objects.push(content_object);
+                    }
                     manifests.push(BlobManifest {
                         blob_id: blob.blob_id.clone(),
                         name,
@@ -535,14 +542,6 @@ impl SyncManager {
                         stream_commitment: !is_directory,
                     });
                     stored_blobs.push(blob);
-                }
-                if !force_files
-                    && !permits_automatic_file_upload(
-                        packed_total_size,
-                        settings.auto_upload_max_mb,
-                    )
-                {
-                    return Ok(None);
                 }
                 envelope_size = Some(
                     i64::try_from(packed_total_size)
@@ -558,7 +557,14 @@ impl SyncManager {
         for blob in &stored_blobs[source_blob_start..] {
             staging.track(blob);
         }
-        Ok(Some((
+        let content_identity = match item.kind {
+            ClipboardKind::Files => clipboard_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.as_str().to_owned())
+                .context("missing synchronized file content identity")?,
+            ClipboardKind::Text | ClipboardKind::Image => item.content_hash.clone(),
+        };
+        Ok((
             ClipboardEnvelope {
                 version: 1,
                 item: SyncedClipboardItem {
@@ -580,11 +586,13 @@ impl SyncManager {
                 },
                 blobs: manifests,
                 source_app,
+                content_identity: Some(content_identity),
             },
             stored_blobs,
+            content_objects,
             clipboard_fingerprint,
             staging,
-        )))
+        ))
     }
 
     /// Builds a privacy-preserving source reference and reuses the existing blob transport.

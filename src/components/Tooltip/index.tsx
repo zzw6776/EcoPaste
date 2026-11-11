@@ -1,6 +1,7 @@
 import { Tooltip as AntdTooltip, type TooltipProps } from "antd";
 import type { FC } from "react";
-import { isValidElement } from "react";
+import { isValidElement, useState } from "react";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 
 export type OverlayTooltipConfig =
   | TooltipProps["title"]
@@ -36,13 +37,26 @@ export const resolveOverlayTooltipProps = (
  * 调用方与原生 Tooltip 完全兼容，传入的 `align` 会整体覆盖默认值。
  */
 const Tooltip: FC<TooltipProps> = (props) => {
-  const { align, ...rest } = props;
+  const { align, defaultOpen, onOpenChange, open, ...rest } = props;
+  const [innerOpen, setInnerOpen] = useState(defaultOpen ?? false);
+  const mergedOpen = open ?? innerOpen;
+
+  function handleOpenChange(nextOpen: boolean) {
+    setInnerOpen(nextOpen);
+    onOpenChange?.(nextOpen);
+  }
+
+  useCloseAppOverlay(mergedOpen, () => {
+    handleOpenChange(false);
+  });
 
   return (
     <AntdTooltip
       align={
         align ?? { overflow: { adjustY: true, shiftX: true, shiftY: true } }
       }
+      onOpenChange={handleOpenChange}
+      open={mergedOpen}
       {...rest}
     />
   );
