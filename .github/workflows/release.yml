@@ -149,7 +149,7 @@ jobs:
         include:
           - apple_candidate: native
             label: macOS Apple Silicon (native)
-            os: macos-26
+            os: macos-15
             publish_release: false
             redundant: true
             target: aarch64-apple-darwin

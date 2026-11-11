@@ -98,6 +98,14 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
   assert.equal(workflow.match(/target: aarch64-apple-darwin/g)?.length, 2);
   assert.match(
     workflow,
+    /label: macOS Apple Silicon \(native\)\n\s+os: macos-15/,
+  );
+  assert.match(
+    workflow,
+    /label: macOS Apple Silicon \(Intel fallback\)\n\s+os: macos-26-intel/,
+  );
+  assert.match(
+    workflow,
     /name: macos-aarch64-\$\{\{ matrix\.apple_candidate }}/,
   );
   assert.match(workflow, /name: Upload macOS Apple Silicon/);
