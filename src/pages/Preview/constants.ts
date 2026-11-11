@@ -1,5 +1,4 @@
 export const PREVIEW_CACHE_LIMIT = 16;
-export const PREVIEW_PANEL_GAP = 40;
 export const PREVIEW_PANEL_MARGIN = 32;
 export const PREVIEW_PANEL_MIN_HEIGHT = 260;
 export const PREVIEW_PANEL_MIN_WIDTH = 460;

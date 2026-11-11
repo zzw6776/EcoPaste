@@ -3,6 +3,8 @@
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "android")]
+use std::{collections::HashSet, io::Write, mem::ManuallyDrop, os::fd::FromRawFd, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -24,9 +26,16 @@ pub(crate) struct ShareDelivery {
 
 #[derive(Deserialize)]
 struct SharedFile {
+    #[serde(default)]
     path: PathBuf,
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    fd: Option<i32>,
     name: String,
     mime: String,
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    size: Option<u64>,
 }
 
 #[derive(Default)]
@@ -250,6 +259,225 @@ fn prepare_items(
     (items, outcome)
 }
 
+/// Applies the shared delivery policy and maps its exclusive route into the durable outbox model.
+#[cfg(target_os = "android")]
+fn shared_delivery_route(
+    item: &ClipboardItem,
+    auto_upload_max_mb: u32,
+    lan_connected: bool,
+) -> Option<crate::db::sync_queue::ContentDeliveryRoute> {
+    let target = crate::sync::android_share_delivery_target(
+        item.kind == crate::db::models::ClipboardKind::Files,
+        item.size.and_then(|size| u64::try_from(size).ok()),
+        auto_upload_max_mb,
+        lan_connected,
+    )?;
+    Some(match target {
+        crate::sync::SyncTarget::Lan => crate::db::sync_queue::ContentDeliveryRoute::Lan,
+        crate::sync::SyncTarget::Cloud => crate::db::sync_queue::ContentDeliveryRoute::Cloud,
+    })
+}
+
+#[cfg(target_os = "android")]
+fn clone_shared_descriptor(file: &SharedFile) -> Result<fs::File> {
+    let fd = file.fd.context("shared attachment descriptor is missing")?;
+    anyhow::ensure!(fd >= 0, "shared attachment descriptor is invalid");
+    // Kotlin retains the provider descriptor until this JNI call returns. Clone it so Rust owns
+    // exactly one close operation without racing Android's final close.
+    let borrowed = ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+    borrowed
+        .try_clone()
+        .context("clone shared attachment descriptor")
+}
+
+#[cfg(target_os = "android")]
+fn importable_as_image(file: &SharedFile) -> bool {
+    const MAX_DECODE_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+    file.mime.starts_with("image/") && file.size.is_none_or(|size| size <= MAX_DECODE_SOURCE_BYTES)
+}
+
+#[cfg(target_os = "android")]
+fn prepare_shared_images(
+    files: Vec<SharedFile>,
+    store: &ImageStore,
+    staging_root: &Path,
+    owned_root: &Path,
+) -> (Vec<ClipboardItem>, ShareOutcome) {
+    let capture = share_capture();
+    let mut outcome = ShareOutcome::default();
+    let mut items = Vec::new();
+    if let Err(error) = fs::create_dir_all(staging_root) {
+        outcome.failed = files.len();
+        log::warn!("create Android image share staging directory failed: {error}");
+        return (items, outcome);
+    }
+    for file in files {
+        let result = (|| -> Result<ClipboardPayload> {
+            let mut temporary = tempfile::NamedTempFile::new_in(staging_root)?;
+            std::io::copy(&mut clone_shared_descriptor(&file)?, &mut temporary)?;
+            let staged = SharedFile {
+                path: temporary.path().to_owned(),
+                fd: None,
+                name: file.name,
+                mime: file.mime,
+                size: file.size,
+            };
+            attachment_payload(&staged, staging_root, owned_root)
+        })();
+        match result {
+            Ok(payload) => append_item(store, payload, &capture, &mut items, &mut outcome),
+            Err(error) => {
+                outcome.failed += 1;
+                log::warn!("prepare Android shared image failed: {error:#}");
+            }
+        }
+    }
+    (items, outcome)
+}
+
+#[cfg(target_os = "android")]
+fn unique_import_name(name: &str, used: &mut HashSet<String>) -> String {
+    let safe = safe_file_name(name);
+    if used.insert(safe.clone()) {
+        return safe;
+    }
+    let path = Path::new(&safe);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for suffix in 2_u32.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(target_os = "android")]
+struct PendingFileImport {
+    item: ClipboardItem,
+    files: Vec<(SharedFile, PathBuf)>,
+    directory: PathBuf,
+    declared_bytes: u64,
+}
+
+#[cfg(target_os = "android")]
+fn plan_file_import(
+    files: Vec<SharedFile>,
+    store: &ImageStore,
+    owned_root: &Path,
+) -> Result<PendingFileImport> {
+    let directory = owned_root.join(
+        blake3::hash(uuid::Uuid::new_v4().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    fs::create_dir_all(&directory)?;
+    let mut used = HashSet::new();
+    let mut planned = Vec::with_capacity(files.len());
+    let mut paths = Vec::with_capacity(files.len());
+    let mut declared_bytes = 0_u64;
+    let all_sizes_known = files.iter().all(|file| file.size.is_some());
+    for file in files {
+        let destination = directory.join(unique_import_name(&file.name, &mut used));
+        fs::File::create(&destination)?;
+        declared_bytes = declared_bytes.saturating_add(file.size.unwrap_or(0));
+        paths.push(destination.to_string_lossy().into_owned());
+        planned.push((file, destination));
+    }
+    let mut item = build_item_with_settings(
+        store,
+        &ClipboardPayload::Files(paths),
+        &share_capture(),
+        &Sensitive {
+            collect_secrets: true,
+            ..Default::default()
+        },
+        false,
+    )?
+    .context("shared file payload was empty")?;
+    item.size = all_sizes_known.then(|| i64::try_from(declared_bytes).unwrap_or(i64::MAX));
+    Ok(PendingFileImport {
+        item,
+        files: planned,
+        directory,
+        declared_bytes,
+    })
+}
+
+#[cfg(target_os = "android")]
+fn materialize_file_import(
+    files: Vec<(SharedFile, PathBuf)>,
+    manager: Option<&Arc<crate::sync::SyncManager>>,
+    task_id: Option<&str>,
+) -> Result<u64> {
+    let mut transferred = 0_u64;
+    let mut buffer = [0_u8; 256 * 1024];
+    for (file, destination) in files {
+        let mut source = clone_shared_descriptor(&file)?;
+        let directory = destination
+            .parent()
+            .context("shared attachment destination has no directory")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        loop {
+            if manager
+                .zip(task_id)
+                .is_some_and(|(manager, task_id)| manager.shared_file_import_canceled(task_id))
+            {
+                anyhow::bail!("shared file import canceled");
+            }
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            temporary.write_all(&buffer[..count])?;
+            transferred = transferred.saturating_add(count as u64);
+            if let Some((manager, task_id)) = manager.zip(task_id) {
+                manager.update_shared_file_import(task_id, transferred);
+            }
+        }
+        temporary.flush()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)
+            .context("persist shared attachment")?;
+    }
+    Ok(transferred)
+}
+
+#[cfg(target_os = "android")]
+async fn remove_import_placeholder(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    item_id: &str,
+    directory: &Path,
+) {
+    if let Err(error) = sqlx::query("DELETE FROM clipboard_items WHERE id = ?")
+        .bind(item_id)
+        .execute(pool)
+        .await
+    {
+        log::warn!("remove failed Android share placeholder failed: {error:#}");
+    }
+    if let Err(error) = fs::remove_dir_all(directory) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("remove failed Android share files failed: {error}");
+        }
+    }
+    super::watcher::notify_clipboard_updated(
+        app,
+        item_id,
+        crate::db::models::ClipboardKind::Files,
+        false,
+    );
+}
+
 /// Commits each record independently so an unreadable attachment cannot discard the other content.
 #[cfg(target_os = "android")]
 pub(crate) async fn receive(
@@ -262,18 +490,52 @@ pub(crate) async fn receive(
     let store = app.state::<ImageStore>().inner().clone();
     let staging_root = app.path().app_cache_dir()?.join("ecopaste-share");
     let owned_root = crate::core::paths::resources_dir(app)?.join(super::shared_files::DIRECTORY);
+    let ShareDelivery {
+        texts,
+        html,
+        files,
+        failed,
+    } = delivery;
+    let (image_files, direct_files): (Vec<_>, Vec<_>) =
+        files.into_iter().partition(importable_as_image);
     let owned_root_for_task = owned_root.clone();
-    let (items, mut outcome) = tauri::async_runtime::spawn_blocking(move || {
-        prepare_items(delivery, &store, &staging_root, &owned_root_for_task)
+    let staging_root_for_task = staging_root.clone();
+    let store_for_task = store.clone();
+    let (mut items, mut outcome) = tauri::async_runtime::spawn_blocking(move || {
+        let (mut items, mut outcome) = prepare_items(
+            ShareDelivery {
+                texts,
+                html,
+                files: Vec::new(),
+                failed,
+            },
+            &store_for_task,
+            &staging_root_for_task,
+            &owned_root_for_task,
+        );
+        let (image_items, image_outcome) = prepare_shared_images(
+            image_files,
+            &store_for_task,
+            &staging_root_for_task,
+            &owned_root_for_task,
+        );
+        items.extend(image_items);
+        outcome.skipped += image_outcome.skipped;
+        outcome.failed += image_outcome.failed;
+        (items, outcome)
     })
     .await?;
     let pool = app.state::<crate::db::DatabaseState>().pool().await;
-    let delivery_route = app
+    let sync_settings = app
+        .state::<crate::settings::SettingsStore>()
+        .snapshot()
+        .sync;
+    let lan_connected = app
         .try_state::<std::sync::Arc<crate::sync::SyncManager>>()
-        .is_some_and(|manager| manager.has_connected_lan_peer())
-        .then_some(crate::db::sync_queue::ContentDeliveryRoute::Lan)
-        .unwrap_or(crate::db::sync_queue::ContentDeliveryRoute::Cloud);
-    for item in items {
+        .is_some_and(|manager| manager.has_connected_lan_peer());
+    for item in items.drain(..) {
+        let initial_delivery_route =
+            shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
         match super::watcher::persist_and_notify_with_sync(
             app,
             &pool,
@@ -282,7 +544,7 @@ pub(crate) async fn receive(
             None,
             Some(crate::db::sync_queue::ContentSyncOptions {
                 manual_share: true,
-                delivery_route: Some(delivery_route),
+                delivery_route: initial_delivery_route,
                 ..Default::default()
             }),
         )
@@ -292,6 +554,164 @@ pub(crate) async fn receive(
             Err(error) => {
                 outcome.failed += 1;
                 log::error!("persist Android shared record failed: {error}");
+            }
+        }
+    }
+    if !direct_files.is_empty() {
+        let pending = plan_file_import(direct_files, &store, &owned_root)?;
+        let mut item = pending.item;
+        let initial_delivery_route =
+            shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
+        let manager = app
+            .try_state::<Arc<crate::sync::SyncManager>>()
+            .map(|manager| manager.inner().clone());
+        let initial_route = match initial_delivery_route.unwrap_or({
+            if lan_connected {
+                crate::db::sync_queue::ContentDeliveryRoute::Lan
+            } else {
+                crate::db::sync_queue::ContentDeliveryRoute::Cloud
+            }
+        }) {
+            crate::db::sync_queue::ContentDeliveryRoute::Cloud => crate::sync::TransferRoute::Cloud,
+            crate::db::sync_queue::ContentDeliveryRoute::Lan => crate::sync::TransferRoute::Lan,
+        };
+        let task_id = manager.as_ref().map(|manager| {
+            manager.start_shared_file_import(&item.id, pending.declared_bytes, initial_route)
+        });
+        match super::watcher::persist_and_notify_with_sync(app, &pool, &item, None, None, None)
+            .await
+        {
+            Ok(result) => {
+                item = crate::db::items::find_item_by_id(&pool, &result.id)
+                    .await?
+                    .context("imported shared file record is missing")?;
+                let files = pending.files;
+                let manager_for_task = manager.clone();
+                let task_id_for_task = task_id.clone();
+                let import_result = tauri::async_runtime::spawn_blocking(move || {
+                    materialize_file_import(
+                        files,
+                        manager_for_task.as_ref(),
+                        task_id_for_task.as_deref(),
+                    )
+                })
+                .await?;
+                match import_result {
+                    Ok(total_bytes) => {
+                        item.size = Some(i64::try_from(total_bytes).unwrap_or(i64::MAX));
+                        sqlx::query("UPDATE clipboard_items SET size = ? WHERE id = ?")
+                            .bind(item.size)
+                            .bind(&item.id)
+                            .execute(&pool)
+                            .await
+                            .context("update imported shared file size")?;
+                        let delivery_route = shared_delivery_route(
+                            &item,
+                            sync_settings.auto_upload_max_mb,
+                            lan_connected,
+                        );
+                        let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
+                            |(manager, task_id)| manager.shared_file_import_canceled(task_id),
+                        );
+                        if canceled {
+                            remove_import_placeholder(app, &pool, &item.id, &pending.directory)
+                                .await;
+                            outcome.skipped += 1;
+                        } else {
+                            if let Some((manager, task_id)) =
+                                manager.as_ref().zip(task_id.as_deref())
+                            {
+                                manager.finish_shared_file_import(task_id, total_bytes);
+                            }
+                            match crate::db::sync_queue::stage_existing_content(
+                                &pool,
+                                &item.id,
+                                &item.sync_key,
+                                &item.source_revision,
+                                crate::db::sync_queue::ContentSyncOptions {
+                                    manual_share: true,
+                                    delivery_route,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            {
+                                Ok(operation_order) => {
+                                    if let Some((manager, task_id)) =
+                                        manager.as_ref().zip(task_id.as_deref())
+                                    {
+                                        manager.bind_shared_file_import(
+                                            task_id,
+                                            operation_order,
+                                            item.source_revision.clone(),
+                                        );
+                                    }
+                                    let canceled = manager
+                                        .as_ref()
+                                        .zip(task_id.as_deref())
+                                        .is_some_and(|(manager, task_id)| {
+                                            manager.shared_file_import_canceled(task_id)
+                                        });
+                                    if canceled {
+                                        crate::db::sync_queue::complete_content(
+                                            &pool,
+                                            operation_order,
+                                        )
+                                        .await?;
+                                        outcome.saved += 1;
+                                    } else {
+                                        crate::sync::notify_local_item_ready(app);
+                                        outcome.saved += 1;
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Some((manager, task_id)) =
+                                        manager.as_ref().zip(task_id.as_deref())
+                                    {
+                                        manager.fail_shared_file_import(
+                                            task_id,
+                                            total_bytes,
+                                            error.to_string(),
+                                        );
+                                    }
+                                    remove_import_placeholder(
+                                        app,
+                                        &pool,
+                                        &item.id,
+                                        &pending.directory,
+                                    )
+                                    .await;
+                                    outcome.failed += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
+                            |(manager, task_id)| manager.shared_file_import_canceled(task_id),
+                        );
+                        if !canceled {
+                            if let Some((manager, task_id)) =
+                                manager.as_ref().zip(task_id.as_deref())
+                            {
+                                manager.fail_shared_file_import(task_id, 0, error.to_string());
+                            }
+                            outcome.failed += 1;
+                            log::warn!("import Android shared files failed: {error:#}");
+                        } else {
+                            outcome.skipped += 1;
+                        }
+                        remove_import_placeholder(app, &pool, &item.id, &pending.directory).await;
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some((manager, task_id)) = manager.as_ref().zip(task_id.as_deref()) {
+                    manager.fail_shared_file_import(task_id, 0, error.to_string());
+                }
+                outcome.failed += 1;
+                let _ = fs::remove_dir_all(&pending.directory);
+                log::error!("persist Android shared file placeholder failed: {error:#}");
             }
         }
     }
@@ -325,18 +745,24 @@ mod tests {
             files: vec![
                 SharedFile {
                     path: image,
+                    fd: None,
                     name: "photo.png".to_owned(),
                     mime: "image/png".to_owned(),
+                    size: None,
                 },
                 SharedFile {
                     path: document,
+                    fd: None,
                     name: "report.pdf".to_owned(),
                     mime: "application/pdf".to_owned(),
+                    size: None,
                 },
                 SharedFile {
                     path: staging.join("missing"),
+                    fd: None,
                     name: "missing".to_owned(),
                     mime: "video/mp4".to_owned(),
+                    size: None,
                 },
             ],
             ..Default::default()
@@ -368,8 +794,10 @@ mod tests {
         fs::write(&path, b"GIF89a-original-animation").unwrap();
         let file = SharedFile {
             path,
+            fd: None,
             name: "animation.gif".to_owned(),
             mime: "image/gif".to_owned(),
+            size: None,
         };
         let owned = temp.path().join("owned");
         let first = attachment_payload(&file, &staging, &owned).unwrap();
@@ -400,8 +828,10 @@ mod tests {
         for mime in ["image/png", "image/apng"] {
             let file = SharedFile {
                 path: path.clone(),
+                fd: None,
                 name: "animation.png".to_owned(),
                 mime: mime.to_owned(),
+                size: None,
             };
             let payload = attachment_payload(&file, &staging, &owned).unwrap();
             let ClipboardPayload::Files(paths) = payload else {
@@ -421,8 +851,10 @@ mod tests {
         fs::write(&path, b"%PDF-original").unwrap();
         let file = SharedFile {
             path,
+            fd: None,
             name: format!("{}.pdf", "文".repeat(68)),
             mime: "application/pdf".to_owned(),
+            size: None,
         };
         let payload = attachment_payload(&file, &staging, &temp.path().join("owned")).unwrap();
         let ClipboardPayload::Files(paths) = payload else {
@@ -460,8 +892,10 @@ mod tests {
         fs::write(&path, b"private data").unwrap();
         let file = SharedFile {
             path,
+            fd: None,
             name: "../../escape\n.txt".to_owned(),
             mime: "application/octet-stream".to_owned(),
+            size: None,
         };
         assert!(attachment_payload(&file, &staging, &temp.path().join("owned")).is_err());
         assert_eq!(safe_file_name("../../escape\n.txt"), ".._.._escape_.txt");
@@ -481,8 +915,10 @@ mod tests {
                 fs::write(&path, bytes).unwrap();
                 SharedFile {
                     path,
+                    fd: None,
                     name: "document.txt".to_owned(),
                     mime: "text/plain".to_owned(),
+                    size: None,
                 }
             })
             .collect();

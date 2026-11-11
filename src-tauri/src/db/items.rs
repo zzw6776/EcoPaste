@@ -29,14 +29,34 @@ macro_rules! evictable_history {
     () => {
         "is_pinned = 0 AND is_favorite = 0 AND NOT EXISTS (
             SELECT 1 FROM sync_content_outbox manual
-            WHERE manual.item_id = clipboard_items.id AND manual.manual_share = 1
+            WHERE manual.item_id = clipboard_items.id
+              AND manual.manual_share = 1
+              AND julianday(manual.updated_at) > julianday('now', '-24 hours')
         ) AND NOT EXISTS (
             SELECT 1 FROM sync_active_transfers active
             WHERE active.item_id = clipboard_items.id
         ) AND NOT EXISTS (
+            SELECT 1
+            FROM sync_item_events links
+            JOIN sync_delivery_targets receiver
+              ON receiver.event_id = links.event_id
+            WHERE links.item_id = clipboard_items.id
+              AND links.direction = 'local'
+              AND receiver.target_id LIKE 'peer:%'
+              AND receiver.confirmed_content = 'metadata'
+              AND julianday(receiver.updated_at) > julianday('now', '-24 hours')
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_delivery_targets cloud
+                  WHERE cloud.event_id = links.event_id
+                    AND cloud.target_id = 'cloud'
+                    AND cloud.confirmed_content = 'complete'
+              )
+        ) AND NOT EXISTS (
             SELECT 1 FROM sync_item_events links
-            JOIN sync_delivery_states delivery ON delivery.event_id = links.event_id
-            WHERE links.item_id = clipboard_items.id AND delivery.state = 'syncing'
+            JOIN sync_delivery_targets delivery ON delivery.event_id = links.event_id
+            WHERE links.item_id = clipboard_items.id
+              AND delivery.status = 'pending'
+              AND julianday(delivery.updated_at) > julianday('now', '-24 hours')
         ) AND NOT EXISTS (
             SELECT 1
             FROM sync_item_events links
@@ -44,39 +64,31 @@ macro_rules! evictable_history {
             WHERE links.item_id = clipboard_items.id
               AND links.direction = 'local'
               AND event.delivery_route IS NOT NULL
-              AND (
-                  (
-                      NOT EXISTS (
-                          SELECT 1 FROM sync_delivery_states delivery
-                          WHERE delivery.event_id = event.event_id
-                            AND (
-                                (event.delivery_route = 'cloud' AND delivery.target_id = 'cloud')
-                                OR (event.delivery_route = 'lan' AND delivery.target_id LIKE 'peer:%')
-                            )
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM sync_canceled_deliveries canceled
-                          WHERE canceled.event_id = event.event_id
-                            AND (
-                                (event.delivery_route = 'cloud' AND canceled.target_id = 'cloud')
-                                OR (event.delivery_route = 'lan' AND canceled.target_id LIKE 'peer:%')
-                            )
-                      )
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM sync_delivery_states delivery
-                      WHERE delivery.event_id = event.event_id
-                        AND delivery.state <> 'success'
-                        AND (
-                            (event.delivery_route = 'cloud' AND delivery.target_id = 'cloud')
-                            OR (event.delivery_route = 'lan' AND delivery.target_id LIKE 'peer:%')
+              AND julianday(event.updated_at) > julianday('now', '-24 hours')
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_delivery_targets canceled
+                  WHERE canceled.event_id = event.event_id
+                    AND canceled.status IN ('blocked', 'canceled')
+                    AND (
+                        (event.delivery_route = 'cloud' AND canceled.target_id = 'cloud')
+                        OR (event.delivery_route = 'lan' AND canceled.target_id LIKE 'peer:%')
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_delivery_targets delivery
+                  WHERE delivery.event_id = event.event_id
+                    AND delivery.status = 'confirmed'
+                    AND (
+                        (
+                            event.delivery_route = 'cloud'
+                            AND delivery.target_id = 'cloud'
+                            AND delivery.confirmed_content = 'complete'
                         )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM sync_canceled_deliveries canceled
-                            WHERE canceled.event_id = delivery.event_id
-                              AND canceled.target_id = delivery.target_id
+                        OR (
+                            event.delivery_route = 'lan'
+                            AND delivery.target_id LIKE 'peer:%'
                         )
-                  )
+                    )
               )
         )"
     };
@@ -159,7 +171,10 @@ pub async fn upsert_item_with_sync_outbox(
     item: &ClipboardItem,
     sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
 ) -> Result<(UpsertResult, bool)> {
-    let mut transaction = pool.begin().await.context("begin local clipboard upsert")?;
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin local clipboard upsert")?;
     let existing_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM clipboard_items WHERE content_hash = ? ORDER BY created_at DESC LIMIT 1",
     )
@@ -248,7 +263,7 @@ pub async fn upsert_remote_file_item(
     origin_device_id: &str,
 ) -> Result<UpsertResult> {
     let mut transaction = pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin remote file metadata upsert")?;
     let existing: Option<(String, bool)> = sqlx::query_as(
@@ -315,7 +330,7 @@ pub async fn upsert_materialized_synced_item(
     item: &ClipboardItem,
 ) -> Result<UpsertResult> {
     let mut transaction = pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin materialized synchronized item upsert")?;
     let existing: Option<(String, bool)> = sqlx::query_as(
@@ -672,6 +687,29 @@ pub async fn query_items_page(
     Ok((items, total))
 }
 
+/// 返回指定记录在当前筛选与排序下的零基索引；记录不属于该视图时返回 `None`。
+pub async fn find_item_index(
+    pool: &SqlitePool,
+    id: &str,
+    q: &ClipboardItemQuery,
+) -> Result<Option<i64>> {
+    let keyword = KeywordFilter::from_keyword(q.keyword.as_deref());
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        "SELECT item_index FROM (SELECT clipboard_items.id, ROW_NUMBER() OVER (ORDER BY ",
+    );
+    push_sort_clause(&mut qb, q.sort);
+    qb.push(") - 1 AS item_index FROM clipboard_items WHERE 1 = 1");
+    push_filter_clauses(&mut qb, q, &keyword);
+    qb.push(") ranked WHERE id = ").push_bind(id.to_owned());
+
+    let row = qb
+        .build_query_as::<(i64,)>()
+        .fetch_optional(pool)
+        .await
+        .context("find clipboard item index")?;
+    Ok(row.map(|(index,)| index))
+}
+
 /// 按 `id` 查找单条记录，不存在时返回 `None`。
 pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ClipboardItem>> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_ITEM);
@@ -939,7 +977,7 @@ pub struct CleanupOutcome {
     pub image_files: Vec<String>,
 }
 
-/// 历史清理：按时间和条数裁剪，保留置顶、收藏与尚未生成同步事件的手动分享。
+/// 历史清理：按时间和条数裁剪，保留置顶、收藏与保护期内的手动分享。
 /// 返回删除行数与被删图片的文件名。`older_than = None` 跳过时长清理；`max_count = None` 或 `Some(0)` 跳过条数清理。
 pub async fn cleanup_history(
     pool: &SqlitePool,
@@ -1175,18 +1213,8 @@ async fn fetch_items(
         qb.push(" WHERE 1 = 1");
         push_filter_clauses(&mut qb, q, &keyword);
 
-        qb.push(" ORDER BY clipboard_items.is_pinned DESC, ");
-        match q.sort {
-            ClipboardItemSort::CreatedAt => {
-                qb.push("clipboard_items.created_at DESC");
-            }
-            ClipboardItemSort::UpdatedAt => {
-                qb.push("clipboard_items.updated_at DESC, clipboard_items.created_at DESC");
-            }
-            ClipboardItemSort::UseCount => {
-                qb.push("clipboard_items.use_count DESC, clipboard_items.created_at DESC");
-            }
-        }
+        qb.push(" ORDER BY ");
+        push_sort_clause(&mut qb, q.sort);
 
         qb.push(" LIMIT ").push_bind(q.limit);
         qb.push(" OFFSET ").push_bind(q.offset);
@@ -1217,6 +1245,22 @@ async fn fetch_items_count(
         .await
         .context("failed to count filtered clipboard items")?;
     Ok(row.0)
+}
+
+/// 追加与列表查询完全一致的排序，供分页查询和记录定位共同使用。
+fn push_sort_clause(qb: &mut QueryBuilder<Sqlite>, sort: ClipboardItemSort) {
+    qb.push("clipboard_items.is_pinned DESC, ");
+    match sort {
+        ClipboardItemSort::CreatedAt => {
+            qb.push("clipboard_items.created_at DESC");
+        }
+        ClipboardItemSort::UpdatedAt => {
+            qb.push("clipboard_items.updated_at DESC, clipboard_items.created_at DESC");
+        }
+        ClipboardItemSort::UseCount => {
+            qb.push("clipboard_items.use_count DESC, clipboard_items.created_at DESC");
+        }
+    }
 }
 
 /// 把当前查询的过滤条件追加到 `qb`（不含 ORDER BY / LIMIT / OFFSET），供列表查询与计数共用。
@@ -1453,6 +1497,38 @@ mod tests {
                 .removed,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn history_cleanup_releases_expired_manual_share_protection() {
+        let pool = memory_pool().await;
+        let item = sample_item("expired-share");
+        upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE sync_content_outbox SET updated_at = datetime('now', '-25 hours') WHERE item_id = ?",
+        )
+        .bind(&item.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cleanup_history(&pool, Some(Utc::now()), None)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_none());
     }
 
     async fn insert_source_app(pool: &SqlitePool, id: &str) {

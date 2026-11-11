@@ -27,6 +27,7 @@ pub fn label(key: Key) -> &'static str {
             "开发构建仅支持检查和下载更新，请在已安装的正式版中安装更新"
         }
         Key::ExternalUrlUnsupported => "只能打开 http 或 https 开头的链接",
+        Key::FileImportInProgress => "文件仍在导入，请等待导入完成",
         #[cfg(target_os = "macos")]
         Key::PasteAccessibilityRequired => {
             "请在“系统设置 → 隐私与安全性 → 辅助功能”中允许 EcoPaste，然后重新粘贴"
@@ -46,7 +47,7 @@ pub fn label(key: Key) -> &'static str {
         Key::SyncDisabled => "请先启用多端同步",
         Key::SyncGroupRequired => "请先创建或加入同步设备组",
         Key::SyncLanDisabled => "局域网同步已关闭",
-        Key::SyncOperationPending => "此记录仍在等待前序同步操作，请稍后重试",
+        Key::SyncNoLanDevice => "当前没有可达的局域网设备",
         Key::SyncPreparationFailed => "准备上传失败",
         Key::SyncSensitiveDisabled => "敏感内容同步已关闭",
         Key::SyncTransferCancelFailed => "取消传输失败",

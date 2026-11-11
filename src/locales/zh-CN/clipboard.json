@@ -1,11 +1,14 @@
 {
   "cardMeta": {
+    "compactCharacters": "{{count}} 字",
+    "compactItems": "{{count}} 项",
     "file": "{{count}} 个文件",
     "files": "{{count}} 个文件",
     "folder": "{{count}} 个文件夹",
     "folders": "{{count}} 个文件夹",
     "item": "{{count}} 个项目",
-    "items": "{{count}} 个项目"
+    "items": "{{count}} 个项目",
+    "useCount": "已使用 {{count}} 次"
   },
   "empty": {
     "categories": {
@@ -102,8 +105,11 @@
     "confirming": "正在校验并保存",
     "connecting": "正在连接",
     "download": "下载",
+    "downloadAgain": "重新下载",
+    "downloadedExternally": "已保存到所选位置",
     "eta": "预计 {{seconds}} 秒",
     "expired": "远端已过期",
+    "externalMissing": "外部文件不存在，请重新下载",
     "failed": "下载失败，点击重试",
     "notDownloaded": "未下载",
     "queued": "等待下载",
@@ -139,24 +145,36 @@
     "cloud": {
       "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
       "confirming": "云端：等待确认",
+      "downloading": "云端：正在下载文件",
       "error": "云端同步失败，点击重试",
       "errorWithReason": "云端：{{reason}}，等待重试或点击重试",
       "idle": "云端：本次未使用",
-      "manual": "云端：超过自动同步大小，点击上传",
+      "manual": "云端：超过自动上传上限，点击上传文件",
+      "metadataOnly": "云端：仅记录已同步，点击上传文件",
+      "partial": "云端：部分内容已就绪（{{content}}/{{total}}）",
       "queued": "云端：等待同步",
+      "remoteMetadataOnly": "云端：仅同步记录，文件内容尚未上传",
+      "remoteSuccess": "云端：文件内容已就绪",
+      "remoteSyncing": "云端：正在启动文件下载",
       "started": "已开始云端同步",
-      "success": "云端：已同步",
+      "success": "云端：文件内容已同步",
       "syncing": "云端：正在上传"
     },
     "lan": {
       "confirming": "局域网：等待确认",
+      "downloading": "局域网：正在下载文件",
       "error": "局域网同步失败，点击重试",
       "errorWithReason": "局域网：{{reason}}，等待重试或点击重试",
       "idle": "局域网：当前无在线设备，已跳过",
       "manual": "局域网：需要手动同步，点击传输",
+      "metadataOnly": "局域网：仅记录已同步到 {{delivered}}/{{total}} 台设备，请在接收设备下载",
+      "partial": "局域网：文件内容已到达 {{content}}/{{total}} 台设备",
       "queued": "局域网：等待同步",
+      "remoteMetadataOnly": "局域网：仅同步记录，文件内容尚未投递",
+      "remoteSuccess": "局域网：文件内容已就绪",
+      "remoteSyncing": "局域网：正在启动文件下载",
       "started": "已开始局域网同步",
-      "success": "局域网：已投递到 {{delivered}}/{{total}} 台设备",
+      "success": "局域网：完整内容已投递到 {{delivered}}/{{total}} 台设备",
       "syncing": "局域网：正在投递"
     }
   },
@@ -238,6 +256,16 @@
     }
   },
   "transfer": {
+    "import": {
+      "canceled": "导入已取消",
+      "completed": "导入完成",
+      "confirming": "正在完成导入",
+      "connecting": "正在准备导入",
+      "failed": "导入失败",
+      "preparing": "正在导入",
+      "queued": "导入完成",
+      "transferring": "正在导入"
+    },
     "upload": {
       "canceled": "上传已取消",
       "completed": "上传完成",
@@ -259,9 +287,27 @@
       "queued": "等待下载",
       "transferring": "正在下载"
     },
-    "empty": "暂无传输任务",
+    "empty": "暂无文件传输记录",
+    "import": {
+      "canceled": "导入已取消",
+      "completed": "导入完成",
+      "confirming": "正在完成导入",
+      "connecting": "正在准备导入",
+      "failed": "导入失败",
+      "preparing": "正在导入",
+      "queued": "导入完成",
+      "transferring": "正在导入"
+    },
+    "item": "文件传输",
+    "itemCount": "{{count}} 个项目",
     "retry": "重试",
-    "title": "传输任务",
+    "route": {
+      "cloud": "云端",
+      "lan": "Wi-Fi",
+      "lanDevice": "Wi-Fi · {{device}}",
+      "local": "本地"
+    },
+    "title": "文件传输",
     "upload": {
       "canceled": "上传已取消",
       "completed": "上传完成",

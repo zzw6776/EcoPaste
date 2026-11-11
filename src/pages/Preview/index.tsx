@@ -170,7 +170,7 @@ const Preview: FC = () => {
 
       <motion.div
         animate={active ? "open" : "closed"}
-        className="absolute z-10 flex max-h-[600px] min-h-[260px] min-w-[460px] max-w-[680px] flex-col overflow-visible rounded-[22px] border-0 bg-white shadow-[0_25px_65px_-10px_rgba(0,0,0,0.28),0_10px_25px_-5px_rgba(0,0,0,0.12),0_0_1px_rgba(0,0,0,0.18)] dark:bg-[#1E1E1E] dark:shadow-[0_25px_65px_-10px_rgba(0,0,0,0.65),0_0_1px_rgba(255,255,255,0.15)]"
+        className="absolute z-10 flex max-h-[600px] max-w-[680px] flex-col overflow-visible rounded-[22px] border-0 bg-white shadow-[0_25px_65px_-10px_rgba(0,0,0,0.28),0_10px_25px_-5px_rgba(0,0,0,0.12),0_0_1px_rgba(0,0,0,0.18)] dark:bg-[#1E1E1E] dark:shadow-[0_25px_65px_-10px_rgba(0,0,0,0.65),0_0_1px_rgba(255,255,255,0.15)]"
         initial="closed"
         style={motionLayout.panelStyle}
         transition={PREVIEW_PANEL_TRANSITION}

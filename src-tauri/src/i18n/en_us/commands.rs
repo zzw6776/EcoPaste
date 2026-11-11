@@ -23,6 +23,7 @@ pub fn label(key: Key) -> &'static str {
         #[cfg(not(target_os = "android"))]
         Key::UpdateInstallRequiresRelease => "Development builds can only check and download updates. Install updates from the installed release build",
         Key::ExternalUrlUnsupported => "Only links starting with http or https can be opened",
+        Key::FileImportInProgress => "The file is still being imported",
         #[cfg(target_os = "macos")]
         Key::PasteAccessibilityRequired => {
             "Allow EcoPaste in System Settings → Privacy & Security → Accessibility, then paste again"
@@ -46,9 +47,7 @@ pub fn label(key: Key) -> &'static str {
         Key::SyncDisabled => "Enable multi-device sync first",
         Key::SyncGroupRequired => "Create or join a sync group first",
         Key::SyncLanDisabled => "Local network sync is disabled",
-        Key::SyncOperationPending => {
-            "This item is still waiting for an earlier sync operation. Try again shortly"
-        }
+        Key::SyncNoLanDevice => "No local-network device is currently reachable",
         Key::SyncPreparationFailed => "Unable to prepare the upload",
         Key::SyncSensitiveDisabled => "Sensitive content sync is disabled",
         Key::SyncTransferCancelFailed => "Unable to cancel the transfer",

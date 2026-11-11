@@ -7,6 +7,7 @@ export interface AndroidPermissionsStatus {
   overlayGranted: boolean;
   notificationGranted: boolean;
   batteryIgnored: boolean;
+  storageGranted: boolean;
   rootStatus: AndroidRootStatus;
   overlayServiceRunning: boolean;
   clipboardMonitorRunning: boolean;
@@ -42,7 +43,7 @@ export const getAndroidPermissionsStatus =
  * 请求跳转系统权限设置页或触发授权
  */
 export const requestAndroidPermission = async (
-  kind: "overlay" | "battery" | "notification",
+  kind: "overlay" | "battery" | "notification" | "storage",
 ): Promise<void> => {
   await invoke("request_android_permission", { kind });
 };

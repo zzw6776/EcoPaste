@@ -65,6 +65,10 @@
       "root": {
         "description": "Requests access from the Root manager only when you tap the button. Status refresh never opens the authorization prompt.",
         "title": "Root access"
+      },
+      "storage": {
+        "description": "Allows direct shared-storage access so saved files can be verified, opened, and reused. Saving through the system picker does not require it.",
+        "title": "All files access"
       }
     },
     "rootStatus": {

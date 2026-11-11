@@ -13,6 +13,7 @@ struct PendingEvent {
     stored: StoredSyncEvent,
     sync_key: String,
     required: HashSet<String>,
+    required_bytes: u64,
     complete: bool,
     failed: bool,
 }
@@ -31,8 +32,7 @@ impl TransferQueue {
         events: Vec<StoredSyncEvent>,
         blobs: Vec<StoredBlob>,
         key: &[u8; 32],
-        require_source_icons: bool,
-        deferred_event_ids: &HashSet<String>,
+        skip_content_event_ids: &HashSet<String>,
     ) -> Result<Self> {
         let available: HashMap<_, _> = blobs
             .into_iter()
@@ -50,17 +50,20 @@ impl TransferQueue {
                 for blob in &envelope.blobs {
                     referenced.insert(blob.blob_id.clone());
                 }
-                if require_source_icons {
-                    if let Some(icon) = envelope.source_app.and_then(|app| app.icon) {
-                        referenced.insert(icon.blob_id);
-                    }
-                }
             }
-            let required = if deferred_event_ids.contains(&stored.event.event_id) {
+            let required = if skip_content_event_ids.contains(&stored.event.event_id) {
                 HashSet::new()
             } else {
                 referenced.clone()
             };
+            let required_bytes = required.iter().fold(0_u64, |total, blob_id| {
+                total.saturating_add(
+                    available
+                        .get(blob_id)
+                        .map(|blob| blob.size)
+                        .unwrap_or_default(),
+                )
+            });
             let mut failed = false;
             for blob_id in &required {
                 match available.get(blob_id) {
@@ -82,6 +85,7 @@ impl TransferQueue {
                 stored,
                 sync_key,
                 required,
+                required_bytes,
                 complete: false,
                 failed,
             });
@@ -125,11 +129,11 @@ impl TransferQueue {
             .collect()
     }
 
-    pub fn event_for_blob(&self, blob_id: &str) -> Option<&str> {
+    pub fn operation_for_blob(&self, blob_id: &str) -> Option<(&str, u64)> {
         self.events
             .iter()
             .find(|event| !event.failed && !event.complete && event.required.contains(blob_id))
-            .map(|event| event.stored.event.event_id.as_str())
+            .map(|event| (event.stored.event.event_id.as_str(), event.required_bytes))
     }
 
     /// Fails only records requiring this attachment; unrelated uploads remain runnable.
@@ -209,7 +213,9 @@ impl TransferQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::model::{BlobManifest, BlobRole, ClipboardEnvelope, SyncedClipboardItem};
+    use crate::sync::model::{
+        BlobManifest, BlobRole, ClipboardEnvelope, SourceAppRef, SourceIconRef, SyncedClipboardItem,
+    };
 
     const KEY: [u8; 32] = [7; 32];
 
@@ -247,6 +253,7 @@ mod tests {
                 })
                 .collect(),
             source_app: None,
+            content_identity: Some(key.into()),
         };
         StoredSyncEvent {
             cursor: 1,
@@ -268,6 +275,39 @@ mod tests {
             .collect()
     }
 
+    fn event_with_source_icon(
+        id: &str,
+        key: &str,
+        file_blob: &str,
+        icon_blob: &str,
+    ) -> StoredSyncEvent {
+        let stored = event(id, key, &[file_blob]);
+        let DecryptedSyncEvent::Clipboard(mut envelope) =
+            crypto::decrypt_sync_event(&KEY, &stored.event).unwrap()
+        else {
+            unreachable!()
+        };
+        envelope.source_app = Some(SourceAppRef {
+            version: 1,
+            source_key: "source".into(),
+            platform: "android".into(),
+            display_name: "Example".into(),
+            icon: Some(SourceIconRef {
+                icon_hash: "icon".into(),
+                blob_id: icon_blob.into(),
+                original_size: 4,
+                encrypted_size: 20,
+            }),
+            accent_start: None,
+            accent_end: None,
+        });
+        StoredSyncEvent {
+            cursor: stored.cursor,
+            event: crypto::encrypt_event(&KEY, id.into(), "origin".into(), 1, 1, &envelope)
+                .unwrap(),
+        }
+    }
+
     #[test]
     fn ready_record_does_not_wait_for_unrelated_stalled_attachment() {
         let mut queue = TransferQueue::new(
@@ -278,7 +318,6 @@ mod tests {
             ],
             blobs(&["slow", "fast", "next"]),
             &KEY,
-            false,
             &HashSet::new(),
         )
         .unwrap();
@@ -320,7 +359,6 @@ mod tests {
             vec![content, deletion, event("healthy", "other", &["good"])],
             blobs(&["broken", "good"]),
             &KEY,
-            false,
             &HashSet::new(),
         )
         .unwrap();
@@ -342,7 +380,6 @@ mod tests {
             ],
             blobs(&["one", "two"]),
             &KEY,
-            false,
             &HashSet::new(),
         )
         .unwrap();
@@ -371,7 +408,6 @@ mod tests {
             ],
             blobs(&["shared"]),
             &KEY,
-            false,
             &HashSet::new(),
         )
         .unwrap();
@@ -393,14 +429,16 @@ mod tests {
             ],
             blobs(&["shared"]),
             &KEY,
-            false,
             &HashSet::new(),
         )
         .unwrap();
         queue.cancel_events(&HashSet::from(["canceled".to_owned()]));
 
         let blob = queue.next_blob().unwrap();
-        assert_eq!(queue.event_for_blob(&blob.blob_id), Some("active"));
+        assert_eq!(
+            queue.operation_for_blob(&blob.blob_id),
+            Some(("active", blob.size))
+        );
         queue.blob_stored(blob.blob_id);
 
         let ready = queue.ready_events();
@@ -419,7 +457,6 @@ mod tests {
             ],
             blobs(&["small-blob"]),
             &KEY,
-            false,
             &deferred,
         )
         .unwrap();
@@ -427,5 +464,15 @@ mod tests {
         assert_eq!(queue.next_blob().unwrap().blob_id, "small-blob");
         assert!(queue.next_blob().is_none());
         assert_eq!(queue.ready_events()[0].event.event_id, "large");
+    }
+
+    #[test]
+    fn source_icons_never_block_content_delivery() {
+        let event = event_with_source_icon("event", "key", "file", "icon");
+        let queue =
+            TransferQueue::new(vec![event], blobs(&["file", "icon"]), &KEY, &HashSet::new())
+                .unwrap();
+        assert_eq!(queue.operation_for_blob("file"), Some(("event", 20)));
+        assert_eq!(queue.operation_for_blob("icon"), None);
     }
 }

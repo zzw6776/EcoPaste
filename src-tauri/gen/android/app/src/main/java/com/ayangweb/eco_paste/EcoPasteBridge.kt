@@ -19,6 +19,7 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -41,6 +42,7 @@ import java.io.FileInputStream
 import java.lang.ref.WeakReference
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -101,9 +103,11 @@ object EcoPasteBridge {
     @Volatile
     private var currentEngineMode: String = "foreground" // "root", "foreground"
     private val remoteDownloadSinks = ConcurrentHashMap<String, RemoteDownloadSink>()
+    private val remoteDownloadCommitLock = Any()
 
     private data class RemoteDownloadSink(
         val uri: Uri,
+        val parentUri: Uri,
         val finalName: String,
         val workerCompleted: CountDownLatch? = null,
         val workerError: AtomicReference<String?>? = null,
@@ -416,7 +420,7 @@ object EcoPasteBridge {
                 val fd = descriptor.detachFd()
                 descriptor.close()
                 detachedFd = fd
-                val sink = RemoteDownloadSink(destinationUri, finalName)
+                val sink = RemoteDownloadSink(destinationUri, parent, finalName)
                 remoteDownloadSinks[token] = sink
                 registeredToken = token
                 registeredSink = sink
@@ -437,6 +441,7 @@ object EcoPasteBridge {
             val workerError = AtomicReference<String?>(null)
             val sink = RemoteDownloadSink(
                 destinationUri,
+                parent,
                 finalName,
                 completed,
                 workerError,
@@ -537,13 +542,16 @@ object EcoPasteBridge {
                     workerError.orEmpty(),
                 )
             }
-            val committedUri = requireNotNull(
-                DocumentsContract.renameDocument(
-                    context.contentResolver,
-                    sink.uri,
-                    sink.finalName,
-                ),
-            ) { "unable to finalize destination document" }
+            val committedUri = synchronized(remoteDownloadCommitLock) {
+                val finalName = nonConflictingRemoteName(context, sink.parentUri, sink.finalName)
+                requireNotNull(
+                    DocumentsContract.renameDocument(
+                        context.contentResolver,
+                        sink.uri,
+                        finalName,
+                    ),
+                ) { "unable to finalize destination document" }
+            }
             fileActionResult("success", uri = committedUri.toString())
         } catch (error: Throwable) {
             requestRemoteDownloadCleanup(context, sink)
@@ -574,6 +582,45 @@ object EcoPasteBridge {
         }
     }
 
+    /** Matches desktop download behavior by preserving existing entries and numbering duplicates. */
+    private fun nonConflictingRemoteName(
+        context: Context,
+        parentUri: Uri,
+        requestedName: String,
+    ): String {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            parentUri,
+            DocumentsContract.getDocumentId(parentUri),
+        )
+        val existingNames = mutableSetOf<String>()
+        context.contentResolver.query(
+            childrenUri,
+            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            val nameColumn = cursor.getColumnIndexOrThrow(
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            )
+            while (cursor.moveToNext()) {
+                existingNames += cursor.getString(nameColumn).lowercase(Locale.ROOT)
+            }
+        }
+        if (requestedName.lowercase(Locale.ROOT) !in existingNames) return requestedName
+
+        val extensionIndex = requestedName.lastIndexOf('.').takeIf { index ->
+            index > 0 && index < requestedName.lastIndex
+        }
+        val stem = extensionIndex?.let { requestedName.substring(0, it) } ?: requestedName
+        val extension = extensionIndex?.let { requestedName.substring(it) }.orEmpty()
+        for (index in 1..999) {
+            val candidate = "$stem ($index)$extension"
+            if (candidate.lowercase(Locale.ROOT) !in existingNames) return candidate
+        }
+        return "$stem-${UUID.randomUUID().toString().take(8)}$extension"
+    }
+
     /** Signals a directory extraction worker without waiting for the blocking finalizer. */
     @JvmStatic
     fun cancelRemoteDownloadSink(token: String): Boolean {
@@ -593,6 +640,46 @@ object EcoPasteBridge {
         } catch (error: Throwable) {
             Log.e(FILE_ACTION_TAG, "discard remote download document failed", error)
             fileActionResult("failed", error.message.orEmpty())
+        }
+    }
+
+    /** Checks one previously committed SAF document without scanning user storage. */
+    @JvmStatic
+    fun isRemoteDownloadDocumentAvailable(
+        context: Context,
+        uriValue: String,
+        expectedSize: Long,
+        directory: Boolean,
+    ): Boolean {
+        return try {
+            val uri = Uri.parse(uriValue)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+            )
+            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return false
+                val mimeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val mimeType = if (mimeIndex >= 0 && !cursor.isNull(mimeIndex)) {
+                    cursor.getString(mimeIndex)
+                } else {
+                    null
+                }
+                val isDirectory = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+                if (directory) return isDirectory
+                if (isDirectory) return false
+
+                val sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                    return cursor.getLong(sizeIndex) == expectedSize
+                }
+            } ?: return false
+
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                descriptor.statSize < 0 || descriptor.statSize == expectedSize
+            } ?: false
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -1279,6 +1366,12 @@ object EcoPasteBridge {
             true
         }
 
+        val storageGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            true
+        }
+
         val overlayRunning = isOverlayServiceRunning(context)
         val clipboardMonitorRunning = rootClipboardMonitor?.isReady() == true
         val gestureMonitorRunning = EcoPasteOverlayService.isGestureMonitorReady()
@@ -1295,6 +1388,7 @@ object EcoPasteBridge {
             put("overlayGranted", overlayGranted)
             put("notificationGranted", notificationGranted)
             put("batteryIgnored", batteryIgnored)
+            put("storageGranted", storageGranted)
             put("rootStatus", rootAuthorizationStatus)
             put("overlayServiceRunning", overlayRunning)
             put("clipboardMonitorRunning", clipboardMonitorRunning)
@@ -1322,6 +1416,7 @@ object EcoPasteBridge {
                 when (kind) {
                     "overlay" -> requestOverlayPermission(targetContext)
                     "battery" -> requestBatteryOptimization(targetContext)
+                    "storage" -> requestStoragePermission(targetContext)
                     "notification" -> {
                         val act = getCurrentActivity()
                         if (act != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1388,6 +1483,31 @@ object EcoPasteBridge {
             }
         } else {
             openAppDetailsSettings(context)
+        }
+    }
+
+    /** Opens the app-specific all-files access page on Android 11 and newer. */
+    @JvmStatic
+    fun requestStoragePermission(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+
+        try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:${context.packageName}"),
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            try {
+                val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(fallbackIntent)
+            } catch (_: Exception) {
+                openAppDetailsSettings(context)
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-import { Button, Empty, Spin, Tag, Tooltip } from "antd";
+import { Button, Empty, Spin, Tag } from "antd";
 import type { FC } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -7,6 +7,7 @@ import { type CloudRecord, listCloudRecords } from "@/commands";
 import { toAssetUrl } from "@/components/AssetImage";
 import Drawer from "@/components/Drawer";
 import Image from "@/components/Image";
+import Tooltip from "@/components/Tooltip";
 import { cn } from "@/utils/cn";
 import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";

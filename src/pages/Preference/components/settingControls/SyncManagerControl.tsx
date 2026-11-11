@@ -82,6 +82,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   const cloudRelayTokenDirtyRef = useRef(false);
   const mountedRef = useRef(false);
   const qrScannerRef = useRef<SyncQrScannerHandle | null>(null);
+  const joinAttemptRequestIdRef = useRef<string | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
   const joinUnlistenRef = useRef<null | (() => void)>(null);
 
@@ -113,11 +114,18 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       const joinUnlisten = await listen<NearbyJoinAttempt>(
         TAURI_EVENT.SYNC_JOIN_ATTEMPT_UPDATED,
         (event) => {
-          setJoinAttempt((current) => {
-            if (current?.requestId !== event.payload.requestId) return current;
+          if (joinAttemptRequestIdRef.current !== event.payload.requestId)
+            return;
 
-            return event.payload;
-          });
+          if (event.payload.state === "approved") {
+            clearJoinAttempt();
+            setJoinOpen(false);
+            setNearbySpaces([]);
+            void refresh();
+            return;
+          }
+
+          setJoinAttempt(event.payload);
         },
       );
       if (!mountedRef.current) {
@@ -185,7 +193,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       await joinSyncGroup(pairingCode, replaceExisting);
       setJoinCode("");
       setJoinOpen(false);
-      setJoinAttempt(null);
+      clearJoinAttempt();
     });
   }
 
@@ -211,7 +219,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       }),
       onCancel: async () => {
         await handleExport();
-        setJoinAttempt(null);
+        clearJoinAttempt();
       },
       onOk: async () => {
         await joinWithPairingCode(code, true);
@@ -440,7 +448,9 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
     replaceExisting: boolean,
   ) {
     try {
-      setJoinAttempt(await requestNearbySyncJoin(endpointId, replaceExisting));
+      const attempt = await requestNearbySyncJoin(endpointId, replaceExisting);
+      joinAttemptRequestIdRef.current = attempt.requestId;
+      setJoinAttempt(attempt);
     } catch {
       // 命令层已统一记录并显示错误。
     }
@@ -463,7 +473,7 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
       }),
       onCancel: async () => {
         await handleExport();
-        setJoinAttempt(null);
+        clearJoinAttempt();
       },
       onOk: async () => {
         await handleRequestNearbyJoin(device.endpointId, true);
@@ -503,8 +513,14 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
 
   function handleJoinCancel() {
     closeScanner();
+    clearJoinAttempt();
     setJoinOpen(false);
     setNearbySpaces([]);
+  }
+
+  function clearJoinAttempt() {
+    joinAttemptRequestIdRef.current = null;
+    setJoinAttempt(null);
   }
 
   function handleJoinCodeChange(event: ChangeEvent<HTMLTextAreaElement>) {

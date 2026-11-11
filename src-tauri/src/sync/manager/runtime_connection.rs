@@ -75,6 +75,11 @@ impl SyncManager {
             .bind()
             .await
             .context("failed to bind Iroh sync endpoint")?;
+        // Android immediately supplies its current Wi-Fi route through the native network
+        // callback. Desktop platforms need one initial refresh before mDNS can publish an
+        // address instead of only browsing for peers.
+        #[cfg(not(target_os = "android"))]
+        endpoint.network_change().await;
         log::info!(
             "Iroh sync endpoint bound IPv4-only: sockets={:?}",
             endpoint.bound_sockets()
@@ -344,11 +349,6 @@ impl SyncManager {
         };
         if removed {
             self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
-            self.runtime_state
-                .confirmed_cloud_source_icons
-                .write()
-                .expect("confirmed cloud source icons poisoned")
-                .clear_connection(stable_id);
             let mut session = self
                 .runtime_state
                 .cloud_session
@@ -375,11 +375,6 @@ impl SyncManager {
         let stable_id = connection.stable_id();
         connection.close(0_u32.into(), b"cloud network path changed");
         self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
-        self.runtime_state
-            .confirmed_cloud_source_icons
-            .write()
-            .expect("confirmed cloud source icons poisoned")
-            .clear_connection(stable_id);
         let mut session = self
             .runtime_state
             .cloud_session
@@ -416,11 +411,6 @@ impl SyncManager {
             .write()
             .expect("cloud session state poisoned")
             .take();
-        *self
-            .runtime_state
-            .confirmed_cloud_source_icons
-            .write()
-            .expect("confirmed cloud source icons poisoned") = ConfirmedCloudSourceIcons::default();
         self.runtime_state
             .cloud_server_version
             .write()

@@ -109,8 +109,11 @@ class EcoPasteOverlayPanel(
     )
 
     private data class ItemSyncChannel(
-        val state: String,
+        val availability: String,
+        val activity: String,
+        val action: String,
         val deliveredTargets: Int,
+        val contentTargets: Int,
         val totalTargets: Int,
         val lastError: String,
     )
@@ -1726,8 +1729,11 @@ class EcoPasteOverlayPanel(
 
     private fun parseItemSyncChannel(value: JSONObject?): ItemSyncChannel {
         return ItemSyncChannel(
-            state = value?.optString("state", "idle") ?: "idle",
+            availability = value?.optString("availability", "none") ?: "none",
+            activity = value?.optString("activity", "idle") ?: "idle",
+            action = value?.optString("action", "none") ?: "none",
             deliveredTargets = value?.optInt("deliveredTargets") ?: 0,
+            contentTargets = value?.optInt("contentTargets") ?: 0,
             totalTargets = value?.optInt("totalTargets") ?: 0,
             lastError = value?.optString("lastError").orEmpty(),
         )
@@ -2097,10 +2103,10 @@ class EcoPasteOverlayPanel(
 
     private fun createItemSyncButton(item: OverlayItem, target: String, iconRes: Int): ImageButton {
         val channel = if (target == "lan") item.sync.lan else item.sync.cloud
-        val actionable = channel.state == "manual" || channel.state == "error"
+        val actionable = channel.action == "upload" || channel.action == "retry"
         return ImageButton(context).apply {
             setImageResource(iconRes)
-            imageTintList = ColorStateList.valueOf(itemSyncStateColor(channel.state))
+            imageTintList = ColorStateList.valueOf(itemSyncStateColor(channel))
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(dp(6), dp(6), dp(6), dp(6))
             background = null
@@ -2110,7 +2116,7 @@ class EcoPasteOverlayPanel(
                 if (actionable) synchronizeItem(item.id, target)
             }
             layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
-            if (channel.state == "syncing") {
+            if (channel.activity == "syncing") {
                 startAnimation(AlphaAnimation(0.45f, 1f).apply {
                     duration = 700L
                     repeatCount = Animation.INFINITE
@@ -2159,18 +2165,33 @@ class EcoPasteOverlayPanel(
 
     private fun itemSyncDescription(target: String, channel: ItemSyncChannel): String {
         val name = if (target == "lan") "局域网" else "云端"
-        return when (channel.state) {
-            "success" -> if (target == "lan") {
-                "$name：已投递到 ${channel.deliveredTargets}/${channel.totalTargets} 台设备"
-            } else {
-                "$name：已同步"
-            }
+        if (channel.activity == "error") {
+            return "$name：${channel.lastError.ifBlank { "同步失败" }}，等待重试或点击重试"
+        }
+        return when (channel.activity) {
             "queued" -> "$name：等待同步"
             "confirming" -> "$name：等待确认"
             "syncing" -> "$name：同步中"
-            "manual" -> "$name：需要手动同步，点击开始"
-            "error" -> "$name：${channel.lastError.ifBlank { "同步失败" }}，等待重试或点击重试"
-            else -> if (target == "lan") "$name：当前无在线设备，已跳过" else "$name：本次未使用"
+            else -> when (channel.availability) {
+                "complete" -> if (target == "lan") {
+                    "$name：已投递到 ${channel.deliveredTargets}/${channel.totalTargets} 台设备"
+                } else {
+                    "$name：文件内容已就绪"
+                }
+                "partial" -> "$name：部分内容已就绪（${channel.contentTargets}/${channel.totalTargets}）"
+                "metadataOnly" -> if (channel.action == "upload") {
+                    "$name：仅记录已同步，点击上传文件"
+                } else {
+                    "$name：仅记录已同步"
+                }
+                else -> if (channel.action == "upload") {
+                    "$name：需要手动同步，点击开始"
+                } else if (target == "lan") {
+                    "$name：当前无在线设备，已跳过"
+                } else {
+                    "$name：本次未使用"
+                }
+            }
         }
     }
 
@@ -2533,13 +2554,15 @@ class EcoPasteOverlayPanel(
         }
     }
 
-    private fun itemSyncStateColor(state: String): Int {
-        return when (state) {
-            "success" -> Color.rgb(82, 196, 26)
-            "syncing" -> Color.rgb(22, 119, 255)
-            "confirming" -> Color.rgb(22, 119, 255)
-            "manual" -> Color.rgb(250, 173, 20)
-            "error" -> Color.rgb(255, 77, 79)
+    private fun itemSyncStateColor(channel: ItemSyncChannel): Int {
+        return when {
+            channel.activity == "error" -> Color.rgb(255, 77, 79)
+            channel.activity == "syncing" || channel.activity == "confirming" ->
+                Color.rgb(22, 119, 255)
+            channel.availability == "complete" -> Color.rgb(82, 196, 26)
+            channel.availability == "metadataOnly" || channel.availability == "partial" ->
+                Color.rgb(22, 119, 255)
+            channel.action == "upload" -> Color.rgb(250, 173, 20)
             else -> tertiaryTextColor()
         }
     }

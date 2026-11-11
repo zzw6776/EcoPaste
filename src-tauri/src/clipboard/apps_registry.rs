@@ -44,7 +44,7 @@ impl AppsRegistry {
     pub async fn load_from_db(&self) -> Result<()> {
         let pool = self.pool().await;
         let mut all = apps::list_all_apps(&pool).await?;
-        let mut refreshed = false;
+        let mut refreshed_app_ids = Vec::new();
         for app in &mut all {
             if app.icon_hash.is_some() && app.accent_start.is_some() && app.accent_end.is_some() {
                 continue;
@@ -59,7 +59,7 @@ impl AppsRegistry {
                     app.accent_start = Some(metadata.accent_start);
                     app.accent_end = Some(metadata.accent_end);
                     apps::upsert_app(&pool, app).await?;
-                    refreshed = true;
+                    refreshed_app_ids.push(app.id.clone());
                 }
                 Err(error) => {
                     log::warn!(
@@ -75,9 +75,14 @@ impl AppsRegistry {
             cache.insert(app.id.clone(), app);
         }
         drop(cache);
-        if refreshed {
-            if let Err(error) = self.app.emit(super::SOURCE_APP_UPDATED_EVENT, ()) {
-                log::warn!("emit source app metadata backfill update failed: {error}");
+        if !refreshed_app_ids.is_empty() {
+            for app_id in refreshed_app_ids {
+                if let Err(error) = self.app.emit(
+                    super::SOURCE_APP_UPDATED_EVENT,
+                    serde_json::json!({ "appId": app_id }),
+                ) {
+                    log::warn!("emit source app metadata backfill update failed: {error}");
+                }
             }
             #[cfg(target_os = "android")]
             crate::commands::android::notify_overlay_clipboard_changed();

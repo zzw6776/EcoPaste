@@ -1,6 +1,7 @@
 import { Modal as AntdModal, type ModalProps } from "antd";
 import type { FC } from "react";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 
 export interface AppModalProps extends Omit<ModalProps, "onCancel"> {
   onCancel: () => void;
@@ -11,6 +12,7 @@ const Modal: FC<AppModalProps> = (props) => {
   const { onCancel, open, ...rest } = props;
 
   useAndroidBack(open === true, onCancel);
+  useCloseAppOverlay(open === true, onCancel);
 
   return <AntdModal {...rest} onCancel={onCancel} open={open} />;
 };

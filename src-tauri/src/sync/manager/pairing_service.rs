@@ -47,7 +47,9 @@ impl SyncManager {
                 invitation_secret: Some(code.invitation_secret.clone()),
             };
             let response = tokio::time::timeout(
-                Duration::from_secs(JOIN_TIMEOUT_SECS) + JOIN_HANDSHAKE_TIMEOUT * 2,
+                Duration::from_secs(JOIN_TIMEOUT_SECS)
+                    + JOIN_COMMIT_TIMEOUT
+                    + JOIN_HANDSHAKE_TIMEOUT,
                 call_join(&connection, request, Some((self, replace_existing, true))),
             )
             .await
@@ -78,6 +80,7 @@ impl SyncManager {
         replace_existing: bool,
         preserve_runtime: bool,
     ) -> Result<()> {
+        self.validate_pairing_bootstrap(bootstrap, replace_existing)?;
         let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
         let _lan_guard = self.runtime_state.lan_cycle_lock.write().await;
         let current_group = self.identity.snapshot().group;
@@ -123,6 +126,51 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Validates an approved bootstrap before the current sync space is changed.
+    pub(super) fn validate_pairing_bootstrap(
+        &self,
+        bootstrap: &PairingBootstrap,
+        replace_existing: bool,
+    ) -> Result<()> {
+        bootstrap.group.validate()?;
+        let current_group = self.identity.snapshot().group;
+        let switching_group = current_group
+            .as_ref()
+            .is_some_and(|group| group != &bootstrap.group);
+        if switching_group && !replace_existing {
+            bail!("本机已连接到其他设备，请先确认是否加入二维码所属设备");
+        }
+        Ok(())
+    }
+
+    /// Commits an approved member and publishes its restoration before it may contact the Hub.
+    pub(super) async fn commit_approved_peer(
+        self: &Arc<Self>,
+        peer: &PeerAnnouncement,
+    ) -> Result<()> {
+        let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
+        let pool = self.pool().await;
+        repository::restore_and_upsert_peer(&pool, peer).await?;
+
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !server_is_configured(&settings) {
+            return Ok(());
+        }
+
+        let identity = self.identity.snapshot();
+        let group = identity.group.context("本机尚未加入同步空间")?;
+        let endpoint = self.ensure_endpoint(&settings).await?;
+        let device = self.device_announcement(&endpoint);
+        let connection = self
+            .request_cloud_connection(Duration::from_secs(8))
+            .await
+            .context("等待云端确认设备恢复")?;
+        self.ensure_cloud_group(&connection, &group).await?;
+        self.publish_cloud_membership(&connection, &pool, &group, &device)
+            .await
+            .context("云端确认设备恢复")
+    }
+
     pub async fn remove_peer(self: &Arc<Self>, device_id: &str) -> Result<()> {
         let device_id = device_id.trim();
         if device_id.is_empty() || device_id == self.identity.snapshot().device_id {
@@ -138,8 +186,6 @@ impl SyncManager {
         if repository::remove_peer(&pool, device_id).await?.is_none() {
             bail!("未找到指定的已配对设备");
         }
-        self.clear_peer_suspension(device_id);
-
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
         let group = identity.group.clone();
@@ -150,13 +196,16 @@ impl SyncManager {
                     let address = peer_endpoint_addr(&peer.announcement)?;
                     let connection =
                         connect_peer(&endpoint, address, Duration::from_secs(8)).await?;
-                    self.sync_removed_devices(
+                    super::protocol_handlers::spawn_peer_connection_service(
+                        self.clone(),
+                        connection.clone(),
+                    );
+                    self.sync_lan_removed_devices(
                         &connection,
                         &pool,
                         &group,
                         &identity.device_id,
                         &endpoint.id().to_string(),
-                        false,
                     )
                     .await
                 }
@@ -184,11 +233,6 @@ impl SyncManager {
         self.pending_observations
             .lock()
             .expect("pending clipboard observations poisoned")
-            .clear();
-        self.runtime_state
-            .lan_suspended_peers
-            .write()
-            .expect("LAN suspended peers poisoned")
             .clear();
         self.wake();
         Ok(())
@@ -332,23 +376,8 @@ impl SyncManager {
             #[cfg(target_os = "android")]
             let _lan_discovery_guard = AndroidLanDiscoveryGuard::acquire();
             let _endpoint = self.ensure_endpoint(&settings).await?;
-            let deadline = Instant::now() + NEARBY_DISCOVERY_TIMEOUT;
-            loop {
-                // Register before reading the cache so an event between the read and await
-                // cannot be lost. Existing fresh results still return immediately.
-                let discovered = self.runtime_state.nearby_wake.notified();
-                tokio::pin!(discovered);
-                discovered.as_mut().enable();
-                let spaces = self.nearby_spaces();
-                if !spaces.is_empty() {
-                    break Ok(spaces);
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() || tokio::time::timeout(remaining, discovered).await.is_err()
-                {
-                    break Ok(self.nearby_spaces());
-                }
-            }
+            tokio::time::sleep(NEARBY_DISCOVERY_TIMEOUT).await;
+            Ok(self.nearby_spaces())
         }
         .await;
         self.pairing_sessions.fetch_sub(1, Ordering::AcqRel);
@@ -470,7 +499,9 @@ impl SyncManager {
                 .await
                 .context("连接附近设备超时")??;
                 tokio::time::timeout(
-                    Duration::from_secs(JOIN_TIMEOUT_SECS) + JOIN_HANDSHAKE_TIMEOUT * 2,
+                    Duration::from_secs(JOIN_TIMEOUT_SECS)
+                        + JOIN_COMMIT_TIMEOUT
+                        + JOIN_HANDSHAKE_TIMEOUT,
                     call_join(
                         &connection,
                         request,

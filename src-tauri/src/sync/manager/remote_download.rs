@@ -1,5 +1,10 @@
 use super::*;
 
+struct RemoteFileDownloadResult {
+    completed_routes: HashSet<super::super::progress::TransferRoute>,
+    external_destinations: Vec<repository::ExternalDownloadTarget>,
+}
+
 impl SyncManager {
     /// Prompts for an external destination, then downloads a metadata-only file card in background.
     pub async fn download_remote_files(
@@ -41,11 +46,27 @@ impl SyncManager {
         }
 
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let origin_device_id = &stored.event.origin_device_id;
+        let status = repository::item_statuses(&pool, std::slice::from_ref(&item_id))
+            .await?
+            .into_iter()
+            .next()
+            .context("远端文件状态不存在")?;
+        let cloud_content_available =
+            status.cloud.availability == SyncContentAvailability::Complete;
+        let active_lan_connection = self.cached_lan_connection(origin_device_id).is_some();
+        let discovered_origin = repository::list_peers(&pool)
+            .await?
+            .into_iter()
+            .find(|peer| peer.announcement.device_id == origin_device_id.as_str())
+            .is_some_and(|peer| peer_endpoint_addr(&peer.announcement).is_ok());
         let route = preferred_route.unwrap_or_else(|| {
-            if self
-                .cached_lan_connection(&stored.event.origin_device_id)
-                .is_some()
-                || !server_is_configured(&settings)
+            if settings.lan_enabled && active_lan_connection {
+                super::super::progress::TransferRoute::Lan
+            } else if cloud_content_available && server_is_configured(&settings) {
+                super::super::progress::TransferRoute::Cloud
+            } else if settings.lan_enabled
+                && (discovered_origin || !server_is_configured(&settings))
             {
                 super::super::progress::TransferRoute::Lan
             } else {
@@ -55,6 +76,12 @@ impl SyncManager {
         if route == super::super::progress::TransferRoute::Cloud && !server_is_configured(&settings)
         {
             bail!("云端同步未配置");
+        }
+        if route == super::super::progress::TransferRoute::Lan && !settings.lan_enabled {
+            bail!(crate::i18n::commands::label(
+                crate::i18n::current_language(&self.app),
+                crate::i18n::commands::Key::SyncLanDisabled,
+            ));
         }
         let Some(claim) = self.delivery.claim_remote_download(&item_id) else {
             return Ok(None);
@@ -89,6 +116,7 @@ impl SyncManager {
         let task_id = Uuid::new_v4().simple().to_string();
         let task = super::super::progress::TransferTask {
             id: task_id,
+            revision: 0,
             operation_id: stored.event.event_id.clone(),
             item_id: item_id.clone(),
             direction: super::super::progress::TransferDirection::Download,
@@ -98,7 +126,6 @@ impl SyncManager {
             phase: super::super::progress::TransferPhase::Queued,
             transferred_bytes: 0,
             total_bytes,
-            operation_total_bytes: total_bytes,
             speed_bytes_per_second: 0,
             elapsed_ms: 0,
             eta_seconds: None,
@@ -127,25 +154,42 @@ impl SyncManager {
                 .await;
             let transferred = transferred.load(Ordering::Acquire);
             let pool = manager.pool().await;
-            let remote_expired = !handle.canceled()
-                && result
-                    .as_ref()
-                    .is_err_and(|error| error.downcast_ref::<RemoteBlobUnavailable>().is_some());
-            if remote_expired {
-                match repository::expire_remote_file_item(&pool, &item_id, &stored.event.event_id)
-                    .await
-                {
-                    Ok(true) => {
-                        manager.emit_clipboard_reconciled();
-                        #[cfg(target_os = "android")]
-                        crate::commands::android::notify_overlay_clipboard_changed();
-                    }
-                    Ok(false) => {}
-                    Err(error) => log::warn!("expire unavailable remote file failed: {error:#}"),
-                }
-            }
             match result {
-                Ok(()) => handle.completed(total_bytes),
+                Ok(download) => {
+                    let mut lan_receipt_recorded = false;
+                    for completed_route in &download.completed_routes {
+                        let delivered_by_lan =
+                            *completed_route == super::super::progress::TransferRoute::Lan;
+                        if let Err(error) = repository::complete_remote_file_download(
+                            &pool,
+                            &stored.event.origin_device_id,
+                            &stored.event.event_id,
+                            delivered_by_lan,
+                        )
+                        .await
+                        {
+                            log::warn!("record completed remote file download failed: {error:#}");
+                        } else if delivered_by_lan {
+                            lan_receipt_recorded = true;
+                        }
+                    }
+                    if let Err(error) = repository::record_external_download_session(
+                        &pool,
+                        &stored.event.event_id,
+                        &download.external_destinations,
+                    )
+                    .await
+                    {
+                        log::warn!("record external download destinations failed: {error:#}");
+                    }
+                    if lan_receipt_recorded {
+                        manager.wake_lan_transfer();
+                    }
+                    manager.emit_updated();
+                    #[cfg(target_os = "android")]
+                    crate::commands::android::notify_overlay_clipboard_changed();
+                    handle.completed(total_bytes);
+                }
                 Err(_error) if handle.canceled() => handle.mark_canceled(transferred),
                 Err(error) => handle.failed(transferred, error.to_string()),
             }
@@ -226,7 +270,7 @@ impl SyncManager {
         request: RemoteDownloadRequest<'_>,
         handle: &super::super::progress::TransferHandle,
         transferred: &AtomicU64,
-    ) -> Result<()> {
+    ) -> Result<RemoteFileDownloadResult> {
         let RemoteDownloadRequest {
             event,
             group,
@@ -250,6 +294,8 @@ impl SyncManager {
             };
         let key = group.content_key_bytes()?;
         let mut completed_bytes = 0_u64;
+        let mut completed_route_counts = HashMap::new();
+        let mut external_destinations = Vec::new();
         #[cfg(not(target_os = "android"))]
         let mut committed_downloads = Vec::new();
         #[cfg(target_os = "android")]
@@ -319,6 +365,12 @@ impl SyncManager {
                             }
                         }
                     };
+                    external_destinations.push(repository::ExternalDownloadTarget {
+                        destination_kind: "path".to_owned(),
+                        destination: commit.destination().to_string_lossy().into_owned(),
+                        expected_size: manifest.original_size,
+                        is_directory: manifest.is_directory_archive,
+                    });
                     committed_downloads.push(commit);
                     if handle.canceled() {
                         bail!("transfer canceled");
@@ -379,6 +431,12 @@ impl SyncManager {
                             }
                         }
                     };
+                    external_destinations.push(repository::ExternalDownloadTarget {
+                        destination_kind: "uri".to_owned(),
+                        destination: committed_uri.clone(),
+                        expected_size: manifest.original_size,
+                        is_directory: manifest.is_directory_archive,
+                    });
                     committed_uris.push(committed_uri);
                     if handle.canceled() {
                         bail!("transfer canceled");
@@ -386,6 +444,10 @@ impl SyncManager {
                 }
                 completed_bytes = completed_bytes.saturating_add(manifest.encrypted_size);
                 transferred.store(completed_bytes, Ordering::Release);
+                let completed = completed_route_counts
+                    .entry(active_route)
+                    .or_insert(0_usize);
+                *completed = completed.saturating_add(1);
             }
             if handle.canceled() {
                 bail!("transfer canceled");
@@ -393,15 +455,22 @@ impl SyncManager {
             if !handle.begin_finalizing(completed_bytes) {
                 bail!("transfer canceled");
             }
-            Ok(())
+            let completed_routes = completed_route_counts
+                .into_iter()
+                .filter_map(|(route, count)| (count == manifests.len()).then_some(route))
+                .collect();
+            Ok(RemoteFileDownloadResult {
+                completed_routes,
+                external_destinations,
+            })
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(completed_routes) => {
                 #[cfg(not(target_os = "android"))]
                 finalize_external_downloads(committed_downloads).await;
-                Ok(())
+                Ok(completed_routes)
             }
             Err(error) => {
                 #[cfg(not(target_os = "android"))]
@@ -471,20 +540,29 @@ impl SyncManager {
             }
             return self.request_cloud_connection(Duration::from_secs(8)).await;
         }
-        if let Some(connection) = self.cached_lan_connection(&event.origin_device_id) {
-            return Ok(connection);
+        if !settings.lan_enabled {
+            bail!(crate::i18n::commands::label(
+                crate::i18n::current_language(&self.app),
+                crate::i18n::commands::Key::SyncLanDisabled,
+            ));
         }
-
         let pool = self.pool().await;
         let peer = repository::list_peers(&pool)
             .await?
             .into_iter()
             .find(|peer| peer.announcement.device_id == event.origin_device_id)
             .context("来源设备当前不可达")?;
-        let preferred = repository::preferred_peer_address(&pool, &event.origin_device_id).await?;
-        let address = peer_endpoint_addr_with_preferred(&peer.announcement, preferred.as_deref())?;
+        let address = peer_endpoint_addr(&peer.announcement)?;
+        if let Some(connection) = self.cached_lan_connection(&event.origin_device_id) {
+            if lan_connection_matches_discovery(&connection, &address) {
+                return Ok(connection);
+            }
+            self.invalidate_lan_connection(&event.origin_device_id, connection.stable_id());
+            connection.close(0_u32.into(), b"LAN route no longer discovered");
+        }
         let endpoint = self.ensure_endpoint(&settings).await?;
         let connection = connect_peer(&endpoint, address, Duration::from_secs(8)).await?;
+        super::protocol_handlers::spawn_peer_connection_service(self.clone(), connection.clone());
         self.store_lan_connection(&event.origin_device_id, connection.clone());
         Ok(connection)
     }

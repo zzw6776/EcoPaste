@@ -25,8 +25,8 @@ use tauri_nspanel::{
 };
 
 use super::{
-    get_window, ClipboardNativeShowTiming, ClipboardShowRequest, CLIPBOARD_WINDOW_LABEL,
-    ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL, UPDATE_WINDOW_LABEL,
+    get_window, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL,
+    UPDATE_WINDOW_LABEL,
 };
 use crate::core::Result;
 use crate::settings::SettingsStore;
@@ -38,8 +38,6 @@ const PASTE_TARGET_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration
 const PASTE_TARGET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const SLOW_CLIPBOARD_SHOW_MS: u128 = 100;
 
-static ACTIVE_CLIPBOARD_SHOW_TRACE: LazyLock<Mutex<Option<ClipboardShowRequest>>> =
-    LazyLock::new(|| Mutex::new(None));
 static CLIPBOARD_PASTE_TARGET_PID: LazyLock<Mutex<Option<i32>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -166,43 +164,6 @@ pub fn setup_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     panel.set_corner_radius(CLIPBOARD_CORNER_RADIUS);
 
     let handler = MainPanelEventHandler::new();
-
-    handler.window_did_become_key(|_| {
-        let request = ACTIVE_CLIPBOARD_SHOW_TRACE
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
-        if let Some(request) = request {
-            log::info!(
-                "clipboard show AppKit trace: requestId={} phase=becameKey totalUs={}",
-                request.id,
-                elapsed_us(request.requested_at)
-            );
-        }
-    });
-
-    let occlusion_handle = app_handle.clone();
-    handler.window_did_change_occlusion_state(move |_| {
-        let visible = occlusion_handle
-            .get_webview_panel(CLIPBOARD_WINDOW_LABEL)
-            .map(|panel| panel.is_visible())
-            .unwrap_or(false);
-        if !visible {
-            return;
-        }
-
-        let request = ACTIVE_CLIPBOARD_SHOW_TRACE
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        if let Some(request) = request {
-            log::info!(
-                "clipboard show AppKit trace: requestId={} phase=occlusionVisible totalUs={}",
-                request.id,
-                elapsed_us(request.requested_at)
-            );
-        }
-    });
 
     let resign_handle = app_handle.clone();
     handler.window_did_resign_key(move |_| {
@@ -401,16 +362,9 @@ fn configure_idle_activity() {
     std::mem::forget(activity);
 }
 
-pub fn show_window(
-    app_handle: &AppHandle,
-    label: &str,
-    clipboard_show_request: Option<ClipboardShowRequest>,
-) -> Result<()> {
+pub fn show_window(app_handle: &AppHandle, label: &str) -> Result<()> {
     if label == CLIPBOARD_WINDOW_LABEL {
-        let request = clipboard_show_request
-            .ok_or_else(|| anyhow::anyhow!("clipboard show request is missing"))?;
-
-        show_clipboard_panel(app_handle, request)
+        show_clipboard_panel(app_handle)
     } else {
         let window = get_window(app_handle, label)?;
         window.show().map_err(|e| anyhow::anyhow!(e))?;
@@ -496,93 +450,34 @@ pub fn handle_reopen(app_handle: &AppHandle, has_visible_windows: bool) {
         }
     }
 
-    if let Err(err) = show_window(app_handle, PREFERENCE_WINDOW_LABEL, None) {
+    if let Err(err) = show_window(app_handle, PREFERENCE_WINDOW_LABEL) {
         log::error!("show preference window on reopen failed: {err:?}");
     }
 }
 
 /// 所有 panel 方法必须在主线程。
-fn show_clipboard_panel(app_handle: &AppHandle, request: ClipboardShowRequest) -> Result<()> {
+fn show_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     let panel_handle = app_handle.clone();
     app_handle
         .run_on_main_thread(move || {
-            let main_thread_started = Instant::now();
-            let panel_lookup_started = Instant::now();
+            let started_at = Instant::now();
             if let Ok(panel) = panel_handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 remember_clipboard_paste_target();
-                let panel_lookup_us = elapsed_us(panel_lookup_started);
-                if let Ok(mut trace) = ACTIVE_CLIPBOARD_SHOW_TRACE.lock() {
-                    *trace = Some(request);
-                }
-
-                let content_view_started = Instant::now();
                 let content_view = panel.content_view();
-                let content_view_us = elapsed_us(content_view_started);
-
-                let first_responder_started = Instant::now();
-                let first_responder_accepted = panel.make_first_responder(Some(&content_view));
-                let first_responder_us = elapsed_us(first_responder_started);
-
-                let order_front_started = Instant::now();
+                panel.make_first_responder(Some(&content_view));
                 panel.order_front_regardless();
-                let order_front_us = elapsed_us(order_front_started);
-
-                let make_key_started = Instant::now();
                 panel.make_key_window();
-                let make_key_us = elapsed_us(make_key_started);
 
                 if let Err(err) = super::raise_visible_update_window(&panel_handle) {
                     log::warn!("raise update window after clipboard show failed: {err}");
                 }
 
-                let preview_resume_started = Instant::now();
                 super::preview::resume_after_clipboard_show();
-                let preview_resume_us = elapsed_us(preview_resume_started);
-
-                let native_timing = ClipboardNativeShowTiming {
-                    content_view_us,
-                    first_responder_accepted,
-                    first_responder_us,
-                    layout_position_us: request.layout_position_us,
-                    layout_restore_us: request.layout_restore_us,
-                    main_queue_us: duration_us(request.layout_completed_at, main_thread_started),
-                    make_key_us,
-                    native_completed_ms: elapsed_ms(request.requested_at),
-                    order_front_us,
-                    panel_lookup_us,
-                    preview_resume_us,
-                };
-
-                let emit_started = Instant::now();
-                super::emit_clipboard_visibility_after_show(&panel_handle, request, native_timing);
-                let emit_us = elapsed_us(emit_started);
-
-                let lifecycle_started = Instant::now();
+                super::emit_visibility(&panel_handle, CLIPBOARD_WINDOW_LABEL, true);
                 super::lifecycle::on_shown(&panel_handle, CLIPBOARD_WINDOW_LABEL);
-                let lifecycle_us = elapsed_us(lifecycle_started);
-
-                let total_ms = request.requested_at.elapsed().as_millis();
-                let message = format!(
-                    "clipboard show native trace: requestId={} layoutRestoreUs={} layoutPositionUs={} mainQueueUs={} panelLookupUs={} contentViewUs={} firstResponderUs={} firstResponderAccepted={} orderFrontUs={} makeKeyUs={} previewResumeUs={} emitUs={} lifecycleUs={} totalMs={}",
-                    request.id,
-                    native_timing.layout_restore_us,
-                    native_timing.layout_position_us,
-                    native_timing.main_queue_us,
-                    native_timing.panel_lookup_us,
-                    native_timing.content_view_us,
-                    native_timing.first_responder_us,
-                    native_timing.first_responder_accepted,
-                    native_timing.order_front_us,
-                    native_timing.make_key_us,
-                    native_timing.preview_resume_us,
-                    emit_us,
-                    lifecycle_us,
-                    total_ms
-                );
+                let total_ms = started_at.elapsed().as_millis();
                 if total_ms >= SLOW_CLIPBOARD_SHOW_MS {
-                    log::warn!("{message}");
-                } else {
-                    log::info!("{message}");
+                    log::warn!("slow clipboard panel show: totalMs={total_ms}");
                 }
             }
         })
@@ -595,9 +490,6 @@ fn hide_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
     let handle = app_handle.clone();
     app_handle
         .run_on_main_thread(move || {
-            if let Ok(mut trace) = ACTIVE_CLIPBOARD_SHOW_TRACE.lock() {
-                *trace = None;
-            }
             if let Ok(panel) = handle.get_webview_panel(CLIPBOARD_WINDOW_LABEL) {
                 panel.hide();
             }
@@ -609,21 +501,6 @@ fn hide_clipboard_panel(app_handle: &AppHandle) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(())
-}
-
-fn duration_us(started: Instant, completed: Instant) -> u64 {
-    completed
-        .saturating_duration_since(started)
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn elapsed_us(started: Instant) -> u64 {
-    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 /// 让主 panel 放弃 key 状态，但保持可见——用于固定窗口下的粘贴：

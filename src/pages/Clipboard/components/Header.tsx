@@ -26,6 +26,7 @@ import {
   CLIPBOARD_TYPE_TO_SEARCH_EVENT,
 } from "@/constants/keyboard";
 import { WINDOW_LABEL } from "@/constants/windows";
+import { useSyncTransferActivity } from "@/hooks/useSyncTransferActivity";
 import { useTauriListen } from "@/hooks/useTauriListen";
 import { router } from "@/router";
 import { openAndroidPermissionsModal } from "@/stores/android";
@@ -69,6 +70,7 @@ const PIN_WINDOW_SHORTCUT = formatShortcutDisplay("CmdOrCtrl+P", " ");
  * 左侧 🔍 极简搜索，中间绝对居中 Pinboards（剪贴板胶囊 + 收藏 + 自定义画板 + 新建），右侧极简 `...` 更多。
  */
 const Header: FC = () => {
+  useSyncTransferActivity();
   const { t } = useTranslation(["clipboard", "common"]);
   const settings = useSnapshot(settingsState);
   const snapshot = useSnapshot(clipboardViewState);
@@ -384,10 +386,10 @@ const Header: FC = () => {
               trigger={MORE_ACTION_TRIGGER}
             >
               <button
-                className="flex size-9 cursor-pointer items-center justify-center rounded-xl bg-ant-container text-ant-secondary shadow-xs transition-colors hover:bg-ant-fill-tertiary"
+                className="group flex size-9 cursor-pointer items-center justify-center rounded-xl bg-ant-container shadow-xs transition-colors hover:bg-ant-fill-tertiary"
                 type="button"
               >
-                <i className="i-lucide:more-vertical size-4" />
+                <i className="i-lucide:more-vertical size-4 text-ant-tertiary transition-colors group-hover:text-ant-text" />
               </button>
             </Dropdown>
           </div>
@@ -550,14 +552,14 @@ const Header: FC = () => {
 
   return (
     <div
-      className="relative flex h-11 shrink-0 select-none items-center justify-between px-5"
+      className="relative flex h-13 shrink-0 select-none items-center justify-between px-5"
       data-tauri-drag-region
     >
       {/* 左侧：保持通透拖拽区 */}
       <div className="w-8 shrink-0" />
 
       {/* 中间：搜索与 Pinboard 画板组（整体水平居中，1:1 完全对齐 Paste） */}
-      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+      <div className="clipboard-header-content pointer-events-none absolute inset-0 flex items-center justify-center">
         {searchOpen ? (
           <div className="pointer-events-auto z-20 flex items-center gap-2">
             <SearchInput
@@ -769,7 +771,7 @@ const Header: FC = () => {
       </div>
 
       {/* 右侧：极简 `...` 更多操作 */}
-      <div className="z-10 flex items-center gap-1">
+      <div className="clipboard-header-content z-10 flex items-center gap-1">
         <SyncStatusIcons />
         <TransferCenter />
         {!isMobile() && (
@@ -777,10 +779,10 @@ const Header: FC = () => {
             <button
               aria-label={isPinned ? t("header.unpin") : t("header.pin")}
               className={cn(
-                "flex size-7 cursor-pointer items-center justify-center rounded-full transition-all",
+                "group flex size-7 cursor-pointer items-center justify-center rounded-full transition-all",
                 isPinned
                   ? "bg-ant-primary/15 text-ant-primary opacity-100"
-                  : "text-neutral-500 opacity-40 hover:bg-black/5 hover:text-neutral-800 hover:opacity-100 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white",
+                  : "hover:bg-ant-fill-tertiary",
               )}
               onClick={() => {
                 void toggleClipboardWindowPinned();
@@ -789,8 +791,10 @@ const Header: FC = () => {
             >
               <i
                 className={cn(
-                  "size-3.5 transition-transform",
-                  isPinned ? "i-lucide:pin-off" : "i-lucide:pin rotate-45",
+                  "size-3.5 transition-all",
+                  isPinned
+                    ? "i-lucide:pin-off"
+                    : "i-lucide:pin rotate-45 text-ant-tertiary group-hover:text-ant-text",
                 )}
               />
             </button>
@@ -802,10 +806,10 @@ const Header: FC = () => {
           trigger={MORE_ACTION_TRIGGER}
         >
           <button
-            className="flex size-7 cursor-pointer items-center justify-center rounded-full text-neutral-600 transition-colors hover:bg-black/5 hover:text-neutral-900 dark:text-white/70 dark:hover:bg-white/10 dark:hover:text-white"
+            className="group flex size-7 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary"
             type="button"
           >
-            <i className="i-lucide:more-horizontal size-4" />
+            <i className="i-lucide:more-horizontal size-4 text-ant-tertiary transition-colors group-hover:text-ant-text" />
           </button>
         </Dropdown>
       </div>

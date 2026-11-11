@@ -35,34 +35,104 @@ pub async fn clear_stale_transfer_locks(pool: &SqlitePool) -> Result<()> {
 /// Prevents a canceled upload route from being restarted by the background worker.
 pub async fn cancel_delivery(pool: &SqlitePool, target_id: &str, event_id: &str) -> Result<()> {
     let now = Utc::now();
-    let mut transaction = pool.begin().await.context("begin cancel sync delivery")?;
     sqlx::query(
         r#"
-        INSERT INTO sync_canceled_deliveries (event_id, target_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(event_id, target_id) DO UPDATE SET updated_at = excluded.updated_at
+        INSERT INTO sync_delivery_targets (
+            event_id, target_id, desired_content, confirmed_content,
+            status, last_error, created_at, updated_at
+        )
+        SELECT ?, ?,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM sync_event_blobs WHERE event_id = ?
+               ) THEN 'complete' ELSE 'metadata' END,
+               'none', 'canceled', 'transfer canceled', ?, ?
+        WHERE EXISTS (SELECT 1 FROM sync_events WHERE event_id = ?)
+        ON CONFLICT(event_id, target_id) DO UPDATE SET
+            status = CASE
+                WHEN sync_delivery_targets.confirmed_content = 'complete'
+                    OR (
+                        sync_delivery_targets.desired_content = 'metadata'
+                        AND sync_delivery_targets.confirmed_content = 'metadata'
+                    )
+                    THEN 'confirmed'
+                ELSE 'canceled'
+            END,
+            last_error = CASE
+                WHEN sync_delivery_targets.confirmed_content = 'complete'
+                    OR (
+                        sync_delivery_targets.desired_content = 'metadata'
+                        AND sync_delivery_targets.confirmed_content = 'metadata'
+                    )
+                    THEN NULL
+                ELSE 'transfer canceled'
+            END,
+            updated_at = excluded.updated_at
         "#,
     )
     .bind(event_id)
     .bind(target_id)
+    .bind(event_id)
     .bind(now)
     .bind(now)
-    .execute(&mut *transaction)
+    .bind(event_id)
+    .execute(pool)
     .await
     .context("cancel sync delivery")?;
-    set_delivery_state_on(
-        &mut transaction,
-        target_id,
-        &[event_id.to_owned()],
-        "error",
-        "uploading",
-        Some("transfer canceled"),
+    Ok(())
+}
+
+/// Records an event-specific terminal failure without blocking unrelated background deliveries.
+pub async fn block_delivery(
+    pool: &SqlitePool,
+    target_id: &str,
+    event_id: &str,
+    error: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_delivery_targets (
+            event_id, target_id, desired_content, confirmed_content,
+            status, last_error, created_at, updated_at
+        )
+        SELECT ?, ?,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM sync_event_blobs WHERE event_id = ?
+               ) THEN 'complete' ELSE 'metadata' END,
+               'none', 'blocked', ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM sync_events WHERE event_id = ?)
+        ON CONFLICT(event_id, target_id) DO UPDATE SET
+            status = CASE
+                WHEN sync_delivery_targets.confirmed_content = 'complete'
+                    OR (
+                        sync_delivery_targets.desired_content = 'metadata'
+                        AND sync_delivery_targets.confirmed_content = 'metadata'
+                    )
+                    THEN 'confirmed'
+                ELSE 'blocked'
+            END,
+            last_error = CASE
+                WHEN sync_delivery_targets.confirmed_content = 'complete'
+                    OR (
+                        sync_delivery_targets.desired_content = 'metadata'
+                        AND sync_delivery_targets.confirmed_content = 'metadata'
+                    )
+                    THEN NULL
+                ELSE excluded.last_error
+            END,
+            updated_at = excluded.updated_at
+        "#,
     )
-    .await?;
-    transaction
-        .commit()
-        .await
-        .context("commit canceled sync delivery")?;
+    .bind(event_id)
+    .bind(target_id)
+    .bind(event_id)
+    .bind(error)
+    .bind(now)
+    .bind(now)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .context("block sync delivery")?;
     Ok(())
 }
 
@@ -75,8 +145,9 @@ pub async fn canceled_delivery_ids(
     if event_ids.is_empty() {
         return Ok(HashSet::new());
     }
-    let mut query =
-        sqlx::QueryBuilder::new("SELECT event_id FROM sync_canceled_deliveries WHERE target_id = ");
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT event_id FROM sync_delivery_targets WHERE status IN ('blocked', 'canceled') AND target_id = ",
+    );
     query.push_bind(target_id).push(" AND event_id IN (");
     let mut separated = query.separated(", ");
     for event_id in event_ids {
@@ -92,39 +163,104 @@ pub async fn canceled_delivery_ids(
         .collect())
 }
 
-/// Re-enables an explicitly selected route and expands to both routes only when needed.
+/// Selects one explicit retry route; choosing the other route later expands delivery to both.
 pub async fn resume_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool) -> Result<()> {
-    let target_filter = if cloud { "cloud" } else { "peer:%" };
     let delivery_route = if cloud { "cloud" } else { "lan" };
     let mut transaction = pool.begin().await.context("begin sync delivery retry")?;
-    let delete = if cloud {
-        "DELETE FROM sync_canceled_deliveries WHERE target_id = ? AND event_id IN (SELECT event_id FROM sync_item_events WHERE item_id = ?)"
-    } else {
-        "DELETE FROM sync_canceled_deliveries WHERE target_id LIKE ? AND event_id IN (SELECT event_id FROM sync_item_events WHERE item_id = ?)"
-    };
-    sqlx::query(delete)
-        .bind(target_filter)
-        .bind(item_id)
-        .execute(&mut *transaction)
-        .await
-        .context("resume canceled sync delivery")?;
-    sqlx::query(
+    let event_id: Option<String> = sqlx::query_scalar(
         r#"
-        UPDATE sync_events
-        SET delivery_route = CASE
-                WHEN delivery_route IS NULL OR delivery_route = ? THEN delivery_route
-                ELSE NULL
-            END,
-            updated_at = ?
-        WHERE event_id IN (SELECT event_id FROM sync_item_events WHERE item_id = ?)
+        SELECT links.event_id
+        FROM sync_item_events links
+        JOIN sync_events event ON event.event_id = links.event_id
+        WHERE links.item_id = ? AND links.direction = 'local' AND event.event_kind = ?
+        ORDER BY links.created_at DESC
+        LIMIT 1
         "#,
     )
-    .bind(delivery_route)
-    .bind(Utc::now())
     .bind(item_id)
-    .execute(&mut *transaction)
+    .bind(SyncEventKind::Content.as_i64())
+    .fetch_optional(&mut *transaction)
     .await
-    .context("allow manually selected sync route")?;
+    .context("find selected sync delivery event")?;
+    if let Some(event_id) = event_id {
+        let now = Utc::now();
+        if cloud {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_delivery_targets (
+                    event_id, target_id, desired_content, confirmed_content,
+                    status, created_at, updated_at
+                ) VALUES (?, 'cloud', 'complete', 'none', 'pending', ?, ?)
+                ON CONFLICT(event_id, target_id) DO UPDATE SET
+                    desired_content = 'complete',
+                    status = CASE
+                        WHEN sync_delivery_targets.confirmed_content = 'complete'
+                            THEN 'confirmed'
+                        ELSE 'pending'
+                    END,
+                    last_error = NULL,
+                    retry_at = NULL,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(&event_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .context("request explicit cloud content delivery")?;
+        } else {
+            let peer_ids = sqlx::query_scalar::<_, String>("SELECT device_id FROM sync_peers")
+                .fetch_all(&mut *transaction)
+                .await
+                .context("list LAN delivery targets")?;
+            for peer_id in peer_ids {
+                sqlx::query(
+                    r#"
+                    INSERT INTO sync_delivery_targets (
+                        event_id, target_id, desired_content, confirmed_content,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, 'complete', 'none', 'pending', ?, ?)
+                    ON CONFLICT(event_id, target_id) DO UPDATE SET
+                        desired_content = 'complete',
+                        status = CASE
+                            WHEN sync_delivery_targets.confirmed_content = 'complete'
+                                THEN 'confirmed'
+                            ELSE 'pending'
+                        END,
+                        last_error = NULL,
+                        retry_at = NULL,
+                        updated_at = excluded.updated_at
+                    "#,
+                )
+                .bind(&event_id)
+                .bind(format!("peer:{peer_id}"))
+                .bind(now)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .context("request explicit LAN content delivery")?;
+            }
+        }
+        sqlx::query(
+            r#"
+            UPDATE sync_events
+            SET delivery_route = CASE
+                    WHEN delivery_route IS NULL THEN NULL
+                    WHEN delivery_route = ? THEN delivery_route
+                    ELSE NULL
+                END,
+                updated_at = ?
+            WHERE event_id = ?
+            "#,
+        )
+        .bind(delivery_route)
+        .bind(Utc::now())
+        .bind(&event_id)
+        .execute(&mut *transaction)
+        .await
+        .context("allow manually selected sync route")?;
+    }
     transaction
         .commit()
         .await
@@ -412,9 +548,11 @@ pub async fn has_unapplied_events_by_kind(pool: &SqlitePool, kind: SyncEventKind
         != 0)
 }
 
-pub async fn pending_events_for_target(
+/// Lists LAN events for one peer without parsing a route identifier or echoing its own events.
+pub async fn pending_peer_events_for_target(
     pool: &SqlitePool,
     target_id: &str,
+    peer_device_id: &str,
     limit: u16,
 ) -> Result<Vec<StoredSyncEvent>> {
     let rows = sqlx::query(
@@ -422,24 +560,26 @@ pub async fn pending_events_for_target(
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
                e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_events e
-        LEFT JOIN sync_deliveries d
+        LEFT JOIN sync_delivery_targets d
           ON d.event_id = e.event_id AND d.target_id = ?
-        WHERE d.event_id IS NULL
-          AND NOT EXISTS (
-              SELECT 1 FROM sync_canceled_deliveries canceled
-              WHERE canceled.event_id = e.event_id AND canceled.target_id = ?
+        WHERE (
+              d.event_id IS NULL
+              OR (
+                  d.status = 'pending'
+                  AND (
+                      d.confirmed_content = 'none'
+                      OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')
+                  )
+              )
           )
-          AND (
-              e.delivery_route IS NULL
-              OR e.delivery_route = CASE WHEN ? = 'cloud' THEN 'cloud' ELSE 'lan' END
-          )
+          AND e.origin_device_id <> ?
+          AND (e.delivery_route IS NULL OR e.delivery_route = 'lan')
         ORDER BY e.cursor ASC
         LIMIT ?
         "#,
     )
     .bind(target_id)
-    .bind(target_id)
-    .bind(target_id)
+    .bind(peer_device_id)
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -460,13 +600,20 @@ pub async fn pending_origin_events_for_target(
         SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
                e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
         FROM sync_events e
-        LEFT JOIN sync_deliveries d
+        LEFT JOIN sync_delivery_targets d
           ON d.event_id = e.event_id AND d.target_id = ?
-        WHERE d.event_id IS NULL AND e.origin_device_id = ?
-          AND NOT EXISTS (
-              SELECT 1 FROM sync_canceled_deliveries canceled
-              WHERE canceled.event_id = e.event_id AND canceled.target_id = ?
+        WHERE (
+              d.event_id IS NULL
+              OR (
+                  d.status = 'pending'
+                  AND (
+                      d.confirmed_content = 'none'
+                      OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')
+                  )
+              )
           )
+          AND e.origin_device_id = ?
+          AND substr(e.ciphertext, 1, 8) = ?
           AND (
               e.delivery_route IS NULL
               OR e.delivery_route = CASE WHEN ? = 'cloud' THEN 'cloud' ELSE 'lan' END
@@ -477,7 +624,7 @@ pub async fn pending_origin_events_for_target(
     )
     .bind(target_id)
     .bind(origin_device_id)
-    .bind(target_id)
+    .bind(crate::sync::crypto::EVENT_AAD_MAGIC.as_slice())
     .bind(target_id)
     .bind(i64::from(limit))
     .fetch_all(pool)
@@ -486,6 +633,7 @@ pub async fn pending_origin_events_for_target(
     rows.into_iter().map(event_from_row).collect()
 }
 
+#[cfg(test)]
 pub async fn events_after_cursor(
     pool: &SqlitePool,
     after_cursor: u64,
@@ -507,6 +655,51 @@ pub async fn events_after_cursor(
     .await
     .context("list sync events after cursor")?;
     rows.into_iter().map(event_from_row).collect()
+}
+
+/// Reads the peer-visible LAN stream while advancing across events that are not routed to it.
+pub async fn peer_events_after_cursor(
+    pool: &SqlitePool,
+    peer_device_id: &str,
+    after_cursor: u64,
+    limit: u16,
+) -> Result<(Vec<StoredSyncEvent>, u64)> {
+    let after_cursor = i64::try_from(after_cursor).unwrap_or(i64::MAX);
+    let rows = sqlx::query(
+        r#"
+        SELECT cursor, event_id, origin_device_id, origin_sequence,
+               event_created_at_ms, nonce, ciphertext, event_kind
+        FROM sync_events
+        WHERE cursor > ?
+          AND origin_device_id <> ?
+          AND (delivery_route IS NULL OR delivery_route = 'lan')
+        ORDER BY cursor ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(after_cursor)
+    .bind(peer_device_id)
+    .bind(i64::from(limit.max(1)))
+    .fetch_all(pool)
+    .await
+    .context("list peer-visible sync events after cursor")?;
+    let events = rows
+        .into_iter()
+        .map(event_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    let latest_cursor = if let Some(event) = events.last() {
+        event.cursor
+    } else {
+        let latest: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(cursor), ?) FROM sync_events WHERE cursor > ?")
+                .bind(after_cursor)
+                .bind(after_cursor)
+                .fetch_one(pool)
+                .await
+                .context("advance peer cursor across filtered sync events")?;
+        u64::try_from(latest).context("negative sync event cursor")?
+    };
+    Ok((events, latest_cursor))
 }
 
 pub async fn blobs_for_events(pool: &SqlitePool, event_ids: &[String]) -> Result<Vec<StoredBlob>> {
@@ -541,6 +734,59 @@ pub async fn blobs_for_events(pool: &SqlitePool, event_ids: &[String]) -> Result
         .collect()
 }
 
+/// Returns selected-route events so an explicit upload bypasses the automatic size policy.
+pub async fn event_ids_with_delivery_route(
+    pool: &SqlitePool,
+    events: &[StoredSyncEvent],
+    route: &str,
+) -> Result<HashSet<String>> {
+    if events.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut query =
+        sqlx::QueryBuilder::new("SELECT event_id FROM sync_events WHERE delivery_route = ");
+    query.push_bind(route).push(" AND event_id IN (");
+    let mut separated = query.separated(", ");
+    for event in events {
+        separated.push_bind(&event.event.event_id);
+    }
+    query.push(")");
+    Ok(query
+        .build_query_scalar::<String>()
+        .fetch_all(pool)
+        .await
+        .context("list explicitly routed sync events")?
+        .into_iter()
+        .collect())
+}
+
+/// Returns events whose user explicitly requested full content on one delivery target.
+pub async fn event_ids_with_forced_content_delivery(
+    pool: &SqlitePool,
+    events: &[StoredSyncEvent],
+    target_id: &str,
+) -> Result<HashSet<String>> {
+    if events.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT event_id FROM sync_delivery_targets WHERE desired_content = 'complete' AND confirmed_content <> 'complete' AND target_id = ",
+    );
+    query.push_bind(target_id).push(" AND event_id IN (");
+    let mut separated = query.separated(", ");
+    for event in events {
+        separated.push_bind(&event.event.event_id);
+    }
+    query.push(")");
+    Ok(query
+        .build_query_scalar::<String>()
+        .fetch_all(pool)
+        .await
+        .context("list forced content deliveries")?
+        .into_iter()
+        .collect())
+}
+
 /// Resolves a local blob so a LAN pull can use staging or recreate it from its source.
 pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<StoredBlob>> {
     let row = sqlx::query(
@@ -566,6 +812,42 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
             source_is_directory: row.try_get("source_is_directory")?,
             stream_nonce: row.try_get("stream_nonce")?,
         })
+    })
+    .transpose()
+}
+
+/// Resolves a pulled file blob back to the local clipboard operation that owns it.
+pub async fn outgoing_file_event_for_blob(
+    pool: &SqlitePool,
+    blob_id: &str,
+) -> Result<Option<(String, StoredSyncEvent)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT links.item_id,
+               event.cursor, event.event_id, event.origin_device_id,
+               event.origin_sequence, event.event_created_at_ms,
+               event.nonce, event.ciphertext, event.event_kind
+        FROM sync_event_blobs blob
+        JOIN sync_item_events links
+          ON links.event_id = blob.event_id AND links.direction = 'local'
+        JOIN sync_events event ON event.event_id = links.event_id
+        JOIN clipboard_items item ON item.id = links.item_id
+        WHERE blob.blob_id = ?
+          AND event.event_kind = ?
+          AND item.kind = 'files'
+        ORDER BY event.event_created_at_ms DESC, event.cursor DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(blob_id)
+    .bind(SyncEventKind::Content.as_i64())
+    .fetch_optional(pool)
+    .await
+    .context("resolve pulled file blob operation")?;
+    row.map(|row| {
+        let item_id = row.try_get("item_id")?;
+        let event = event_from_row(row)?;
+        Ok((item_id, event))
     })
     .transpose()
 }
@@ -597,8 +879,16 @@ pub async fn releasable_staging_for_events(
           AND NOT EXISTS (
               SELECT 1
               FROM sync_event_blobs reference
-              JOIN sync_deliveries delivery ON delivery.event_id = reference.event_id
-              WHERE reference.blob_id = candidate.blob_id AND delivery.confirmed = 0
+              JOIN sync_delivery_targets delivery ON delivery.event_id = reference.event_id
+              WHERE reference.blob_id = candidate.blob_id
+                AND delivery.status = 'pending'
+                AND (
+                    delivery.confirmed_content = 'none'
+                    OR (
+                        delivery.desired_content = 'complete'
+                        AND delivery.confirmed_content <> 'complete'
+                    )
+                )
           )
           AND NOT EXISTS (
               SELECT 1 FROM sync_source_icon_uploads icon
@@ -617,17 +907,14 @@ pub async fn releasable_staging_for_events(
         .collect())
 }
 
-/// Resolves one outgoing event to the logical clipboard operation shown in transfer progress.
-pub async fn transfer_item_for_event(
+/// Resolves one outgoing event to the logical clipboard item shown in transfer progress.
+pub async fn transfer_item_id_for_event(
     pool: &SqlitePool,
     event_id: &str,
-) -> Result<Option<(String, u64)>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
         r#"
-        SELECT links.item_id,
-               (SELECT COALESCE(SUM(event_blob.size), 0)
-                FROM sync_event_blobs event_blob
-                WHERE event_blob.event_id = links.event_id) AS operation_total_bytes
+        SELECT links.item_id
         FROM sync_item_events links
         WHERE links.event_id = ? AND links.direction = 'local'
         ORDER BY links.created_at DESC
@@ -637,14 +924,7 @@ pub async fn transfer_item_for_event(
     .bind(event_id)
     .fetch_optional(pool)
     .await
-    .context("resolve outgoing event transfer item")?;
-    row.map(|(item_id, total_bytes)| {
-        Ok((
-            item_id,
-            u64::try_from(total_bytes).context("negative transfer operation size")?,
-        ))
-    })
-    .transpose()
+    .context("resolve outgoing event transfer item")
 }
 
 /// Adds transport-only blob references to a batch without duplicating them in the event table.
@@ -796,16 +1076,34 @@ pub async fn complete_source_icon_uploads(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn mark_delivered(
     pool: &SqlitePool,
     target_id: &str,
     event_ids: &[String],
 ) -> Result<()> {
+    mark_delivered_with_metadata(pool, target_id, event_ids, &HashSet::new()).await
+}
+
+/// Persists whether each confirmed route received file bytes or authenticated metadata only.
+#[cfg(test)]
+pub async fn mark_delivered_with_metadata(
+    pool: &SqlitePool,
+    target_id: &str,
+    event_ids: &[String],
+    metadata_only_event_ids: &HashSet<String>,
+) -> Result<()> {
     let mut transaction = pool
         .begin()
         .await
         .context("begin sync delivery transaction")?;
-    mark_delivered_on(&mut transaction, target_id, event_ids).await?;
+    mark_delivered_on(
+        &mut transaction,
+        target_id,
+        event_ids,
+        metadata_only_event_ids,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -813,59 +1111,374 @@ pub async fn mark_delivered(
     Ok(())
 }
 
+/// Commits route delivery and every receiver state already known at acknowledgement time.
+pub async fn complete_outbound_delivery(
+    pool: &SqlitePool,
+    target_id: &str,
+    event_ids: &[String],
+    metadata_only_event_ids: &HashSet<String>,
+) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin completed outbound delivery")?;
+    for event_id in event_ids {
+        let content = if metadata_only_event_ids.contains(event_id) {
+            ContentLevel::Metadata
+        } else {
+            ContentLevel::Complete
+        };
+        confirm_delivery_on(&mut transaction, target_id, event_id, content, false).await?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit completed outbound delivery")?;
+    Ok(())
+}
+
+/// Confirms durable LAN receipts using the route's two availability levels.
+pub async fn confirm_lan_receipts(
+    pool: &SqlitePool,
+    target_id: &str,
+    event_ids: &[String],
+    complete_event_ids: &HashSet<String>,
+) -> Result<()> {
+    let metadata_only_event_ids = event_ids
+        .iter()
+        .filter(|event_id| !complete_event_ids.contains(*event_id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut transaction = pool.begin().await.context("begin confirmed LAN receipts")?;
+    for event_id in event_ids {
+        let content = if metadata_only_event_ids.contains(event_id) {
+            ContentLevel::Metadata
+        } else {
+            ContentLevel::Complete
+        };
+        confirm_delivery_on(&mut transaction, target_id, event_id, content, false).await?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit confirmed LAN receipts")?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingPeerReceipt {
+    pub event_id: String,
+    pub content_complete: bool,
+}
+
+/// Reads durable LAN receipts that still need to be returned to one peer.
+pub async fn pending_peer_receipts(
+    pool: &SqlitePool,
+    peer_device_id: &str,
+    limit: u16,
+) -> Result<Vec<PendingPeerReceipt>> {
+    let target_id = format!("peer:{peer_device_id}");
+    let rows = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT delivery.event_id, delivery.confirmed_content
+        FROM sync_delivery_targets delivery
+        WHERE delivery.target_id = ?
+          AND delivery.receipt_pending = 1
+        ORDER BY delivery.created_at, delivery.event_id
+        LIMIT ?
+        "#,
+    )
+    .bind(target_id)
+    .bind(i64::from(limit.max(1)))
+    .fetch_all(pool)
+    .await
+    .context("list pending peer receipts")?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, confirmed_content)| PendingPeerReceipt {
+            event_id,
+            content_complete: confirmed_content == "complete",
+        })
+        .collect())
+}
+
+/// Records that one route delivered complete content without claiming an app-managed replica.
+pub async fn complete_remote_file_download(
+    pool: &SqlitePool,
+    origin_device_id: &str,
+    event_id: &str,
+    lan_only: bool,
+) -> Result<()> {
+    let source = if lan_only {
+        RemoteBatchSource::Peer {
+            device_id: origin_device_id,
+        }
+    } else {
+        RemoteBatchSource::Cloud
+    };
+    record_inbound_outcome(pool, source, event_id, InboundContentOutcome::External).await?;
+    Ok(())
+}
+
+/// Replaces the user-owned destination set attached to this local content replica.
+pub async fn record_external_download_session(
+    pool: &SqlitePool,
+    event_id: &str,
+    targets: &[ExternalDownloadTarget],
+) -> Result<()> {
+    if targets.is_empty() {
+        bail!("external download has no destinations");
+    }
+    let destinations_json =
+        serde_json::to_string(targets).context("encode external download destinations")?;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_local_content (
+            event_id, state, destinations_json, created_at, updated_at
+        ) VALUES (?, 'external', ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            state = CASE
+                WHEN sync_local_content.state = 'managed' THEN 'managed'
+                ELSE 'external'
+            END,
+            destinations_json = excluded.destinations_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(event_id)
+    .bind(destinations_json)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("record external download destinations")?;
+    Ok(())
+}
+
+/// Removes accepted receipts without deleting a concurrently upgraded content receipt.
+pub async fn complete_peer_receipts(
+    pool: &SqlitePool,
+    peer_device_id: &str,
+    receipts: &[PendingPeerReceipt],
+) -> Result<()> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let target_id = format!("peer:{peer_device_id}");
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin completing peer receipts")?;
+    for receipt in receipts {
+        sqlx::query(
+            r#"
+            UPDATE sync_delivery_targets
+            SET receipt_pending = 0, updated_at = ?
+            WHERE target_id = ? AND event_id = ? AND confirmed_content = ?
+            "#,
+        )
+        .bind(Utc::now())
+        .bind(&target_id)
+        .bind(&receipt.event_id)
+        .bind(if receipt.content_complete {
+            "complete"
+        } else {
+            "metadata"
+        })
+        .execute(&mut *transaction)
+        .await
+        .context("complete peer receipt")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit completed peer receipts")?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn mark_delivered_on(
     connection: &mut SqliteConnection,
     target_id: &str,
     event_ids: &[String],
+    metadata_only_event_ids: &HashSet<String>,
+) -> Result<()> {
+    for event_id in event_ids {
+        let content = if metadata_only_event_ids.contains(event_id) {
+            ContentLevel::Metadata
+        } else {
+            ContentLevel::Complete
+        };
+        confirm_delivery_on(connection, target_id, event_id, content, false).await?;
+    }
+    Ok(())
+}
+
+/// Records route transport and local replica state without deriving either fact from the other.
+pub async fn record_inbound_outcome(
+    pool: &SqlitePool,
+    source: RemoteBatchSource<'_>,
+    event_id: &str,
+    outcome: InboundContentOutcome,
+) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin inbound content outcome")?;
+    record_inbound_outcome_on(&mut transaction, source, event_id, outcome).await?;
+    transaction
+        .commit()
+        .await
+        .context("commit inbound content outcome")?;
+    Ok(())
+}
+
+/// Applies one Hub availability page and its continuation cursor atomically.
+pub async fn record_cloud_availability_batch(
+    pool: &SqlitePool,
+    updates: &[(String, RouteContentAvailability)],
+    latest_cursor: u64,
+) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin cloud availability batch")?;
+    for (event_id, state) in updates {
+        let content = match state {
+            RouteContentAvailability::Metadata => ContentLevel::Metadata,
+            RouteContentAvailability::Complete => ContentLevel::Complete,
+        };
+        confirm_delivery_on(&mut transaction, CLOUD_TARGET, event_id, content, false).await?;
+    }
+    set_state_value_on(
+        &mut transaction,
+        CLOUD_AVAILABILITY_CURSOR_KEY,
+        &latest_cursor.to_string(),
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .context("commit cloud availability batch")?;
+    Ok(())
+}
+
+async fn record_inbound_outcome_on(
+    connection: &mut SqliteConnection,
+    source: RemoteBatchSource<'_>,
+    event_id: &str,
+    outcome: InboundContentOutcome,
 ) -> Result<()> {
     let now = Utc::now();
-    for event_id in event_ids {
-        sqlx::query(
-            r#"
-            INSERT INTO sync_deliveries (event_id, target_id, confirmed, created_at, updated_at)
-            VALUES (?, ?, 1, ?, ?)
-            ON CONFLICT(event_id, target_id) DO UPDATE SET
-                confirmed = 1,
-                updated_at = excluded.updated_at
-            "#,
+    let source_id = source.delivery_target();
+    let local_state = match outcome {
+        InboundContentOutcome::Received | InboundContentOutcome::Deduplicated => "managed",
+        InboundContentOutcome::External => "external",
+        InboundContentOutcome::Metadata => "metadata",
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO sync_local_content (
+            event_id, state, destinations_json, created_at, updated_at
         )
-        .bind(event_id)
-        .bind(target_id)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *connection)
-        .await
-        .context("mark sync event delivered")?;
-        sqlx::query(
-            r#"
-            INSERT INTO sync_delivery_states (
-                event_id, target_id, state, last_error, last_attempt_at,
-                last_success_at, created_at, updated_at
-            ) VALUES (?, ?, 'success', NULL, ?, ?, ?, ?)
-            ON CONFLICT(event_id, target_id) DO UPDATE SET
-                state = 'success',
-                last_error = NULL,
-                last_attempt_at = excluded.last_attempt_at,
-                last_success_at = excluded.last_success_at,
-                updated_at = excluded.updated_at
-            "#,
+        SELECT ?,
+               CASE WHEN EXISTS (
+                   SELECT 1 FROM sync_item_events
+                   WHERE event_id = ? AND direction = 'local'
+               ) THEN 'managed' ELSE ? END,
+               NULL, ?, ?
+        WHERE EXISTS (
+            SELECT 1 FROM sync_events WHERE event_id = ? AND event_kind = 0
         )
-        .bind(event_id)
-        .bind(target_id)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *connection)
-        .await
-        .context("record successful sync delivery")?;
-        sqlx::query("DELETE FROM sync_canceled_deliveries WHERE event_id = ? AND target_id = ?")
-            .bind(event_id)
-            .bind(target_id)
-            .execute(&mut *connection)
-            .await
-            .context("clear canceled sync delivery after success")?;
-    }
+        ON CONFLICT(event_id) DO UPDATE SET
+            state = CASE
+                WHEN sync_local_content.state = 'managed' THEN 'managed'
+                WHEN excluded.state = 'managed' THEN 'managed'
+                WHEN sync_local_content.state = 'external' THEN 'external'
+                WHEN excluded.state = 'external' THEN 'external'
+                ELSE excluded.state
+            END,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(event_id)
+    .bind(event_id)
+    .bind(local_state)
+    .bind(now)
+    .bind(now)
+    .bind(event_id)
+    .execute(&mut *connection)
+    .await
+    .context("record local content replica")?;
+
+    let content = if outcome.received_bytes() {
+        ContentLevel::Complete
+    } else {
+        ContentLevel::Metadata
+    };
+    let receipt_pending = matches!(source, RemoteBatchSource::Peer { .. });
+    confirm_delivery_on(connection, &source_id, event_id, content, receipt_pending).await?;
+    Ok(())
+}
+
+/// Updates the sole durable route fact after an authenticated acknowledgement.
+async fn confirm_delivery_on(
+    connection: &mut SqliteConnection,
+    target_id: &str,
+    event_id: &str,
+    content: ContentLevel,
+    receipt_pending: bool,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_delivery_targets (
+            event_id, target_id, desired_content, confirmed_content,
+            status, receipt_pending, last_error, created_at, updated_at
+        )
+        SELECT ?, ?, ?, ?, 'confirmed', ?, NULL, ?, ?
+        WHERE EXISTS (SELECT 1 FROM sync_events WHERE event_id = ?)
+        ON CONFLICT(event_id, target_id) DO UPDATE SET
+            desired_content = CASE
+                WHEN sync_delivery_targets.desired_content = 'complete'
+                    OR excluded.confirmed_content = 'complete'
+                    THEN 'complete'
+                ELSE 'metadata'
+            END,
+            confirmed_content = CASE
+                WHEN excluded.confirmed_content = 'complete' THEN 'complete'
+                WHEN sync_delivery_targets.confirmed_content = 'complete' THEN 'complete'
+                ELSE excluded.confirmed_content
+            END,
+            status = CASE
+                WHEN excluded.confirmed_content = 'complete'
+                    OR sync_delivery_targets.confirmed_content = 'complete'
+                    THEN 'confirmed'
+                WHEN sync_delivery_targets.desired_content = 'complete'
+                    THEN 'pending'
+                ELSE 'confirmed'
+            END,
+            receipt_pending = MAX(
+                sync_delivery_targets.receipt_pending,
+                excluded.receipt_pending
+            ),
+            last_error = NULL,
+            retry_at = NULL,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(event_id)
+    .bind(target_id)
+    .bind(content.as_str())
+    .bind(content.as_str())
+    .bind(receipt_pending)
+    .bind(now)
+    .bind(now)
+    .bind(event_id)
+    .execute(&mut *connection)
+    .await
+    .context("confirm sync delivery")?;
     Ok(())
 }
 
@@ -879,11 +1492,22 @@ pub async fn store_remote_batch(
     events: &[EncryptedEvent],
     local_device_id: &str,
 ) -> Result<StoreRemoteBatchResult> {
+    store_remote_batch_with_availability(pool, source, latest_cursor, events, local_device_id, &[])
+        .await
+}
+
+/// Stores a remote batch, its route facts, and its continuation cursor in one transaction.
+pub async fn store_remote_batch_with_availability(
+    pool: &SqlitePool,
+    source: RemoteBatchSource<'_>,
+    latest_cursor: Option<u64>,
+    events: &[EncryptedEvent],
+    local_device_id: &str,
+    availability: &[(String, RouteContentAvailability)],
+) -> Result<StoreRemoteBatchResult> {
     let mut transaction = pool.begin().await.context("begin remote sync batch")?;
-    let target_id = source.delivery_target();
     let mut result = StoreRemoteBatchResult::default();
     let mut received_event_ids = Vec::new();
-    let mut remote_event_ids = Vec::new();
 
     for event in events {
         let inserted = insert_event_on(
@@ -905,12 +1529,40 @@ pub async fn store_remote_batch(
             result.inserted_event_ids.push(event.event_id.clone());
         }
         if event.origin_device_id != local_device_id {
-            remote_event_ids.push(event.event_id.clone());
             result.received_new_events |= inserted.inserted;
         }
     }
 
-    mark_delivered_on(&mut transaction, &target_id, &received_event_ids).await?;
+    for event_id in &received_event_ids {
+        let already_managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sync_local_content WHERE event_id = ? AND state = 'managed') \
+             OR EXISTS(SELECT 1 FROM sync_item_events WHERE event_id = ? AND direction = 'local')",
+        )
+        .bind(event_id)
+        .bind(event_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read existing local content replica")?;
+        record_inbound_outcome_on(
+            &mut transaction,
+            source,
+            event_id,
+            if already_managed {
+                InboundContentOutcome::Deduplicated
+            } else {
+                InboundContentOutcome::Metadata
+            },
+        )
+        .await?;
+    }
+    let source_id = source.delivery_target();
+    for (event_id, state) in availability {
+        let content = match state {
+            RouteContentAvailability::Metadata => ContentLevel::Metadata,
+            RouteContentAvailability::Complete => ContentLevel::Complete,
+        };
+        confirm_delivery_on(&mut transaction, &source_id, event_id, content, false).await?;
+    }
     match source {
         RemoteBatchSource::Cloud => {
             if let Some(latest_cursor) = latest_cursor {
@@ -923,22 +1575,13 @@ pub async fn store_remote_batch(
             }
         }
         RemoteBatchSource::Peer { device_id } => {
-            // Receipt from a peer confirms only that peer route, never Hub delivery.
-            set_delivery_state_on(
-                &mut transaction,
-                CLOUD_TARGET,
-                &remote_event_ids,
-                "syncing",
-                "queued",
-                None,
-            )
-            .await?;
             if let Some(latest_cursor) = latest_cursor {
+                let now = Utc::now();
                 sqlx::query(
                     "UPDATE sync_peers SET pull_cursor = ?, updated_at = ? WHERE device_id = ?",
                 )
                 .bind(i64::try_from(latest_cursor).unwrap_or(i64::MAX))
-                .bind(Utc::now())
+                .bind(now)
                 .bind(device_id)
                 .execute(&mut *transaction)
                 .await
@@ -954,116 +1597,13 @@ pub async fn store_remote_batch(
     Ok(result)
 }
 
-/// Reads the one-time legacy repair cursor without moving the normal cloud receive cursor.
-pub async fn cloud_confirmation_repair_cursor(
-    pool: &SqlitePool,
-    local_device_id: &str,
-) -> Result<Option<Option<u64>>> {
-    let cursor: Option<String> = sqlx::query_scalar("SELECT value FROM sync_state WHERE key = ?")
-        .bind(CLOUD_CONFIRMATION_REPAIR_KEY)
-        .fetch_optional(pool)
-        .await?;
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    // The old peer-receipt shortcut never marked this device's own events as cloud-delivered.
-    sqlx::query("UPDATE sync_deliveries SET confirmed = 1 WHERE target_id = 'cloud' AND confirmed = 0 AND event_id IN (SELECT event_id FROM sync_events WHERE origin_device_id = ?)")
-        .bind(local_device_id).execute(pool).await?;
-    let remaining: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sync_deliveries WHERE target_id = 'cloud' AND confirmed = 0)",
-    )
-    .fetch_one(pool)
-    .await?;
-    if !remaining {
-        sqlx::query("DELETE FROM sync_state WHERE key = ?")
-            .bind(CLOUD_CONFIRMATION_REPAIR_KEY)
-            .execute(pool)
-            .await?;
-        return Ok(None);
-    }
-    Ok(Some(if cursor == "start" {
-        None
-    } else {
-        Some(
-            cursor
-                .parse()
-                .context("invalid legacy confirmation cursor")?,
-        )
-    }))
-}
-
-/// Reconciles only authenticated, byte-identical local events returned by the Hub.
-pub async fn repair_cloud_confirmations(
-    pool: &SqlitePool,
-    events: &[EncryptedEvent],
-    next_before_cursor: Option<u64>,
-) -> Result<()> {
-    let mut transaction = pool
-        .begin()
-        .await
-        .context("begin cloud delivery confirmation repair")?;
-    let mut confirmed = Vec::new();
-    for event in events {
-        let matches: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sync_events e JOIN sync_deliveries d USING(event_id) \
-             WHERE d.target_id = 'cloud' AND d.confirmed = 0 AND e.event_id = ? \
-             AND e.origin_device_id = ? AND e.origin_sequence = ? AND e.nonce = ? AND e.ciphertext = ? AND e.event_kind = ?)",
-        )
-        .bind(&event.event_id).bind(&event.origin_device_id).bind(i64::try_from(event.origin_sequence).context("invalid event origin sequence")?)
-        .bind(&event.nonce).bind(&event.ciphertext).bind(event.kind.as_i64())
-        .fetch_one(&mut *transaction).await?;
-        if matches {
-            confirmed.push(event.event_id.clone());
-        }
-    }
-    mark_delivered_on(&mut transaction, CLOUD_TARGET, &confirmed).await?;
-    if let Some(cursor) = next_before_cursor {
-        sqlx::query("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = ?")
-            .bind(cursor.to_string())
-            .bind(Utc::now())
-            .bind(CLOUD_CONFIRMATION_REPAIR_KEY)
-            .execute(&mut *transaction)
-            .await?;
-    } else {
-        sqlx::query("UPDATE sync_delivery_states SET state = 'syncing', phase = 'queued', last_error = NULL, updated_at = ? WHERE target_id = 'cloud' AND event_id IN (SELECT event_id FROM sync_deliveries WHERE target_id = 'cloud' AND confirmed = 0)")
-            .bind(Utc::now()).execute(&mut *transaction).await?;
-        sqlx::query("DELETE FROM sync_deliveries WHERE target_id = 'cloud' AND confirmed = 0")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("DELETE FROM sync_state WHERE key = ?")
-            .bind(CLOUD_CONFIRMATION_REPAIR_KEY)
-            .execute(&mut *transaction)
-            .await?;
-    }
-    transaction
-        .commit()
-        .await
-        .context("commit cloud delivery confirmation repair")?;
-    Ok(())
-}
-
-pub async fn mark_delivery_syncing(
+/// Counts a real transport attempt while leaving its live phase in the transfer registry.
+pub async fn record_delivery_attempt(
     pool: &SqlitePool,
     target_id: &str,
     event_ids: &[String],
 ) -> Result<()> {
-    set_delivery_state(pool, target_id, event_ids, "syncing", "uploading", None).await
-}
-
-pub async fn mark_delivery_queued(
-    pool: &SqlitePool,
-    target_id: &str,
-    event_ids: &[String],
-) -> Result<()> {
-    set_delivery_state(pool, target_id, event_ids, "syncing", "queued", None).await
-}
-
-pub async fn mark_delivery_confirming(
-    pool: &SqlitePool,
-    target_id: &str,
-    event_ids: &[String],
-) -> Result<()> {
-    set_delivery_state(pool, target_id, event_ids, "syncing", "confirming", None).await
+    set_delivery_pending(pool, target_id, event_ids, None, true).await
 }
 
 pub async fn mark_delivery_error(
@@ -1072,30 +1612,90 @@ pub async fn mark_delivery_error(
     event_ids: &[String],
     error: &str,
 ) -> Result<()> {
-    set_delivery_state(
-        pool,
-        target_id,
-        event_ids,
-        "error",
-        "uploading",
-        Some(error),
-    )
-    .await
+    set_delivery_pending(pool, target_id, event_ids, Some(error), false).await
 }
 
-async fn set_delivery_state(
+/// Persists the scheduler's desired content level before live transfer phases begin.
+pub async fn plan_deliveries(
     pool: &SqlitePool,
     target_id: &str,
     event_ids: &[String],
-    state: &str,
-    phase: &str,
+    metadata_only_event_ids: &HashSet<String>,
+) -> Result<()> {
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    let mut transaction = pool.begin().await.context("begin delivery planning")?;
+    let now = Utc::now();
+    for event_id in event_ids {
+        let desired = if metadata_only_event_ids.contains(event_id) {
+            "metadata"
+        } else {
+            "complete"
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO sync_delivery_targets (
+                event_id, target_id, desired_content, confirmed_content,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'none', 'pending', ?, ?)
+            ON CONFLICT(event_id, target_id) DO UPDATE SET
+                desired_content = CASE
+                    WHEN sync_delivery_targets.desired_content = 'complete'
+                        OR excluded.desired_content = 'complete'
+                        THEN 'complete'
+                    ELSE 'metadata'
+                END,
+                status = CASE
+                    WHEN sync_delivery_targets.confirmed_content = 'complete'
+                        OR (
+                            sync_delivery_targets.desired_content = 'metadata'
+                            AND excluded.desired_content = 'metadata'
+                            AND sync_delivery_targets.confirmed_content = 'metadata'
+                        )
+                        THEN 'confirmed'
+                    ELSE 'pending'
+                END,
+                last_error = NULL,
+                retry_at = NULL,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(event_id)
+        .bind(target_id)
+        .bind(desired)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("persist sync delivery plan")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit sync delivery plan")?;
+    Ok(())
+}
+
+async fn set_delivery_pending(
+    pool: &SqlitePool,
+    target_id: &str,
+    event_ids: &[String],
     error: Option<&str>,
+    increment_attempt: bool,
 ) -> Result<()> {
     if event_ids.is_empty() {
         return Ok(());
     }
     let mut transaction = pool.begin().await.context("begin sync state transaction")?;
-    set_delivery_state_on(&mut transaction, target_id, event_ids, state, phase, error).await?;
+    set_delivery_pending_on(
+        &mut transaction,
+        target_id,
+        event_ids,
+        error,
+        increment_attempt,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -1103,45 +1703,52 @@ async fn set_delivery_state(
     Ok(())
 }
 
-/// Keeps route progress and incoming-event storage inside their caller's transaction.
-async fn set_delivery_state_on(
+/// Persists retry intent and errors without duplicating live transfer phases in SQLite.
+async fn set_delivery_pending_on(
     connection: &mut SqliteConnection,
     target_id: &str,
     event_ids: &[String],
-    state: &str,
-    phase: &str,
     error: Option<&str>,
+    increment_attempt: bool,
 ) -> Result<()> {
     let now = Utc::now();
     for event_id in event_ids {
         sqlx::query(
             r#"
-            INSERT INTO sync_delivery_states (
-                event_id, target_id, state, last_error, last_attempt_at,
-                last_success_at, phase, created_at, updated_at
-            ) SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM sync_deliveries
-                WHERE event_id = ? AND target_id = ? AND confirmed = 1
+            INSERT INTO sync_delivery_targets (
+                event_id, target_id, desired_content, confirmed_content,
+                status, last_error, attempt_count, created_at, updated_at
             )
+            SELECT ?, ?,
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM sync_event_blobs WHERE event_id = ?
+                   ) THEN 'complete' ELSE 'metadata' END,
+                   'none', 'pending', ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM sync_events WHERE event_id = ?)
             ON CONFLICT(event_id, target_id) DO UPDATE SET
-                state = excluded.state,
+                status = CASE
+                    WHEN sync_delivery_targets.confirmed_content = 'complete'
+                        OR (
+                            sync_delivery_targets.desired_content = 'metadata'
+                            AND sync_delivery_targets.confirmed_content = 'metadata'
+                        )
+                        THEN 'confirmed'
+                    ELSE 'pending'
+                END,
                 last_error = excluded.last_error,
-                last_attempt_at = excluded.last_attempt_at,
-                phase = excluded.phase,
+                attempt_count = sync_delivery_targets.attempt_count + excluded.attempt_count,
+                retry_at = NULL,
                 updated_at = excluded.updated_at
             "#,
         )
         .bind(event_id)
         .bind(target_id)
-        .bind(state)
+        .bind(event_id)
         .bind(error)
-        .bind(now)
-        .bind(phase)
+        .bind(if increment_attempt { 1_i64 } else { 0_i64 })
         .bind(now)
         .bind(now)
         .bind(event_id)
-        .bind(target_id)
         .execute(&mut *connection)
         .await
         .context("record sync delivery state")?;

@@ -63,6 +63,10 @@ impl GroupSecrets {
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid sync content key length"))
     }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_group(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +146,9 @@ impl IdentityStore {
     }
 
     pub fn set_group(&self, group: Option<GroupSecrets>) -> Result<PersistedIdentity> {
+        if let Some(group) = group.as_ref() {
+            group.validate()?;
+        }
         let mut guard = self.current.write().expect("sync identity poisoned");
         guard.group = group;
         write_identity(&self.path, &guard)?;
@@ -305,14 +312,6 @@ pub async fn server_endpoint_addr(settings: &SyncSettings) -> Result<Option<Endp
 
 /// 局域网同步只接收局域网 IP 路由，Relay 和公网直连地址不会进入拨号集合。
 pub fn peer_endpoint_addr(peer: &ecopaste_sync_protocol::PeerAnnouncement) -> Result<EndpointAddr> {
-    peer_endpoint_addr_with_preferred(peer, None)
-}
-
-/// Keeps the last proven LAN route first while retaining current mDNS fallbacks.
-pub fn peer_endpoint_addr_with_preferred(
-    peer: &ecopaste_sync_protocol::PeerAnnouncement,
-    preferred: Option<&str>,
-) -> Result<EndpointAddr> {
     let endpoint_id =
         EndpointId::from_str(peer.endpoint_id.trim()).context("invalid Iroh endpoint id")?;
     let parsed = peer
@@ -324,16 +323,9 @@ pub fn peer_endpoint_addr_with_preferred(
                 .context("invalid Iroh direct address")
         })
         .collect::<Result<Vec<_>>>()?;
-    let preferred = preferred
-        .map(|value| value.strip_prefix("ip:").unwrap_or(value))
-        .and_then(|value| value.parse::<SocketAddr>().ok())
-        .filter(|address| is_lan_ip(address.ip()));
     let mut addresses = Vec::new();
-    if let Some(preferred) = preferred {
-        addresses.push(TransportAddr::Ip(preferred));
-    }
     for address in parsed {
-        if is_lan_ip(address.ip()) && Some(address) != preferred {
+        if is_lan_ip(address.ip()) {
             addresses.push(TransportAddr::Ip(address));
         }
     }

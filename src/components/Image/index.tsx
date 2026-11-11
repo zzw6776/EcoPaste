@@ -2,9 +2,9 @@ import { Image as AntdImage, type ImageProps } from "antd";
 import type { FC } from "react";
 import { useState } from "react";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
-import { isAndroid } from "@/utils/is";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 
-/** 统一接入 Android 系统返回栈的图片预览。 */
+/** 统一接入 Android 返回栈与主窗口隐藏生命周期的图片预览。 */
 const Image: FC<ImageProps> = (props) => {
   const { preview, ...rest } = props;
   const [innerOpen, setInnerOpen] = useState(false);
@@ -28,20 +28,21 @@ const Image: FC<ImageProps> = (props) => {
   useAndroidBack(previewEnabled && mergedOpen, () => {
     handleOpenChange(false);
   });
+  useCloseAppOverlay(previewEnabled && mergedOpen, () => {
+    handleOpenChange(false);
+  });
 
   return (
     <AntdImage
       {...rest}
       preview={
-        !isAndroid
-          ? preview
-          : previewEnabled
-            ? {
-                ...previewRest,
-                onOpenChange: handleOpenChange,
-                open: mergedOpen,
-              }
-            : false
+        previewEnabled
+          ? {
+              ...previewRest,
+              onOpenChange: handleOpenChange,
+              open: mergedOpen,
+            }
+          : false
       }
     />
   );

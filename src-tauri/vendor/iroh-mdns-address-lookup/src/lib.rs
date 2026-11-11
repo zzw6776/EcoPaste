@@ -409,8 +409,12 @@ impl MdnsAddressLookup {
                         let unchanged = endpoint_addrs
                             .insert(discovered_endpoint_id, peer_info.clone())
                             .is_some_and(|previous| peer_metadata_eq(&previous, &peer_info));
+                        let item = peer_to_discovery_item(&peer_info, &discovered_endpoint_id);
                         if unchanged {
-                            // this is a republish we already know about
+                            subscribers.send(DiscoveryEvent::Discovered {
+                                endpoint_info: item.endpoint_info().clone(),
+                                last_updated: item.last_updated(),
+                            });
                             continue;
                         }
 
@@ -420,24 +424,16 @@ impl MdnsAddressLookup {
                             "adding endpoint to Mdns address book"
                         );
 
-                        let mut resolved = false;
-                        let item = peer_to_discovery_item(&peer_info, &discovered_endpoint_id);
                         if let Some(senders) = senders.get(&discovered_endpoint_id) {
                             trace!(?item, senders = senders.len(), "sending AddressLookupItem");
-                            resolved = true;
                             for sender in senders.values() {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        // only send endpoints to the `subscriber` if they weren't explicitly resolved
-                        // in other words, endpoints sent to the `subscribers` should only be the ones that
-                        // have been "passively" discovered
-                        if !resolved {
-                            subscribers.send(DiscoveryEvent::Discovered {
-                                endpoint_info: item.endpoint_info().clone(),
-                                last_updated: item.last_updated(),
-                            });
-                        }
+                        subscribers.send(DiscoveryEvent::Discovered {
+                            endpoint_info: item.endpoint_info().clone(),
+                            last_updated: item.last_updated(),
+                        });
                     }
                     Message::SetMulticastEnabled(enabled) => {
                         if enabled == multicast_enabled {

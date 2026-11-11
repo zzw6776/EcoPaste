@@ -20,6 +20,14 @@ const CURRENT_SYNC_REMOVAL_CHECKSUM: [u8; 48] = [
     0xdc, 0x6e, 0x18, 0x44, 0x88, 0xff, 0x70, 0x21, 0x5f, 0xde, 0x1f, 0xb8, 0xbc, 0xd8, 0xa0, 0x2c,
     0x95, 0xc4, 0x20, 0xe9, 0xea, 0x78, 0x89, 0xcc, 0x9b, 0xc4, 0x64, 0x44, 0x72, 0x7c, 0x4e, 0x47,
 ];
+const LEGACY_REMOTE_FILE_CONTENT_CHECKSUM: &str =
+    "DD908558755B6704B5A3E98AC0F48A2B2B2EB78082D4E05C7B8B96B39E82A882D27B517DD551A5C02FAB3EAA45C3E081";
+const CURRENT_REMOTE_FILE_CONTENT_CHECKSUM: &str =
+    "27AF35544968CA90B8CB0EF932828CEE190E37918E4A0DB862F65AE47F7C087443BACE95FA5F2E51BBCEB725F1EA01E2";
+const LEGACY_CONTENT_AVAILABILITY_CHECKSUM: &str =
+    "5997EDC9F723F05C6D110CD1FA5D9D6F122A32ACD08DA3FB0609268E462AAA5745DC6B8EB15AA79A06B4496B23058264";
+const CURRENT_CONTENT_AVAILABILITY_CHECKSUM: &str =
+    "52EDB0AA5436E20531BBB1BEDCF88BEF032A1B3BFC91DE879C207964BD13C2BF8BEAEBBEAA8057A4B5A852F893968224";
 const MIGRATION_LINE_ENDING_CHECKSUMS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -77,6 +85,8 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
 
     let migrator = sqlx::migrate!("./migrations");
     repair_legacy_sync_removal_migration(&pool).await?;
+    repair_remote_file_content_draft(&pool, &migrator).await?;
+    repair_content_availability_draft(&pool, &migrator).await?;
     repair_migration_line_endings(&pool, &migrator).await?;
     migrator
         .run(&pool)
@@ -157,6 +167,162 @@ async fn repair_migration_line_endings(pool: &SqlitePool, migrator: &Migrator) -
 
 fn checksum_hex(checksum: &[u8]) -> String {
     checksum.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+/// Normalizes the one distributed draft of migration 29 whose SQL differed only in timestamp text.
+/// Unknown checksums still reach SQLx unchanged and remain fatal.
+async fn repair_remote_file_content_draft(pool: &SqlitePool, migrator: &Migrator) -> AnyResult<()> {
+    let migration_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("check migration metadata table for remote file draft repair")?;
+    if migration_table_exists == 0 {
+        return Ok(());
+    }
+
+    let migration = migrator
+        .iter()
+        .find(|migration| migration.version == 29)
+        .context("migration 29 is missing")?;
+    if checksum_hex(migration.checksum.as_ref()) != CURRENT_REMOTE_FILE_CONTENT_CHECKSUM {
+        return Ok(());
+    }
+    let applied_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 29 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read migration 29 checksum")?;
+    if applied_checksum.as_deref() != Some(LEGACY_REMOTE_FILE_CONTENT_CHECKSUM) {
+        return Ok(());
+    }
+
+    let content_state_column_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sync_deliveries') WHERE name = 'content_delivered')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("verify migration 29 delivery state schema")?;
+    if content_state_column_exists == 0 {
+        anyhow::bail!("migration 29 draft schema is incomplete");
+    }
+
+    let result = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = 29 AND success = 1 AND checksum = ?",
+    )
+    .bind(migration.checksum.to_vec())
+    .bind(decode_hex_checksum(LEGACY_REMOTE_FILE_CONTENT_CHECKSUM)?)
+    .execute(pool)
+    .await
+    .context("normalize migration 29 draft checksum")?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("migration 29 draft checksum changed during normalization");
+    }
+    log::info!("normalized distributed draft of remote file content migration 29");
+    Ok(())
+}
+
+/// Completes the one known migration 30 draft before adopting its current checksum.
+/// A partial or unknown schema is left untouched so SQLx still rejects it.
+async fn repair_content_availability_draft(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> AnyResult<()> {
+    let migration_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("check migration metadata table for content availability draft repair")?;
+    if migration_table_exists == 0 {
+        return Ok(());
+    }
+
+    let migration = migrator
+        .iter()
+        .find(|migration| migration.version == 30)
+        .context("migration 30 is missing")?;
+    if checksum_hex(migration.checksum.as_ref()) != CURRENT_CONTENT_AVAILABILITY_CHECKSUM {
+        return Ok(());
+    }
+    let applied_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 30 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read migration 30 checksum")?;
+    if applied_checksum.as_deref() != Some(LEGACY_CONTENT_AVAILABILITY_CHECKSUM) {
+        return Ok(());
+    }
+
+    let schema_parts = content_availability_schema_parts(pool).await?;
+    if schema_parts != 0 {
+        anyhow::bail!("migration 30 draft schema is partially applied");
+    }
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin migration 30 draft completion")?;
+    sqlx::raw_sql(migration.sql.clone())
+        .execute(&mut *transaction)
+        .await
+        .context("complete migration 30 draft schema")?;
+    let completed_parts = content_availability_schema_parts(&mut *transaction).await?;
+    if completed_parts != 4 {
+        anyhow::bail!("migration 30 completed schema is incomplete");
+    }
+    let result = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = 30 AND success = 1 AND checksum = ?",
+    )
+    .bind(migration.checksum.to_vec())
+    .bind(decode_hex_checksum(LEGACY_CONTENT_AVAILABILITY_CHECKSUM)?)
+    .execute(&mut *transaction)
+    .await
+    .context("normalize migration 30 draft checksum")?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("migration 30 draft checksum changed during completion");
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit migration 30 draft completion")?;
+    log::info!("completed distributed draft of content availability migration 30");
+    Ok(())
+}
+
+async fn content_availability_schema_parts<'e, E>(executor: E) -> AnyResult<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query_scalar(
+        r#"
+        SELECT
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_event_ingress') +
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_local_replicas') +
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_target_replicas') +
+            EXISTS(SELECT 1 FROM pragma_table_info('sync_peer_receipts') WHERE name = 'content_state')
+        "#,
+    )
+    .fetch_one(executor)
+    .await
+    .context("inspect content availability schema")
+}
+
+fn decode_hex_checksum(checksum: &str) -> AnyResult<Vec<u8>> {
+    let (pairs, remainder) = checksum.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        anyhow::bail!("invalid odd-length migration checksum");
+    }
+    pairs
+        .iter()
+        .map(|digits| {
+            let digits = std::str::from_utf8(digits).context("invalid migration checksum text")?;
+            u8::from_str_radix(digits, 16).context("invalid migration checksum hex")
+        })
+        .collect()
 }
 
 /// Repairs the one development-only draft of migration 4 that was already applied locally.
@@ -251,16 +417,6 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     use super::*;
-
-    fn decode_checksum(checksum: &str) -> Vec<u8> {
-        checksum
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
-            .collect()
-    }
 
     #[tokio::test]
     async fn search_index_upgrade_preserves_content_and_skips_unchanged_text() {
@@ -439,7 +595,7 @@ mod tests {
                 lf_checksum
             };
             sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
-                .bind(decode_checksum(alternate_checksum))
+                .bind(decode_hex_checksum(alternate_checksum).unwrap())
                 .bind(version)
                 .execute(&pool)
                 .await
@@ -450,6 +606,75 @@ mod tests {
             .await
             .unwrap();
         migrator.run(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normalizes_only_the_known_migration_29_draft() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(34, &pool).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 29")
+            .bind(decode_hex_checksum(LEGACY_REMOTE_FILE_CONTENT_CHECKSUM).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        repair_remote_file_content_draft(&pool, &migrator)
+            .await
+            .unwrap();
+        migrator.run(&pool).await.unwrap();
+
+        let checksum: String =
+            sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 29")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checksum, CURRENT_REMOTE_FILE_CONTENT_CHECKSUM);
+    }
+
+    #[tokio::test]
+    async fn completes_only_the_known_migration_30_draft() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(29, &pool).await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO _sqlx_migrations (
+                version, description, success, checksum, execution_time
+            ) VALUES (30, 'content availability draft', 1, ?, 0)
+            "#,
+        )
+        .bind(decode_hex_checksum(LEGACY_CONTENT_AVAILABILITY_CHECKSUM).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repair_content_availability_draft(&pool, &migrator)
+            .await
+            .unwrap();
+        migrator.run(&pool).await.unwrap();
+
+        let checksum: String =
+            sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checksum, CURRENT_CONTENT_AVAILABILITY_CHECKSUM);
+        let consolidated_tables: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_delivery_targets') + EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_local_content')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(consolidated_tables, 2);
     }
 
     #[tokio::test]

@@ -118,6 +118,7 @@ pub fn run() {
             commands::restart_as_admin,
             commands::read_clipboard,
             commands::list_clipboard_items,
+            commands::get_clipboard_item_index,
             commands::open_external_url,
             commands::list_clipboard_groups,
             commands::create_clipboard_group,
@@ -281,7 +282,7 @@ pub fn run() {
                     })?;
                 handle_db.manage(db::DatabaseState::new(pool));
                 clipboard::init(&handle_db)?;
-                sync::init(&handle_db).await?;
+                sync::init(&handle_db)?;
                 clipboard::cleanup::spawn(handle_db.clone());
                 #[cfg(target_os = "android")]
                 {

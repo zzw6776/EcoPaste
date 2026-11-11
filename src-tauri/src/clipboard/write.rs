@@ -23,14 +23,18 @@ use clipboard_rs::common::RustImage;
 use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState};
+#[cfg(not(target_os = "android"))]
 use super::guard::WritebackGuard;
 #[cfg(not(target_os = "android"))]
 use super::storage::ImageStore;
 use crate::core::{AppError, Result};
+#[cfg(not(target_os = "android"))]
 use crate::db::items::content_hash;
+use crate::db::models::ClipboardItem;
+#[cfg(not(target_os = "android"))]
+use crate::db::models::ClipboardKind;
 #[cfg(not(target_os = "android"))]
 use crate::db::models::ClipboardSubKind;
-use crate::db::models::{ClipboardItem, ClipboardKind};
 
 /// 把 `item` 写回系统剪贴板；`plain = true` 强制只写纯文本（剥离 HTML/RTF）。
 #[cfg(not(target_os = "android"))]
@@ -105,44 +109,45 @@ pub fn write_synced_item_to_clipboard(
 #[cfg(target_os = "android")]
 pub fn write_to_clipboard_app(
     _app: &tauri::AppHandle,
-    guard: &WritebackGuard,
+    fingerprints: &ClipboardFingerprintState,
     item: &ClipboardItem,
 ) -> Result<()> {
-    write_to_clipboard_app_with_guard(guard, item)
+    let text = item.search_text.as_deref().unwrap_or(&item.content);
+    write_text_to_clipboard_app(fingerprints, text)
 }
 
 /// Android 同步文本仅在纯文本语义变化时写回系统剪贴板。
 #[cfg(target_os = "android")]
 pub fn write_synced_item_to_clipboard_app(
     _app: &tauri::AppHandle,
-    guard: &WritebackGuard,
     fingerprints: &ClipboardFingerprintState,
     item: &ClipboardItem,
 ) -> Result<bool> {
-    let Some(fingerprint) = ClipboardFingerprint::from_text_item(item) else {
+    let text = item.search_text.as_deref().unwrap_or(&item.content);
+    if text.is_empty() {
         return Ok(false);
-    };
+    }
+    let fingerprint = ClipboardFingerprint::from_text(text);
     if fingerprints.matches(&fingerprint) {
         return Ok(false);
     }
 
-    let write = fingerprints.begin_write(fingerprint);
-    let result = write_to_clipboard_app_with_guard(guard, item);
-    if result.is_err() {
-        fingerprints.rollback_write(write);
-    }
-    result.map(|_| true)
+    write_text_to_clipboard_app(fingerprints, text).map(|_| true)
 }
 
 #[cfg(target_os = "android")]
-fn write_to_clipboard_app_with_guard(guard: &WritebackGuard, item: &ClipboardItem) -> Result<()> {
-    let text = item.search_text.as_deref().unwrap_or(&item.content);
-    if !text.is_empty() {
-        guard.suppress(content_hash(ClipboardKind::Text, text));
-        crate::commands::android::write_android_clipboard_text(text)
-            .map_err(|error| AppError::Clipboard(error.to_string()))?;
+fn write_text_to_clipboard_app(fingerprints: &ClipboardFingerprintState, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
     }
-    Ok(())
+
+    let write = fingerprints.begin_write(ClipboardFingerprint::from_text(text));
+    let result = crate::commands::android::write_android_clipboard_text(text)
+        .map_err(|error| AppError::Clipboard(error.to_string()));
+    if result.is_err() {
+        fingerprints.rollback_write(write);
+    }
+    result
 }
 
 #[cfg(not(target_os = "android"))]

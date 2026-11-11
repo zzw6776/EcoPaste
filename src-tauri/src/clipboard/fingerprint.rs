@@ -54,6 +54,11 @@ struct PerceptualImageFingerprint {
 }
 
 impl ClipboardFingerprint {
+    /// Builds the canonical cross-device fingerprint for a plain-text clipboard value.
+    pub fn from_text(text: &str) -> Self {
+        Self::exact(hash_parts(TEXT_DOMAIN, [text.as_bytes()]))
+    }
+
     /// 文本以纯文本表示为跨应用语义；HTML/RTF 被远程工具降级后仍视为同一内容。
     pub fn from_text_item(item: &ClipboardItem) -> Option<Self> {
         if item.kind != ClipboardKind::Text {
@@ -68,7 +73,7 @@ impl ClipboardFingerprint {
             &item.content
         };
 
-        Some(Self::exact(hash_parts(TEXT_DOMAIN, [text.as_bytes()])))
+        Some(Self::from_text(text))
     }
 
     /// 图片使用 RGBA 语义指纹；最多缓存 64 个字节摘要到指纹的映射，不保留原图或像素。
@@ -133,7 +138,6 @@ impl ClipboardFingerprint {
     }
 
     /// 写回保护继续使用与监听端一致的字符串形式。
-    #[cfg(any(not(target_os = "android"), test))]
     pub fn as_str(&self) -> &str {
         &self.exact
     }
@@ -261,9 +265,7 @@ struct RecentSyncedImage {
 #[derive(Clone)]
 pub struct ClipboardObservation {
     generation: u64,
-    #[cfg(any(not(target_os = "android"), test))]
     previous: Option<ClipboardFingerprint>,
-    #[cfg(any(not(target_os = "android"), test))]
     restore_previous: bool,
     #[cfg(any(not(target_os = "android"), test))]
     outbound_image: Option<ClipboardFingerprint>,
@@ -289,9 +291,7 @@ impl ClipboardFingerprintState {
         state.generation = state.generation.wrapping_add(1);
         let observation = ClipboardObservation {
             generation: state.generation,
-            #[cfg(any(not(target_os = "android"), test))]
             previous: state.current.take(),
-            #[cfg(any(not(target_os = "android"), test))]
             restore_previous: state.write_pending,
             #[cfg(any(not(target_os = "android"), test))]
             outbound_image: None,
@@ -429,6 +429,14 @@ impl ClipboardFingerprintState {
                     .as_ref()
                     .is_some_and(|candidate| candidate.is_similar_to(perceptual))
         })
+    }
+}
+
+#[cfg(target_os = "android")]
+impl ClipboardObservation {
+    /// 判断本次系统通知是否对应此前尚未回执的同步写回。
+    pub fn matches_pending_writeback(&self, fingerprint: &ClipboardFingerprint) -> bool {
+        self.restore_previous && self.previous.as_ref() == Some(fingerprint)
     }
 }
 

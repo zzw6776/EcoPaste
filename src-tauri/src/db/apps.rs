@@ -145,7 +145,7 @@ pub async fn resolve_synced_app(
     source_revision: &str,
 ) -> Result<ClipboardApp> {
     let mut transaction = pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin synchronized source app resolution")?;
     let existing: Option<(String, DateTime<Utc>, String)> = sqlx::query_as(

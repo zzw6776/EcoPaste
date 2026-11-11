@@ -5,19 +5,19 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.text.Html
 import android.util.Log
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.core.content.IntentCompat
-import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reads temporary Android content grants off the UI thread and hands owned copies to Rust. */
+/** Opens temporary Android content grants off the UI thread and lets Rust own materialization. */
 object EcoPasteShareReceiver {
     private val executor = Executors.newSingleThreadExecutor()
     private val runtimeReady = CompletableFuture<Unit>()
@@ -36,11 +36,10 @@ object EcoPasteShareReceiver {
         executor.execute { importDelivery(application, delivery) }
     }
 
-    /** Keeps source URI permissions in use only while streaming into the app's private cache. */
+    /** Keeps source descriptors alive while Rust streams them once into managed storage. */
     private fun importDelivery(context: Context, intent: Intent) {
-        val stagingRoot = File(context.cacheDir, "ecopaste-share")
-        var staging: File? = null
         val payload = JSONObject()
+        val descriptors = mutableListOf<ParcelFileDescriptor>()
         var failed = 0
         try {
             val uris = linkedSetOf<Uri>()
@@ -82,23 +81,28 @@ object EcoPasteShareReceiver {
             payload.put("html", html)
 
             val files = JSONArray()
-            if (uris.isNotEmpty()) {
-                check(stagingRoot.isDirectory || stagingRoot.mkdirs())
-                staging = File(stagingRoot, java.util.UUID.randomUUID().toString())
-                check(staging.mkdirs())
-            }
-            uris.forEachIndexed { index, uri ->
-                val target = File(checkNotNull(staging), index.toString())
+            uris.forEach { uri ->
                 try {
                     // Only provider-granted content is accepted; never read arbitrary file:// paths.
                     require(uri.scheme == "content")
                     var name: String? = null
+                    var size: Long? = null
                     try {
                         context.contentResolver.query(
-                            uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null,
+                            uri,
+                            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                            null,
+                            null,
+                            null,
                         )?.use { cursor ->
-                            val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                            if (column >= 0 && cursor.moveToFirst()) name = cursor.getString(column)
+                            if (cursor.moveToFirst()) {
+                                val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                if (nameColumn >= 0) name = cursor.getString(nameColumn)
+                                val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
+                                if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
+                                    size = cursor.getLong(sizeColumn).takeIf { it >= 0L }
+                                }
+                            }
                         }
                     } catch (error: Exception) {
                         Log.d("EcoPasteShare", "Shared attachment has no display name", error)
@@ -112,17 +116,18 @@ object EcoPasteShareReceiver {
                     val extension = mime?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
                     val fileName = name?.takeIf { it.isNotBlank() }
                         ?: if (extension.isNullOrBlank()) "attachment" else "attachment.$extension"
-                    context.contentResolver.openInputStream(uri).use { input ->
-                        checkNotNull(input) { "Shared content is unavailable" }
-                        target.outputStream().use { output -> input.copyTo(output) }
-                    }
-                    files.put(
-                        JSONObject().put("path", target.absolutePath)
-                            .put("name", fileName)
-                            .put("mime", mime ?: "application/octet-stream"),
-                    )
+                    val descriptor = checkNotNull(
+                        context.contentResolver.openFileDescriptor(uri, "r"),
+                    ) { "Shared content is unavailable" }
+                    descriptors.add(descriptor)
+                    val resolvedSize = size ?: descriptor.statSize.takeIf { it >= 0L }
+                    val file = JSONObject()
+                        .put("fd", descriptor.fd)
+                        .put("name", fileName)
+                        .put("mime", mime ?: "application/octet-stream")
+                    resolvedSize?.let { file.put("size", it) }
+                    files.put(file)
                 } catch (error: Exception) {
-                    target.delete()
                     failed += 1
                     Log.w("EcoPasteShare", "Unable to read shared attachment", error)
                 }
@@ -144,7 +149,13 @@ object EcoPasteShareReceiver {
         } catch (error: Exception) {
             Log.e("EcoPasteShare", "Unable to import share delivery", error)
         } finally {
-            staging?.deleteRecursively()
+            descriptors.forEach { descriptor ->
+                try {
+                    descriptor.close()
+                } catch (error: Exception) {
+                    Log.d("EcoPasteShare", "Unable to close shared attachment", error)
+                }
+            }
         }
     }
 }

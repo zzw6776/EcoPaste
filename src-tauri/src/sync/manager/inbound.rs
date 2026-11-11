@@ -1,6 +1,62 @@
 use super::*;
 
 impl SyncManager {
+    /// Applies the Hub's independent, resumable blob-availability stream.
+    pub(super) async fn sync_cloud_availability(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+    ) -> Result<bool> {
+        let after_cursor = repository::cloud_availability_cursor(pool).await?;
+        let response = call_cloud(
+            connection,
+            Request::SyncCloudAvailability {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                after_cursor,
+                limit: MAX_EVENTS_PER_BATCH,
+            },
+            crate::i18n::current_language(&self.app),
+        )
+        .await?;
+        let Response::CloudAvailabilitySynced {
+            updates,
+            latest_cursor,
+            has_more,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                bail!(message);
+            }
+            bail!("云端返回了无效的内容可用性响应");
+        };
+        let event_ids = updates
+            .iter()
+            .map(|update| update.event_id.clone())
+            .collect::<Vec<_>>();
+        let events = repository::events_by_ids(pool, &event_ids)
+            .await?
+            .into_iter()
+            .map(|stored| (stored.event.event_id.clone(), stored.event))
+            .collect::<HashMap<_, _>>();
+        let key = group.content_key_bytes()?;
+        let availability = updates
+            .iter()
+            .filter_map(|update| {
+                events.get(&update.event_id).and_then(|event| {
+                    cloud_event_content_availability(event, &update.available_blob_ids, &key)
+                        .map(|state| (update.event_id.clone(), state))
+                })
+            })
+            .collect::<Vec<_>>();
+        repository::record_cloud_availability_batch(pool, &availability, latest_cursor).await?;
+        if !availability.is_empty() {
+            self.emit_updated();
+        }
+        Ok(has_more)
+    }
+
     /// Stores one authenticated remote batch and applies all currently eligible events.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn accept_remote_events(
@@ -9,7 +65,7 @@ impl SyncManager {
         pool: &SqlitePool,
         sync_settings: &SyncSettings,
         device_id: &str,
-        events: Vec<CloudEvent>,
+        events: Vec<ReceivedSyncEvent>,
         group: &GroupSecrets,
         source: &SyncConnectionTarget,
         latest_cursor: u64,
@@ -19,15 +75,31 @@ impl SyncManager {
         let removed_peers = repository::removed_peer_ids(pool).await?;
         let events = events
             .into_iter()
-            .map(|cloud_event| cloud_event.event)
-            .filter(|event| !removed_peers.contains(&event.origin_device_id))
+            .filter(|received| !removed_peers.contains(&received.event.origin_device_id))
             .collect::<Vec<_>>();
-        let stored = repository::store_remote_batch(
+        let cloud_availability = if source.is_cloud() {
+            let key = group.content_key_bytes()?;
+            events
+                .iter()
+                .filter_map(|received| {
+                    cloud_content_availability(received, &key)
+                        .map(|state| (received.event.event_id.clone(), state))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let encrypted_events = events
+            .into_iter()
+            .map(|received| received.event)
+            .collect::<Vec<_>>();
+        let stored = repository::store_remote_batch_with_availability(
             pool,
             source.remote_batch_source(),
             Some(latest_cursor),
-            &events,
+            &encrypted_events,
             device_id,
+            &cloud_availability,
         )
         .await?;
         for (event_id, origin_device_id) in stored.conflicts {
@@ -182,7 +254,15 @@ impl SyncManager {
         // 只有不持有数据库事务的 Blob 网络与文件 I/O 才并发执行。
         let mut ready_content = Vec::new();
         let mut metadata_only_content = Vec::new();
+        let mut deduplicated_content = Vec::new();
         let resources = crate::core::paths::resources_dir(&self.app)?;
+        let local_storage_limit_bytes = self
+            .app
+            .state::<SettingsStore>()
+            .snapshot()
+            .clipboard
+            .history
+            .max_storage_bytes;
         for (event, envelope) in pending_content {
             let presence = SyncedItemStatePatch {
                 sync_key: envelope.item.sync_key.clone(),
@@ -263,17 +343,22 @@ impl SyncManager {
                     &resources,
                     &envelope.item.sync_key,
                     source_revision,
+                    envelope.content_identity.as_deref(),
                 )
                 .await?
                 .is_some();
-            if local_file_available
-                || should_defer_remote_files(&envelope, sync_settings.auto_download_max_mb)
-            {
+            if local_file_available {
+                deduplicated_content.push((event, envelope));
+            } else if should_defer_remote_file_download(
+                &envelope,
+                sync_settings.auto_download_max_mb,
+                local_storage_limit_bytes,
+            ) {
                 metadata_only_content.push((event, envelope));
             } else {
                 let item_id = if envelope.item.kind == "files" {
                     let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-                    let (item_id, _) = self
+                    let (item_id, _, _) = self
                         .materialize_remote_file_metadata_card(
                             pool,
                             &event,
@@ -297,6 +382,13 @@ impl SyncManager {
                 .await
             {
                 Ok(_) => {
+                    repository::record_inbound_outcome(
+                        pool,
+                        source.remote_batch_source(),
+                        &event.event_id,
+                        repository::InboundContentOutcome::Metadata,
+                    )
+                    .await?;
                     repository::mark_applied(pool, &event.event_id).await?;
                     made_content_progress = true;
                     source_assets_pending |= source_icon.is_some();
@@ -308,6 +400,41 @@ impl SyncManager {
                 Err(error) => {
                     log::warn!(
                         "defer metadata-only sync content event {}: {error:#}",
+                        event.event_id
+                    );
+                    let delay =
+                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
+                            .await?;
+                    self.schedule_transfer_wake(delay);
+                }
+            }
+        }
+
+        for (event, envelope) in deduplicated_content {
+            let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
+            match self
+                .materialize_remote_file_metadata_card(pool, &event, envelope, group)
+                .await
+            {
+                Ok(_) => {
+                    repository::record_inbound_outcome(
+                        pool,
+                        source.remote_batch_source(),
+                        &event.event_id,
+                        repository::InboundContentOutcome::Deduplicated,
+                    )
+                    .await?;
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    made_content_progress = true;
+                    source_assets_pending |= source_icon.is_some();
+                    #[cfg(target_os = "android")]
+                    {
+                        applied_any = true;
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "defer deduplicated sync content event {}: {error:#}",
                         event.event_id
                     );
                     let delay =
@@ -342,6 +469,7 @@ impl SyncManager {
                         );
                         let handle = self.delivery.start(super::super::progress::TransferTask {
                             id: blake3::hash(task_key.as_bytes()).to_hex().to_string(),
+                            revision: 0,
                             operation_id: event.event_id.clone(),
                             item_id,
                             direction: super::super::progress::TransferDirection::Download,
@@ -352,7 +480,6 @@ impl SyncManager {
                             phase: super::super::progress::TransferPhase::Queued,
                             transferred_bytes: 0,
                             total_bytes,
-                            operation_total_bytes: total_bytes,
                             speed_bytes_per_second: 0,
                             elapsed_ms: 0,
                             eta_seconds: None,
@@ -463,20 +590,34 @@ impl SyncManager {
             }
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
             let manifests = envelope.blobs.clone();
+            let content_identity = envelope.content_identity.clone();
             match self.apply_envelope(&event, envelope, group).await {
-                Ok((item_id, item, fingerprint)) => {
+                Ok((item_id, item, fingerprint, deduplicated)) => {
                     if !item_id.is_empty() {
                         let sources = self
                             .materialized_blob_sources(&item, &manifests, &stored_blobs)
                             .await?;
                         repository::register_event_blob_sources(pool, &event.event_id, &sources)
                             .await?;
-                        repository::link_event_to_item(pool, &item_id, &event.event_id, "remote")
-                            .await?;
+                        repository::link_content_event_to_item(
+                            pool,
+                            &item_id,
+                            &event.event_id,
+                            "remote",
+                            content_identity.as_deref(),
+                        )
+                        .await?;
                         self.reconcile_item_timestamps(pool, group, &item_id)
                             .await?;
-                        latest_clipboard_item = Some((item, fingerprint));
+                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
                     }
+                    repository::record_inbound_outcome(
+                        pool,
+                        source.remote_batch_source(),
+                        &event.event_id,
+                        repository::InboundContentOutcome::Received,
+                    )
+                    .await?;
                     repository::mark_applied(pool, &event.event_id).await?;
                     if let Some((handle, total_bytes, _)) = &download {
                         handle.completed(*total_bytes);
@@ -520,7 +661,7 @@ impl SyncManager {
                 }
             }
         }
-        if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
+        if let Some((item, fingerprint, deduplicated)) = latest_clipboard_item.as_ref() {
             self.write_latest_synced_item_to_clipboard(
                 item,
                 fingerprint.as_ref(),
@@ -531,6 +672,7 @@ impl SyncManager {
                 serde_json::json!({
                     "id": item.id,
                     "kind": item.kind,
+                    "deduplicated": deduplicated,
                     "reconciled": true,
                 }),
             ) {
@@ -623,7 +765,11 @@ impl SyncManager {
             repository::link_event_to_item(pool, item_id, &event.event_id, "remote").await?;
             self.app.emit(
                 crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-                serde_json::json!({ "id": item_id, "reconciled": true }),
+                serde_json::json!({
+                    "id": item_id,
+                    "deduplicated": true,
+                    "reconciled": true,
+                }),
             )?;
         } else if outcome.canonical_presence == Some(false) {
             self.app.emit(
@@ -766,12 +912,20 @@ impl SyncManager {
         event: &EncryptedEvent,
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
-    ) -> Result<(String, ClipboardItem)> {
-        let (item_id, item) = self
+    ) -> Result<(String, ClipboardItem, bool)> {
+        let content_identity = envelope.content_identity.clone();
+        let (item_id, item, deduplicated) = self
             .apply_remote_file_metadata(event, envelope, group)
             .await?;
         if !item_id.is_empty() {
-            repository::link_event_to_item(pool, &item_id, &event.event_id, "remote").await?;
+            repository::link_content_event_to_item(
+                pool,
+                &item_id,
+                &event.event_id,
+                "remote",
+                content_identity.as_deref(),
+            )
+            .await?;
             self.reconcile_item_timestamps(pool, group, &item_id)
                 .await?;
             if let Err(error) = self.app.emit(
@@ -779,13 +933,14 @@ impl SyncManager {
                 serde_json::json!({
                     "id": item.id,
                     "kind": item.kind,
+                    "deduplicated": deduplicated,
                     "reconciled": true,
                 }),
             ) {
                 log::warn!("emit remote file metadata update failed: {error}");
             }
         }
-        Ok((item_id, item))
+        Ok((item_id, item, deduplicated))
     }
 
     /// Materializes a remote file card from its encrypted event without downloading file bytes.
@@ -794,7 +949,7 @@ impl SyncManager {
         event: &EncryptedEvent,
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
-    ) -> Result<(String, ClipboardItem)> {
+    ) -> Result<(String, ClipboardItem, bool)> {
         if envelope.version != 1 || parse_kind(&envelope.item.kind)? != ClipboardKind::Files {
             bail!("不支持的远端文件元数据");
         }
@@ -810,10 +965,11 @@ impl SyncManager {
             &resources,
             &envelope.item.sync_key,
             source_revision,
+            envelope.content_identity.as_deref(),
         )
         .await?
         {
-            return Ok((existing.id.clone(), existing));
+            return Ok((existing.id.clone(), existing, true));
         }
 
         let mut manifests = envelope
@@ -901,7 +1057,7 @@ impl SyncManager {
         if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
             item = materialized;
         }
-        Ok((result.id, item))
+        Ok((result.id, item, result.deduplicated))
     }
 
     async fn apply_envelope(
@@ -909,7 +1065,7 @@ impl SyncManager {
         event: &EncryptedEvent,
         envelope: ClipboardEnvelope,
         group: &GroupSecrets,
-    ) -> Result<(String, ClipboardItem, Option<ClipboardFingerprint>)> {
+    ) -> Result<(String, ClipboardItem, Option<ClipboardFingerprint>, bool)> {
         let _sync_activity = SyncActivityGuard::acquire();
         if envelope.version != 1 {
             bail!("不支持的同步事件版本");
@@ -1089,14 +1245,14 @@ impl SyncManager {
         };
         let result = db::items::upsert_materialized_synced_item(&pool, &item).await?;
         if result.id.is_empty() {
-            return Ok((String::new(), item, None));
+            return Ok((String::new(), item, None, result.deduplicated));
         }
         item.id.clone_from(&result.id);
         if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
             item = materialized;
         }
         let fingerprint = files_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
-        Ok((result.id, item, fingerprint))
+        Ok((result.id, item, fingerprint, result.deduplicated))
     }
 
     /// A remote batch updates the system clipboard at most once. Clipboard ownership is
@@ -1125,19 +1281,19 @@ impl SyncManager {
             return;
         }
 
-        let guard = self.app.state::<Arc<WritebackGuard>>();
         let fingerprints = self.app.state::<Arc<ClipboardFingerprintState>>();
         #[cfg(target_os = "android")]
         let result = if resolved_item.kind == ClipboardKind::Text {
             crate::clipboard::write_synced_item_to_clipboard_app(
                 &self.app,
-                &guard,
                 &fingerprints,
                 &resolved_item,
             )
         } else {
             Ok(false)
         };
+        #[cfg(not(target_os = "android"))]
+        let guard = self.app.state::<Arc<WritebackGuard>>();
         #[cfg(not(target_os = "android"))]
         let result = crate::clipboard::write_synced_item_to_clipboard(
             &self.app.state::<ImageStore>(),
@@ -1154,4 +1310,38 @@ impl SyncManager {
             );
         }
     }
+}
+
+/// Derives Hub content availability from its authoritative stored-blob list.
+fn cloud_content_availability(
+    received: &ReceivedSyncEvent,
+    key: &[u8; 32],
+) -> Option<repository::RouteContentAvailability> {
+    let available_blob_ids = received.cloud_blob_ids.as_ref()?;
+    cloud_event_content_availability(&received.event, available_blob_ids, key)
+}
+
+fn cloud_event_content_availability(
+    event: &EncryptedEvent,
+    available_blob_ids: &[String],
+    key: &[u8; 32],
+) -> Option<repository::RouteContentAvailability> {
+    let DecryptedSyncEvent::Clipboard(envelope) = crypto::decrypt_sync_event(key, event).ok()?
+    else {
+        return None;
+    };
+    let available_blob_ids = available_blob_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let complete = envelope
+        .blobs
+        .iter()
+        .filter(|blob| matches!(blob.role, BlobRole::Image | BlobRole::File))
+        .all(|blob| available_blob_ids.contains(blob.blob_id.as_str()));
+    Some(if complete {
+        repository::RouteContentAvailability::Complete
+    } else {
+        repository::RouteContentAvailability::Metadata
+    })
 }

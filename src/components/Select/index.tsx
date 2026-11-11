@@ -6,7 +6,7 @@ import type {
 } from "antd/es/select";
 import { useState } from "react";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
-import { isAndroid } from "@/utils/is";
+import { useCloseAppOverlay } from "@/hooks/useCloseAppOverlay";
 
 /** 统一接入 Android 系统返回栈的 Select。 */
 const Select = <
@@ -15,8 +15,9 @@ const Select = <
 >(
   props: SelectProps<ValueType, OptionType>,
 ) => {
-  const { onDropdownVisibleChange, onOpenChange, open, ...rest } = props;
-  const [innerOpen, setInnerOpen] = useState(false);
+  const { defaultOpen, onDropdownVisibleChange, onOpenChange, open, ...rest } =
+    props;
+  const [innerOpen, setInnerOpen] = useState(defaultOpen ?? false);
   const mergedOpen = open ?? innerOpen;
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -28,12 +29,15 @@ const Select = <
   useAndroidBack(mergedOpen, () => {
     handleOpenChange(false);
   });
+  useCloseAppOverlay(mergedOpen, () => {
+    handleOpenChange(false);
+  });
 
   return (
     <AntdSelect<ValueType, OptionType>
       {...rest}
       onOpenChange={handleOpenChange}
-      open={isAndroid ? mergedOpen : open}
+      open={mergedOpen}
     />
   );
 };

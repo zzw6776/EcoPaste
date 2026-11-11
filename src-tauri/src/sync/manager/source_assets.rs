@@ -109,10 +109,6 @@ impl SyncManager {
         let Some(connection) = connection else {
             return Ok(0);
         };
-        if !self.cloud_async_source_icons_supported(connection, &group.group_id) {
-            return Ok(0);
-        }
-
         let pool = self.pool().await;
         let blobs = repository::pending_source_icon_uploads(
             &pool,
@@ -138,8 +134,8 @@ impl SyncManager {
             group,
             blobs,
             BlobUploadOptions {
-                kind: BlobUploadKind::PublishedSourceIcon,
-                managed_hub_blob: self.bounded_hub_supported(connection, &group.group_id),
+                kind: BlobUploadKind::SourceIcon,
+                managed_hub_blob: true,
                 is_cloud: true,
                 language: crate::i18n::current_language(&self.app),
                 started: None,
@@ -151,11 +147,6 @@ impl SyncManager {
         for (blob_id, path) in blob_ids.iter().zip(blob_paths) {
             self.delivery.request_staging_release(blob_id, path);
         }
-        self.runtime_state
-            .confirmed_cloud_source_icons
-            .write()
-            .expect("confirmed cloud source icons poisoned")
-            .confirm(connection.stable_id(), &group.group_id, &blob_ids);
         Ok(blob_ids.len())
     }
 

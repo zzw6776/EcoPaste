@@ -1,7 +1,9 @@
 mod activity;
 mod crypto;
 mod delivery;
+mod delivery_plan;
 mod identity;
+mod item_status;
 mod manager;
 mod model;
 mod pairing;
@@ -10,6 +12,8 @@ pub(crate) mod repository;
 mod transfer;
 mod upload;
 
+#[cfg(target_os = "android")]
+pub(crate) use delivery_plan::android_share_delivery_target;
 pub use identity::PairingCode;
 pub use manager::SyncManager;
 pub(crate) use manager::{LEGACY_SYNC_BLOB_DIR, SYNC_STAGING_DIR};
@@ -28,8 +32,8 @@ use crate::{
     settings::SettingsStore,
 };
 
-pub async fn init(app: &AppHandle) -> Result<()> {
-    manager::init(app).await
+pub fn init(app: &AppHandle) -> Result<()> {
+    manager::init(app)
 }
 
 /// Returns whether this local capture should create a durable automatic-sync operation.
@@ -56,7 +60,7 @@ pub fn enqueue_local_item(
 /// Wakes the durable content materializer after delayed file metadata becomes available.
 pub fn notify_local_item_ready(app: &AppHandle) {
     if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
-        manager.wake_local_outbox();
+        manager.wake_content_outbox();
     }
 }
 

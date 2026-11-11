@@ -618,12 +618,12 @@
       },
       "sync": {
         "autoDownloadMaxMb": {
-          "description": "Automatically download a remote file card into EcoPaste-managed storage when its total original size is within this limit. Larger cards sync metadata only. Set 0 for manual download only.",
-          "title": "Automatic Download Limit"
+          "description": "Automatically receive file content from LAN or cloud when the card's total original size is within this limit. Larger cards sync metadata only. Set 0 for manual download only.",
+          "title": "Automatic File Receive Limit"
         },
         "autoUploadMaxMb": {
-          "description": "Automatically encrypt and upload a file card when its total original size is within this limit. Folders include all nested files. Set 0 for manual upload only.",
-          "title": "Automatic Sync Size Limit"
+          "description": "Automatically encrypt and upload a file card to the cloud when its total original size is within this limit. For normal clipboard captures, larger cards sync metadata to the cloud while LAN follows the receiving device's automatic receive limit. Explicit large-file shares from Android use one route: LAN when a device is connected, otherwise cloud. Set 0 to require manual cloud uploads for normal clipboard captures.",
+          "title": "Automatic Cloud Upload Limit"
         },
         "autoWriteClipboard": {
           "description": "When disabled, remote items enter history without replacing the current system clipboard.",
