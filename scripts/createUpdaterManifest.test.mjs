@@ -113,13 +113,21 @@ test("publishes the first parallel Apple Silicon candidate", async () => {
   );
   assert.match(workflow, /Neither Apple Silicon build route produced/);
   assert.match(workflow, /actions\/runs\/\$\{CANDIDATE_RUN_ID\}\/cancel/);
+  const candidateStartJob = workflow.slice(
+    workflow.indexOf("  start-macos-apple-candidates:"),
+    workflow.indexOf("  upload-macos-apple:"),
+  );
+  assert.match(candidateStartJob, /GH_REPO: \$\{\{ github\.repository }}/);
   const appleUploadJob = workflow.slice(
     workflow.indexOf("  upload-macos-apple:"),
     workflow.indexOf("  build-android:"),
   );
   assert.match(appleUploadJob, /- build-desktop/);
   assert.match(appleUploadJob, /- start-macos-apple-candidates/);
-  assert.match(appleUploadJob, /GH_REPO: \$\{\{ github\.repository }}/);
+  assert.equal(
+    appleUploadJob.match(/GH_REPO: \$\{\{ github\.repository }}/g)?.length,
+    2,
+  );
   assert.match(candidateWorkflow, /continue-on-error: true/);
   assert.match(candidateWorkflow, /fail-fast: false/);
   assert.match(

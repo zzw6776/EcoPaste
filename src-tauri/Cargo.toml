@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.210"
+version = "1.1.211"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -21,6 +21,7 @@ name = "eco_paste_lib"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
+sha2 = "0.10"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]

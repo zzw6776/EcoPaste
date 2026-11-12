@@ -247,6 +247,7 @@ jobs:
         id: candidates
         shell: bash
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
         run: |
@@ -295,6 +296,7 @@ jobs:
         shell: bash
         env:
           CANDIDATE_RUN_ID: ${{ needs.start-macos-apple-candidates.outputs.run_id }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
