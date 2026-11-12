@@ -28,10 +28,29 @@ const LEGACY_CONTENT_AVAILABILITY_CHECKSUM: &str =
     "5997EDC9F723F05C6D110CD1FA5D9D6F122A32ACD08DA3FB0609268E462AAA5745DC6B8EB15AA79A06B4496B23058264";
 const CURRENT_CONTENT_AVAILABILITY_CHECKSUM: &str =
     "52EDB0AA5436E20531BBB1BEDCF88BEF032A1B3BFC91DE879C207964BD13C2BF8BEAEBBEAA8057A4B5A852F893968224";
-const LEGACY_CONTENT_OBJECTS_CHECKSUM: &str =
-    "B88CBBF51A4D0D062E15E607E3B0B15D00B631668450016928CF414E8DE01BC4B49926449A9E4EE111D8744A8B07DE39";
-const CURRENT_CONTENT_OBJECTS_CHECKSUM: &str =
-    "8D1CFA204FC191222F229A2C59880F9D3AD5E9122AAAE9857CF16AF3FFF24FCFB72901170B237A35C3C65487092DE6D6";
+struct SchemaEquivalentDraft {
+    version: i64,
+    legacy_checksum: &'static str,
+    current_checksum: &'static str,
+}
+
+const SCHEMA_EQUIVALENT_DRAFTS: &[SchemaEquivalentDraft] = &[
+    SchemaEquivalentDraft {
+        version: 31,
+        legacy_checksum: "B88CBBF51A4D0D062E15E607E3B0B15D00B631668450016928CF414E8DE01BC4B49926449A9E4EE111D8744A8B07DE39",
+        current_checksum: "8D1CFA204FC191222F229A2C59880F9D3AD5E9122AAAE9857CF16AF3FFF24FCFB72901170B237A35C3C65487092DE6D6",
+    },
+    SchemaEquivalentDraft {
+        version: 32,
+        legacy_checksum: "2E2E1363E7ACE6F3FF312EAE9BB96AECBEB771197529CA78A90AA4B8A6CE2DEC9E46145611C3A3A59A8961DA2CA3A109",
+        current_checksum: "BEC483DE5B60E33BCCE09B8CC2F2087AAF22A8AB3955964F1CEB3083C3B68A0AFA5BAC9F41A771081311D381EE67FE27",
+    },
+    SchemaEquivalentDraft {
+        version: 35,
+        legacy_checksum: "FB025322614F0508ABEDDF2AC43FBFFE5CC2D1AD322868700ACE4F926C2F4FE9D5544EE9DD39ECF8762F877FDA4D4905",
+        current_checksum: "80E1DE741F19EDB8AF7223A3ECA4A0F6087C037212FFCF248C6AAF258984C5A3B4CF363360A668217CCF39B189808030",
+    },
+];
 const MIGRATION_LINE_ENDING_CHECKSUMS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -91,7 +110,7 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
     repair_legacy_sync_removal_migration(&pool).await?;
     repair_remote_file_content_draft(&pool, &migrator).await?;
     repair_content_availability_draft(&pool, &migrator).await?;
-    repair_content_objects_draft(&pool, &migrator).await?;
+    repair_schema_equivalent_drafts(&pool, &migrator).await?;
     repair_migration_line_endings(&pool, &migrator).await?;
     migrator
         .run(&pool)
@@ -316,51 +335,86 @@ where
     .context("inspect content availability schema")
 }
 
-/// Adopts the current checksum for the one known migration 31 draft after proving that its
-/// materialized table already has the exact current structure.
-async fn repair_content_objects_draft(pool: &SqlitePool, migrator: &Migrator) -> AnyResult<()> {
+/// Atomically adopts current checksums for the known development drafts only after proving that
+/// their materialized schemas and data invariants already satisfy the current contracts.
+async fn repair_schema_equivalent_drafts(pool: &SqlitePool, migrator: &Migrator) -> AnyResult<()> {
     let migration_table_exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
     )
     .fetch_one(pool)
     .await
-    .context("check migration metadata table for content objects draft repair")?;
+    .context("check migration metadata table for schema-equivalent draft repair")?;
     if migration_table_exists == 0 {
         return Ok(());
     }
 
-    let migration = migrator
-        .iter()
-        .find(|migration| migration.version == 31)
-        .context("migration 31 is missing")?;
-    if checksum_hex(migration.checksum.as_ref()) != CURRENT_CONTENT_OBJECTS_CHECKSUM {
-        return Ok(());
+    let mut repairs = Vec::new();
+    for draft in SCHEMA_EQUIVALENT_DRAFTS {
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == draft.version)
+            .with_context(|| format!("migration {} is missing", draft.version))?;
+        if checksum_hex(migration.checksum.as_ref()) != draft.current_checksum {
+            continue;
+        }
+        let applied_checksum: Option<String> = sqlx::query_scalar(
+            "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = ? AND success = 1",
+        )
+        .bind(draft.version)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("read migration {} checksum", draft.version))?;
+        if applied_checksum.as_deref() != Some(draft.legacy_checksum) {
+            continue;
+        }
+        let schema_matches = match draft.version {
+            31 => content_objects_schema_is_current(pool).await?,
+            32 => content_identity_schema_is_current(pool).await?,
+            35 => unified_delivery_schema_is_current(pool).await?,
+            _ => false,
+        };
+        if !schema_matches {
+            anyhow::bail!(
+                "migration {} draft does not satisfy the current contract",
+                draft.version
+            );
+        }
+        repairs.push((
+            draft.version,
+            migration.checksum.to_vec(),
+            decode_hex_checksum(draft.legacy_checksum)?,
+        ));
     }
-    let applied_checksum: Option<String> = sqlx::query_scalar(
-        "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 31 AND success = 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .context("read migration 31 checksum")?;
-    if applied_checksum.as_deref() != Some(LEGACY_CONTENT_OBJECTS_CHECKSUM) {
+    if repairs.is_empty() {
         return Ok(());
-    }
-    if !content_objects_schema_is_current(pool).await? {
-        anyhow::bail!("migration 31 draft schema does not match the current structure");
     }
 
-    let result = sqlx::query(
-        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = 31 AND success = 1 AND checksum = ?",
-    )
-    .bind(migration.checksum.to_vec())
-    .bind(decode_hex_checksum(LEGACY_CONTENT_OBJECTS_CHECKSUM)?)
-    .execute(pool)
-    .await
-    .context("normalize migration 31 draft checksum")?;
-    if result.rows_affected() != 1 {
-        anyhow::bail!("migration 31 draft checksum changed during normalization");
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin schema-equivalent draft normalization")?;
+    for (version, current_checksum, legacy_checksum) in &repairs {
+        let result = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND success = 1 AND checksum = ?",
+        )
+        .bind(current_checksum)
+        .bind(version)
+        .bind(legacy_checksum)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("normalize migration {version} draft checksum"))?;
+        if result.rows_affected() != 1 {
+            anyhow::bail!("migration {version} draft checksum changed during normalization");
+        }
     }
-    log::info!("normalized distributed draft of content objects migration 31");
+    transaction
+        .commit()
+        .await
+        .context("commit schema-equivalent draft normalization")?;
+    log::info!(
+        "normalized {} verified schema-equivalent migration draft(s)",
+        repairs.len()
+    );
     Ok(())
 }
 
@@ -403,6 +457,89 @@ async fn content_objects_schema_is_current(pool: &SqlitePool) -> AnyResult<bool>
     .await
     .context("inspect content objects unique index")?;
     Ok(unique_blob_index_exists != 0)
+}
+
+async fn content_identity_schema_is_current(pool: &SqlitePool) -> AnyResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT
+            EXISTS(
+                SELECT 1 FROM pragma_table_info('sync_item_events')
+                WHERE name = 'content_identity' AND type = 'TEXT' AND "notnull" = 0
+            )
+            AND EXISTS(
+                SELECT 1 FROM pragma_index_list('sync_item_events') indexes
+                WHERE indexes.name = 'idx_sync_item_events_content_identity'
+                  AND indexes."unique" = 0
+                  AND (SELECT COUNT(*) FROM pragma_index_xinfo(indexes.name) WHERE key = 1) = 3
+                  AND (SELECT name FROM pragma_index_xinfo(indexes.name) WHERE seqno = 0) = 'item_id'
+                  AND (SELECT name FROM pragma_index_xinfo(indexes.name) WHERE seqno = 1) = 'content_identity'
+                  AND (SELECT name FROM pragma_index_xinfo(indexes.name) WHERE seqno = 2) = 'created_at'
+                  AND (SELECT "desc" FROM pragma_index_xinfo(indexes.name) WHERE seqno = 2) = 1
+            )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect sync event content identity schema")
+}
+
+async fn unified_delivery_schema_is_current(pool: &SqlitePool) -> AnyResult<bool> {
+    let schema_parts: i64 = sqlx::query_scalar(
+        r#"
+        SELECT
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_delivery_targets') +
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_local_content') +
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_sync_delivery_targets_pending') +
+            EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_sync_delivery_targets_receipts')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect unified delivery schema")?;
+    if schema_parts != 4 {
+        return Ok(false);
+    }
+
+    let legacy_tables: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM sqlite_master
+        WHERE type = 'table' AND name IN (
+            'sync_deliveries', 'sync_delivery_states', 'sync_target_replicas',
+            'sync_event_ingress', 'sync_local_replicas', 'sync_forced_content_deliveries',
+            'sync_canceled_deliveries', 'sync_peer_receipts',
+            'sync_external_download_sessions', 'sync_external_download_targets'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect retired delivery tables")?;
+    if legacy_tables != 0 {
+        return Ok(false);
+    }
+
+    let invalid_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM sync_delivery_targets delivery
+             LEFT JOIN sync_events event ON event.event_id = delivery.event_id
+             WHERE event.event_id IS NULL
+                OR delivery.desired_content NOT IN ('metadata', 'complete')
+                OR delivery.confirmed_content NOT IN ('none', 'metadata', 'complete')
+                OR delivery.status NOT IN ('pending', 'confirmed', 'blocked', 'canceled')
+                OR delivery.receipt_pending NOT IN (0, 1)) +
+            (SELECT COUNT(*) FROM sync_local_content local
+             LEFT JOIN sync_events event ON event.event_id = local.event_id
+             WHERE event.event_id IS NULL
+                OR local.state NOT IN ('metadata', 'managed', 'external', 'external_missing')) +
+            (SELECT COUNT(*) FROM sync_state WHERE key = 'cloud_confirmation_repair_before')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("verify unified delivery data invariants")?;
+    Ok(invalid_rows == 0)
 }
 
 fn decode_hex_checksum(checksum: &str) -> AnyResult<Vec<u8>> {
@@ -772,7 +909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normalizes_only_the_known_migration_31_draft() {
+    async fn normalizes_all_known_schema_equivalent_drafts() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
@@ -780,24 +917,32 @@ mod tests {
             .unwrap();
         let migrator = sqlx::migrate!("./migrations");
         migrator.run(&pool).await.unwrap();
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 31")
-            .bind(decode_hex_checksum(LEGACY_CONTENT_OBJECTS_CHECKSUM).unwrap())
-            .execute(&pool)
-            .await
-            .unwrap();
+        for draft in SCHEMA_EQUIVALENT_DRAFTS {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(decode_hex_checksum(draft.legacy_checksum).unwrap())
+                .bind(draft.version)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
 
-        repair_content_objects_draft(&pool, &migrator)
+        repair_schema_equivalent_drafts(&pool, &migrator)
             .await
             .unwrap();
         migrator.run(&pool).await.unwrap();
 
-        let checksum: String =
-            sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 31")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(checksum, CURRENT_CONTENT_OBJECTS_CHECKSUM);
+        for draft in SCHEMA_EQUIVALENT_DRAFTS {
+            let checksum: String =
+                sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = ?")
+                    .bind(draft.version)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(checksum, draft.current_checksum);
+        }
         assert!(content_objects_schema_is_current(&pool).await.unwrap());
+        assert!(content_identity_schema_is_current(&pool).await.unwrap());
+        assert!(unified_delivery_schema_is_current(&pool).await.unwrap());
     }
 
     #[tokio::test]

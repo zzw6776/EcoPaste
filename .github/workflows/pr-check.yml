@@ -18,6 +18,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Reject changes to merged migrations
+        shell: bash
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          invalid=false
+
+          while IFS=$'\t' read -r status source target; do
+            if [[ -z "$status" || "$status" == A* ]]; then
+              continue
+            fi
+
+            invalid=true
+            if [[ -n "$target" ]]; then
+              echo "::error file=$source::Merged migration cannot be renamed to $target; add a new numbered migration instead."
+            else
+              echo "::error file=$source::Merged migration cannot be modified or deleted; add a new numbered migration instead."
+            fi
+          done < <(git diff --name-status --find-renames "$base_sha" HEAD -- 'src-tauri/migrations/*.sql')
+
+          if [[ "$invalid" == true ]]; then
+            exit 1
+          fi
+
       - name: Filter changed paths
         id: filter
         shell: bash
