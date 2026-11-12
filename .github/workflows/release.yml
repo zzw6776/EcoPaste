@@ -147,31 +147,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - apple_candidate: native
-            label: macOS Apple Silicon (native)
-            os: macos-15
-            publish_release: false
-            redundant: true
-            target: aarch64-apple-darwin
-          - apple_candidate: cross
-            label: macOS Apple Silicon (Intel fallback)
-            os: macos-26-intel
-            publish_release: false
-            redundant: true
-            target: aarch64-apple-darwin
-          - apple_candidate: ""
-            label: macOS Intel
+          - label: macOS Intel
             os: macos-26-intel
             publish_release: true
-            redundant: false
             target: x86_64-apple-darwin
-          - apple_candidate: ""
-            label: Windows x64
+          - label: Windows x64
             os: windows-latest
             publish_release: true
-            redundant: false
             target: x86_64-pc-windows-msvc
-    continue-on-error: ${{ matrix.redundant }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout release
@@ -221,53 +204,7 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${APPLE_CERTIFICATE}" || -z "${APPLE_CERTIFICATE_PASSWORD}" ]]; then
-            echo "::error::macOS release signing secrets are not configured."
-            exit 1
-          fi
-
-          certificate_bundle="${RUNNER_TEMP}/ecopaste-release-signing.p12"
-          certificate_pem="${RUNNER_TEMP}/ecopaste-release-signing.pem"
-          cleanup() {
-            rm -f "${certificate_bundle}" "${certificate_pem}"
-          }
-          trap cleanup EXIT
-
-          printf '%s' "${APPLE_CERTIFICATE}" \
-            | openssl base64 -d -A -out "${certificate_bundle}"
-          extract_certificate() {
-            openssl pkcs12 "$@" \
-              -in "${certificate_bundle}" \
-              -clcerts \
-              -nokeys \
-              -passin env:APPLE_CERTIFICATE_PASSWORD \
-              -out "${certificate_pem}"
-          }
-          if openssl pkcs12 -help 2>&1 | grep -Fq -- '-legacy'; then
-            extract_certificate -legacy
-          else
-            extract_certificate
-          fi
-
-          expected_fingerprint='DE:D1:2F:3B:5E:76:32:56:9C:C0:70:AE:54:5B:F4:B5:4F:40:DB:25:54:73:BB:98:F5:07:15:2D:C8:F9:42:15'
-          actual_fingerprint="$(
-            openssl x509 -in "${certificate_pem}" -noout -fingerprint -sha256 \
-              | cut -d= -f2
-          )"
-          if [[ "${actual_fingerprint}" != "${expected_fingerprint}" ]]; then
-            echo "::error::macOS release signing certificate fingerprint does not match the pinned identity."
-            exit 1
-          fi
-
-          sudo security add-trusted-cert \
-            -d \
-            -r trustRoot \
-            -p codeSign \
-            -k /Library/Keychains/System.keychain \
-            "${certificate_pem}"
+        run: bash scripts/trustMacosReleaseCertificate.sh
 
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v1
@@ -296,93 +233,132 @@ jobs:
           TAURI_TARGET: ${{ matrix.target }}
         run: bash scripts/verifyMacosBundle.sh "src-tauri/target/${TAURI_TARGET}/release/bundle"
 
-      - name: Upload Apple Silicon candidate
-        if: matrix.apple_candidate != ''
-        uses: actions/upload-artifact@v4
-        with:
-          if-no-files-found: error
-          name: macos-aarch64-${{ matrix.apple_candidate }}
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
-            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
-
-      - name: Create required desktop readiness marker
-        if: matrix.publish_release
+  start-macos-apple-candidates:
+    name: Start macOS Apple Silicon candidates
+    needs: release-metadata
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      run_id: ${{ steps.candidates.outputs.run_id }}
+    steps:
+      - name: Start parallel candidate builds
+        id: candidates
         shell: bash
         env:
-          DESKTOP_TARGET: ${{ matrix.target }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
         run: |
-          mkdir -p .release-ready
-          printf '%s\n' "${DESKTOP_TARGET}" > ".release-ready/${DESKTOP_TARGET}.txt"
+          set -euo pipefail
 
-      - name: Upload required desktop readiness marker
-        if: matrix.publish_release
-        uses: actions/upload-artifact@v4
-        with:
-          if-no-files-found: error
-          name: desktop-ready-${{ matrix.target }}
-          path: .release-ready/${{ matrix.target }}.txt
-          retention-days: 1
+          title="macOS Apple Silicon ${TAG_NAME}"
+          gh workflow run macos-apple-candidates.yml \
+            --ref "${TAG_NAME}" \
+            -f "tag_name=${TAG_NAME}"
+
+          deadline=$((SECONDS + 120))
+          while (( SECONDS < deadline )); do
+            run_id="$(
+              gh run list \
+                --workflow macos-apple-candidates.yml \
+                --event workflow_dispatch \
+                --limit 20 \
+                --json databaseId,displayTitle \
+                | jq -r --arg title "${title}" \
+                    '.[] | select(.displayTitle == $title) | .databaseId' \
+                | head -n 1
+            )"
+            if [[ -n "${run_id}" ]]; then
+              echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo '::error::The Apple Silicon candidate workflow did not start.'
+          exit 1
 
   upload-macos-apple:
     name: Upload macOS Apple Silicon
-    needs: release-metadata
+    needs:
+      - release-metadata
+      - build-desktop
+      - start-macos-apple-candidates
     runs-on: ubuntu-latest
-    timeout-minutes: 65
     permissions:
-      actions: read
+      actions: write
       contents: write
     steps:
-      - name: Wait for the first complete desktop release set
-        id: release_set
+      - name: Download first successful Apple Silicon candidate
+        id: candidate
         shell: bash
         env:
+          CANDIDATE_RUN_ID: ${{ needs.start-macos-apple-candidates.outputs.run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           deadline=$((SECONDS + 3600))
+          artifact_id=''
+          artifact_name=''
           while (( SECONDS < deadline )); do
-            artifact_names="$(
+            artifacts="$(
               gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
-                --jq '.artifacts[] | select(.expired == false) | .name'
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/artifacts?per_page=100"
             )"
-            has_artifact() {
-              grep -Fqx "$1" <<< "${artifact_names}"
-            }
-
-            candidate=''
-            if has_artifact 'macos-aarch64-native'; then
-              candidate='macos-aarch64-native'
-            elif has_artifact 'macos-aarch64-cross'; then
-              candidate='macos-aarch64-cross'
+            native_id="$(
+              jq -r '.artifacts[] | select(.expired == false and .name == "macos-aarch64-native") | .id' \
+                <<< "${artifacts}" \
+                | head -n 1
+            )"
+            cross_id="$(
+              jq -r '.artifacts[] | select(.expired == false and .name == "macos-aarch64-cross") | .id' \
+                <<< "${artifacts}" \
+                | head -n 1
+            )"
+            if [[ -n "${native_id}" ]]; then
+              artifact_id="${native_id}"
+              artifact_name='macos-aarch64-native'
+              break
+            fi
+            if [[ -n "${cross_id}" ]]; then
+              artifact_id="${cross_id}"
+              artifact_name='macos-aarch64-cross'
+              break
             fi
 
-            if [[ -n "${candidate}" ]] \
-              && has_artifact 'desktop-ready-x86_64-apple-darwin' \
-              && has_artifact 'desktop-ready-x86_64-pc-windows-msvc'; then
-              echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
-              exit 0
+            run_status="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" \
+                --jq '.status'
+            )"
+            if [[ "${run_status}" == "completed" ]]; then
+              echo '::error::Neither Apple Silicon build route produced a complete candidate.'
+              exit 1
             fi
-
-            sleep 15
+            sleep 10
           done
 
-          echo '::error::No complete desktop release set became ready within 60 minutes.'
-          exit 1
+          if [[ -z "${artifact_id}" ]]; then
+            echo '::error::No Apple Silicon candidate completed within 60 minutes.'
+            exit 1
+          fi
 
-      - name: Download first successful Apple Silicon candidate
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ steps.release_set.outputs.candidate }}
-          path: ${{ runner.temp }}/macos-aarch64/${{ steps.release_set.outputs.candidate }}
+          destination="${RUNNER_TEMP}/macos-aarch64"
+          mkdir -p "${destination}"
+          gh run download "${CANDIDATE_RUN_ID}" \
+            --name "${artifact_name}" \
+            --dir "${destination}"
+          echo "Selected ${artifact_name}."
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/cancel" \
+            >/dev/null 2>&1 || true
 
       - name: Upload successful candidate
         shell: bash
         env:
-          APPLE_CANDIDATE: ${{ steps.release_set.outputs.candidate }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
@@ -390,8 +366,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          artifact_root="${RUNNER_TEMP}/macos-aarch64"
-          selected="${artifact_root}/${APPLE_CANDIDATE}"
+          selected="${RUNNER_TEMP}/macos-aarch64"
 
           source_assets=(
             "${selected}/dmg/EcoPaste_${RELEASE_VERSION}_aarch64.dmg"

@@ -1,0 +1,108 @@
+name: macOS Apple Silicon Candidates
+run-name: macOS Apple Silicon ${{ inputs.tag_name }}
+
+"on":
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: macos-aarch64-native
+            label: macOS Apple Silicon (native)
+            runner: macos-15
+          - artifact_name: macos-aarch64-cross
+            label: macOS Apple Silicon (Intel cross-compile)
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Check updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured."
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Tauri icons
+        run: pnpm icons:check
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-aarch64-apple-darwin
+          workspaces: src-tauri
+
+      - name: Trust macOS release signing certificate
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: bash scripts/trustMacosReleaseCertificate.sh
+
+      - name: Build desktop app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: "Mac Development: EcoPaste Self-Signed"
+          CI: false
+          GITHUB_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.runner }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          args: --target aarch64-apple-darwin --config src-tauri/tauri.release.conf.json
+          releaseDraft: true
+          retryAttempts: 3
+          uploadUpdaterJson: false
+
+      - name: Verify macOS app signatures and DMG contents
+        shell: bash
+        run: bash scripts/verifyMacosBundle.sh src-tauri/target/aarch64-apple-darwin/release/bundle
+
+      - name: Upload Apple Silicon candidate
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: ${{ matrix.artifact_name }}
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
