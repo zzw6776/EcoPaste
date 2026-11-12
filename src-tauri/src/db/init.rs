@@ -28,6 +28,10 @@ const LEGACY_CONTENT_AVAILABILITY_CHECKSUM: &str =
     "5997EDC9F723F05C6D110CD1FA5D9D6F122A32ACD08DA3FB0609268E462AAA5745DC6B8EB15AA79A06B4496B23058264";
 const CURRENT_CONTENT_AVAILABILITY_CHECKSUM: &str =
     "52EDB0AA5436E20531BBB1BEDCF88BEF032A1B3BFC91DE879C207964BD13C2BF8BEAEBBEAA8057A4B5A852F893968224";
+const LEGACY_CONTENT_OBJECTS_CHECKSUM: &str =
+    "B88CBBF51A4D0D062E15E607E3B0B15D00B631668450016928CF414E8DE01BC4B49926449A9E4EE111D8744A8B07DE39";
+const CURRENT_CONTENT_OBJECTS_CHECKSUM: &str =
+    "8D1CFA204FC191222F229A2C59880F9D3AD5E9122AAAE9857CF16AF3FFF24FCFB72901170B237A35C3C65487092DE6D6";
 const MIGRATION_LINE_ENDING_CHECKSUMS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -87,6 +91,7 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
     repair_legacy_sync_removal_migration(&pool).await?;
     repair_remote_file_content_draft(&pool, &migrator).await?;
     repair_content_availability_draft(&pool, &migrator).await?;
+    repair_content_objects_draft(&pool, &migrator).await?;
     repair_migration_line_endings(&pool, &migrator).await?;
     migrator
         .run(&pool)
@@ -309,6 +314,95 @@ where
     .fetch_one(executor)
     .await
     .context("inspect content availability schema")
+}
+
+/// Adopts the current checksum for the one known migration 31 draft after proving that its
+/// materialized table already has the exact current structure.
+async fn repair_content_objects_draft(pool: &SqlitePool, migrator: &Migrator) -> AnyResult<()> {
+    let migration_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("check migration metadata table for content objects draft repair")?;
+    if migration_table_exists == 0 {
+        return Ok(());
+    }
+
+    let migration = migrator
+        .iter()
+        .find(|migration| migration.version == 31)
+        .context("migration 31 is missing")?;
+    if checksum_hex(migration.checksum.as_ref()) != CURRENT_CONTENT_OBJECTS_CHECKSUM {
+        return Ok(());
+    }
+    let applied_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 31 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read migration 31 checksum")?;
+    if applied_checksum.as_deref() != Some(LEGACY_CONTENT_OBJECTS_CHECKSUM) {
+        return Ok(());
+    }
+    if !content_objects_schema_is_current(pool).await? {
+        anyhow::bail!("migration 31 draft schema does not match the current structure");
+    }
+
+    let result = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = 31 AND success = 1 AND checksum = ?",
+    )
+    .bind(migration.checksum.to_vec())
+    .bind(decode_hex_checksum(LEGACY_CONTENT_OBJECTS_CHECKSUM)?)
+    .execute(pool)
+    .await
+    .context("normalize migration 31 draft checksum")?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("migration 31 draft checksum changed during normalization");
+    }
+    log::info!("normalized distributed draft of content objects migration 31");
+    Ok(())
+}
+
+async fn content_objects_schema_is_current(pool: &SqlitePool) -> AnyResult<bool> {
+    let columns_match: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) = 8 AND SUM(CASE
+            WHEN name = 'group_id' AND type = 'TEXT' AND "notnull" = 1 AND pk = 1 THEN 1
+            WHEN name = 'plaintext_hash' AND type = 'TEXT' AND "notnull" = 1 AND pk = 2 THEN 1
+            WHEN name = 'blob_id' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0 THEN 1
+            WHEN name = 'stream_nonce' AND type = 'BLOB' AND "notnull" = 1 AND pk = 0 THEN 1
+            WHEN name IN ('original_size', 'encrypted_size')
+                AND type = 'INTEGER' AND "notnull" = 1 AND pk = 0 THEN 1
+            WHEN name IN ('created_at', 'updated_at')
+                AND type = 'TEXT' AND "notnull" = 1 AND pk = 0 THEN 1
+            ELSE 0
+        END) = 8
+        FROM pragma_table_info('sync_content_objects')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect content objects columns")?;
+    if columns_match == 0 {
+        return Ok(false);
+    }
+
+    let unique_blob_index_exists: i64 = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM pragma_index_list('sync_content_objects') indexes
+            WHERE indexes."unique" = 1
+              AND (SELECT COUNT(*) FROM pragma_index_info(indexes.name)) = 2
+              AND (SELECT name FROM pragma_index_info(indexes.name) WHERE seqno = 0) = 'group_id'
+              AND (SELECT name FROM pragma_index_info(indexes.name) WHERE seqno = 1) = 'blob_id'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect content objects unique index")?;
+    Ok(unique_blob_index_exists != 0)
 }
 
 fn decode_hex_checksum(checksum: &str) -> AnyResult<Vec<u8>> {
@@ -675,6 +769,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(consolidated_tables, 2);
+    }
+
+    #[tokio::test]
+    async fn normalizes_only_the_known_migration_31_draft() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run(&pool).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 31")
+            .bind(decode_hex_checksum(LEGACY_CONTENT_OBJECTS_CHECKSUM).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        repair_content_objects_draft(&pool, &migrator)
+            .await
+            .unwrap();
+        migrator.run(&pool).await.unwrap();
+
+        let checksum: String =
+            sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 31")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checksum, CURRENT_CONTENT_OBJECTS_CHECKSUM);
+        assert!(content_objects_schema_is_current(&pool).await.unwrap());
     }
 
     #[tokio::test]
