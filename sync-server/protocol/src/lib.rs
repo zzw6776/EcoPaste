@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod batch_tests;
 
 pub const ALPN: &[u8] = b"ecopaste/sync/2";
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 27;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -567,6 +567,16 @@ pub enum Request {
         #[n(3)]
         limit: u16,
     },
+    /// Revalidates known cloud records after Hub retention has removed history.
+    #[n(27)]
+    CheckCloudAvailability {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        event_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -699,6 +709,15 @@ pub enum Response {
         latest_cursor: u64,
         #[n(2)]
         has_more: bool,
+        #[n(3)]
+        pruned_availability_cursor: u64,
+    },
+    #[n(20)]
+    CloudAvailabilityChecked {
+        #[n(0)]
+        updates: Vec<CloudAvailabilityUpdate>,
+        #[n(1)]
+        missing_event_ids: Vec<String>,
     },
 }
 
@@ -1070,7 +1089,7 @@ mod tests {
             let decoded: Request = minicbor::decode(&encoded).unwrap();
             assert_eq!(decoded, request);
         }
-        assert_eq!(PROTOCOL_VERSION, 26);
+        assert_eq!(PROTOCOL_VERSION, 27);
     }
 
     #[tokio::test]
@@ -1106,6 +1125,7 @@ mod tests {
             }],
             latest_cursor: 43,
             has_more: false,
+            pruned_availability_cursor: 0,
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 

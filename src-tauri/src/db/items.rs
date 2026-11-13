@@ -1286,6 +1286,7 @@ fn push_sort_clause(qb: &mut QueryBuilder<Sqlite>, sort: ClipboardItemSort) {
             qb.push("clipboard_items.use_count DESC, clipboard_items.created_at DESC");
         }
     }
+    qb.push(", clipboard_items.id ASC");
 }
 
 /// 把当前查询的过滤条件追加到 `qb`（不含 ORDER BY / LIMIT / OFFSET），供列表查询与计数共用。

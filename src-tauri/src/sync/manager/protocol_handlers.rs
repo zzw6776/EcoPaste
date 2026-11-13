@@ -875,6 +875,7 @@ async fn dispatch_peer(
         | Request::PutManagedSourceIcon { .. }
         | Request::PutManagedStreamBlob { .. }
         | Request::SyncCloudAvailability { .. }
+        | Request::CheckCloudAvailability { .. }
         | Request::CommitStreamBlob { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }

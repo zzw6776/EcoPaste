@@ -276,10 +276,10 @@ export const useClipboardItems = (
    */
   const upsertItem = useCallback(
     (item: ClipboardItem, options: { existing: boolean }) => {
-      const token = requestTokenRef.current + 1;
-      requestTokenRef.current = token;
-      staleRangeRef.current = false;
-      resetLoadingRanges();
+      if (staleRangeRef.current) {
+        reload();
+        return;
+      }
 
       const next = upsertClipboardItemCache({
         existing: options.existing,
@@ -289,10 +289,17 @@ export const useClipboardItems = (
         query: queryRef.current,
         total: totalRef.current,
       });
+      if (next === null) {
+        reload();
+        return;
+      }
+
+      requestTokenRef.current += 1;
+      resetLoadingRanges();
       commitItems(next.items);
       commitTotal(next.total);
     },
-    [commitItems, commitTotal, resetLoadingRanges],
+    [commitItems, commitTotal, reload, resetLoadingRanges],
   );
 
   /** 使用一条权威记录携带的来源应用元数据，批量修补当前缓存中的同源卡片。 */

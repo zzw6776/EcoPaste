@@ -20,16 +20,26 @@ interface UpsertClipboardItemCacheResult {
 
 /**
  * 在已加载的连续顶部缓存中插入或移动一条权威记录。
- * 调用方只在无关键词查询时使用；关键词匹配仍由 Rust 查询负责。
+ * 调用方只在无关键词查询时使用；位置超出已知排序边界时返回 null，由 Rust 重读分页。
  */
 export function upsertClipboardItemCache(
   input: UpsertClipboardItemCacheInput,
-): UpsertClipboardItemCacheResult {
+): UpsertClipboardItemCacheResult | null {
   const prefix = getLoadedPrefix(input.items);
   const loadedExisting = prefix.some((current) => {
     return current.id === input.item.id;
   });
   const matches = itemMatchesQuery(input.item, input.query);
+  const boundary = prefix.at(-1);
+  if (
+    matches &&
+    prefix.length < input.total &&
+    (!boundary ||
+      compareClipboardItems(input.item, boundary, input.query.sort) > 0)
+  ) {
+    return null;
+  }
+
   let total = input.total;
   if (!input.existing && !loadedExisting && matches) total += 1;
   if (loadedExisting && !matches) total = Math.max(0, total - 1);
@@ -108,7 +118,8 @@ function compareClipboardItems(
   }
   if (primary !== 0) return primary;
 
-  return left.id.localeCompare(right.id);
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? -1 : 1;
 }
 
 function compareDateDescending(left: string, right: string) {

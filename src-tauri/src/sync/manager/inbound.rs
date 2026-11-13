@@ -1,3 +1,5 @@
+use ecopaste_sync_protocol::CloudAvailabilityUpdate;
+
 use super::*;
 
 impl SyncManager {
@@ -26,6 +28,7 @@ impl SyncManager {
                 updates,
                 latest_cursor,
                 has_more,
+                pruned_availability_cursor,
             } = response
             else {
                 if let Response::Error { message, .. } = response {
@@ -33,27 +36,21 @@ impl SyncManager {
                 }
                 bail!("云端返回了无效的内容可用性响应");
             };
-            let event_ids = updates
-                .iter()
-                .map(|update| update.event_id.clone())
-                .collect::<Vec<_>>();
-            let events = repository::events_by_ids(pool, &event_ids)
-                .await?
-                .into_iter()
-                .map(|stored| (stored.event.event_id.clone(), stored.event))
-                .collect::<HashMap<_, _>>();
             let key = group.content_key_bytes()?;
-            let availability = updates
-                .iter()
-                .filter_map(|update| {
-                    events.get(&update.event_id).and_then(|event| {
-                        cloud_event_content_availability(event, &update.available_blob_ids, &key)
-                            .map(|state| (update.event_id.clone(), state))
-                    })
-                })
-                .collect::<Vec<_>>();
-            repository::record_cloud_availability_batch(pool, &availability, latest_cursor).await?;
-            changed |= !availability.is_empty();
+            changed |=
+                apply_cloud_availability_updates(pool, &key, &updates, &[], latest_cursor).await?;
+            let reconciled_cursor = repository::cloud_pruned_availability_cursor(pool).await?;
+            if pruned_availability_cursor > reconciled_cursor {
+                changed |= self
+                    .reconcile_pruned_cloud_availability(
+                        connection,
+                        pool,
+                        group,
+                        latest_cursor,
+                        pruned_availability_cursor,
+                    )
+                    .await?;
+            }
             if !has_more {
                 if changed {
                     self.emit_updated();
@@ -62,6 +59,59 @@ impl SyncManager {
             }
         }
         Ok(true)
+    }
+
+    /// Revalidates retained cloud facts once per Hub cleanup, including equivalent older events.
+    async fn reconcile_pruned_cloud_availability(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        availability_cursor: u64,
+        pruned_availability_cursor: u64,
+    ) -> Result<bool> {
+        let key = group.content_key_bytes()?;
+        let mut after_event_id = String::new();
+        let mut changed = false;
+        loop {
+            let event_ids =
+                repository::confirmed_cloud_event_ids(pool, &after_event_id, MAX_EVENTS_PER_BATCH)
+                    .await?;
+            let Some(last_event_id) = event_ids.last() else {
+                break;
+            };
+            after_event_id = last_event_id.clone();
+            let response = call_cloud(
+                connection,
+                Request::CheckCloudAvailability {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    event_ids,
+                },
+                crate::i18n::current_language(&self.app),
+            )
+            .await?;
+            let Response::CloudAvailabilityChecked {
+                updates,
+                missing_event_ids,
+            } = response
+            else {
+                if let Response::Error { message, .. } = response {
+                    bail!(message);
+                }
+                bail!("云端返回了无效的内容可用性响应");
+            };
+            changed |= apply_cloud_availability_updates(
+                pool,
+                &key,
+                &updates,
+                &missing_event_ids,
+                availability_cursor,
+            )
+            .await?;
+        }
+        repository::mark_cloud_pruning_reconciled(pool, pruned_availability_cursor).await?;
+        Ok(changed)
     }
 
     /// Stores one authenticated remote batch and applies all currently eligible events.
@@ -1365,6 +1415,37 @@ impl SyncManager {
             );
         }
     }
+}
+
+/// Applies authoritative Hub facts without treating removed metadata as complete inline content.
+async fn apply_cloud_availability_updates(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    updates: &[CloudAvailabilityUpdate],
+    missing_event_ids: &[String],
+    latest_cursor: u64,
+) -> Result<bool> {
+    let event_ids = updates
+        .iter()
+        .map(|update| update.event_id.clone())
+        .collect::<Vec<_>>();
+    let events = repository::events_by_ids(pool, &event_ids)
+        .await?
+        .into_iter()
+        .map(|stored| (stored.event.event_id.clone(), stored.event))
+        .collect::<HashMap<_, _>>();
+    let availability = updates
+        .iter()
+        .filter_map(|update| {
+            events.get(&update.event_id).and_then(|event| {
+                cloud_event_content_availability(event, &update.available_blob_ids, key)
+                    .map(|state| (update.event_id.clone(), state))
+            })
+        })
+        .collect::<Vec<_>>();
+    repository::record_cloud_availability_batch(pool, &availability, missing_event_ids, latest_cursor)
+        .await?;
+    Ok(!availability.is_empty() || !missing_event_ids.is_empty())
 }
 
 /// Derives Hub content availability from its authoritative stored-blob list.

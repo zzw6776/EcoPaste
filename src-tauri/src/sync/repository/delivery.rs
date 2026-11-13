@@ -1451,10 +1451,32 @@ pub async fn record_inbound_outcome(
     Ok(())
 }
 
-/// Applies one Hub availability page and its continuation cursor atomically.
+/// Pages confirmed cloud records for retention revalidation without loading full history.
+pub async fn confirmed_cloud_event_ids(
+    pool: &SqlitePool,
+    after_event_id: &str,
+    limit: u16,
+) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT target.event_id FROM sync_delivery_targets target \
+         JOIN sync_events event ON event.event_id = target.event_id \
+         WHERE target.target_id = 'cloud' AND target.confirmed_content <> 'none' \
+           AND event.event_kind = ? AND target.event_id > ? \
+         ORDER BY target.event_id LIMIT ?",
+    )
+    .bind(SyncEventKind::Content.as_i64())
+    .bind(after_event_id)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .context("list cloud records for retention revalidation")
+}
+
+/// Applies one Hub availability page, removed records and its cursor atomically.
 pub async fn record_cloud_availability_batch(
     pool: &SqlitePool,
     updates: &[(String, RouteContentAvailability)],
+    missing_event_ids: &[String],
     latest_cursor: u64,
 ) -> Result<()> {
     let mut transaction = pool
@@ -1467,6 +1489,18 @@ pub async fn record_cloud_availability_batch(
             RouteContentAvailability::Complete => ContentLevel::Complete,
         };
         set_cloud_availability_on(&mut transaction, event_id, content).await?;
+    }
+    // Retention invalidates the stored fact; it must not restart completed uploads.
+    for event_id in missing_event_ids {
+        sqlx::query(
+            "UPDATE sync_delivery_targets SET confirmed_content = 'none', receipt_pending = 0, \
+             updated_at = ? WHERE target_id = 'cloud' AND event_id = ?",
+        )
+        .bind(Utc::now())
+        .bind(event_id)
+        .execute(&mut *transaction)
+        .await
+        .context("invalidate pruned cloud record")?;
     }
     set_state_value_on(
         &mut transaction,

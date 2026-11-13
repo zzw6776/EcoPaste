@@ -522,6 +522,7 @@ impl HubService {
             };
             let cleanup_target = strictest_cleanup_target(requested_quota_target, policy_target);
             let mut blocked_by_upload = false;
+            let mut history_pruned = false;
             loop {
                 let now = now_ms();
                 let retention_cutoff_ms = (self.event_retention_days > 0)
@@ -577,10 +578,14 @@ impl HubService {
                         "Hub retention batch completed"
                     );
                 }
+                history_pruned |= result.deleted_events > 0;
                 if !result.has_more {
                     break;
                 }
                 tokio::task::yield_now().await;
+            }
+            if history_pruned {
+                self.notify_group_change(&group_id).await;
             }
             if let Some(target) = requested_quota_target
                 && !blocked_by_upload
@@ -1072,7 +1077,7 @@ impl HubService {
                     .await?;
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
-                let (updates, latest_cursor, has_more) = self
+                let (updates, latest_cursor, has_more, pruned_availability_cursor) = self
                     .repository
                     .cloud_availability_updates(&group_id, after_cursor, limit)
                     .await?;
@@ -1082,6 +1087,30 @@ impl HubService {
                         updates,
                         latest_cursor,
                         has_more,
+                        pruned_availability_cursor,
+                    },
+                )
+                .await?;
+            }
+            Request::CheckCloudAvailability {
+                group_id,
+                access_token,
+                event_ids,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
+                let (updates, missing_event_ids) = self
+                    .repository
+                    .check_cloud_availability(&group_id, &event_ids)
+                    .await?;
+                write_frame(
+                    send,
+                    &Response::CloudAvailabilityChecked {
+                        updates,
+                        missing_event_ids,
                     },
                 )
                 .await?;
