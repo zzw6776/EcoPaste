@@ -403,6 +403,19 @@ export const preferenceTabs: PreferenceTab[] = [
       {
         id: "actions",
         settings: [
+          ...(!isAndroid
+            ? [
+                {
+                  control: { type: "switch" } as const,
+                  id: "actions.alwaysShow",
+                  keywords: ["action", "hover", "buttons", "always", "visible"],
+                  path: ["clipboard", "content", "alwaysShowItemActions"] as const,
+                  value: (settings: Settings) => {
+                    return settings.clipboard.content.alwaysShowItemActions;
+                  },
+                },
+              ]
+            : []),
           {
             control: {
               options: ITEM_ACTION_OPTIONS,

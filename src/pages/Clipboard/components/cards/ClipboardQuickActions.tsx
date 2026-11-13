@@ -32,7 +32,7 @@ interface QuickActionButtonProps {
 }
 
 /**
- * 在卡片 meta 右侧展示时间，并在 hover 时替换为当前条目可执行的快捷动作。
+ * 渲染卡片底栏已启用的快捷动作，显示时机由卡片样式控制。
  */
 const ClipboardQuickActions: FC<ClipboardQuickActionsProps> = (props) => {
   const { item, labels, onQuickAction, quickActions, visible } = props;
@@ -93,7 +93,7 @@ const ClipboardQuickActions: FC<ClipboardQuickActionsProps> = (props) => {
 export default ClipboardQuickActions;
 
 /**
- * 单个 hover 快捷动作按钮；按下时阻止事件冒泡，避免触发卡片点击或自动粘贴。
+ * 单个快捷动作按钮；按下时阻止事件冒泡，避免触发卡片点击或自动粘贴。
  */
 const QuickActionButton: FC<QuickActionButtonProps> = (props) => {
   const {
@@ -162,7 +162,6 @@ const QuickActionButton: FC<QuickActionButtonProps> = (props) => {
         className={cn(
           "flex size-5 items-center justify-center rounded-1.5 border-0 bg-transparent text-ant-tertiary transition-colors hover:bg-ant-fill-tertiary hover:text-ant-text motion-reduce:transition-none",
           {
-            "text-ant-error hover:text-ant-error": presentation.danger,
             "text-ant-primary hover:text-ant-primary": activePrimary,
             "text-ant-success hover:text-ant-success": copied,
             "text-ant-warning hover:text-ant-warning": activeFavorite,

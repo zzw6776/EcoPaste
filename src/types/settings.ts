@@ -122,6 +122,7 @@ export interface Content {
   autoFavorite: boolean;
   updateOnReuse: boolean;
   sort: ClipboardItemSort;
+  alwaysShowItemActions: boolean;
   itemActions: ItemAction[];
   itemActionOrder: ItemAction[];
 }

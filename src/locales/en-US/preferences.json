@@ -172,6 +172,10 @@
         }
       },
       "actions": {
+        "alwaysShow": {
+          "description": "Keep quick action buttons visible on desktop cards. When off, they appear only while hovering over the footer. Changes apply immediately.",
+          "title": "Always Show Quick Actions"
+        },
         "deleteConfirm": {
           "description": "Ask before deleting regular history records. Favorited and pinned records use their own switches.",
           "title": "Confirm Regular Deletes"
@@ -198,7 +202,7 @@
         },
         "visible": {
           "controlLabel": "Manage",
-          "description": "Choose which action buttons appear when hovering over a record.",
+          "description": "Choose and reorder the quick action buttons shown in card footers.",
           "title": "Visible Quick Actions"
         }
       },

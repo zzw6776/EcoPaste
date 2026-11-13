@@ -457,9 +457,11 @@ pub struct Content {
     pub update_on_reuse: bool,
     /// 历史列表默认排序，和 `ClipboardItemQuery.sort` 使用同一套契约字面量。
     pub sort: ClipboardItemSort,
-    /// 列表项悬停操作按钮（仅保存已启用项，顺序按 `item_action_order` 过滤）。
+    /// 桌面卡片的快捷动作是否常驻显示；关闭时仅悬停底栏显示。
+    pub always_show_item_actions: bool,
+    /// 列表项快捷操作按钮（仅保存已启用项，顺序按 `item_action_order` 过滤）。
     pub item_actions: Vec<ItemAction>,
-    /// 列表项悬停操作按钮的完整排序，包含未启用项，供偏好弹框下次打开时恢复位置。
+    /// 列表项快捷操作按钮的完整排序，包含未启用项，供偏好弹框下次打开时恢复位置。
     pub item_action_order: Vec<ItemAction>,
 }
 
@@ -482,6 +484,7 @@ impl Default for Content {
             auto_favorite: false,
             update_on_reuse: false,
             sort: ClipboardItemSort::UpdatedAt,
+            always_show_item_actions: false,
             item_actions: vec![
                 ItemAction::Copy,
                 ItemAction::Star,

@@ -44,6 +44,7 @@ interface ClipboardCardProps {
   onDoubleClick?: (event: MouseEvent<HTMLDivElement>) => void;
   availableActions?: ClipboardAction[];
   quickActions?: ItemAction[];
+  alwaysShowItemActions?: boolean;
   quickActionLabels?: ItemActionLabels;
   onQuickAction?: (action: ItemAction) => Promise<void> | void;
   onMobileSave?: () => void;
@@ -78,6 +79,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     onDoubleClick,
     availableActions,
     quickActions = [],
+    alwaysShowItemActions = false,
     quickActionLabels,
     onQuickAction,
     onMobileSave,
@@ -410,7 +412,15 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         </div>
 
         {/* 3. 核心信息可伸缩，使用次数与同步状态固定保留。 */}
-        <div className="clipboard-card__status-row flex h-7 shrink-0 select-none items-center justify-between gap-1 px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400">
+        <div
+          className={cn(
+            "clipboard-card__status-row flex h-7 shrink-0 select-none items-center justify-between gap-1 px-3 pt-0 pb-1 font-medium text-[11px] text-neutral-400",
+            {
+              "clipboard-card__status-row--actions-always-visible":
+                alwaysShowItemActions,
+            },
+          )}
+        >
           <div className="flex min-w-0 items-center gap-1 overflow-hidden">
             {compactMetaText ? (
               <span className="truncate" title={metaText}>
@@ -434,7 +444,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
             )}
           </div>
 
-          {/* 右侧：移动端常驻；桌面宽卡常驻，窄卡 hover 时展示。 */}
+          {/* 右侧：移动端常驻，桌面端按设置决定是否仅悬停显示。 */}
           <div className="flex shrink-0 items-center gap-1">
             {isMob && !importing ? (
               <div className="flex items-center gap-1">
@@ -479,7 +489,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
                   </button>
                 )}
                 <button
-                  className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors hover:text-red-500 active:bg-neutral-100 dark:active:bg-neutral-700"
+                  className="flex size-6.5 cursor-pointer items-center justify-center rounded-full text-neutral-400 transition-colors active:bg-neutral-100 dark:active:bg-neutral-700"
                   onClick={handleMobileDelete}
                   onMouseDown={handleMobileActionMouseDown}
                   title="删除"
