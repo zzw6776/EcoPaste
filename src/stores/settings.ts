@@ -10,6 +10,7 @@ import { TAURI_EVENT } from "@/constants/events";
 import type { Settings, SettingsPatch } from "@/types/settings";
 import { isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
+import { recordStartupTiming } from "@/utils/startupTiming";
 import { DEFAULT_MOCK_SETTINGS } from "@/utils/mockData";
 
 const SETTINGS_STARTUP_TIMEOUT_MS = 1500;
@@ -51,6 +52,7 @@ async function startSettingsListener() {
       settingsUpdateSequence += 1;
       Object.assign(settingsState, event.payload);
       settingsInitializationState.status = "ready";
+      recordStartupTiming("settings-ready", { via: "event" });
     });
     // 首次快照若先于监听注册完成，注册后再校准一次，封住二者之间的丢事件窗口。
     if (settingsHydrationCompleted) void hydrateSettingsFromRust();
@@ -61,6 +63,8 @@ async function startSettingsListener() {
 
 /** 拉取权威设置；若订阅期间已有更新事件，保留更新事件携带的更新快照。 */
 async function hydrateSettingsFromRust() {
+  const startedAt = performance.now();
+  recordStartupTiming("settings-request");
   const requestSequence = settingsUpdateSequence;
   try {
     const initial = await getSettings();
@@ -68,9 +72,15 @@ async function hydrateSettingsFromRust() {
       Object.assign(settingsState, initial);
     }
     settingsInitializationState.status = "ready";
+    recordStartupTiming("settings-ready", {
+      requestMs: Math.round(performance.now() - startedAt),
+    });
   } catch (error) {
     settingsInitializationState.status = "degraded";
     log.error("initial settings snapshot failed", error);
+    recordStartupTiming("settings-failed", {
+      requestMs: Math.round(performance.now() - startedAt),
+    });
   } finally {
     settingsHydrationCompleted = true;
   }
@@ -87,6 +97,9 @@ async function initializeSettings() {
   if (settingsInitializationState.status !== "loading") return;
 
   settingsInitializationState.status = "degraded";
+  recordStartupTiming("settings-timeout", {
+    timeoutMs: SETTINGS_STARTUP_TIMEOUT_MS,
+  });
   log.warn("initial settings snapshot timed out", {
     timeoutMs: SETTINGS_STARTUP_TIMEOUT_MS,
   });

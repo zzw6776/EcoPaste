@@ -16,12 +16,23 @@ use crate::settings::{Capture, Sensitive};
 const MAX_FILE_NAME_BYTES: usize = 200;
 
 #[derive(Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct ShareDelivery {
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    source_app: Option<ShareSourceApp>,
     texts: Vec<String>,
     html: Option<String>,
     files: Vec<SharedFile>,
     failed: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+struct ShareSourceApp {
+    package_name: String,
+    app_name: String,
+    icon_png: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -491,11 +502,26 @@ pub(crate) async fn receive(
     let staging_root = app.path().app_cache_dir()?.join("ecopaste-share");
     let owned_root = crate::core::paths::resources_dir(app)?.join(super::shared_files::DIRECTORY);
     let ShareDelivery {
+        source_app,
         texts,
         html,
         files,
         failed,
     } = delivery;
+    let source_app = source_app
+        .filter(|source| !source.package_name.is_empty())
+        .map(|source| {
+            super::watcher::materialize_source(
+                &app.state::<super::AppIconStore>(),
+                Some(&app.state::<super::AppsRegistry>()),
+                super::source::FrontmostApp {
+                    id: source.package_name,
+                    name: source.app_name,
+                    platform: crate::db::models::Platform::Android,
+                    icon_png: (!source.icon_png.is_empty()).then_some(source.icon_png),
+                },
+            )
+        });
     let (image_files, direct_files): (Vec<_>, Vec<_>) =
         files.into_iter().partition(importable_as_image);
     let owned_root_for_task = owned_root.clone();
@@ -504,6 +530,7 @@ pub(crate) async fn receive(
     let (mut items, mut outcome) = tauri::async_runtime::spawn_blocking(move || {
         let (mut items, mut outcome) = prepare_items(
             ShareDelivery {
+                source_app: None,
                 texts,
                 html,
                 files: Vec::new(),
@@ -533,14 +560,15 @@ pub(crate) async fn receive(
     let lan_connected = app
         .try_state::<std::sync::Arc<crate::sync::SyncManager>>()
         .is_some_and(|manager| manager.has_connected_lan_peer());
-    for item in items.drain(..) {
+    for mut item in items.drain(..) {
+        item.source_app_id = source_app.as_ref().map(|source| source.id.clone());
         let initial_delivery_route =
             shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
         match super::watcher::persist_and_notify_with_sync(
             app,
             &pool,
             &item,
-            None,
+            source_app.as_ref(),
             None,
             Some(crate::db::sync_queue::ContentSyncOptions {
                 manual_share: true,
@@ -560,6 +588,7 @@ pub(crate) async fn receive(
     if !direct_files.is_empty() {
         let pending = plan_file_import(direct_files, &store, &owned_root)?;
         let mut item = pending.item;
+        item.source_app_id = source_app.as_ref().map(|source| source.id.clone());
         let initial_delivery_route =
             shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
         let manager = app
@@ -578,8 +607,10 @@ pub(crate) async fn receive(
         let task_id = manager.as_ref().map(|manager| {
             manager.start_shared_file_import(&item.id, pending.declared_bytes, initial_route)
         });
-        match super::watcher::persist_and_notify_with_sync(app, &pool, &item, None, None, None)
-            .await
+        match super::watcher::persist_and_notify_with_sync(
+            app, &pool, &item, source_app.as_ref(), None, None,
+        )
+        .await
         {
             Ok(result) => {
                 item = crate::db::items::find_item_by_id(&pool, &result.id)

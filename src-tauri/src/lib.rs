@@ -246,7 +246,20 @@ pub fn run() {
     });
 
     builder
+        .on_page_load(|webview, payload| {
+            log::info!(
+                "startup timing: stage=webview-page-load window={} event={:?} atMs={}",
+                webview.label(),
+                payload.event(),
+                chrono::Utc::now().timestamp_millis()
+            );
+        })
         .setup(move |app| {
+            let setup_started = std::time::Instant::now();
+            log::info!(
+                "startup timing: stage=rust-setup-begin atMs={}",
+                chrono::Utc::now().timestamp_millis()
+            );
             let handle = app.handle().clone();
 
             // macOS：plugin 必须在 to_panel 前注册。
@@ -262,35 +275,66 @@ pub fn run() {
             handle.manage(window::lifecycle::WindowLifecycleManager::new());
             update::init(&handle);
 
+            let settings_started = std::time::Instant::now();
             let settings = settings::init(&handle).map_err(|err| {
                 log::error!("settings initialization failed: {err:?}");
                 err
             })?;
+            log::info!(
+                "startup timing: stage=local-settings elapsedMs={}",
+                settings_started.elapsed().as_millis()
+            );
 
             let handle_db = handle.clone();
             tauri::async_runtime::block_on(async move {
+                let database_started = std::time::Instant::now();
                 let pool = db::init(&handle_db).await.map_err(|err| {
                     log::error!("database initialization failed: {err:?}");
                     err
                 })?;
+                log::info!(
+                    "startup timing: stage=database-ready elapsedMs={}",
+                    database_started.elapsed().as_millis()
+                );
                 let resources = core::paths::resources_dir(&handle_db)?;
-                clipboard::shared_files::ReferenceMigration::current(resources)
-                    .apply(&pool)
+                let references_started = std::time::Instant::now();
+                let references_migrated =
+                    clipboard::shared_files::ReferenceMigration::current(resources)
+                    .apply_on_startup(&pool)
                     .await
                     .map_err(|err| {
                         log::error!("managed resource reference migration failed: {err:#}");
                         err
                     })?;
+                log::info!(
+                    "startup timing: stage=resource-references performed={references_migrated} elapsedMs={}",
+                    references_started.elapsed().as_millis()
+                );
                 handle_db.manage(db::DatabaseState::new(pool));
+                let clipboard_started = std::time::Instant::now();
                 clipboard::init(&handle_db)?;
+                log::info!(
+                    "startup timing: stage=clipboard-ready elapsedMs={}",
+                    clipboard_started.elapsed().as_millis()
+                );
+                let sync_started = std::time::Instant::now();
                 sync::init(&handle_db)?;
+                log::info!(
+                    "startup timing: stage=sync-scheduled elapsedMs={}",
+                    sync_started.elapsed().as_millis()
+                );
                 clipboard::cleanup::spawn(handle_db.clone());
                 #[cfg(target_os = "android")]
                 {
+                    let android_started = std::time::Instant::now();
                     commands::android::set_app_handle(handle_db.clone());
                     if let Err(err) = commands::android::apply_android_settings(&settings.android) {
                         log::warn!("sync initial Android settings failed: {err}");
                     }
+                    log::info!(
+                        "startup timing: stage=android-settings elapsedMs={}",
+                        android_started.elapsed().as_millis()
+                    );
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
@@ -351,6 +395,10 @@ pub fn run() {
                 }
             }
 
+            log::info!(
+                "startup timing: stage=rust-setup-ready elapsedMs={}",
+                setup_started.elapsed().as_millis()
+            );
             Ok(())
         })
         .on_window_event(|window, event| {

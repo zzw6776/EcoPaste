@@ -7,9 +7,28 @@ use crate::{admin, autostart, shortcut, tray, window};
 /// 与前端 `src/constants/events.ts` 的 `TAURI_EVENT.SETTINGS_UPDATED` 一一对应。
 const SETTINGS_UPDATED_EVENT: &str = "settings://updated";
 
+/// 读取内存设置快照，分别记录首屏 IPC 排队与快照读取耗时。
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<Settings> {
-    Ok(app.state::<SettingsStore>().snapshot())
+pub async fn get_settings(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    requested_at_ms: i64,
+) -> Result<Settings> {
+    let received_at_ms = chrono::Utc::now().timestamp_millis();
+    log::info!(
+        "startup timing: stage=settings-command-received window={} atMs={received_at_ms} requestedAtMs={requested_at_ms} dispatchWaitMs={}",
+        window.label(),
+        received_at_ms.saturating_sub(requested_at_ms).max(0)
+    );
+    let started_at = std::time::Instant::now();
+    let settings = app.state::<SettingsStore>().snapshot();
+    log::info!(
+        "startup timing: stage=settings-snapshot-ready window={} atMs={} snapshotMs={}",
+        window.label(),
+        chrono::Utc::now().timestamp_millis(),
+        started_at.elapsed().as_millis()
+    );
+    Ok(settings)
 }
 
 /// 暂停当前全局快捷键注册；用于前端录入快捷键期间避免旧绑定被触发。

@@ -1,5 +1,6 @@
 package com.ayangweb.eco_paste
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -33,11 +34,13 @@ object EcoPasteShareReceiver {
         }
         val application = context.applicationContext
         val delivery = Intent(intent)
-        executor.execute { importDelivery(application, delivery) }
+        val sourcePackage = delivery.getStringExtra(SHARE_SOURCE_PACKAGE)
+            ?: (context as? Activity)?.let { shareSourcePackage(it) }
+        executor.execute { importDelivery(application, delivery, sourcePackage) }
     }
 
     /** Keeps source descriptors alive while Rust streams them once into managed storage. */
-    private fun importDelivery(context: Context, intent: Intent) {
+    private fun importDelivery(context: Context, intent: Intent, sourcePackage: String?) {
         val payload = JSONObject()
         val descriptors = mutableListOf<ParcelFileDescriptor>()
         var failed = 0
@@ -141,6 +144,7 @@ object EcoPasteShareReceiver {
         try {
             // Cold-start delivery can arrive before the database and image store exist.
             runtimeReady.get()
+            payload.put("sourceApp", EcoPasteBridge.shareSourceApp(sourcePackage))
             payload.put("failed", failed)
             val message = EcoPasteBridge.receiveShare(payload.toString())
             Handler(Looper.getMainLooper()).post {

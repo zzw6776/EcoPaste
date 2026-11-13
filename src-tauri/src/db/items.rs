@@ -9,7 +9,8 @@ use crate::db::models::{
 };
 
 const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clipboard_items.sub_kind, \
-     clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, clipboard_items.content, \
+     clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, clipboard_items.source_updated_at, \
+     clipboard_items.source_device_id, clipboard_items.source_device_name, clipboard_items.content, \
      clipboard_items.content_hash, clipboard_items.sync_key, clipboard_items.search_text, clipboard_items.summary, \
      clipboard_items.file_types, clipboard_items.size, clipboard_items.width, clipboard_items.height, \
      clipboard_items.use_count, clipboard_items.is_favorite, clipboard_items.is_pinned, \
@@ -102,7 +103,8 @@ macro_rules! evictable_history {
 /// LEFT JOIN `clipboard_apps` 顺带把来源应用名 / 图标文件名带回，前端直接渲染，
 /// 不再额外发 list_clipboard_apps + get_clipboard_app_icon_path 请求。
 const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, \
-     clipboard_items.sub_kind, clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, \
+     clipboard_items.sub_kind, clipboard_items.group_id, clipboard_items.source_app_id, clipboard_items.source_revision, clipboard_items.source_updated_at, \
+     clipboard_items.source_device_id, clipboard_items.source_device_name, \
      CASE WHEN clipboard_items.sub_kind = 'url' THEN clipboard_items.content \
           WHEN clipboard_items.kind = 'text' THEN '' ELSE clipboard_items.content END AS content, \
      clipboard_items.content_hash, clipboard_items.sync_key, \
@@ -383,6 +385,7 @@ async fn merge_synced_item_on(
     id: &str,
     item: &ClipboardItem,
 ) -> Result<()> {
+    let source_updated_at = item.source_updated_at.unwrap_or(item.updated_at);
     sqlx::query(
         r#"
         UPDATE clipboard_items
@@ -391,6 +394,12 @@ async fn merge_synced_item_on(
             source_app_id = CASE
                 WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
                 THEN ? ELSE source_app_id END,
+            source_device_id = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_device_id END,
+            source_device_name = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_device_name END,
             source_revision = CASE
                 WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
                 THEN ? ELSE source_revision END,
@@ -404,18 +413,26 @@ async fn merge_synced_item_on(
     .bind(item.created_at)
     .bind(item.updated_at)
     .bind(item.updated_at)
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
     .bind(item.source_app_id.as_deref())
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_device_id.as_deref())
+    .bind(source_updated_at)
+    .bind(source_updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_device_name.as_deref())
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
     .bind(&item.source_revision)
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
     .bind(id)
     .execute(connection)
     .await
@@ -431,20 +448,14 @@ async fn replace_remote_content_on(
     sqlx::query(
         r#"
         UPDATE clipboard_items
-        SET kind = ?, sub_kind = ?, source_app_id = ?, source_revision = ?,
-            source_updated_at = ?, content = ?, content_hash = ?, search_text = ?,
+        SET kind = ?, sub_kind = ?, content = ?, content_hash = ?, search_text = ?,
             summary = ?, file_types = ?, size = ?, width = ?, height = ?,
-            is_sensitive = ?, platform = ?,
-            created_at = CASE WHEN created_at > ? THEN ? ELSE created_at END,
-            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+            is_sensitive = ?, platform = ?
         WHERE id = ?
         "#,
     )
     .bind(item.kind)
     .bind(item.sub_kind)
-    .bind(item.source_app_id.as_deref())
-    .bind(&item.source_revision)
-    .bind(item.updated_at)
     .bind(&item.content)
     .bind(&item.content_hash)
     .bind(item.search_text.as_deref())
@@ -455,14 +466,11 @@ async fn replace_remote_content_on(
     .bind(item.height)
     .bind(item.is_sensitive)
     .bind(item.platform)
-    .bind(item.created_at)
-    .bind(item.created_at)
-    .bind(item.updated_at)
-    .bind(item.updated_at)
     .bind(id)
-    .execute(connection)
+    .execute(&mut *connection)
     .await
     .context("promote remote metadata to local content")?;
+    merge_synced_item_on(connection, id, item).await?;
     Ok(())
 }
 
@@ -547,6 +555,7 @@ async fn merge_local_reuse_on(
     item: &ClipboardItem,
 ) -> Result<()> {
     let now = Utc::now();
+    let source_updated_at = item.source_updated_at.unwrap_or(item.updated_at);
     sqlx::query(
         r#"
         UPDATE clipboard_items
@@ -556,6 +565,12 @@ async fn merge_local_reuse_on(
             source_app_id = CASE
                 WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
                 THEN ? ELSE source_app_id END,
+            source_device_id = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_device_id END,
+            source_device_name = CASE
+                WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
+                THEN ? ELSE source_device_name END,
             source_revision = CASE
                 WHEN source_updated_at < ? OR (source_updated_at = ? AND source_revision < ?)
                 THEN ? ELSE source_revision END,
@@ -567,18 +582,26 @@ async fn merge_local_reuse_on(
     )
     .bind(now)
     .bind(item.size)
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
     .bind(item.source_app_id.as_deref())
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_device_id.as_deref())
+    .bind(source_updated_at)
+    .bind(source_updated_at)
+    .bind(&item.source_revision)
+    .bind(item.source_device_name.as_deref())
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
     .bind(&item.source_revision)
-    .bind(item.updated_at)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
+    .bind(source_updated_at)
     .bind(&item.source_revision)
-    .bind(item.updated_at)
+    .bind(source_updated_at)
     .bind(id)
     .execute(connection)
     .await
@@ -589,18 +612,20 @@ async fn merge_local_reuse_on(
 async fn insert_item_on(connection: &mut SqliteConnection, item: &ClipboardItem) -> Result<()> {
     sqlx::query(
         "INSERT INTO clipboard_items \
-         (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
+         (id, kind, sub_kind, group_id, source_app_id, source_device_id, source_device_name, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
           summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
           created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(item.id.as_str())
     .bind(item.kind)
     .bind(item.sub_kind)
     .bind(item.group_id.as_deref())
     .bind(item.source_app_id.as_deref())
+    .bind(item.source_device_id.as_deref())
+    .bind(item.source_device_name.as_deref())
     .bind(&item.source_revision)
-    .bind(item.updated_at)
+    .bind(item.source_updated_at.unwrap_or(item.updated_at))
     .bind(item.content.as_str())
     .bind(item.content_hash.as_str())
     .bind(item.sync_key.as_str())
@@ -1337,6 +1362,10 @@ mod tests {
             group_id: None,
             source_app_id: None,
             source_revision: id.to_owned(),
+            source_device_id: None,
+            source_device_name: None,
+            source_updated_at: None,
+            source_device_is_local: false,
             content_hash: content_hash(ClipboardKind::Text, &content),
             sync_key: content_hash(ClipboardKind::Text, &content),
             content,

@@ -7,7 +7,7 @@ import { App as AntdApp, ConfigProvider } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
 import type { FC } from "react";
-import { useEffect, useRef } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { RouterProvider } from "react-router";
 import { useSnapshot } from "valtio";
@@ -21,6 +21,7 @@ import { router } from "./router";
 import { settingsInitializationState, settingsState } from "./stores/settings";
 import type { Language } from "./types/settings";
 import { handleAndroidBack } from "./utils/androidBack";
+import { cn } from "./utils/cn";
 import {
   closeModalDialogs,
   setMessageApi,
@@ -28,6 +29,7 @@ import {
 } from "./utils/feedback";
 import { isAndroid, isTauri } from "./utils/is";
 import { log } from "./utils/log";
+import { recordStartupTiming } from "./utils/startupTiming";
 
 const ANTD_DRAWER_CONFIG = isAndroid
   ? ({
@@ -85,13 +87,17 @@ const resolveAntdLocale = (language: Language) => {
   return zhCN;
 };
 
-import { AndroidPermissionsModal } from "@/components/AndroidPermissionsModal";
 import SyncJoinApproval from "@/components/SyncJoinApproval";
 import {
   androidState,
   checkAndAutoPromptAndroidPermissions,
   closeAndroidPermissionsModal,
 } from "@/stores/android";
+
+const AndroidPermissionsModal = lazy(async () => {
+  const permissions = await import("@/components/AndroidPermissionsModal");
+  return { default: permissions.AndroidPermissionsModal };
+});
 
 const AppContent: FC<AppContentProps> = (props) => {
   const { windowLabel } = props;
@@ -130,6 +136,7 @@ const AppContent: FC<AppContentProps> = (props) => {
 
   useMount(() => {
     mountedRef.current = true;
+    recordStartupTiming("app-content-mounted");
     if (!isAndroid) return;
 
     void initializeAndroidBackListener();
@@ -165,11 +172,13 @@ const AppContent: FC<AppContentProps> = (props) => {
     <>
       <RouterProvider router={router} />
       <SyncJoinApproval />
-      {isAndroid && (
-        <AndroidPermissionsModal
-          onClose={closeAndroidPermissionsModal}
-          open={androidSnapshot.permissionsModalOpen}
-        />
+      {isAndroid && androidSnapshot.permissionsModalOpen && (
+        <Suspense fallback={null}>
+          <AndroidPermissionsModal
+            onClose={closeAndroidPermissionsModal}
+            open={androidSnapshot.permissionsModalOpen}
+          />
+        </Suspense>
       )}
     </>
   );
@@ -185,7 +194,9 @@ const App: FC = () => {
   const mode =
     windowLabel === WINDOW_LABEL.ONBOARDING
       ? "dark"
-      : settings.appearance.theme;
+      : settingsInitialization.status === "ready"
+        ? settings.appearance.theme
+        : "auto";
   const language = settings.appearance.language;
   const antdTheme = useAppTheme(mode);
   const locale = resolveAntdLocale(language);
@@ -219,17 +230,15 @@ const App: FC = () => {
       modal={ANTD_MODAL_CONFIG}
       theme={antdTheme}
     >
-      <AntdApp message={{ duration: 1.5, maxCount: 2, top: ANTD_MESSAGE_TOP }}>
+      <AntdApp
+        className={cn({
+          "app-surface":
+            isAndroid || settingsInitialization.status === "loading",
+        })}
+        message={{ duration: 1.5, maxCount: 2, top: ANTD_MESSAGE_TOP }}
+      >
         <div id={APP_OVERLAY_ROOT_ID} />
-        {settingsInitialization.status === "loading" ? (
-          <div
-            aria-label="EcoPaste 正在启动"
-            className="app-startup-shell flex size-full min-h-screen items-center justify-center"
-            role="status"
-          >
-            <div className="size-8 animate-pulse rounded-2 bg-ant-primary" />
-          </div>
-        ) : (
+        {settingsInitialization.status !== "loading" && (
           <AppContent windowLabel={windowLabel} />
         )}
       </AntdApp>

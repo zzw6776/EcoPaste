@@ -1,16 +1,23 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useSnapshot } from "valtio";
 import { resizeClipboardWindow } from "@/commands";
 import { minimizeAndroidApp } from "@/commands/android";
 import { useClipboardWindowEditableFocus } from "@/hooks/useClipboardWindowEditableFocus";
+import { useWindowReady } from "@/hooks/useWindowReady";
 import { clipboardViewState } from "@/stores/clipboardView";
 import type { ClipboardCategory, ClipboardRange } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMobile, isTauri, isWin } from "@/utils/is";
+import { recordStartupTiming } from "@/utils/startupTiming";
+import ClipboardList, {
+  type ClipboardListView,
+} from "./components/ClipboardList";
 import Header from "./components/Header";
-import List, { type ClipboardListView } from "./components/List";
-import MobileCategoryPager from "./components/MobileCategoryPager";
+
+const MobileCategoryPager = lazy(async () => {
+  return await import("./components/MobileCategoryPager");
+});
 
 interface BuiltInFilter {
   category: ClipboardCategory | null;
@@ -35,6 +42,7 @@ const BUILT_IN_FILTER_KEYS = BUILT_IN_FILTERS.map((filter) => {
  */
 const Clipboard = () => {
   useClipboardWindowEditableFocus();
+  useWindowReady();
   const clipboardSnapshot = useSnapshot(clipboardViewState);
 
   const isDraggingRef = useRef(false);
@@ -57,6 +65,21 @@ const Clipboard = () => {
       clipboardSnapshot.groupId,
     ),
   );
+
+  useEffect(() => {
+    recordStartupTiming("clipboard-shell-mounted");
+    let paintFrame = 0;
+    const frame = requestAnimationFrame(() => {
+      paintFrame = requestAnimationFrame(() => {
+        recordStartupTiming("clipboard-shell-painted");
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(frame);
+      cancelAnimationFrame(paintFrame);
+    };
+  }, []);
 
   useEffect(() => {
     const handleResize = () => {
@@ -139,7 +162,7 @@ const Clipboard = () => {
         "relative flex h-full w-full select-none flex-col overflow-hidden text-neutral-800 dark:text-white",
         mobileMode
           ? cn(
-              "bg-[#F2F2F7] dark:bg-[#121212]",
+              "bg-ant-layout",
               androidPopupMode ? "rounded-t-4" : "mobile-safe-area-top",
             )
           : cn({
@@ -176,34 +199,36 @@ const Clipboard = () => {
 
       <Header />
 
-      {mobileMode ? (
-        <MobileCategoryPager
-          index={builtInFilterIndex}
-          onIndexChange={(index) => {
-            const filter = BUILT_IN_FILTERS[index];
-            if (filter) applyBuiltInFilter(filter);
-          }}
-          pageKeys={BUILT_IN_FILTER_KEYS}
-          renderPage={(index, active) => {
-            const filter = BUILT_IN_FILTERS[index];
-            if (!filter) return null;
+      <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
+        <Suspense fallback={null}>
+          {mobileMode ? (
+            <MobileCategoryPager
+              index={builtInFilterIndex}
+              onIndexChange={(index) => {
+                const filter = BUILT_IN_FILTERS[index];
+                if (filter) applyBuiltInFilter(filter);
+              }}
+              pageKeys={BUILT_IN_FILTER_KEYS}
+              renderPage={(index, active) => {
+                const filter = BUILT_IN_FILTERS[index];
+                if (!filter) return null;
 
-            const view = getBuiltInListView(
-              filter,
-              index,
-              clipboardSnapshot.range,
-              clipboardSnapshot.category,
-              clipboardSnapshot.groupId,
-            );
+                const view = getBuiltInListView(
+                  filter,
+                  index,
+                  clipboardSnapshot.range,
+                  clipboardSnapshot.category,
+                  clipboardSnapshot.groupId,
+                );
 
-            return <List active={active} view={view} />;
-          }}
-        />
-      ) : (
-        <div className="min-h-0 w-full flex-1 overflow-hidden">
-          <List />
-        </div>
-      )}
+                return <ClipboardList active={active} view={view} />;
+              }}
+            />
+          ) : (
+            <ClipboardList />
+          )}
+        </Suspense>
+      </div>
 
       {isWin && !mobileMode ? (
         <div

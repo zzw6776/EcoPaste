@@ -992,6 +992,11 @@ pub unsafe extern "C" fn Java_com_ayangweb_eco_1paste_EcoPasteBridge_refreshAuto
 }
 
 #[cfg(target_os = "android")]
+pub(crate) fn notify_startup_ready() -> Result<()> {
+    jni_bridge::notify_startup_ready()
+}
+
+#[cfg(target_os = "android")]
 mod jni_bridge {
     use anyhow::anyhow;
     use jni::objects::{JClass, JObject, JString, JValue};
@@ -1461,6 +1466,14 @@ mod jni_bridge {
                 &[JValue::Object(context), JValue::Object(&text)],
             )
             .map_err(|error| anyhow!("write Android clipboard text failed: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn notify_startup_ready() -> Result<()> {
+        with_jni_env(|env, _context, bridge_class| {
+            env.call_static_method(bridge_class, "onWindowReady", "()V", &[])
+                .map_err(|error| anyhow!("notify Android window ready failed: {error}"))?;
             Ok(())
         })
     }

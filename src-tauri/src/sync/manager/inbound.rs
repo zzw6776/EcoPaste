@@ -1013,6 +1013,11 @@ impl SyncManager {
         }
 
         let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
+        let source_updated_at = envelope
+            .item
+            .source_updated_at_ms
+            .and_then(|value| Utc.timestamp_millis_opt(value).single())
+            .unwrap_or(updated_at);
         let source_revision = envelope
             .item
             .source_revision
@@ -1020,7 +1025,13 @@ impl SyncManager {
             .unwrap_or_else(|| event.event_id.clone());
         let source_app_id = if let Some(source_app) = envelope.source_app.as_ref() {
             match self
-                .resolve_received_source_app(&pool, group, source_app, updated_at, &source_revision)
+                .resolve_received_source_app(
+                    &pool,
+                    group,
+                    source_app,
+                    source_updated_at,
+                    &source_revision,
+                )
                 .await
             {
                 Ok(app_id) => Some(app_id),
@@ -1040,6 +1051,10 @@ impl SyncManager {
             group_id: None,
             source_app_id,
             source_revision,
+            source_device_id: envelope.item.source_device_id.clone(),
+            source_device_name: envelope.item.source_device_name.clone(),
+            source_updated_at: Some(source_updated_at),
+            source_device_is_local: false,
             content: content.clone(),
             content_hash: sync_key.clone(),
             sync_key: sync_key.clone(),
@@ -1199,6 +1214,11 @@ impl SyncManager {
             }
         };
         let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
+        let source_updated_at = envelope
+            .item
+            .source_updated_at_ms
+            .and_then(|value| Utc.timestamp_millis_opt(value).single())
+            .unwrap_or(updated_at);
         let source_revision = envelope
             .item
             .source_revision
@@ -1207,7 +1227,13 @@ impl SyncManager {
         let pool = self.pool().await;
         let source_app_id = if let Some(source_app) = envelope.source_app.as_ref() {
             match self
-                .resolve_received_source_app(&pool, group, source_app, updated_at, &source_revision)
+                .resolve_received_source_app(
+                    &pool,
+                    group,
+                    source_app,
+                    source_updated_at,
+                    &source_revision,
+                )
                 .await
             {
                 Ok(app_id) => Some(app_id),
@@ -1233,6 +1259,10 @@ impl SyncManager {
             group_id: None,
             source_app_id,
             source_revision,
+            source_device_id: envelope.item.source_device_id.clone(),
+            source_device_name: envelope.item.source_device_name.clone(),
+            source_updated_at: Some(source_updated_at),
+            source_device_is_local: false,
             content_hash: if kind == ClipboardKind::Files {
                 db::items::content_hash(kind, &content)
             } else {

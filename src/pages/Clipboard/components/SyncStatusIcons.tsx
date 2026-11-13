@@ -674,7 +674,7 @@ const CloudDetails: FC<CloudDetailsProps> = (props) => {
         </span>
       ) : null}
       {status?.pendingEvents ? (
-        <span className="text-ant-warning text-xs">
+        <span className="text-ant-secondary text-xs">
           {t("syncStatus.cloud.pending", { count: status.pendingEvents })}
         </span>
       ) : null}

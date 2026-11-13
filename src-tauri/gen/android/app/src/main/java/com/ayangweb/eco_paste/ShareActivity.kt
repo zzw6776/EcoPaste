@@ -5,6 +5,15 @@ import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 
+internal const val SHARE_SOURCE_PACKAGE = "com.ayangweb.eco_paste.SHARE_SOURCE_PACKAGE"
+
+/** Captures the sender before forwarding the share into our own main activity. */
+internal fun shareSourcePackage(activity: Activity): String? {
+    val packageName = activity.callingPackage
+        ?: activity.referrer?.takeIf { it.scheme == "android-app" }?.host
+    return packageName?.takeIf { it.isNotBlank() && it != activity.packageName }
+}
+
 /** Preserves URI grants while replacing every sender-controlled activity/task flag. */
 internal fun shareForwardingFlags(flags: Int): Int {
     val grants = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
@@ -23,6 +32,7 @@ class ShareActivity : Activity() {
         }
 
         val forwarded = Intent(delivery).apply {
+            putExtra(SHARE_SOURCE_PACKAGE, shareSourcePackage(this@ShareActivity))
             setClass(this@ShareActivity, MainActivity::class.java)
             // CLEAR_TASK from some file managers would destroy the running Rust event loop.
             flags = shareForwardingFlags(delivery.flags)

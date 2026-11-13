@@ -1,8 +1,16 @@
-import type { DragEvent, FC, MouseEvent, PointerEvent, Ref } from "react";
+import type {
+  DragEvent,
+  FC,
+  MouseEvent,
+  PointerEvent,
+  Ref,
+  SyntheticEvent,
+} from "react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { popupClipboardItemMenu, startDragClipboardItem } from "@/commands";
 import AssetImage from "@/components/AssetImage";
+import Tooltip from "@/components/Tooltip";
 import type { ItemActionLabels } from "@/constants/itemActions";
 import { useClipboardItemActivity } from "@/hooks/useClipboardItemActivity";
 import { isTransferActive } from "@/pages/Clipboard/utils/transferTasks";
@@ -118,6 +126,11 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     item.summary,
   );
   const timeText = displayCreatedAt || formatRelativeTime(createdAt);
+  const sourceAppText = sourceAppName || t("cardSource.unknownApp");
+  const sourceDeviceText = item.sourceDeviceIsLocal
+    ? t("cardSource.thisDevice")
+    : item.sourceDeviceName || t("cardSource.unknownDevice");
+  const sourceDescription = `${sourceAppText} · ${item.sourceDeviceName || sourceDeviceText}`;
   const dynamicHeaderBg = useDynamicHeaderBg(
     sourceAppAccentStart && sourceAppAccentEnd
       ? null
@@ -127,6 +140,10 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
     sourceAppAccentStart && sourceAppAccentEnd
       ? `linear-gradient(135deg, ${sourceAppAccentStart} 0%, ${sourceAppAccentEnd} 100%)`
       : dynamicHeaderBg;
+
+  function handleSourceInteraction(event: SyntheticEvent<HTMLElement>) {
+    event.stopPropagation();
+  }
 
   const handleDragStart = async (event: DragEvent) => {
     event.preventDefault();
@@ -304,7 +321,7 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
         {/* 左侧：类型标签 + 时间 / 置顶 / 收藏 */}
         <div className="flex min-w-0 flex-col justify-center pr-2">
           <div className="flex items-center gap-1">
-            <span className="font-bold text-[12px] text-white leading-none tracking-tight drop-shadow-2xs">
+            <span className="shrink-0 font-bold text-[12px] text-white leading-none tracking-tight drop-shadow-2xs">
               {typeLabel}
             </span>
             {item.isPinned && (
@@ -321,24 +338,33 @@ const ClipboardCard: FC<ClipboardCardProps> = (props) => {
             )}
           </div>
           <span className="mt-1 truncate font-medium text-[10px] text-white/85 leading-none">
-            {timeText}
+            {timeText} · {sourceDeviceText}
           </span>
         </div>
 
         {/* 右侧：App 图标 */}
-        <div
-          className={cn(
-            "flex shrink-0 items-center justify-center",
-            isMob ? "size-[28px]" : "size-[38px]",
-          )}
-        >
-          <AssetImage
-            alt={sourceAppName ?? "app"}
-            className="pointer-events-none size-full object-contain"
-            fallbackSrc={theme.iconUrl}
-            src={sourceAppIconPath || theme.iconUrl}
-          />
-        </div>
+        <Tooltip title={sourceDescription} trigger={isMob ? "click" : "hover"}>
+          <button
+            className={cn(
+              "flex shrink-0 cursor-default items-center justify-center border-0 bg-transparent p-0",
+              isMob ? "size-[28px]" : "size-[38px]",
+            )}
+            onAuxClick={handleSourceInteraction}
+            onClick={handleSourceInteraction}
+            onDoubleClick={handleSourceInteraction}
+            onKeyDown={handleSourceInteraction}
+            onMouseDown={handleSourceInteraction}
+            onPointerDown={handleSourceInteraction}
+            type="button"
+          >
+            <AssetImage
+              alt={sourceAppText}
+              className="pointer-events-none size-full object-contain"
+              fallbackSrc={theme.iconUrl}
+              src={sourceAppIconPath || theme.iconUrl}
+            />
+          </button>
+        </Tooltip>
       </div>
 
       {/* 2. 下半段内容区 */}

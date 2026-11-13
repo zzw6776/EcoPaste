@@ -59,13 +59,9 @@ html {
   }
 }
 
-/* ConfigProvider 尚未挂载时也必须有不透明首帧，避免透明 Android Activity 露出黑底。 */
-.app-startup-shell {
-  background-color: var(--ant-color-bg-layout, #f2f2f7) !important;
-}
-
-html.dark .app-startup-shell {
-  background-color: var(--ant-color-bg-layout, #121212) !important;
+/* 启动等待与 Android 正式页面共用同一背景容器，不切换独立占位页。 */
+.app-surface {
+  background-color: var(--ant-color-bg-layout, var(--app-background)) !important;
 }
 
 .clipboard-card-selection-shell {

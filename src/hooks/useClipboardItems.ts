@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listClipboardItems } from "@/commands";
 import type { ClipboardItem, ClipboardItemQuery } from "@/types/clipboard";
+import { recordStartupTiming } from "@/utils/startupTiming";
 import {
   type ClipboardItemsRange,
   getMissingClipboardRanges,
@@ -25,8 +26,13 @@ interface FetchRangeOptions {
  * 剪贴板列表 range cache：Rust 仍是查询、排序、搜索和 payload 裁剪的唯一真相；
  * 前端只按 Virtuoso 的可视范围缓存少量已加载行，避免无限滚动后持有完整列表。
  */
-export const useClipboardItems = (query: ClipboardItemQuery) => {
+export const useClipboardItems = (
+  query: ClipboardItemQuery,
+  trackStartup = true,
+) => {
   const queryRef = useRef(query);
+  const trackStartupRef = useRef(trackStartup);
+  trackStartupRef.current = trackStartup;
 
   const requestTokenRef = useRef(0);
   const staleRangeRef = useRef(false);
@@ -112,12 +118,23 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
         ranges.map(async (range) => {
           addLoadingRange(range);
 
+          const requestStartedAt = performance.now();
           try {
+            if (trackStartupRef.current) {
+              recordStartupTiming("clipboard-request", { offset: range.start });
+            }
             const page = await listClipboardItems({
               ...queryRef.current,
               limit: range.end - range.start + 1,
               offset: range.start,
             });
+            if (trackStartupRef.current) {
+              recordStartupTiming("clipboard-response", {
+                requestMs: Math.round(performance.now() - requestStartedAt),
+                rows: page.list.length,
+                total: page.total,
+              });
+            }
 
             if (options.token !== requestTokenRef.current) return;
 
@@ -135,6 +152,11 @@ export const useClipboardItems = (query: ClipboardItemQuery) => {
             commitTotal(nextTotal);
             commitLoadedInitial(true);
           } catch {
+            if (trackStartupRef.current) {
+              recordStartupTiming("clipboard-request-failed", {
+                requestMs: Math.round(performance.now() - requestStartedAt),
+              });
+            }
             // 命令包装层已统一 log + toast；这里只避免初始请求失败后卡在 loading。
             if (
               options.token === requestTokenRef.current &&

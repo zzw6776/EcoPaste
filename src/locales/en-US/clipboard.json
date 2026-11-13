@@ -10,6 +10,11 @@
     "items": "{{count}} items",
     "useCount": "Used {{count}} times"
   },
+  "cardSource": {
+    "thisDevice": "This device",
+    "unknownApp": "Unknown app",
+    "unknownDevice": "Unknown device"
+  },
   "empty": {
     "categories": {
       "files": "file",
@@ -148,12 +153,12 @@
       "downloading": "Cloud: downloading files",
       "error": "Cloud sync failed; click to retry",
       "errorWithReason": "Cloud: {{reason}}; retrying automatically, or click to retry",
-      "idle": "Cloud: not used for this item",
-      "manual": "Cloud: file not uploaded; click to upload",
+      "idle": "Cloud: sync not yet confirmed",
+      "manual": "Cloud: content availability not yet confirmed; click to upload",
       "metadataOnly": "Cloud: record only synced; click to upload the file",
       "partial": "Cloud: content ready on {{content}}/{{total}} targets",
       "queued": "Cloud: waiting to sync",
-      "remoteMetadataOnly": "Cloud: record synced; file content is not uploaded",
+      "remoteMetadataOnly": "Cloud: record synced; content is not fully ready yet",
       "remoteSuccess": "Cloud: file content is ready",
       "remoteSyncing": "Cloud: starting file download",
       "started": "Cloud sync queued",
@@ -165,8 +170,8 @@
       "downloading": "LAN: downloading files",
       "error": "LAN sync failed; click to retry",
       "errorWithReason": "LAN: {{reason}}; retrying automatically, or click to retry",
-      "idle": "LAN: no online devices; skipped",
-      "manual": "LAN: manual sync required; click to transfer",
+      "idle": "LAN: delivery not yet confirmed",
+      "manual": "LAN: delivery not yet confirmed; click to transfer",
       "metadataOnly": "LAN: record only synced to {{delivered}}/{{total}} devices; download it on the receiving device",
       "partial": "LAN: file content reached {{content}}/{{total}} devices",
       "queued": "LAN: waiting to sync",

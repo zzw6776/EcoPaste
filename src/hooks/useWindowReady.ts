@@ -5,7 +5,7 @@ import { isTauri } from "@/utils/is";
 
 let reported = false;
 
-/** 当前路由和首屏数据提交到 DOM 后再上报；隐藏窗口也能完成预加载。 */
+/** 页面可展示时上报就绪；剪贴板外壳可以先于卡片数据完成，隐藏窗口也能预加载。 */
 export function useWindowReady(ready = true) {
   useEffect(() => {
     if (!ready || !isTauri || reported) return;

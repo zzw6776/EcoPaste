@@ -8,6 +8,33 @@
       name="viewport"
     />
     <title>EcoPaste</title>
+    <style>
+      :root {
+        --app-background: #f2f2f7;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root:not(.light) {
+          --app-background: #121212;
+        }
+      }
+
+      :root.dark {
+        --app-background: #121212;
+      }
+
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      #root:empty {
+        background-color: var(--app-background) !important;
+      }
+    </style>
   </head>
 
   <body>

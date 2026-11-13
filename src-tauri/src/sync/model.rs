@@ -55,6 +55,15 @@ pub struct SyncedClipboardItem {
     #[n(14)]
     #[cbor(default)]
     pub source_revision: Option<String>,
+    #[n(15)]
+    #[cbor(default)]
+    pub source_device_id: Option<String>,
+    #[n(16)]
+    #[cbor(default)]
+    pub source_device_name: Option<String>,
+    #[n(17)]
+    #[cbor(default)]
+    pub source_updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -540,6 +549,9 @@ mod tests {
             sync_key: "hash".into(),
             updated_at_ms: Some(456),
             source_revision: Some("revision".into()),
+            source_device_id: None,
+            source_device_name: None,
+            source_updated_at_ms: None,
         };
 
         let encoded = minicbor::to_vec(current).unwrap();
@@ -585,6 +597,9 @@ mod tests {
                 sync_key: "hash".into(),
                 updated_at_ms: Some(456),
                 source_revision: Some("revision".into()),
+                source_device_id: None,
+                source_device_name: None,
+                source_updated_at_ms: None,
             },
             blobs: Vec::new(),
             source_app: Some(SourceAppRef {

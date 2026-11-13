@@ -90,6 +90,7 @@ const MIGRATION_LINE_ENDING_CHECKSUMS: &[(i64, &str, &str)] = &[
 ];
 
 pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
+    let started_at = std::time::Instant::now();
     let path = db_path(app)?;
 
     let options = SqliteConnectOptions::new()
@@ -105,6 +106,7 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
         .connect_with(options)
         .await
         .with_context(|| format!("failed to open sqlite database at {path:?}"))?;
+    let open_ms = started_at.elapsed().as_millis();
 
     let migrator = sqlx::migrate!("./migrations");
     repair_legacy_sync_removal_migration(&pool).await?;
@@ -118,6 +120,11 @@ pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
         .context("failed to run sqlite migrations")?;
 
     log::info!("sqlite pool ready at {path:?}");
+    let total_ms = started_at.elapsed().as_millis();
+    log::info!(
+        "startup timing: stage=sqlite openMs={open_ms} migrationsMs={} totalMs={total_ms}",
+        total_ms.saturating_sub(open_ms)
+    );
     Ok(pool)
 }
 

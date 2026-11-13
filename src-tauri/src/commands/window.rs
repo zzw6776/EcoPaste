@@ -32,6 +32,10 @@ pub async fn resize_clipboard_window(app: AppHandle, height: f64) -> Result<()> 
 #[tauri::command]
 pub async fn notify_window_ready(app: AppHandle, label: String) {
     window::lifecycle::on_ready(&app, &label);
+    #[cfg(target_os = "android")]
+    if let Err(error) = crate::commands::android::notify_startup_ready() {
+        log::warn!("finish Android startup splash failed: {error}");
+    }
 }
 
 /// 标记当前窗口是否存在未保存草稿。相同 owner 可重复设置；所有 owner 清除后才允许销毁。
