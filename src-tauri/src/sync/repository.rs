@@ -47,6 +47,7 @@ pub use state::*;
 
 const CLOUD_CURSOR_KEY: &str = "cloud_cursor";
 const CLOUD_AVAILABILITY_CURSOR_KEY: &str = "cloud_availability_cursor";
+const CLOUD_PRUNED_AVAILABILITY_CURSOR_KEY: &str = "cloud_pruned_availability_cursor";
 const CLOUD_BOOTSTRAP_GROUP_KEY: &str = "cloud_bootstrap_group_id";
 const CLOUD_BOOTSTRAP_TARGET_KEY: &str = "cloud_bootstrap_target_cursor";
 const CLOUD_TARGET: &str = "cloud";

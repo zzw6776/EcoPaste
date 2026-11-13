@@ -50,6 +50,7 @@ test("新记录增量插入顶部且重复事件不会重复增加总数", () =>
     query: { sort: "updatedAtDesc" },
     total: 1,
   });
+  assert.ok(first);
   const repeated = upsertClipboardItemCache({
     existing: false,
     item: inserted,
@@ -58,6 +59,7 @@ test("新记录增量插入顶部且重复事件不会重复增加总数", () =>
     query: { sort: "updatedAtDesc" },
     total: first.total,
   });
+  assert.ok(repeated);
 
   assert.deepEqual(ids(first.items), ["inserted", "original"]);
   assert.equal(first.total, 2);
@@ -79,6 +81,7 @@ test("复用记录按后端 useCount 规则移动但不改变总数", () => {
     query: { sort: "useCountDesc" },
     total: 2,
   });
+  assert.ok(result);
 
   assert.deepEqual(ids(result.items), ["reused", "first"]);
   assert.equal(result.total, 2);
@@ -94,6 +97,7 @@ test("不满足当前筛选的新记录不会进入缓存或改变总数", () =>
     query: { favorite: true, sort: "updatedAtDesc" },
     total: 1,
   });
+  assert.ok(result);
 
   assert.deepEqual(ids(result.items), ["favorite"]);
   assert.equal(result.total, 1);
@@ -108,6 +112,7 @@ test("已加载记录离开当前筛选时就地移除并扣减总数", () => {
     query: { favorite: true, sort: "updatedAtDesc" },
     total: 1,
   });
+  assert.ok(result);
 
   assert.deepEqual(ids(result.items), []);
   assert.equal(result.total, 0);

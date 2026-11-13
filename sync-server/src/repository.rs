@@ -988,7 +988,7 @@ impl Repository {
         group_id: &str,
         after_cursor: u64,
         limit: u16,
-    ) -> Result<(Vec<CloudAvailabilityUpdate>, u64, bool)> {
+    ) -> Result<(Vec<CloudAvailabilityUpdate>, u64, bool, u64)> {
         let limit = limit.clamp(1, MAX_EVENTS_PER_BATCH);
         let mut transaction = self.pool.begin().await?;
         let rows = sqlx::query(
@@ -1049,26 +1049,85 @@ impl Repository {
                     .unwrap_or_default();
             }
         }
+        let (availability_cursor, pruned_availability_cursor): (i64, i64) = sqlx::query_as(
+            "SELECT availability_cursor, pruned_availability_cursor FROM sync_groups WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read cloud availability watermarks")?;
         let latest_cursor = if has_more {
             updates
                 .last()
                 .map(|update| update.cursor)
                 .unwrap_or(after_cursor)
         } else {
-            let cursor: i64 = sqlx::query_scalar(
-                "SELECT availability_cursor FROM sync_groups WHERE group_id = ?",
-            )
-            .bind(group_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .context("read latest cloud availability cursor")?;
-            u64::try_from(cursor).context("negative latest cloud availability cursor")?
+            u64::try_from(availability_cursor).context("negative latest cloud availability cursor")?
         };
         transaction
             .commit()
             .await
             .context("commit cloud availability snapshot")?;
-        Ok((updates, latest_cursor, has_more))
+        Ok((
+            updates,
+            latest_cursor,
+            has_more,
+            u64::try_from(pruned_availability_cursor).context("negative cloud pruning revision")?,
+        ))
+    }
+
+    /// Rechecks only the caller's known records, including history removed by retention.
+    pub async fn check_cloud_availability(
+        &self,
+        group_id: &str,
+        event_ids: &[String],
+    ) -> Result<(Vec<CloudAvailabilityUpdate>, Vec<String>)> {
+        if event_ids.len() > usize::from(MAX_EVENTS_PER_BATCH) {
+            bail!("too many cloud availability checks");
+        }
+        if event_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT e.event_id, e.availability_cursor, b.blob_id FROM events e \
+             LEFT JOIN event_blob_refs refs ON refs.group_id = e.group_id AND refs.event_id = e.event_id \
+             LEFT JOIN blobs b ON b.group_id = refs.group_id AND b.blob_id = refs.blob_id \
+             WHERE e.group_id = ",
+        );
+        query.push_bind(group_id).push(" AND e.event_id IN (");
+        let mut separated = query.separated(", ");
+        for event_id in event_ids {
+            validate_identifier("event_id", event_id)?;
+            separated.push_bind(event_id);
+        }
+        query.push(")");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .context("check retained cloud availability")?;
+        let mut updates: HashMap<String, CloudAvailabilityUpdate> = HashMap::new();
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let cursor = u64::try_from(row.try_get::<i64, _>("availability_cursor")?)
+                .context("negative cloud availability cursor")?;
+            let update = updates
+                .entry(event_id.clone())
+                .or_insert_with(|| CloudAvailabilityUpdate {
+                    cursor,
+                    event_id,
+                    available_blob_ids: Vec::new(),
+                });
+            if let Some(blob_id) = row.try_get::<Option<String>, _>("blob_id")? {
+                update.available_blob_ids.push(blob_id);
+            }
+        }
+        let missing_event_ids = event_ids
+            .iter()
+            .filter(|event_id| !updates.contains_key(*event_id))
+            .cloned()
+            .collect();
+        Ok((updates.into_values().collect(), missing_event_ids))
     }
 
     pub async fn blob_size(&self, group_id: &str, blob_id: &str) -> Result<Option<u64>> {
@@ -1476,7 +1535,9 @@ impl Repository {
         .await
         .context("delete retained Hub events")?;
         sqlx::query(
-            "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?) WHERE group_id = ?",
+            "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?), \
+             availability_cursor = availability_cursor + 1, \
+             pruned_availability_cursor = availability_cursor + 1 WHERE group_id = ?",
         )
         .bind(deleted_through)
         .bind(group_id)
@@ -1736,7 +1797,7 @@ mod tests {
             .insert_events("group_123", &[event], None)
             .await
             .unwrap();
-        let (before, cursor, has_more) = repository
+        let (before, cursor, has_more, _) = repository
             .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
             .await
             .unwrap();
@@ -1748,7 +1809,7 @@ mod tests {
             .record_blob("group_123", &blob_id, 128, true)
             .await
             .unwrap();
-        let (updates, cursor, has_more) = repository
+        let (updates, cursor, has_more, _) = repository
             .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
             .await
             .unwrap();

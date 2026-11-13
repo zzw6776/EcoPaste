@@ -18,6 +18,19 @@ pub async fn cloud_availability_cursor(pool: &SqlitePool) -> Result<u64> {
         .context("invalid cloud availability cursor")
 }
 
+pub async fn cloud_pruned_availability_cursor(pool: &SqlitePool) -> Result<u64> {
+    state_value(pool, CLOUD_PRUNED_AVAILABILITY_CURSOR_KEY)
+        .await?
+        .as_deref()
+        .unwrap_or("0")
+        .parse()
+        .context("invalid cloud pruning cursor")
+}
+
+pub async fn mark_cloud_pruning_reconciled(pool: &SqlitePool, cursor: u64) -> Result<()> {
+    set_state_value(pool, CLOUD_PRUNED_AVAILABILITY_CURSOR_KEY, &cursor.to_string()).await
+}
+
 pub async fn cloud_bootstrap_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
     let value = state_value(pool, CLOUD_BOOTSTRAP_GROUP_KEY).await?;
     Ok(value.as_deref() == Some(group_id) || value == Some(format!("complete:{group_id}")))

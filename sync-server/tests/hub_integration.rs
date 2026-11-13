@@ -335,6 +335,7 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         updates,
         latest_cursor,
         has_more,
+        ..
     } = call(
         &connection,
         Request::SyncCloudAvailability {
