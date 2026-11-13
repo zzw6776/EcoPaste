@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub const TRANSFER_UPDATED_EVENT: &str = "sync-transfer://updated";
+pub const TRANSFER_REMOVED_EVENT: &str = "sync-transfer://removed";
 const EMIT_INTERVAL: Duration = Duration::from_millis(500);
-const MAX_RETAINED_TASKS: usize = 100;
+const FINISHED_TASK_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_FINISHED_TASKS: usize = 50;
 const LOCAL_IMPORT_TARGET: &str = "import";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -37,6 +39,7 @@ pub enum TransferPhase {
     Connecting,
     Transferring,
     Confirming,
+    Available,
     Completed,
     Failed,
     Canceled,
@@ -44,7 +47,10 @@ pub enum TransferPhase {
 
 impl TransferPhase {
     fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
+        matches!(
+            self,
+            Self::Available | Self::Completed | Self::Failed | Self::Canceled
+        )
     }
 }
 
@@ -53,6 +59,7 @@ impl TransferPhase {
 pub struct TransferTask {
     pub id: String,
     pub revision: u64,
+    pub started_at_ms: i64,
     pub operation_id: String,
     pub item_id: String,
     pub direction: TransferDirection,
@@ -100,7 +107,9 @@ struct TransferEntry {
     persistence: TransferPersistence,
     cancel: Arc<AtomicBool>,
     active_components: u32,
+    completed_bytes: u64,
     started_at: Instant,
+    finished_at: Option<Instant>,
     last_sample_at: Instant,
     last_sample_bytes: u64,
     last_emit_at: Instant,
@@ -138,12 +147,6 @@ pub(super) enum PreparationClaim {
     Claimed(TransferHandle),
     Canceled,
     Missing,
-}
-
-pub(super) enum MetadataOnlyDeliveryStart {
-    Tracked,
-    Canceled,
-    Untracked,
 }
 
 #[derive(Default)]
@@ -227,21 +230,6 @@ impl TransferRegistry {
 
         let entry_id = task.id.clone();
         task.revision = 0;
-        if task.direction == TransferDirection::Download {
-            let stale_ids = state
-                .entries
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.task.item_id == task.item_id
-                        && entry.task.direction == TransferDirection::Download
-                        && entry.task.phase.terminal()
-                })
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            for stale_id in stale_ids {
-                state.entries.remove(&stale_id);
-            }
-        }
         let cancel = Arc::new(AtomicBool::new(false));
         let item_id = task.item_id.clone();
         let local_import = task.target == LOCAL_IMPORT_TARGET;
@@ -253,7 +241,9 @@ impl TransferRegistry {
                 persistence,
                 cancel: cancel.clone(),
                 active_components: 1,
+                completed_bytes: 0,
                 started_at: now,
+                finished_at: None,
                 last_sample_at: now,
                 last_sample_bytes: 0,
                 last_emit_at: now.checked_sub(EMIT_INTERVAL).unwrap_or(now),
@@ -285,7 +275,54 @@ impl TransferRegistry {
             .local_imports
             .get(item_id)
             .and_then(|id| state.entries.get(id))
-            .is_some_and(|entry| !entry.task.phase.terminal())
+            .is_some_and(|entry| entry.task.phase == TransferPhase::Preparing)
+    }
+
+    /// Ends every component of a failed card operation, including queued preparation.
+    pub fn fail_upload_operation(&self, operation_id: &str, target: &str, error: &str) {
+        let route = if target == "cloud" {
+            TransferRoute::Cloud
+        } else {
+            TransferRoute::Lan
+        };
+        let key = operation_key(operation_id, TransferDirection::Upload, route, target);
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let Some(entry_id) = state.active_operations.remove(&key) else {
+            return;
+        };
+        let Some(entry) = state.entries.get_mut(&entry_id) else {
+            return;
+        };
+        entry.cancel.store(true, Ordering::Release);
+        entry.preparation = None;
+        let item_id = entry.task.item_id.clone();
+        let bytes = entry.task.transferred_bytes;
+        finish_entry(entry, TransferPhase::Failed, bytes, Some(error.to_owned()));
+        state.local_imports.remove(&item_id);
+        drop(state);
+        self.emit(&entry_id, false);
+    }
+
+    /// Ends an imported file task when another route materialized its outgoing event.
+    pub fn complete_local_import_for_item(&self, item_id: &str) {
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let Some(entry_id) = state.local_imports.get(item_id).cloned() else {
+            return;
+        };
+        let Some(entry) = state.entries.get_mut(&entry_id) else {
+            return;
+        };
+        if entry.task.target != LOCAL_IMPORT_TARGET || entry.task.phase != TransferPhase::Queued {
+            return;
+        }
+        let key = TransferOperationKey::from_task(&entry.task);
+        let bytes = entry.task.transferred_bytes;
+        entry.preparation = None;
+        finish_entry(entry, TransferPhase::Completed, bytes, None);
+        state.active_operations.remove(&key);
+        state.local_imports.remove(item_id);
+        drop(state);
+        self.emit(&entry_id, false);
     }
 
     #[cfg(target_os = "android")]
@@ -413,62 +450,6 @@ impl TransferRegistry {
         PreparationClaim::Claimed(self.handle(entry_id, cancel))
     }
 
-    pub fn begin_metadata_only_delivery(
-        &self,
-        operation_id: &str,
-        route: TransferRoute,
-        target: &str,
-    ) -> MetadataOnlyDeliveryStart {
-        let key = operation_key(operation_id, TransferDirection::Upload, route, target);
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry_id) = state.active_operations.get(&key).cloned() else {
-            return MetadataOnlyDeliveryStart::Untracked;
-        };
-        let Some(entry) = state.entries.get_mut(&entry_id) else {
-            return MetadataOnlyDeliveryStart::Untracked;
-        };
-        if entry.preparation.is_none() {
-            return MetadataOnlyDeliveryStart::Untracked;
-        }
-        if entry.cancel.load(Ordering::Acquire) || entry.task.phase == TransferPhase::Canceled {
-            return MetadataOnlyDeliveryStart::Canceled;
-        }
-        if entry.task.phase != TransferPhase::Queued || !entry.task.cancellable {
-            return MetadataOnlyDeliveryStart::Untracked;
-        }
-        entry.task.phase = TransferPhase::Confirming;
-        entry.task.cancellable = false;
-        drop(state);
-        self.emit(&entry_id, false);
-        MetadataOnlyDeliveryStart::Tracked
-    }
-
-    pub fn retry_metadata_only_delivery(
-        &self,
-        operation_id: &str,
-        route: TransferRoute,
-        target: &str,
-    ) {
-        let key = operation_key(operation_id, TransferDirection::Upload, route, target);
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry_id) = state.active_operations.get(&key).cloned() else {
-            return;
-        };
-        let Some(entry) = state.entries.get_mut(&entry_id) else {
-            return;
-        };
-        if entry.preparation.is_none()
-            || entry.task.phase != TransferPhase::Confirming
-            || entry.cancel.load(Ordering::Acquire)
-        {
-            return;
-        }
-        entry.task.phase = TransferPhase::Queued;
-        entry.task.cancellable = true;
-        drop(state);
-        self.emit(&entry_id, false);
-    }
-
     pub fn complete_metadata_only_preparation(
         &self,
         operation_id: &str,
@@ -480,7 +461,7 @@ impl TransferRegistry {
         let Some(entry_id) = state.active_operations.get(&key).cloned() else {
             return false;
         };
-        let Some(entry) = state.entries.get_mut(&entry_id) else {
+        let Some(entry) = state.entries.get(&entry_id) else {
             return false;
         };
         if entry.preparation.is_none()
@@ -492,11 +473,10 @@ impl TransferRegistry {
         {
             return false;
         }
-        entry.preparation = None;
-        finish_entry(entry, TransferPhase::Completed, 0, None);
         state.active_operations.remove(&key);
+        state.entries.remove(&entry_id);
         drop(state);
-        self.emit(&entry_id, false);
+        self.emit_removed(vec![entry_id]);
         true
     }
 
@@ -532,13 +512,32 @@ impl TransferRegistry {
     }
 
     pub fn list(&self) -> Vec<TransferTask> {
-        let state = self.state.lock().expect("transfer registry poisoned");
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let removed = prune_finished_tasks(&mut state, Instant::now());
         let mut entries = state.entries.values().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.started_at);
-        entries
+        let tasks = entries
             .into_iter()
             .map(|entry| entry.task.clone())
-            .collect()
+            .collect();
+        drop(state);
+        self.emit_removed(removed);
+        tasks
+    }
+
+    /// Clears display history without canceling work or changing durable delivery state.
+    pub fn clear_finished(&self) {
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let mut removed = Vec::new();
+        state.entries.retain(|id, entry| {
+            if !entry.task.phase.terminal() {
+                return true;
+            }
+            removed.push(id.clone());
+            false
+        });
+        drop(state);
+        self.emit_removed(removed);
     }
 
     pub fn cancellable_task(&self, id: &str) -> Option<(TransferTask, bool)> {
@@ -728,6 +727,9 @@ impl TransferRegistry {
         entry.task.error = error;
         entry.task.elapsed_ms = elapsed_ms(entry.started_at, now);
         entry.task.cancellable &= !phase.terminal();
+        if phase.terminal() {
+            entry.finished_at = Some(now);
+        }
         update_eta(entry);
         let should_emit = force_emit
             || phase.terminal()
@@ -756,6 +758,7 @@ impl TransferRegistry {
         component: &ComponentProgress,
         phase: TransferPhase,
         bytes: u64,
+        completion_bytes: Option<u64>,
         error: Option<String>,
         force_emit: bool,
     ) {
@@ -790,12 +793,21 @@ impl TransferRegistry {
             finish_entry(entry, TransferPhase::Failed, aggregate_bytes, Some(error));
         } else {
             match phase {
-                TransferPhase::Completed => {
+                TransferPhase::Available | TransferPhase::Completed => {
                     entry.active_components = entry.active_components.saturating_sub(1);
+                    entry.completed_bytes = entry
+                        .completed_bytes
+                        .saturating_add(completion_bytes.unwrap_or(bytes));
                     if (entry.task.total_bytes == 0 && entry.active_components == 0)
-                        || (entry.task.total_bytes > 0 && aggregate_bytes >= entry.task.total_bytes)
+                        || (entry.task.total_bytes > 0
+                            && entry.completed_bytes >= entry.task.total_bytes)
                     {
-                        finish_entry(entry, TransferPhase::Completed, aggregate_bytes, None);
+                        let completed_phase = if aggregate_bytes == 0 {
+                            TransferPhase::Available
+                        } else {
+                            TransferPhase::Completed
+                        };
+                        finish_entry(entry, completed_phase, aggregate_bytes, None);
                     } else if entry.active_components == 0 {
                         entry.task.phase = TransferPhase::Queued;
                     }
@@ -832,34 +844,70 @@ impl TransferRegistry {
     }
 
     fn emit(&self, id: &str, prune: bool) {
-        let task = {
+        let (task, removed) = {
             let mut state = self.state.lock().expect("transfer registry poisoned");
-            if prune && state.entries.len() > MAX_RETAINED_TASKS {
-                let mut terminal = state
+            let prune = prune
+                || state
                     .entries
-                    .iter()
-                    .filter(|(_, entry)| entry.task.phase.terminal())
-                    .map(|(id, entry)| (id.clone(), entry.started_at))
-                    .collect::<Vec<_>>();
-                terminal.sort_by_key(|(_, started_at)| *started_at);
-                let remove_count = state.entries.len().saturating_sub(MAX_RETAINED_TASKS);
-                for (old_id, _) in terminal.into_iter().take(remove_count) {
-                    state.entries.remove(&old_id);
-                }
-            }
+                    .get(id)
+                    .is_some_and(|entry| entry.task.phase.terminal());
+            let removed = if prune {
+                prune_finished_tasks(&mut state, Instant::now())
+            } else {
+                Vec::new()
+            };
             state.next_revision = state.next_revision.saturating_add(1);
             let revision = state.next_revision;
-            state.entries.get_mut(id).map(|entry| {
+            let task = state.entries.get_mut(id).map(|entry| {
                 entry.task.revision = revision;
                 entry.task.clone()
-            })
+            });
+            (task, removed)
         };
         if let Some(task) = task {
             if let Err(error) = self.app.emit(TRANSFER_UPDATED_EVENT, task) {
                 log::warn!("emit transfer progress failed: {error}");
             }
         }
+        self.emit_removed(removed);
     }
+
+    fn emit_removed(&self, task_ids: Vec<String>) {
+        if task_ids.is_empty() {
+            return;
+        }
+        if let Err(error) = self.app.emit(TRANSFER_REMOVED_EVENT, task_ids) {
+            log::warn!("emit removed transfer records failed: {error}");
+        }
+    }
+}
+
+/// Bounds terminal history by completion time while preserving every unfinished operation.
+fn prune_finished_tasks(state: &mut RegistryState, now: Instant) -> Vec<String> {
+    let mut finished = state
+        .entries
+        .iter()
+        .filter_map(|(id, entry)| {
+            entry
+                .finished_at
+                .map(|finished_at| (id.clone(), finished_at))
+        })
+        .collect::<Vec<_>>();
+    finished.sort_by_key(|(_, finished_at)| std::cmp::Reverse(*finished_at));
+
+    let removed = finished
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (id, finished_at))| {
+            (index >= MAX_FINISHED_TASKS
+                || now.saturating_duration_since(finished_at) >= FINISHED_TASK_RETENTION)
+                .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    for id in &removed {
+        state.entries.remove(id);
+    }
+    removed
 }
 
 fn operation_key(
@@ -878,6 +926,7 @@ fn operation_key(
 
 fn reset_entry(entry: &mut TransferEntry, phase: TransferPhase, total_bytes: u64) {
     let now = Instant::now();
+    entry.task.started_at_ms = chrono::Utc::now().timestamp_millis();
     entry.task.phase = phase;
     entry.task.transferred_bytes = 0;
     entry.task.total_bytes = total_bytes;
@@ -887,7 +936,9 @@ fn reset_entry(entry: &mut TransferEntry, phase: TransferPhase, total_bytes: u64
     entry.task.error = None;
     entry.task.cancellable = true;
     entry.active_components = 1;
+    entry.completed_bytes = 0;
     entry.started_at = now;
+    entry.finished_at = None;
     entry.last_sample_at = now;
     entry.last_sample_bytes = 0;
     entry.last_emit_at = now.checked_sub(EMIT_INTERVAL).unwrap_or(now);
@@ -899,13 +950,15 @@ fn finish_entry(
     bytes: u64,
     error: Option<String>,
 ) {
+    let now = Instant::now();
     entry.task.phase = phase;
     entry.task.transferred_bytes = bounded_transfer_bytes(entry.task.total_bytes, bytes);
-    entry.task.elapsed_ms = elapsed_ms(entry.started_at, Instant::now());
+    entry.task.elapsed_ms = elapsed_ms(entry.started_at, now);
     entry.task.eta_seconds = None;
     entry.task.error = error;
     entry.task.cancellable = false;
     entry.active_components = 0;
+    entry.finished_at = Some(now);
 }
 
 fn bounded_transfer_bytes(total_bytes: u64, bytes: u64) -> u64 {
@@ -962,7 +1015,10 @@ fn advance_phase(current: TransferPhase, next: TransferPhase) -> TransferPhase {
         TransferPhase::Preparing => 2,
         TransferPhase::Transferring => 3,
         TransferPhase::Confirming => 4,
-        TransferPhase::Completed | TransferPhase::Failed | TransferPhase::Canceled => 5,
+        TransferPhase::Available
+        | TransferPhase::Completed
+        | TransferPhase::Failed
+        | TransferPhase::Canceled => 5,
     };
     if rank(next) >= rank(current) {
         next
@@ -985,11 +1041,11 @@ impl TransferHandle {
     }
 
     pub fn connecting(&self) {
-        self.update(TransferPhase::Connecting, 0, None, true);
+        self.update(TransferPhase::Connecting, 0, None, None, true);
     }
 
     pub fn preparing(&self, bytes: u64) {
-        self.update(TransferPhase::Preparing, bytes, None, false);
+        self.update(TransferPhase::Preparing, bytes, None, None, false);
     }
 
     pub fn prepared(&self, route: TransferRoute, target: String) {
@@ -1009,7 +1065,7 @@ impl TransferHandle {
     }
 
     pub fn transferred(&self, bytes: u64) {
-        self.update(TransferPhase::Transferring, bytes, None, false);
+        self.update(TransferPhase::Transferring, bytes, None, None, false);
     }
 
     pub fn begin_finalizing(&self, bytes: u64) -> bool {
@@ -1017,23 +1073,36 @@ impl TransferHandle {
     }
 
     pub fn completed(&self, bytes: u64) {
-        self.update(TransferPhase::Completed, bytes, None, true);
+        self.update(TransferPhase::Completed, bytes, Some(bytes), None, true);
+    }
+
+    /// Completes one logical attachment without reporting bytes that never crossed the network.
+    pub fn already_available(&self, bytes: u64) {
+        self.update(TransferPhase::Available, 0, Some(bytes), None, true);
     }
 
     pub fn failed(&self, bytes: u64, error: impl Into<String>) {
-        self.update(TransferPhase::Failed, bytes, Some(error.into()), true);
+        self.update(TransferPhase::Failed, bytes, None, Some(error.into()), true);
     }
 
     pub fn mark_canceled(&self, bytes: u64) {
-        self.update(TransferPhase::Canceled, bytes, None, true);
+        self.update(TransferPhase::Canceled, bytes, None, None, true);
     }
 
-    fn update(&self, phase: TransferPhase, bytes: u64, error: Option<String>, force_emit: bool) {
+    fn update(
+        &self,
+        phase: TransferPhase,
+        bytes: u64,
+        completion_bytes: Option<u64>,
+        error: Option<String>,
+        force_emit: bool,
+    ) {
         self.registry.update_handle(
             &self.entry_id,
             &self.component,
             phase,
             bytes,
+            completion_bytes,
             error,
             force_emit,
         );
@@ -1059,6 +1128,7 @@ mod tests {
             task: TransferTask {
                 id: "task".into(),
                 revision: 0,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
                 operation_id: "event".into(),
                 item_id: "item".into(),
                 direction: TransferDirection::Upload,
@@ -1078,7 +1148,9 @@ mod tests {
             persistence: TransferPersistence::Durable,
             cancel: Arc::new(AtomicBool::new(false)),
             active_components: 0,
+            completed_bytes: 0,
             started_at: now,
+            finished_at: None,
             last_sample_at: now,
             last_sample_bytes: 0,
             last_emit_at: now,

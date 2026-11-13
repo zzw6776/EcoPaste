@@ -987,11 +987,9 @@ mod tests {
                 .map(|stored| stored.event.event_id)
                 .collect::<Vec<_>>()
         };
-        let before = ids(
-            pending_origin_events_for_target(&pool, "cloud", "local", 10)
-                .await
-                .unwrap(),
-        );
+        let before = ids(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
+            .await
+            .unwrap());
         sqlx::query(
             "CREATE INDEX idx_sync_events_origin_cursor \
              ON sync_events(origin_device_id, cursor)",
@@ -1000,17 +998,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ids(
-                pending_origin_events_for_target(&pool, "cloud", "local", 10)
-                    .await
-                    .unwrap()
-            ),
+            ids(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
+                .await
+                .unwrap()),
             before
         );
         assert_eq!(before, ["last"]);
         assert_eq!(
             ids(
-                pending_origin_events_for_target(&pool, "another", "local", 10)
+                pending_cloud_events_for_target(&pool, "another", "local", 10)
                     .await
                     .unwrap()
             ),
@@ -1018,7 +1014,7 @@ mod tests {
         );
         assert_eq!(
             ids(
-                pending_origin_events_for_target(&pool, "another", "local", 1)
+                pending_cloud_events_for_target(&pool, "another", "local", 1)
                     .await
                     .unwrap()
             ),
@@ -1207,47 +1203,11 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
                 .await
                 .unwrap()
                 .len(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_delivery_route_excludes_the_other_transport() {
-        let pool = memory_pool().await;
-        insert_test_event(&pool, "event-1").await;
-        insert_test_event(&pool, "event-2").await;
-        sqlx::query("UPDATE sync_events SET delivery_route = 'lan' WHERE event_id = 'event-1'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE sync_events SET delivery_route = 'cloud' WHERE event_id = 'event-2'")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let lan = pending_peer_events_for_target(&pool, "peer:android", "android", 10)
-            .await
-            .unwrap();
-        let cloud = pending_origin_events_for_target(&pool, "cloud", "mac", 10)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            lan.into_iter()
-                .map(|event| event.event.event_id)
-                .collect::<Vec<_>>(),
-            vec!["event-1"]
-        );
-        assert_eq!(
-            cloud
-                .into_iter()
-                .map(|event| event.event.event_id)
-                .collect::<Vec<_>>(),
-            vec!["event-2"]
         );
     }
 
@@ -1267,7 +1227,7 @@ mod tests {
         .await
         .unwrap();
 
-        let pending = pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+        let pending = pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
             .await
             .unwrap();
         assert_eq!(
@@ -1280,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_delivery_route_exposes_the_other_transport_as_manual_fallback() {
+    async fn lan_content_route_projects_cloud_metadata_after_delivery() {
         let pool = memory_pool().await;
         insert_test_event(&pool, "event-1").await;
         insert_test_item(&pool, "item").await;
@@ -1292,23 +1252,46 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        assert_eq!(
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event.event_id)
+                .collect::<Vec<_>>(),
+            ["event-1"]
+        );
+        let events = events_after_cursor(&pool, 0, 10).await.unwrap();
+        assert_eq!(
+            event_ids_routed_away_from(&pool, &events, "cloud")
+                .await
+                .unwrap(),
+            HashSet::from(["event-1".to_owned()])
+        );
         let status = item_statuses(&pool, &["item".into()])
             .await
             .unwrap()
             .remove(0);
         assert_eq!(status.lan.activity, SyncItemActivity::Queued);
-        assert_eq!(status.cloud.action, SyncItemAction::None);
+        assert_eq!(status.cloud.activity, SyncItemActivity::Queued);
 
-        sqlx::query("UPDATE sync_events SET delivery_route = 'cloud' WHERE event_id = 'event-1'")
-            .execute(&pool)
+        let event_ids = ["event-1".to_owned()];
+        let metadata_only = HashSet::from(["event-1".to_owned()]);
+        plan_deliveries(&pool, "cloud", &event_ids, &metadata_only)
+            .await
+            .unwrap();
+        complete_outbound_delivery(&pool, "cloud", &event_ids, &metadata_only)
             .await
             .unwrap();
         let status = item_statuses(&pool, &["item".into()])
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(status.lan.action, SyncItemAction::None);
-        assert_eq!(status.cloud.activity, SyncItemActivity::Queued);
+        assert_eq!(
+            status.cloud.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(status.cloud.action, SyncItemAction::Upload);
     }
 
     #[tokio::test]
@@ -1339,7 +1322,7 @@ mod tests {
             status.cloud.last_error.as_deref(),
             Some("transfer canceled")
         );
-        assert!(pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+        assert!(pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
             .await
             .unwrap()
             .is_empty());
@@ -1351,9 +1334,9 @@ mod tests {
             1
         );
 
-        resume_item_delivery(&pool, "item", true).await.unwrap();
+        assert!(request_item_delivery(&pool, "item", true).await.unwrap());
         assert_eq!(
-            pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
                 .await
                 .unwrap()
                 .len(),
@@ -1377,7 +1360,7 @@ mod tests {
             status.cloud.last_error.as_deref(),
             Some("missing local attachment for sync event")
         );
-        assert!(pending_origin_events_for_target(&pool, "cloud", "mac", 10)
+        assert!(pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
             .await
             .unwrap()
             .is_empty());
@@ -1416,7 +1399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_preserves_one_route_and_selecting_the_other_expands_it() {
+    async fn manual_delivery_preserves_one_route_and_selecting_the_other_expands_it() {
         let pool = memory_pool().await;
         insert_test_event(&pool, "event-1").await;
         insert_test_item(&pool, "item").await;
@@ -1428,7 +1411,7 @@ mod tests {
             .await
             .unwrap();
 
-        resume_item_delivery(&pool, "item", true).await.unwrap();
+        assert!(request_item_delivery(&pool, "item", true).await.unwrap());
         let route: Option<String> =
             sqlx::query_scalar("SELECT delivery_route FROM sync_events WHERE event_id = 'event-1'")
                 .fetch_one(&pool)
@@ -1436,7 +1419,7 @@ mod tests {
                 .unwrap();
         assert_eq!(route.as_deref(), Some("cloud"));
 
-        resume_item_delivery(&pool, "item", false).await.unwrap();
+        assert!(request_item_delivery(&pool, "item", false).await.unwrap());
         let route: Option<String> =
             sqlx::query_scalar("SELECT delivery_route FROM sync_events WHERE event_id = 'event-1'")
                 .fetch_one(&pool)
@@ -2302,7 +2285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_local_content_keeps_confirmed_availability_during_new_activity() {
+    async fn repeated_local_content_projects_only_the_latest_event_delivery() {
         let pool = memory_pool().await;
         insert_test_item(&pool, "item").await;
         insert_event(&pool, &test_event("older", 1), true, &[])
@@ -2330,7 +2313,7 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::None);
         assert_eq!(status.cloud.activity, SyncItemActivity::Queued);
 
         sqlx::query("UPDATE sync_item_events SET content_identity = ? WHERE event_id = 'newer'")
@@ -2347,7 +2330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_remote_content_keeps_availability_from_each_route() {
+    async fn repeated_remote_content_projects_only_the_latest_event_route() {
         let pool = memory_pool().await;
         insert_test_item(&pool, "item").await;
         upsert_peer(
@@ -2405,7 +2388,7 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(status.cloud.availability, SyncContentAvailability::Complete);
+        assert_eq!(status.cloud.availability, SyncContentAvailability::None);
         assert_eq!(
             status.lan.availability,
             SyncContentAvailability::MetadataOnly
@@ -2492,12 +2475,10 @@ mod tests {
             SyncContentAvailability::MetadataOnly
         );
         assert_eq!(status.cloud.availability, SyncContentAvailability::None);
-        assert!(
-            pending_origin_events_for_target(&pool, "cloud", "local", 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
+            .await
+            .unwrap()
+            .is_empty());
         store_remote_batch(&pool, RemoteBatchSource::Cloud, Some(42), &[event], "local")
             .await
             .unwrap();

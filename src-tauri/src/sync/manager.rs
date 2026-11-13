@@ -101,9 +101,9 @@ use super::{
         CloudHubStatus, CloudRecord, CloudRecordPage, DecryptedSyncEvent, IncomingJoinRequest,
         LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice, NearbySyncSpace,
         SourceAppRef, SourceIconRef, StoredBlob, StoredContentObject, StoredSyncEvent,
-        SyncChannelState, SyncChannelStatus, SyncContentAvailability, SyncItemStatus,
-        SyncLocalContentState, SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget,
-        SyncedClipboardItem, SyncedItemStatePatch,
+        SyncChannelState, SyncChannelStatus, SyncContentAvailability, SyncItemAction,
+        SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer, SyncStatus,
+        SyncTarget, SyncedClipboardItem, SyncedItemStatePatch,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -556,6 +556,13 @@ impl std::fmt::Display for CloudHistoryGap {
 
 impl std::error::Error for CloudHistoryGap {}
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RemoteSyncError {
+    code: ErrorCode,
+    message: String,
+}
+
 #[derive(Debug)]
 struct RemoteBlobUnavailable;
 
@@ -859,6 +866,7 @@ impl SyncManager {
             .start_local_import(super::progress::TransferTask {
                 id: task_id.clone(),
                 revision: 0,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
                 operation_id: format!("android-share:{item_id}"),
                 item_id: item_id.to_owned(),
                 direction: super::progress::TransferDirection::Upload,
@@ -910,6 +918,10 @@ impl SyncManager {
 
     pub fn transfer_tasks(&self) -> Vec<super::progress::TransferTask> {
         self.delivery.tasks()
+    }
+
+    pub fn clear_finished_transfers(&self) {
+        self.delivery.clear_finished_transfers();
     }
 
     pub(crate) fn item_has_active_local_import(&self, item_id: &str) -> bool {
@@ -1573,12 +1585,6 @@ impl SyncManager {
         if self.identity.snapshot().group.is_none() {
             bail!(crate::i18n::commands::label(lang, Key::SyncGroupRequired));
         }
-        if item.remote_file_state.is_some() {
-            bail!(crate::i18n::commands::label(
-                lang,
-                Key::RemoteFileNotDownloaded,
-            ));
-        }
         if item.is_sensitive && !settings.sync_sensitive {
             bail!(crate::i18n::commands::label(
                 lang,
@@ -1592,10 +1598,72 @@ impl SyncManager {
             bail!("云端同步未配置");
         }
         let pool = self.pool().await;
-        if target == SyncTarget::Lan && repository::list_peers(&pool).await?.is_empty() {
+        let remote_content_state = if item.remote_file_state.is_some() {
+            self.item_statuses(std::slice::from_ref(&item.id))
+                .await?
+                .into_iter()
+                .next()
+                .map(|status| status.local_state)
+        } else {
+            None
+        };
+        let remote_content_available = remote_content_state.is_some_and(|state| {
+            matches!(
+                state,
+                SyncLocalContentState::Managed | SyncLocalContentState::External
+            )
+        });
+        if item.remote_file_state.is_some()
+            && (target != SyncTarget::Cloud || !remote_content_available)
+        {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::RemoteFileNotDownloaded,
+            ));
+        }
+        if target == SyncTarget::Lan && !repository::has_online_peer(&pool).await? {
             bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
-        repository::resume_item_delivery(&pool, &item.id, target == SyncTarget::Cloud).await?;
+        let _enqueue_guard = self.delivery.lock_enqueue().await;
+        let content_pending =
+            db::sync_queue::has_pending_content(&pool, &item.id, &item.source_revision).await?;
+        let external_local_event_exists =
+            if remote_content_state == Some(SyncLocalContentState::External) {
+                repository::latest_local_event_for_item(&pool, &item.id)
+                    .await?
+                    .is_some()
+            } else {
+                false
+            };
+        let event_exists = if content_pending
+            || (remote_content_state == Some(SyncLocalContentState::External)
+                && !external_local_event_exists)
+        {
+            false
+        } else {
+            repository::request_item_delivery(&pool, &item.id, target == SyncTarget::Cloud).await?
+        };
+        if event_exists {
+            if target == SyncTarget::Cloud {
+                self.wake_cloud_transfer();
+            } else {
+                self.wake_lan_transfer();
+            }
+            return self
+                .item_statuses(&[item.id])
+                .await?
+                .into_iter()
+                .next()
+                .context("同步状态不存在");
+        }
+        if item.remote_file_state.is_some()
+            && remote_content_state != Some(SyncLocalContentState::External)
+        {
+            bail!(crate::i18n::commands::label(
+                lang,
+                Key::RemoteFileNotDownloaded,
+            ));
+        }
         db::sync_queue::stage_existing_content(
             &pool,
             &item.id,
@@ -1603,6 +1671,7 @@ impl SyncManager {
             &item.source_revision,
             crate::db::sync_queue::ContentSyncOptions {
                 force_files: true,
+                manual_share: true,
                 delivery_route: Some(if target == SyncTarget::Cloud {
                     crate::db::sync_queue::ContentDeliveryRoute::Cloud
                 } else {
@@ -1626,10 +1695,15 @@ impl SyncManager {
 
     pub async fn item_statuses(&self, item_ids: &[String]) -> Result<Vec<SyncItemStatus>> {
         let pool = self.pool().await;
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let lan_actionable = settings.enabled && settings.lan_enabled;
+        let cloud_actionable = settings.enabled && server_is_configured(&settings);
         let mut statuses = repository::item_statuses(&pool, item_ids).await?;
         let sessions = repository::external_download_sessions(&pool, item_ids).await?;
         let mut known_external_items = HashSet::new();
         let mut valid_items = HashSet::new();
+        #[cfg(target_os = "android")]
+        let mut uploadable_external_items = HashSet::new();
         for session in sessions {
             known_external_items.insert(session.item_id.clone());
             let mut valid = !session.targets.is_empty();
@@ -1640,19 +1714,36 @@ impl SyncManager {
                 }
             }
             if valid {
+                #[cfg(target_os = "android")]
+                if session
+                    .targets
+                    .iter()
+                    .all(|target| target.destination_kind == "uri" && !target.is_directory)
+                {
+                    uploadable_external_items.insert(session.item_id.clone());
+                }
                 valid_items.insert(session.item_id);
             }
         }
         for status in &mut statuses {
-            if status.origin != super::model::SyncItemOrigin::Remote
-                || status.local_state == SyncLocalContentState::Managed
-            {
-                continue;
-            }
             if valid_items.contains(&status.item_id) {
                 status.local_state = SyncLocalContentState::External;
             } else if known_external_items.contains(&status.item_id) {
                 status.local_state = SyncLocalContentState::ExternalMissing;
+                status.lan.action = SyncItemAction::None;
+                status.cloud.action = SyncItemAction::None;
+            }
+            #[cfg(target_os = "android")]
+            if status.local_state == SyncLocalContentState::External
+                && !uploadable_external_items.contains(&status.item_id)
+            {
+                status.cloud.action = SyncItemAction::None;
+            }
+            if !lan_actionable {
+                status.lan.action = SyncItemAction::None;
+            }
+            if !cloud_actionable {
+                status.cloud.action = SyncItemAction::None;
             }
         }
         Ok(statuses)

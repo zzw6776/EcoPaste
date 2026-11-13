@@ -328,9 +328,7 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
     if item_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let peer_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_peers")
-        .fetch_one(pool)
-        .await?;
+    let lan_available = has_online_peer(pool).await?;
     let mut facts = item_ids
         .iter()
         .map(|id| {
@@ -342,6 +340,8 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
                     local_state: SyncLocalContentState::Managed,
                     queued_lan: false,
                     queued_cloud: false,
+                    preparation_error: None,
+                    lan_available,
                     remote_file_available: false,
                     deliveries: Vec::new(),
                 },
@@ -353,7 +353,7 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
         r#"
         WITH latest AS (
             SELECT links.item_id, links.event_id, links.content_identity,
-                   links.direction, event.delivery_route,
+                   links.direction,
                    ROW_NUMBER() OVER (
                        PARTITION BY links.item_id ORDER BY links.created_at DESC
                    ) AS rank
@@ -399,29 +399,17 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
                    matching_replica.updated_at DESC
                    LIMIT 1
                ), 'metadata') AS replica_state,
-               EXISTS(
-                   SELECT 1 FROM sync_content_outbox queued
-                   WHERE queued.item_id = latest.item_id
-               ) AS queued,
-               (
-                   SELECT queued.delivery_route FROM sync_content_outbox queued
-                   WHERE queued.item_id = latest.item_id
-                   ORDER BY queued.operation_order DESC LIMIT 1
-               ) AS queued_route,
                latest.direction AS latest_direction,
-               latest.delivery_route AS event_delivery_route,
                EXISTS(
                    SELECT 1 FROM sync_delivery_targets target
                    WHERE target.event_id = latest.event_id
                      AND target.target_id = 'cloud'
                ) AS has_cloud_target,
                EXISTS(
-                   SELECT 1 FROM sync_delivery_targets target
-                   WHERE target.event_id = latest.event_id
-                     AND target.target_id LIKE 'peer:%'
-               ) AS has_lan_target,
-               EXISTS(
                    SELECT 1 FROM sync_peers peer
+                   JOIN sync_peer_connections connection
+                     ON connection.device_id = peer.device_id
+                    AND connection.state = 'online'
                    WHERE NOT EXISTS (
                        SELECT 1 FROM sync_delivery_targets target
                        WHERE target.event_id = latest.event_id
@@ -457,36 +445,36 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
                 _ => SyncLocalContentState::Missing,
             }
         };
-        if row.try_get::<bool, _>("queued")? {
-            match row.try_get::<Option<String>, _>("queued_route")?.as_deref() {
-                Some("lan") => item_facts.queued_lan = true,
-                Some("cloud") => item_facts.queued_cloud = true,
-                _ => {
-                    item_facts.queued_cloud = true;
-                    item_facts.queued_lan = peer_count > 0;
-                }
-            }
-        } else if row.try_get::<String, _>("latest_direction")? == "local" {
+        if row.try_get::<String, _>("latest_direction")? == "local" {
             let has_cloud_target: bool = row.try_get("has_cloud_target")?;
-            let has_lan_target: bool = row.try_get("has_lan_target")?;
             let missing_lan_target: bool = row.try_get("missing_lan_target")?;
-            match row
-                .try_get::<Option<String>, _>("event_delivery_route")?
-                .as_deref()
-            {
-                Some("lan") => {
-                    item_facts.queued_lan = !has_lan_target || missing_lan_target;
-                }
-                Some("cloud") => {
-                    item_facts.queued_cloud = !has_cloud_target;
-                }
-                _ => {
-                    item_facts.queued_cloud = !has_cloud_target;
-                    item_facts.queued_lan = peer_count > 0 && missing_lan_target;
-                }
-            }
+            item_facts.queued_cloud = !has_cloud_target;
+            item_facts.queued_lan = lan_available && missing_lan_target;
         }
         item_facts.remote_file_available = row.try_get("remote_file_available")?;
+    }
+
+    let mut queued_query = sqlx::QueryBuilder::new(
+        "SELECT queued.item_id, queued.last_error FROM sync_content_outbox queued \
+         JOIN clipboard_items item ON item.id = queued.item_id \
+         AND item.source_revision = queued.source_revision WHERE queued.item_id IN (",
+    );
+    let mut queued_ids = queued_query.separated(", ");
+    for item_id in item_ids {
+        queued_ids.push_bind(item_id);
+    }
+    queued_query.push(") ORDER BY queued.operation_order DESC");
+    let mut queued_items = HashSet::new();
+    for row in queued_query.build().fetch_all(pool).await? {
+        let item_id: String = row.try_get("item_id")?;
+        if !queued_items.insert(item_id.clone()) {
+            continue;
+        }
+        if let Some(item_facts) = facts.get_mut(&item_id) {
+            item_facts.queued_cloud = true;
+            item_facts.queued_lan = lan_available;
+            item_facts.preparation_error = row.try_get("last_error")?;
+        }
     }
 
     let mut delivery_query = sqlx::QueryBuilder::new(
@@ -508,44 +496,46 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
     delivery_query.push(") AND linked_event.event_kind = ");
     delivery_query.push_bind(SyncEventKind::Content.as_i64());
     delivery_query.push(
-        r#"), candidates AS (
+        r#"),
+        cloud_fallback AS (
             SELECT latest.item_id, target.target_id, target.desired_content,
-                   target.status, target.last_error,
-                   MAX(CASE target.confirmed_content
-                       WHEN 'complete' THEN 2
-                       WHEN 'metadata' THEN 1
-                       ELSE 0
-                   END) OVER (
-                       PARTITION BY latest.item_id, target.target_id
-                   ) AS confirmed_rank,
+                   target.confirmed_content, target.status, target.last_error,
                    ROW_NUMBER() OVER (
-                       PARTITION BY latest.item_id, target.target_id
-                       ORDER BY matching.created_at DESC,
-                                target.updated_at DESC,
-                                matching.event_id DESC
-                   ) AS route_rank
+                       PARTITION BY latest.item_id
+                       ORDER BY CASE target.confirmed_content
+                           WHEN 'complete' THEN 2
+                           WHEN 'metadata' THEN 1
+                           ELSE 0
+                       END DESC,
+                       target.updated_at DESC
+                   ) AS rank
             FROM latest
-            JOIN sync_item_events matching
-              ON matching.item_id = latest.item_id
-             AND (
-                 matching.event_id = latest.event_id
-                 OR (
-                     latest.content_identity IS NOT NULL
-                     AND matching.content_identity = latest.content_identity
-                 )
-             )
-            JOIN sync_delivery_targets target ON target.event_id = matching.event_id
+            JOIN sync_item_events equivalent
+              ON equivalent.item_id = latest.item_id
+             AND latest.content_identity IS NOT NULL
+             AND equivalent.content_identity = latest.content_identity
+             AND equivalent.event_id <> latest.event_id
+            JOIN sync_delivery_targets target
+              ON target.event_id = equivalent.event_id
+             AND target.target_id = 'cloud'
             WHERE latest.rank = 1
+              AND target.confirmed_content <> 'none'
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_delivery_targets current_target
+                  WHERE current_target.event_id = latest.event_id
+                    AND current_target.target_id = 'cloud'
+              )
         )
+        SELECT latest.item_id, target.target_id, target.desired_content,
+               target.confirmed_content, target.status, target.last_error
+        FROM latest
+        JOIN sync_delivery_targets target ON target.event_id = latest.event_id
+        WHERE latest.rank = 1
+        UNION ALL
         SELECT item_id, target_id, desired_content,
-               CASE confirmed_rank
-                   WHEN 2 THEN 'complete'
-                   WHEN 1 THEN 'metadata'
-                   ELSE 'none'
-               END AS confirmed_content,
-               status, last_error
-        FROM candidates
-        WHERE route_rank = 1
+               confirmed_content, status, last_error
+        FROM cloud_fallback
+        WHERE rank = 1
         "#,
     );
     for row in delivery_query.build().fetch_all(pool).await? {

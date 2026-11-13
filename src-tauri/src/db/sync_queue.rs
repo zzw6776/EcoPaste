@@ -113,7 +113,7 @@ pub async fn stage_content(
     Ok(stored_order)
 }
 
-/// Stages an existing item revision as a standalone transaction.
+/// Stages an existing revision and replaces its pending operation when explicitly requested.
 pub async fn stage_existing_content(
     pool: &SqlitePool,
     item_id: &str,
@@ -125,6 +125,18 @@ pub async fn stage_existing_content(
         .begin()
         .await
         .context("begin clipboard content sync staging")?;
+    if options.manual_share {
+        sqlx::query(
+            "DELETE FROM sync_content_outbox \
+             WHERE item_id = ? AND source_revision = ? AND sync_key = ?",
+        )
+        .bind(item_id)
+        .bind(source_revision)
+        .bind(sync_key)
+        .execute(&mut *transaction)
+        .await
+        .context("replace pending content with explicit upload")?;
+    }
     let operation_order = stage_content(
         &mut transaction,
         item_id,
@@ -138,6 +150,21 @@ pub async fn stage_existing_content(
         .await
         .context("commit clipboard content sync staging")?;
     Ok(operation_order)
+}
+
+pub async fn has_pending_content(
+    pool: &SqlitePool,
+    item_id: &str,
+    source_revision: &str,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_content_outbox WHERE item_id = ? AND source_revision = ?)",
+    )
+    .bind(item_id)
+    .bind(source_revision)
+    .fetch_one(pool)
+    .await
+    .context("read pending clipboard content")
 }
 
 /// Returns the earliest due content operation whose key has no earlier pending content operation.

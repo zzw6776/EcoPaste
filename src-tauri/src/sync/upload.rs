@@ -208,6 +208,43 @@ where
     } = spec;
     let mut file = tokio::fs::File::open(source).await?;
     let original_size = file.metadata().await?.len();
+    encrypt_reader(
+        &mut file,
+        original_size,
+        writer,
+        FileEncryptionSpec {
+            expected_encrypted_size,
+            expected_blob_id,
+            key,
+            stream_nonce,
+            idle_timeout,
+            language,
+        },
+        progress,
+    )
+    .await
+}
+
+/// Encrypts an already-open plaintext source without requiring a filesystem path.
+pub(super) async fn encrypt_reader<R, W>(
+    reader: &mut R,
+    original_size: u64,
+    writer: &mut W,
+    spec: FileEncryptionSpec<'_>,
+    progress: &mut UploadProgress,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let FileEncryptionSpec {
+        expected_encrypted_size,
+        expected_blob_id,
+        key,
+        stream_nonce,
+        idle_timeout,
+        language,
+    } = spec;
     if super::crypto::encrypted_blob_size(original_size)? != expected_encrypted_size {
         anyhow::bail!("sync source size changed before upload");
     }
@@ -238,7 +275,7 @@ where
                 idle_timeout,
                 progress.phase,
                 language,
-                file.read_exact(&mut buffer[..length]),
+                reader.read_exact(&mut buffer[..length]),
             )
             .await?;
         }
@@ -248,6 +285,19 @@ where
         if original_size == 0 || remaining == 0 {
             break;
         }
+    }
+    let mut trailing = [0_u8; 1];
+    progress.phase = UploadPhase::ReadFile;
+    if timed(
+        idle_timeout,
+        progress.phase,
+        language,
+        reader.read(&mut trailing),
+    )
+    .await?
+        != 0
+    {
+        anyhow::bail!("sync source size changed before upload");
     }
     progress.phase = UploadPhase::Flush;
     timed(idle_timeout, progress.phase, language, writer.flush()).await?;

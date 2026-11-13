@@ -11,6 +11,12 @@ pub(super) struct BlobUploadTimings {
 }
 
 #[derive(Clone, Copy)]
+pub(super) enum BlobUploadOutcome {
+    AlreadyAvailable,
+    Uploaded,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct BlobDownloadProgress<'a> {
     pub(super) completed_bytes: u64,
     pub(super) handle: &'a super::super::progress::TransferHandle,
@@ -27,6 +33,39 @@ impl BlobDownloadProgress<'_> {
         self.transferred.store(total, Ordering::Release);
         self.handle.transferred(total);
     }
+}
+
+/// Encrypts either a native path or an Android SAF document directly into the active stream.
+pub(super) async fn encrypt_upload_source<W>(
+    source: &str,
+    writer: &mut W,
+    spec: super::super::upload::FileEncryptionSpec<'_>,
+    progress: &mut super::super::upload::UploadProgress,
+) -> Result<String>
+where
+    W: AsyncWrite + Unpin,
+{
+    #[cfg(target_os = "android")]
+    if source.starts_with("content://") {
+        let original_size = super::super::crypto::original_blob_size(spec.expected_encrypted_size)?;
+        let uri = source.to_owned();
+        let file = tauri::async_runtime::spawn_blocking(move || {
+            crate::commands::android::open_android_remote_download_source(&uri)
+        })
+        .await
+        .context("Android upload source task failed")??;
+        let mut file = tokio::fs::File::from_std(file);
+        return super::super::upload::encrypt_reader(
+            &mut file,
+            original_size,
+            writer,
+            spec,
+            progress,
+        )
+        .await;
+    }
+
+    super::super::upload::encrypt_file(Path::new(source), writer, spec, progress).await
 }
 
 #[derive(Clone, Copy)]
@@ -93,12 +132,13 @@ pub(super) async fn upload_blob(
     }
     if let Some(transfer) = &options.transfer {
         match &result {
-            Ok(()) => transfer.completed(blob.size),
+            Ok(BlobUploadOutcome::AlreadyAvailable) => transfer.already_available(blob.size),
+            Ok(BlobUploadOutcome::Uploaded) => transfer.completed(blob.size),
             Err(_) if transfer.canceled() => transfer.mark_canceled(progress.written_bytes),
             Err(error) => transfer.failed(progress.written_bytes, error.to_string()),
         }
     }
-    result
+    result.map(|_| ())
 }
 
 /// A successful bounded control exchange distinguishes one stalled stream from a dead connection.
@@ -131,7 +171,7 @@ pub(super) async fn upload_blob_inner(
     blob: &StoredBlob,
     options: &BlobUploadOptions,
     progress: &mut super::super::upload::UploadProgress,
-) -> Result<()> {
+) -> Result<BlobUploadOutcome> {
     use super::super::upload::{self, UploadPhase};
     let total_started_at = Instant::now();
     let open_started_at = Instant::now();
@@ -231,10 +271,12 @@ pub(super) async fn upload_blob_inner(
                         ..Default::default()
                     },
                 );
-                return Ok(());
+                return Ok(BlobUploadOutcome::AlreadyAvailable);
             }
             Response::BlobReady { .. } => {}
-            Response::Error { message, .. } => bail!(message),
+            Response::Error { code, message } => {
+                return Err(RemoteSyncError { code, message }.into())
+            }
             _ => bail!("invalid blob upload response"),
         }
         if progress.canceled() {
@@ -260,13 +302,12 @@ pub(super) async fn upload_blob_inner(
             let source = blob
                 .source_path
                 .as_deref()
-                .map(Path::new)
                 .context("streaming upload source is unavailable")?;
             let stream_nonce = blob
                 .stream_nonce
                 .as_deref()
                 .context("streaming upload nonce is unavailable")?;
-            upload::encrypt_file(
+            encrypt_upload_source(
                 source,
                 &mut send,
                 upload::FileEncryptionSpec {
@@ -330,9 +371,9 @@ pub(super) async fn upload_blob_inner(
                         total: total_started_at.elapsed(),
                     },
                 );
-                Ok(())
+                Ok(BlobUploadOutcome::Uploaded)
             }
-            Response::Error { message, .. } => bail!(message),
+            Response::Error { code, message } => Err(RemoteSyncError { code, message }.into()),
             _ => bail!("invalid blob stored response"),
         }
     }
@@ -419,8 +460,8 @@ pub(super) fn mark_optional_source_icon_refs(events: &mut [StoredSyncEvent], key
     }
 }
 
-/// Makes oversized file payloads optional for the Hub while retaining their encrypted metadata.
-pub(super) fn mark_deferred_file_blob_refs(
+/// Publishes encrypted metadata while its image or file payload is still being transferred.
+pub(super) fn mark_metadata_only_blob_refs(
     events: &mut [StoredSyncEvent],
     key: &[u8; 32],
     deferred_event_ids: &HashSet<String>,
@@ -432,20 +473,45 @@ pub(super) fn mark_deferred_file_blob_refs(
         let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
             continue;
         };
-        let file_blob_ids = envelope
+        let content_blob_ids = envelope
             .blobs
             .iter()
-            .filter(|blob| blob.role == BlobRole::File)
             .map(|blob| blob.blob_id.as_str())
             .collect::<HashSet<_>>();
         for blob_id in &stored.event.blob_ids {
-            if file_blob_ids.contains(blob_id.as_str())
+            if content_blob_ids.contains(blob_id.as_str())
                 && !stored.event.optional_blob_ids.contains(blob_id)
             {
                 stored.event.optional_blob_ids.push(blob_id.clone());
             }
         }
     }
+}
+
+/// Reads content availability independently of optional source app assets.
+pub(super) fn metadata_only_content_event_ids(
+    events: &[EncryptedEvent],
+    key: &[u8; 32],
+) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let envelope = crypto::decrypt_event(key, event).ok()?;
+            let content_blob_ids = envelope
+                .blobs
+                .iter()
+                .map(|blob| blob.blob_id.as_str())
+                .collect::<HashSet<_>>();
+            (!content_blob_ids.is_empty()
+                && content_blob_ids.iter().all(|blob_id| {
+                    event
+                        .optional_blob_ids
+                        .iter()
+                        .any(|value| value.as_str() == *blob_id)
+                }))
+            .then(|| event.event_id.clone())
+        })
+        .collect()
 }
 
 /// Uploads independent encrypted blobs over a small number of parallel QUIC streams.

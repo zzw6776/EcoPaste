@@ -1,8 +1,67 @@
-//! Central policy for deciding whether a route receives metadata or complete file content.
+//! Central policy for automatic routes, manual actions and file-content limits.
 
-use super::model::ClipboardEnvelope;
-#[cfg(any(target_os = "android", test))]
-use super::SyncTarget;
+use super::model::{
+    ClipboardEnvelope, SyncContentAvailability, SyncItemAction, SyncItemActivity, SyncItemOrigin,
+    SyncLocalContentState, SyncTarget,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChannelActionContext {
+    pub origin: SyncItemOrigin,
+    pub local_state: SyncLocalContentState,
+    pub target: SyncTarget,
+    pub target_available: bool,
+    pub activity: SyncItemActivity,
+    pub availability: SyncContentAvailability,
+    pub remote_file_available: bool,
+    pub needs_complete_delivery: bool,
+}
+
+/// Resolves the only user action exposed by one card channel.
+pub(super) fn channel_action(context: ChannelActionContext) -> SyncItemAction {
+    if context.activity == SyncItemActivity::Error {
+        return if context.target_available {
+            SyncItemAction::Retry
+        } else {
+            SyncItemAction::None
+        };
+    }
+    if context.activity != SyncItemActivity::Idle {
+        return SyncItemAction::None;
+    }
+    let local_content_available = matches!(
+        context.local_state,
+        SyncLocalContentState::Managed | SyncLocalContentState::External
+    );
+
+    if context.origin == SyncItemOrigin::Remote {
+        if context.target == SyncTarget::Cloud
+            && context.target_available
+            && local_content_available
+            && context.availability != SyncContentAvailability::Complete
+        {
+            return SyncItemAction::Upload;
+        }
+        if context.remote_file_available
+            && matches!(
+                context.availability,
+                SyncContentAvailability::Complete | SyncContentAvailability::Partial
+            )
+        {
+            return SyncItemAction::Download;
+        }
+        return SyncItemAction::None;
+    }
+
+    if !local_content_available || !context.target_available {
+        return SyncItemAction::None;
+    }
+    if context.needs_complete_delivery || context.availability != SyncContentAvailability::Complete
+    {
+        return SyncItemAction::Upload;
+    }
+    SyncItemAction::None
+}
 
 /// Uses binary MiB consistently for every upload entry point.
 pub(crate) fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> bool {

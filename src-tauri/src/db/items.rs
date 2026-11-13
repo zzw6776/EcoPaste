@@ -55,7 +55,7 @@ macro_rules! evictable_history {
             SELECT 1 FROM sync_item_events links
             JOIN sync_delivery_targets delivery ON delivery.event_id = links.event_id
             WHERE links.item_id = clipboard_items.id
-              AND delivery.status = 'pending'
+              AND delivery.status IN ('pending', 'awaiting_receipt')
               AND julianday(delivery.updated_at) > julianday('now', '-24 hours')
         ) AND NOT EXISTS (
             SELECT 1

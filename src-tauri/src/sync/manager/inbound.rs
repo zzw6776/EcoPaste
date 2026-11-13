@@ -8,53 +8,60 @@ impl SyncManager {
         pool: &SqlitePool,
         group: &GroupSecrets,
     ) -> Result<bool> {
-        let after_cursor = repository::cloud_availability_cursor(pool).await?;
-        let response = call_cloud(
-            connection,
-            Request::SyncCloudAvailability {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                after_cursor,
-                limit: MAX_EVENTS_PER_BATCH,
-            },
-            crate::i18n::current_language(&self.app),
-        )
-        .await?;
-        let Response::CloudAvailabilitySynced {
-            updates,
-            latest_cursor,
-            has_more,
-        } = response
-        else {
-            if let Response::Error { message, .. } = response {
-                bail!(message);
-            }
-            bail!("云端返回了无效的内容可用性响应");
-        };
-        let event_ids = updates
-            .iter()
-            .map(|update| update.event_id.clone())
-            .collect::<Vec<_>>();
-        let events = repository::events_by_ids(pool, &event_ids)
-            .await?
-            .into_iter()
-            .map(|stored| (stored.event.event_id.clone(), stored.event))
-            .collect::<HashMap<_, _>>();
-        let key = group.content_key_bytes()?;
-        let availability = updates
-            .iter()
-            .filter_map(|update| {
-                events.get(&update.event_id).and_then(|event| {
-                    cloud_event_content_availability(event, &update.available_blob_ids, &key)
-                        .map(|state| (update.event_id.clone(), state))
+        let mut changed = false;
+        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            let after_cursor = repository::cloud_availability_cursor(pool).await?;
+            let response = call_cloud(
+                connection,
+                Request::SyncCloudAvailability {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    after_cursor,
+                    limit: MAX_EVENTS_PER_BATCH,
+                },
+                crate::i18n::current_language(&self.app),
+            )
+            .await?;
+            let Response::CloudAvailabilitySynced {
+                updates,
+                latest_cursor,
+                has_more,
+            } = response
+            else {
+                if let Response::Error { message, .. } = response {
+                    bail!(message);
+                }
+                bail!("云端返回了无效的内容可用性响应");
+            };
+            let event_ids = updates
+                .iter()
+                .map(|update| update.event_id.clone())
+                .collect::<Vec<_>>();
+            let events = repository::events_by_ids(pool, &event_ids)
+                .await?
+                .into_iter()
+                .map(|stored| (stored.event.event_id.clone(), stored.event))
+                .collect::<HashMap<_, _>>();
+            let key = group.content_key_bytes()?;
+            let availability = updates
+                .iter()
+                .filter_map(|update| {
+                    events.get(&update.event_id).and_then(|event| {
+                        cloud_event_content_availability(event, &update.available_blob_ids, &key)
+                            .map(|state| (update.event_id.clone(), state))
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        repository::record_cloud_availability_batch(pool, &availability, latest_cursor).await?;
-        if !availability.is_empty() {
-            self.emit_updated();
+                .collect::<Vec<_>>();
+            repository::record_cloud_availability_batch(pool, &availability, latest_cursor).await?;
+            changed |= !availability.is_empty();
+            if !has_more {
+                if changed {
+                    self.emit_updated();
+                }
+                return Ok(false);
+            }
         }
-        Ok(has_more)
+        Ok(true)
     }
 
     /// Stores one authenticated remote batch and applies all currently eligible events.
@@ -77,8 +84,8 @@ impl SyncManager {
             .into_iter()
             .filter(|received| !removed_peers.contains(&received.event.origin_device_id))
             .collect::<Vec<_>>();
+        let key = group.content_key_bytes()?;
         let cloud_availability = if source.is_cloud() {
-            let key = group.content_key_bytes()?;
             events
                 .iter()
                 .filter_map(|received| {
@@ -93,13 +100,15 @@ impl SyncManager {
             .into_iter()
             .map(|received| received.event)
             .collect::<Vec<_>>();
-        let stored = repository::store_remote_batch_with_availability(
+        let metadata_only_event_ids = metadata_only_content_event_ids(&encrypted_events, &key);
+        let stored = repository::store_remote_batch_with_content_policy(
             pool,
             source.remote_batch_source(),
             Some(latest_cursor),
             &encrypted_events,
             device_id,
             &cloud_availability,
+            &metadata_only_event_ids,
         )
         .await?;
         for (event_id, origin_device_id) in stored.conflicts {
@@ -122,6 +131,15 @@ impl SyncManager {
             self.wake_lan_transfer();
         }
         Ok(content_has_more)
+    }
+
+    /// Persists one card's retry without treating its application failure as a session failure.
+    async fn defer_card_apply(&self, pool: &SqlitePool, event_id: &str, error: &str) -> Result<()> {
+        log::warn!("defer synchronized card: eventId={event_id} error={error}");
+        let delay = repository::mark_apply_failed(pool, event_id, error).await?;
+        self.schedule_transfer_wake(delay);
+        self.emit_updated();
+        Ok(())
     }
 
     /// Replays state before content so a later tombstone suppresses content even across pages.
@@ -215,10 +233,17 @@ impl SyncManager {
 
         // Replaying still-unapplied content makes a download/apply interruption recoverable even
         // when the Hub no longer returns the duplicate event.
-        let pending_apply = repository::unapplied_events_by_kind(
+        let pending_apply = repository::unapplied_content_events_for_target(
             pool,
-            SyncEventKind::Content,
+            source.delivery_target(),
             MAX_EVENTS_PER_BATCH,
+        )
+        .await?;
+        let complete_content_source_event_ids = repository::event_ids_with_complete_content_source(
+            pool,
+            &pending_apply,
+            source.delivery_target(),
+            source.is_cloud(),
         )
         .await?;
         let mut pending_content = Vec::new();
@@ -264,132 +289,139 @@ impl SyncManager {
             .history
             .max_storage_bytes;
         for (event, envelope) in pending_content {
-            let presence = SyncedItemStatePatch {
-                sync_key: envelope.item.sync_key.clone(),
-                is_favorite: None,
-                is_pinned: None,
-                note: None,
-                note_changed: false,
-                is_present: Some(true),
-            };
-            let _resource_guard = crate::clipboard::shared_files::lock().await;
-            let outcome = match db::sync_item_state::apply_remote_patch(
-                pool,
-                &presence,
-                &db::sync_item_state::SyncEventVersion {
-                    origin_sequence: event.origin_sequence,
-                    origin_device_id: event.origin_device_id.clone(),
-                },
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    log::warn!(
-                        "defer synchronized content presence {}: {error:#}",
-                        event.event_id
-                    );
-                    let delay =
-                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
-                            .await?;
-                    self.schedule_transfer_wake(delay);
-                    continue;
-                }
-            };
-
-            if !outcome.image_files.is_empty() {
-                let store = self.app.state::<ImageStore>();
-                if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
-                    pool,
-                    store.inner(),
-                    &outcome.image_files,
-                )
-                .await
-                {
-                    log::warn!(
-                        "reclaim deleted synchronized images after content presence failed: {error:#}"
-                    );
-                }
-            }
-            if outcome.canonical_presence == Some(false) {
-                if outcome.deleted {
-                    self.emit_clipboard_reconciled();
-                    #[cfg(target_os = "android")]
-                    crate::commands::android::notify_overlay_clipboard_changed();
-                }
-                if let Err(error) = crate::clipboard::shared_files::cleanup_resources_locked(
-                    pool,
-                    resources.clone(),
-                )
-                .await
-                {
-                    log::warn!(
-                        "reclaim deleted synchronized files after content presence failed: {error:#}"
-                    );
-                }
-                repository::mark_applied(pool, &event.event_id).await?;
-                made_content_progress = true;
-                continue;
-            }
-
-            let source_revision = envelope
-                .item
-                .source_revision
-                .as_deref()
-                .unwrap_or(&event.event_id);
-            let local_file_available = envelope.item.kind == "files"
-                && available_materialized_file_item(
-                    pool,
-                    &resources,
-                    &envelope.item.sync_key,
-                    source_revision,
-                    envelope.content_identity.as_deref(),
-                )
-                .await?
-                .is_some();
-            if local_file_available {
-                deduplicated_content.push((event, envelope));
-            } else if should_defer_remote_file_download(
-                &envelope,
-                sync_settings.auto_download_max_mb,
-                local_storage_limit_bytes,
-            ) {
-                metadata_only_content.push((event, envelope));
-            } else {
-                let item_id = if envelope.item.kind == "files" {
-                    let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-                    let (item_id, _, _) = self
-                        .materialize_remote_file_metadata_card(
-                            pool,
-                            &event,
-                            envelope.clone(),
-                            group,
-                        )
-                        .await?;
-                    source_assets_pending |= source_icon.is_some();
-                    Some(item_id)
-                } else {
-                    None
+            let event_id = event.event_id.clone();
+            let preparation: Result<()> = async {
+                let presence = SyncedItemStatePatch {
+                    sync_key: envelope.item.sync_key.clone(),
+                    is_favorite: None,
+                    is_pinned: None,
+                    note: None,
+                    note_changed: false,
+                    is_present: Some(true),
                 };
-                ready_content.push((event, envelope, item_id));
+                let _resource_guard = crate::clipboard::shared_files::lock().await;
+                let outcome = db::sync_item_state::apply_remote_patch(
+                    pool,
+                    &presence,
+                    &db::sync_item_state::SyncEventVersion {
+                        origin_sequence: event.origin_sequence,
+                        origin_device_id: event.origin_device_id.clone(),
+                    },
+                )
+                .await?;
+
+                if !outcome.image_files.is_empty() {
+                    let store = self.app.state::<ImageStore>();
+                    if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
+                        pool,
+                        store.inner(),
+                        &outcome.image_files,
+                    )
+                    .await
+                    {
+                        log::warn!(
+                            "reclaim deleted synchronized images after content presence failed: {error:#}"
+                        );
+                    }
+                }
+                if outcome.canonical_presence == Some(false) {
+                    if outcome.deleted {
+                        self.emit_clipboard_reconciled();
+                        #[cfg(target_os = "android")]
+                        crate::commands::android::notify_overlay_clipboard_changed();
+                    }
+                    if let Err(error) = crate::clipboard::shared_files::cleanup_resources_locked(
+                        pool,
+                        resources.clone(),
+                    )
+                    .await
+                    {
+                        log::warn!(
+                            "reclaim deleted synchronized files after content presence failed: {error:#}"
+                        );
+                    }
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    made_content_progress = true;
+                    return Ok(());
+                }
+
+                let source_revision = envelope
+                    .item
+                    .source_revision
+                    .as_deref()
+                    .unwrap_or(&event.event_id);
+                if envelope.item.kind != "files"
+                    && !envelope.blobs.is_empty()
+                    && !complete_content_source_event_ids.contains(&event.event_id)
+                {
+                    return Ok(());
+                }
+                let local_file_available = envelope.item.kind == "files"
+                    && available_materialized_file_item(
+                        pool,
+                        &resources,
+                        &envelope.item.sync_key,
+                        source_revision,
+                        envelope.content_identity.as_deref(),
+                    )
+                    .await?
+                    .is_some();
+                if local_file_available {
+                    deduplicated_content.push((event, envelope));
+                } else if envelope.item.kind == "files"
+                    && (!complete_content_source_event_ids.contains(&event.event_id)
+                        || should_defer_remote_file_download(
+                            &envelope,
+                            sync_settings.auto_download_max_mb,
+                            local_storage_limit_bytes,
+                        ))
+                {
+                    metadata_only_content.push((event, envelope));
+                } else {
+                    let item_id = if envelope.item.kind == "files" {
+                        let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
+                        let (item_id, _, _) = self
+                            .materialize_remote_file_metadata_card(
+                                pool,
+                                &event,
+                                envelope.clone(),
+                                group,
+                            )
+                            .await?;
+                        source_assets_pending |= source_icon.is_some();
+                        Some(item_id)
+                    } else {
+                        None
+                    };
+                    ready_content.push((event, envelope, item_id));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = preparation {
+                self.defer_card_apply(pool, &event_id, &error.to_string())
+                    .await?;
             }
         }
 
         for (event, envelope) in metadata_only_content {
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            match self
-                .materialize_remote_file_metadata_card(pool, &event, envelope, group)
-                .await
-            {
-                Ok(_) => {
-                    repository::record_inbound_outcome(
-                        pool,
-                        source.remote_batch_source(),
-                        &event.event_id,
-                        repository::InboundContentOutcome::Metadata,
-                    )
+            let applied: Result<()> = async {
+                self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
                     .await?;
-                    repository::mark_applied(pool, &event.event_id).await?;
+                repository::record_inbound_outcome(
+                    pool,
+                    source.remote_batch_source(),
+                    &event.event_id,
+                    repository::InboundContentOutcome::Metadata,
+                )
+                .await?;
+                repository::mark_applied(pool, &event.event_id).await?;
+                Ok(())
+            }
+            .await;
+            match applied {
+                Ok(()) => {
                     made_content_progress = true;
                     source_assets_pending |= source_icon.is_some();
                     #[cfg(target_os = "android")]
@@ -398,33 +430,30 @@ impl SyncManager {
                     }
                 }
                 Err(error) => {
-                    log::warn!(
-                        "defer metadata-only sync content event {}: {error:#}",
-                        event.event_id
-                    );
-                    let delay =
-                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
-                            .await?;
-                    self.schedule_transfer_wake(delay);
+                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
+                        .await?;
                 }
             }
         }
 
         for (event, envelope) in deduplicated_content {
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            match self
-                .materialize_remote_file_metadata_card(pool, &event, envelope, group)
-                .await
-            {
-                Ok(_) => {
-                    repository::record_inbound_outcome(
-                        pool,
-                        source.remote_batch_source(),
-                        &event.event_id,
-                        repository::InboundContentOutcome::Deduplicated,
-                    )
+            let applied: Result<()> = async {
+                self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
                     .await?;
-                    repository::mark_applied(pool, &event.event_id).await?;
+                repository::record_inbound_outcome(
+                    pool,
+                    source.remote_batch_source(),
+                    &event.event_id,
+                    repository::InboundContentOutcome::Deduplicated,
+                )
+                .await?;
+                repository::mark_applied(pool, &event.event_id).await?;
+                Ok(())
+            }
+            .await;
+            match applied {
+                Ok(()) => {
                     made_content_progress = true;
                     source_assets_pending |= source_icon.is_some();
                     #[cfg(target_os = "android")]
@@ -433,14 +462,8 @@ impl SyncManager {
                     }
                 }
                 Err(error) => {
-                    log::warn!(
-                        "defer deduplicated sync content event {}: {error:#}",
-                        event.event_id
-                    );
-                    let delay =
-                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
-                            .await?;
-                    self.schedule_transfer_wake(delay);
+                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
+                        .await?;
                 }
             }
         }
@@ -470,6 +493,7 @@ impl SyncManager {
                         let handle = self.delivery.start(super::super::progress::TransferTask {
                             id: blake3::hash(task_key.as_bytes()).to_hex().to_string(),
                             revision: 0,
+                            started_at_ms: chrono::Utc::now().timestamp_millis(),
                             operation_id: event.event_id.clone(),
                             item_id,
                             direction: super::super::progress::TransferDirection::Download,
@@ -584,41 +608,48 @@ impl SyncManager {
                     }
                     continue;
                 }
-                let delay = repository::mark_apply_failed(pool, &event.event_id, &error).await?;
-                self.schedule_transfer_wake(delay);
+                self.defer_card_apply(pool, &event.event_id, &error).await?;
                 continue;
             }
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
             let manifests = envelope.blobs.clone();
             let content_identity = envelope.content_identity.clone();
-            match self.apply_envelope(&event, envelope, group).await {
-                Ok((item_id, item, fingerprint, deduplicated)) => {
-                    if !item_id.is_empty() {
-                        let sources = self
-                            .materialized_blob_sources(&item, &manifests, &stored_blobs)
-                            .await?;
-                        repository::register_event_blob_sources(pool, &event.event_id, &sources)
-                            .await?;
-                        repository::link_content_event_to_item(
-                            pool,
-                            &item_id,
-                            &event.event_id,
-                            "remote",
-                            content_identity.as_deref(),
-                        )
+            let applied: Result<_> = async {
+                let (item_id, item, fingerprint, deduplicated) =
+                    self.apply_envelope(&event, envelope, group).await?;
+                if !item_id.is_empty() {
+                    let sources = self
+                        .materialized_blob_sources(&item, &manifests, &stored_blobs)
                         .await?;
-                        self.reconcile_item_timestamps(pool, group, &item_id)
-                            .await?;
-                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
-                    }
-                    repository::record_inbound_outcome(
+                    repository::register_event_blob_sources(pool, &event.event_id, &sources)
+                        .await?;
+                    repository::link_content_event_to_item(
                         pool,
-                        source.remote_batch_source(),
+                        &item_id,
                         &event.event_id,
-                        repository::InboundContentOutcome::Received,
+                        "remote",
+                        content_identity.as_deref(),
                     )
                     .await?;
-                    repository::mark_applied(pool, &event.event_id).await?;
+                    self.reconcile_item_timestamps(pool, group, &item_id)
+                        .await?;
+                }
+                repository::record_inbound_outcome(
+                    pool,
+                    source.remote_batch_source(),
+                    &event.event_id,
+                    repository::InboundContentOutcome::Received,
+                )
+                .await?;
+                repository::mark_applied(pool, &event.event_id).await?;
+                Ok((item_id, item, fingerprint, deduplicated))
+            }
+            .await;
+            match applied {
+                Ok((item_id, item, fingerprint, deduplicated)) => {
+                    if !item_id.is_empty() {
+                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
+                    }
                     if let Some((handle, total_bytes, _)) = &download {
                         handle.completed(*total_bytes);
                     }
@@ -638,14 +669,8 @@ impl SyncManager {
                     if let Some((handle, total_bytes, _)) = &download {
                         handle.failed(*total_bytes, error.to_string());
                     }
-                    log::warn!(
-                        "defer unapplyable sync content event {}: {error:#}",
-                        event.event_id
-                    );
-                    let delay =
-                        repository::mark_apply_failed(pool, &event.event_id, &error.to_string())
-                            .await?;
-                    self.schedule_transfer_wake(delay);
+                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
+                        .await?;
                 }
             }
         }
@@ -691,7 +716,7 @@ impl SyncManager {
             self.runtime_state.source_asset_wake.notify_one();
         }
         Ok(made_content_progress
-            && repository::has_unapplied_events_by_kind(pool, SyncEventKind::Content).await?)
+            && repository::has_unapplied_content_for_target(pool, source.delivery_target()).await?)
     }
 
     /// Maps a materialized item back to its plaintext sources for future task-scoped staging.
@@ -1337,7 +1362,6 @@ fn cloud_event_content_availability(
     let complete = envelope
         .blobs
         .iter()
-        .filter(|blob| matches!(blob.role, BlobRole::Image | BlobRole::File))
         .all(|blob| available_blob_ids.contains(blob.blob_id.as_str()));
     Some(if complete {
         repository::RouteContentAvailability::Complete

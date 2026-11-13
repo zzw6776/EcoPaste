@@ -5,6 +5,7 @@ import { TAURI_EVENT } from "@/constants/events";
 import {
   getClipboardTransferRevision,
   getClipboardTransferTasks,
+  removeClipboardTransferTasks,
   replaceClipboardTransferSnapshot,
   subscribeClipboardTransferTasks,
   updateClipboardTransferTask,
@@ -42,6 +43,10 @@ export function useSyncTransferActivity() {
 
   useTauriListen<TransferTask>(TAURI_EVENT.SYNC_TRANSFER_UPDATED, (event) => {
     updateClipboardTransferTask(event.payload);
+  });
+
+  useTauriListen<string[]>(TAURI_EVENT.SYNC_TRANSFER_REMOVED, (event) => {
+    removeClipboardTransferTasks(event.payload);
   });
 
   useMount(() => {

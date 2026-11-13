@@ -1,8 +1,14 @@
 import type { TransferPhase, TransferTask } from "@/commands";
 
-const terminalPhases: TransferPhase[] = ["completed", "failed", "canceled"];
+const terminalPhases: TransferPhase[] = [
+  "available",
+  "completed",
+  "failed",
+  "canceled",
+];
 
 export function isTransferActive(task: TransferTask) {
+  if (task.target === "import" && task.phase === "queued") return false;
   return !terminalPhases.includes(task.phase);
 }
 
@@ -31,6 +37,9 @@ export function sortTransferTasksForDisplay(tasks: TransferTask[]) {
     const leftActive = isTransferActive(left);
     const rightActive = isTransferActive(right);
     if (leftActive !== rightActive) return leftActive ? -1 : 1;
+    if (leftActive && left.startedAtMs !== right.startedAtMs) {
+      return right.startedAtMs - left.startedAtMs;
+    }
     if (left.revision === right.revision) return 0;
     return left.revision > right.revision ? -1 : 1;
   });

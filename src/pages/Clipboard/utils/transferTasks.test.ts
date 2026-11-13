@@ -22,6 +22,7 @@ function transferTask(overrides: Partial<TransferTask>): TransferTask {
     revision: 1,
     route: "cloud",
     speedBytesPerSecond: 10,
+    startedAtMs: 1_794_542_016_000,
     target: "cloud",
     totalBytes: 100,
     transferredBytes: 40,

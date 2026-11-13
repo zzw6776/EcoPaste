@@ -607,8 +607,13 @@ pub(crate) async fn receive(
                             .context("update imported shared file size")?;
                         let delivery_route = shared_delivery_route(
                             &item,
-                            sync_settings.auto_upload_max_mb,
-                            lan_connected,
+                            app.state::<crate::settings::SettingsStore>()
+                                .snapshot()
+                                .sync
+                                .auto_upload_max_mb,
+                            manager
+                                .as_ref()
+                                .is_some_and(|manager| manager.has_connected_lan_peer()),
                         );
                         let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
                             |(manager, task_id)| manager.shared_file_import_canceled(task_id),

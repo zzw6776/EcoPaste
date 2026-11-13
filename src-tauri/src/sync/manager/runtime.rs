@@ -222,7 +222,7 @@ impl SyncManager {
                             true,
                         );
                     } else {
-                        let pending = repository::pending_origin_events_for_target(
+                        let pending = repository::pending_cloud_events_for_target(
                             &pool,
                             CLOUD_TARGET,
                             &identity.device_id,
@@ -387,13 +387,17 @@ impl SyncManager {
                 let message = error.to_string();
                 let connection_failed =
                     is_lan_attempt_timeout(&error) || connection.close_reason().is_some();
-                if self.invalidate_lan_connection(&device_id, connection.stable_id()) {
+                let invalidate = connection_failed || is_shared_sync_failure(&connection, &error);
+                if invalidate && self.invalidate_lan_connection(&device_id, connection.stable_id())
+                {
                     connection.close(0_u32.into(), b"LAN connection invalidated");
                     if connection_failed {
                         repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
                     } else {
                         repository::mark_peer_error(&pool, &device_id, &message).await?;
                     }
+                } else if !invalidate {
+                    repository::mark_peer_error(&pool, &device_id, &message).await?;
                 }
                 if connection_failed {
                     Ok(LanPeerSyncOutcome::ConnectionFailed(message))
@@ -798,7 +802,7 @@ impl SyncManager {
         own_device_id: &str,
         own_endpoint_id: &str,
     ) -> Result<()> {
-        repository::merge_removed_devices(pool, &devices).await?;
+        let changed = repository::merge_removed_devices(pool, &devices).await?;
         let removed_self = repository::removed_devices(pool)
             .await?
             .iter()
@@ -807,7 +811,9 @@ impl SyncManager {
                     && (device.device_id == own_device_id || device.endpoint_id == own_endpoint_id)
             });
         // Membership history is not evidence that a LAN route is currently reachable.
-        self.emit_updated();
+        if changed {
+            self.emit_updated();
+        }
         if removed_self {
             self.leave_after_removal(pool).await?;
             bail!("本设备已被移出同步空间");

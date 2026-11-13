@@ -117,6 +117,7 @@ impl SyncManager {
         let task = super::super::progress::TransferTask {
             id: task_id,
             revision: 0,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
             operation_id: stored.event.event_id.clone(),
             item_id: item_id.clone(),
             direction: super::super::progress::TransferDirection::Download,

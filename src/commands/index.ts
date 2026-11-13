@@ -195,6 +195,7 @@ export type TransferPhase =
   | "connecting"
   | "transferring"
   | "confirming"
+  | "available"
   | "completed"
   | "failed"
   | "canceled";
@@ -202,6 +203,7 @@ export type TransferPhase =
 export interface TransferTask {
   id: string;
   revision: number;
+  startedAtMs: number;
   operationId: string;
   itemId: string;
   direction: TransferDirection;
@@ -539,6 +541,13 @@ export const listSyncTransfers = async () => {
   return call<TransferTask[]>(
     TAURI_COMMAND.LIST_SYNC_TRANSFERS,
     "commands:labels.listSyncTransfers",
+  );
+};
+
+export const clearFinishedSyncTransfers = async () => {
+  return call<void>(
+    TAURI_COMMAND.CLEAR_FINISHED_SYNC_TRANSFERS,
+    "commands:labels.clearFinishedSyncTransfers",
   );
 };
 

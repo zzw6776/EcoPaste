@@ -81,6 +81,19 @@ export function updateClipboardTransferTask(task: TransferTask) {
   commitTransferTasks(next, affectedItems);
 }
 
+/** 同步 Rust 删除的传输历史，并使删除前发出的快照失效。 */
+export function removeClipboardTransferTasks(taskIds: string[]) {
+  if (taskIds.length === 0) return;
+
+  transferRevision += 1;
+  const next = new Map(transferTasks);
+  for (const taskId of taskIds) next.delete(taskId);
+  if (next.size === transferTasks.size) return;
+
+  const affectedItems = getChangedTransferItemIds(transferTasks, next);
+  commitTransferTasks(next, affectedItems);
+}
+
 /** 仅在请求期间没有实时事件时，用 Rust 权威快照完整替换本地投影。 */
 export function replaceClipboardTransferSnapshot(
   snapshot: TransferTask[],
