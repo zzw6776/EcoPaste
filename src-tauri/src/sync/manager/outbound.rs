@@ -1,5 +1,39 @@
 use super::*;
 
+#[derive(Clone)]
+enum FileUploadLocation {
+    Path(PathBuf),
+    #[cfg(target_os = "android")]
+    AndroidUri(String),
+}
+
+#[derive(Clone)]
+struct FileUploadSource {
+    location: FileUploadLocation,
+    name: String,
+    is_directory: bool,
+    #[cfg(target_os = "android")]
+    expected_size: Option<u64>,
+}
+
+impl FileUploadSource {
+    fn locator(&self) -> String {
+        match &self.location {
+            FileUploadLocation::Path(path) => path.to_string_lossy().into_owned(),
+            #[cfg(target_os = "android")]
+            FileUploadLocation::AndroidUri(uri) => uri.clone(),
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match &self.location {
+            FileUploadLocation::Path(path) => Some(path),
+            #[cfg(target_os = "android")]
+            FileUploadLocation::AndroidUri(_) => None,
+        }
+    }
+}
+
 impl SyncManager {
     /// Materializes durable local operations while keeping blob work inside an active connection.
     pub(super) async fn materialize_local_operations(
@@ -99,6 +133,7 @@ impl SyncManager {
                                 retry_delay.num_seconds(),
                             );
                             self.schedule_transfer_wake(retry_delay);
+                            self.emit_updated();
                         }
                     }
                     if materialized_content >= max_content {
@@ -290,6 +325,7 @@ impl SyncManager {
         )
         .await?;
         preparation_guard.commit();
+        self.delivery.complete_local_import_for_item(&item.id);
         let observation = self
             .pending_observations
             .lock()
@@ -317,6 +353,178 @@ impl SyncManager {
             .lock()
             .expect("pending clipboard observations poisoned")
             .remove(&(item_id.to_owned(), source_revision.to_owned()));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn file_upload_sources(
+        &self,
+        pool: &SqlitePool,
+        item: &ClipboardItem,
+        resources: &Path,
+    ) -> Result<Vec<FileUploadSource>> {
+        if item.remote_file_state.is_none() {
+            let paths = item
+                .content
+                .lines()
+                .filter(|value| !value.is_empty())
+                .map(|value| crate::clipboard::shared_files::resolve_path(resources, value))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(paths
+                .into_iter()
+                .map(|path| FileUploadSource {
+                    name: safe_file_name(&path),
+                    is_directory: path.is_dir(),
+                    location: FileUploadLocation::Path(path),
+                })
+                .collect());
+        }
+
+        let unavailable = crate::i18n::commands::label(
+            crate::i18n::current_language(&self.app),
+            crate::i18n::commands::Key::RemoteFileNotDownloaded,
+        );
+        let session = repository::external_download_sessions(pool, std::slice::from_ref(&item.id))
+            .await?
+            .into_iter()
+            .next()
+            .context(unavailable)?;
+        let mut sources = Vec::with_capacity(session.targets.len());
+        for target in session.targets {
+            if target.destination_kind != "path"
+                || !super::external_download_target_available(&target).await
+            {
+                bail!("{unavailable}");
+            }
+            let path = PathBuf::from(target.destination);
+            sources.push(FileUploadSource {
+                name: safe_file_name(&path),
+                is_directory: target.is_directory,
+                location: FileUploadLocation::Path(path),
+            });
+        }
+        Ok(sources)
+    }
+
+    #[cfg(target_os = "android")]
+    async fn file_upload_sources(
+        &self,
+        pool: &SqlitePool,
+        item: &ClipboardItem,
+        resources: &Path,
+    ) -> Result<Vec<FileUploadSource>> {
+        if item.remote_file_state.is_none() {
+            let paths = item
+                .content
+                .lines()
+                .filter(|value| !value.is_empty())
+                .map(|value| crate::clipboard::shared_files::resolve_path(resources, value))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(paths
+                .into_iter()
+                .map(|path| FileUploadSource {
+                    name: safe_file_name(&path),
+                    is_directory: path.is_dir(),
+                    location: FileUploadLocation::Path(path),
+                    expected_size: None,
+                })
+                .collect());
+        }
+
+        let unavailable = crate::i18n::commands::label(
+            crate::i18n::current_language(&self.app),
+            crate::i18n::commands::Key::RemoteFileNotDownloaded,
+        );
+        let names = item
+            .content
+            .lines()
+            .filter(|value| !value.is_empty())
+            .map(sanitize_name)
+            .collect::<Vec<_>>();
+        let session = repository::external_download_sessions(pool, std::slice::from_ref(&item.id))
+            .await?
+            .into_iter()
+            .next()
+            .context(unavailable)?;
+        if names.len() != session.targets.len() {
+            bail!("{unavailable}");
+        }
+        let mut sources = Vec::with_capacity(session.targets.len());
+        for (name, target) in names.into_iter().zip(session.targets) {
+            if target.destination_kind != "uri"
+                || target.is_directory
+                || !super::external_download_target_available(&target).await
+            {
+                bail!("{unavailable}");
+            }
+            sources.push(FileUploadSource {
+                location: FileUploadLocation::AndroidUri(target.destination),
+                name,
+                is_directory: false,
+                expected_size: Some(target.expected_size),
+            });
+        }
+        Ok(sources)
+    }
+
+    async fn fingerprint_upload_source(
+        &self,
+        source: &FileUploadSource,
+        preparation: Option<&PreparationProgress>,
+        progress_base: u64,
+    ) -> Result<(u64, String)> {
+        let preparation = preparation.cloned();
+        match &source.location {
+            FileUploadLocation::Path(path) => {
+                let path = path.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let size = path.metadata()?.len();
+                    let content_hash = crypto::hash_file_with_progress(
+                        &path,
+                        || {
+                            preparation
+                                .as_ref()
+                                .is_some_and(|progress| progress.handle.canceled())
+                        },
+                        |processed| {
+                            if let Some(progress) = &preparation {
+                                progress.report(progress_base.saturating_add(processed));
+                            }
+                        },
+                    )?;
+                    Ok::<_, anyhow::Error>((size, content_hash))
+                })
+                .await
+                .context("file hashing task failed")?
+            }
+            #[cfg(target_os = "android")]
+            FileUploadLocation::AndroidUri(uri) => {
+                let uri = uri.clone();
+                let expected_size = source.expected_size;
+                tauri::async_runtime::spawn_blocking(move || {
+                    let mut file =
+                        crate::commands::android::open_android_remote_download_source(&uri)?;
+                    let (size, content_hash) = crypto::fingerprint_reader_with_progress(
+                        &mut file,
+                        || {
+                            preparation
+                                .as_ref()
+                                .is_some_and(|progress| progress.handle.canceled())
+                        },
+                        |processed| {
+                            if let Some(progress) = &preparation {
+                                progress.report(progress_base.saturating_add(processed));
+                            }
+                        },
+                    )?;
+                    if expected_size.is_some_and(|expected| expected != size) {
+                        bail!("Android upload source size changed");
+                    }
+                    Ok::<_, anyhow::Error>((size, content_hash))
+                })
+                .await
+                .context("Android file hashing task failed")?
+            }
+        }
     }
 
     async fn build_envelope(
@@ -374,26 +582,24 @@ impl SyncManager {
                 stored_blobs.push(blob);
             }
             ClipboardKind::Files => {
-                let paths = item
-                    .content
-                    .lines()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| crate::clipboard::shared_files::resolve_path(&resources, value))
-                    .collect::<Result<Vec<_>>>()?;
+                let paths = self.file_upload_sources(pool, item, &resources).await?;
                 if paths.is_empty() {
                     bail!("没有可同步的文件");
                 }
                 let mut packed_total_size = 0_u64;
                 let mut file_fingerprints = Vec::with_capacity(paths.len());
                 for (index, source) in paths.into_iter().enumerate() {
-                    let name = safe_file_name(&source);
-                    let source_for_task = source.clone();
-                    let is_directory = source.is_dir();
+                    let name = source.name.clone();
+                    let is_directory = source.is_directory;
                     let progress_base = preparation
                         .map(PreparationProgress::processed)
                         .unwrap_or(packed_total_size);
                     let (mut blob, original_size, content_size, content_hash, content_object) =
                         if is_directory {
+                            let source_for_task = source
+                                .path()
+                                .context("directory upload source is unavailable")?
+                                .to_path_buf();
                             let root_for_task = blob_root.clone();
                             let key_for_task = key;
                             let preparation_for_task = preparation.cloned();
@@ -437,29 +643,9 @@ impl SyncManager {
                             .await
                             .context("directory encryption task failed")??
                         } else {
-                            let preparation_for_task = preparation.cloned();
-                            let (size, content_hash) =
-                                tauri::async_runtime::spawn_blocking(move || {
-                                    let size = source_for_task.metadata()?.len();
-                                    let content_hash = crypto::hash_file_with_progress(
-                                        &source_for_task,
-                                        || {
-                                            preparation_for_task
-                                                .as_ref()
-                                                .is_some_and(|progress| progress.handle.canceled())
-                                        },
-                                        |processed| {
-                                            if let Some(progress) = &preparation_for_task {
-                                                progress.report(
-                                                    progress_base.saturating_add(processed),
-                                                );
-                                            }
-                                        },
-                                    )?;
-                                    Ok::<_, anyhow::Error>((size, content_hash))
-                                })
-                                .await
-                                .context("file hashing task failed")??;
+                            let (size, content_hash) = self
+                                .fingerprint_upload_source(&source, preparation, progress_base)
+                                .await?;
                             let encrypted_size = crypto::encrypted_blob_size(size)?;
                             let reusable = repository::reusable_content_object(
                                 pool,
@@ -499,7 +685,7 @@ impl SyncManager {
                                     blob_id: object.blob_id.clone(),
                                     encrypted_path: String::new(),
                                     size: object.encrypted_size,
-                                    source_path: Some(source.to_string_lossy().into_owned()),
+                                    source_path: Some(source.locator()),
                                     source_is_directory: false,
                                     stream_nonce: Some(object.stream_nonce.clone()),
                                 },
@@ -513,7 +699,7 @@ impl SyncManager {
                     if preparation.is_some_and(|progress| progress.handle.canceled()) {
                         bail!("transfer canceled");
                     }
-                    blob.source_path = Some(source.to_string_lossy().into_owned());
+                    blob.source_path = Some(source.locator());
                     blob.source_is_directory = is_directory;
                     packed_total_size = packed_total_size
                         .checked_add(content_size)

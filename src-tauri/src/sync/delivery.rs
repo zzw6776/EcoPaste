@@ -20,8 +20,8 @@ use crate::db;
 use super::{
     model::{StoredBlob, StoredSyncEvent},
     progress::{
-        LocalImportPromotion, MetadataOnlyDeliveryStart, PreparationClaim, TransferDirection,
-        TransferHandle, TransferPhase, TransferRegistry, TransferRoute, TransferTask,
+        LocalImportPromotion, PreparationClaim, TransferDirection, TransferHandle, TransferPhase,
+        TransferRegistry, TransferRoute, TransferTask,
     },
     repository,
     transfer::TransferQueue,
@@ -44,14 +44,10 @@ pub(super) enum UploadTransferStart {
 enum DurableDeliveryTransition<'a> {
     Attempted,
     Failed(&'a str),
+    Blocked(&'a str),
     Completed {
         metadata_only_event_ids: &'a HashSet<String>,
     },
-}
-
-pub(super) struct PreparedReadyEvents {
-    pub events: Vec<StoredSyncEvent>,
-    pub metadata_only_operations: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -343,6 +339,10 @@ impl DeliveryCoordinator {
         self.registry.list()
     }
 
+    pub fn clear_finished_transfers(&self) {
+        self.registry.clear_finished();
+    }
+
     pub fn start(&self, task: TransferTask) -> TransferHandle {
         self.registry.start(task)
     }
@@ -418,6 +418,10 @@ impl DeliveryCoordinator {
 
     pub fn item_has_active_local_import(&self, item_id: &str) -> bool {
         self.registry.item_has_active_local_import(item_id)
+    }
+
+    pub fn complete_local_import_for_item(&self, item_id: &str) {
+        self.registry.complete_local_import_for_item(item_id);
     }
 
     /// Cancels preparation or delivery while serializing the transition to confirmation.
@@ -535,6 +539,7 @@ impl DeliveryCoordinator {
             TransferTask {
                 id: task_id,
                 revision: 0,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
                 operation_id: event_id.to_owned(),
                 item_id,
                 direction: TransferDirection::Upload,
@@ -601,6 +606,22 @@ impl DeliveryCoordinator {
         .await
     }
 
+    pub async fn blocked(
+        &self,
+        pool: &SqlitePool,
+        target: &str,
+        event_ids: &[String],
+        error: &str,
+    ) -> Result<()> {
+        self.transition_active(
+            pool,
+            target,
+            event_ids,
+            DurableDeliveryTransition::Blocked(error),
+        )
+        .await
+    }
+
     pub async fn completed(
         &self,
         pool: &SqlitePool,
@@ -645,6 +666,14 @@ impl DeliveryCoordinator {
             DurableDeliveryTransition::Failed(error) => {
                 repository::mark_delivery_error(pool, target, &active, error).await
             }
+            DurableDeliveryTransition::Blocked(error) => {
+                for event_id in active {
+                    repository::block_delivery(pool, target, &event_id, error).await?;
+                    self.registry
+                        .fail_upload_operation(&event_id, target, error);
+                }
+                Ok(())
+            }
             DurableDeliveryTransition::Completed {
                 metadata_only_event_ids,
             } => {
@@ -659,69 +688,27 @@ impl DeliveryCoordinator {
         }
     }
 
-    /// Selects ready events and atomically closes cancellation for metadata-only deliveries.
+    /// Selects attachment-ready confirmations after merging durable cancellation markers.
     pub async fn prepare_ready_events(
         &self,
         pool: &SqlitePool,
         target: &str,
-        route: TransferRoute,
-        metadata_only_event_ids: &HashSet<String>,
         queue: &mut TransferQueue,
-    ) -> Result<PreparedReadyEvents> {
+    ) -> Result<Vec<StoredSyncEvent>> {
         let _transition_guard = self.transition_lock.lock().await;
         self.reconcile_queue(pool, target, queue).await?;
-        let mut events = queue.ready_events();
-        let mut metadata_only_operations = Vec::new();
-        let mut canceled_metadata = HashSet::new();
-        events.retain(|stored| {
-            if !metadata_only_event_ids.contains(&stored.event.event_id) {
-                return true;
-            }
-            match self
-                .registry
-                .begin_metadata_only_delivery(&stored.event.event_id, route, target)
-            {
-                MetadataOnlyDeliveryStart::Tracked => {
-                    metadata_only_operations.push(stored.event.event_id.clone());
-                    true
-                }
-                MetadataOnlyDeliveryStart::Canceled => {
-                    canceled_metadata.insert(stored.event.event_id.clone());
-                    false
-                }
-                MetadataOnlyDeliveryStart::Untracked => true,
-            }
-        });
-        queue.cancel_events(&canceled_metadata);
-        Ok(PreparedReadyEvents {
-            events,
-            metadata_only_operations,
-        })
+        Ok(queue.ready_events())
     }
 
     pub fn complete_metadata_only(
         &self,
         operations: &[String],
-        delivered: &[String],
         route: TransferRoute,
         target: &str,
     ) {
-        let delivered = delivered.iter().collect::<HashSet<_>>();
-        for event_id in operations {
-            if delivered.contains(event_id) {
-                self.registry
-                    .complete_metadata_only_preparation(event_id, route, target);
-            } else {
-                self.registry
-                    .retry_metadata_only_delivery(event_id, route, target);
-            }
-        }
-    }
-
-    pub fn retry_metadata_only(&self, operations: &[String], route: TransferRoute, target: &str) {
         for event_id in operations {
             self.registry
-                .retry_metadata_only_delivery(event_id, route, target);
+                .complete_metadata_only_preparation(event_id, route, target);
         }
     }
 }

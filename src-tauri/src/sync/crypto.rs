@@ -156,6 +156,27 @@ pub fn encrypted_blob_size(original_size: u64) -> Result<u64> {
         .context("encrypted blob size overflow")
 }
 
+/// Reverses the monotonic streaming-size formula without relying on provider file metadata.
+#[cfg(target_os = "android")]
+pub fn original_blob_size(encrypted_size: u64) -> Result<u64> {
+    let mut low = 0_u64;
+    let mut high = encrypted_size;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        match encrypted_blob_size(middle)?.cmp(&encrypted_size) {
+            std::cmp::Ordering::Equal => return Ok(middle),
+            std::cmp::Ordering::Less => low = middle.saturating_add(1),
+            std::cmp::Ordering::Greater => {
+                let Some(next) = middle.checked_sub(1) else {
+                    break;
+                };
+                high = next;
+            }
+        }
+    }
+    bail!("invalid encrypted blob size")
+}
+
 pub fn verify_stream_blob_id(
     key: &[u8; 32],
     encrypted_path: &Path,
@@ -796,10 +817,28 @@ pub fn hash_file(path: &Path) -> Result<String> {
 
 pub fn hash_file_with_progress(
     path: &Path,
-    mut canceled: impl FnMut() -> bool,
-    mut on_progress: impl FnMut(u64),
+    canceled: impl FnMut() -> bool,
+    on_progress: impl FnMut(u64),
 ) -> Result<String> {
     let mut file = BufReader::new(File::open(path)?);
+    hash_reader_with_progress(&mut file, canceled, on_progress)
+}
+
+/// Hashes a seek-independent source such as an Android SAF document descriptor.
+pub fn hash_reader_with_progress(
+    reader: &mut impl Read,
+    canceled: impl FnMut() -> bool,
+    on_progress: impl FnMut(u64),
+) -> Result<String> {
+    fingerprint_reader_with_progress(reader, canceled, on_progress).map(|(_, hash)| hash)
+}
+
+/// Hashes an arbitrary reader and returns the exact number of consumed plaintext bytes.
+pub fn fingerprint_reader_with_progress(
+    reader: &mut impl Read,
+    mut canceled: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(u64),
+) -> Result<(u64, String)> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     let mut processed = 0_u64;
@@ -807,7 +846,7 @@ pub fn hash_file_with_progress(
         if canceled() {
             bail!("transfer canceled");
         }
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -815,7 +854,7 @@ pub fn hash_file_with_progress(
         processed = processed.saturating_add(read as u64);
         on_progress(processed);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok((processed, hasher.finalize().to_hex().to_string()))
 }
 
 /// Reads the authenticated-stream nonce needed to reproduce temporary ciphertext later.

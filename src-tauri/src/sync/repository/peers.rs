@@ -256,14 +256,15 @@ pub async fn latest_removed_at_ms(pool: &SqlitePool) -> Result<i64> {
 }
 
 /// 合并其他设备或 Hub 传来的删除标记，并清掉对应路由和投递状态。
-pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice]) -> Result<()> {
+pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice]) -> Result<bool> {
     let mut transaction = pool
         .begin()
         .await
         .context("begin merging removed sync devices")?;
+    let mut changed = false;
     for device in devices {
         let now = Utc::now();
-        sqlx::query(
+        let merged = sqlx::query(
             r#"
             INSERT INTO sync_removed_peers (
                 device_id, endpoint_id, removed_at_ms, restored_at_ms, created_at, updated_at
@@ -276,6 +277,12 @@ pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice])
                     ELSE MAX(COALESCE(sync_removed_peers.restored_at_ms, 0), excluded.restored_at_ms)
                 END,
                 updated_at = excluded.updated_at
+            WHERE sync_removed_peers.endpoint_id <> excluded.endpoint_id
+               OR sync_removed_peers.removed_at_ms < excluded.removed_at_ms
+               OR (
+                   excluded.restored_at_ms IS NOT NULL
+                   AND COALESCE(sync_removed_peers.restored_at_ms, 0) < excluded.restored_at_ms
+               )
             "#,
         )
         .bind(&device.device_id)
@@ -287,6 +294,7 @@ pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice])
         .execute(&mut *transaction)
         .await
         .context("merge removed sync device")?;
+        changed |= merged.rows_affected() > 0;
 
         let (stored_removed_at_ms, stored_restored_at_ms): (i64, Option<i64>) = sqlx::query_as(
             "SELECT removed_at_ms, restored_at_ms FROM sync_removed_peers WHERE device_id = ?",
@@ -299,24 +307,26 @@ pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice])
             .is_none_or(|restored_at_ms| stored_removed_at_ms > restored_at_ms);
         if effectively_removed {
             let target_id = format!("peer:{}", device.device_id);
-            sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
+            let deliveries = sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
                 .bind(&target_id)
                 .execute(&mut *transaction)
                 .await
                 .context("clear removed peer deliveries")?;
-            sqlx::query("DELETE FROM sync_peers WHERE device_id = ? OR endpoint_id = ?")
-                .bind(&device.device_id)
-                .bind(&device.endpoint_id)
-                .execute(&mut *transaction)
-                .await
-                .context("purge removed sync peer route")?;
+            let peers =
+                sqlx::query("DELETE FROM sync_peers WHERE device_id = ? OR endpoint_id = ?")
+                    .bind(&device.device_id)
+                    .bind(&device.endpoint_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("purge removed sync peer route")?;
+            changed |= deliveries.rows_affected() > 0 || peers.rows_affected() > 0;
         }
     }
     transaction
         .commit()
         .await
         .context("commit removed sync devices")?;
-    Ok(())
+    Ok(changed)
 }
 
 /// 忘记单个对端及其投递状态，并阻止发现与 Hub 设备列表将它自动加回。
@@ -477,6 +487,24 @@ pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
             })
         })
         .collect()
+}
+
+/// Returns whether at least one paired device currently has an active LAN connection.
+pub async fn has_online_peer(pool: &SqlitePool) -> Result<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM sync_peers peer
+            JOIN sync_peer_connections connection
+              ON connection.device_id = peer.device_id
+             AND connection.state = 'online'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("check online LAN delivery targets")
 }
 
 pub async fn mark_peer_connecting(pool: &SqlitePool, device_id: &str) -> Result<()> {

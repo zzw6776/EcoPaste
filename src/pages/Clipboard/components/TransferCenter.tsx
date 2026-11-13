@@ -1,11 +1,13 @@
 import { useMount, useUnmount } from "ahooks";
-import { Progress } from "antd";
+import { Button, Progress } from "antd";
 import type { TFunction } from "i18next";
 import type { FC, KeyboardEvent, MouseEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Virtuoso } from "react-virtuoso";
 import {
   cancelSyncTransfer,
+  clearFinishedSyncTransfers,
   downloadRemoteFiles,
   getClipboardItem,
   getSyncStatus,
@@ -14,6 +16,7 @@ import {
   type TransferTask,
 } from "@/commands";
 import Popover from "@/components/Popover";
+import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
 import {
   refreshSyncTransferActivity,
@@ -40,9 +43,10 @@ interface TransferCenterProps {
 
 const TransferCenter: FC<TransferCenterProps> = (props) => {
   const { compact = false } = props;
-  const { t } = useTranslation("clipboard");
+  const { t, i18n } = useTranslation("clipboard");
   const transferTasks = useSyncTransferTasks();
   const [open, setOpen] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [groups, setGroups] = useState<ClipboardGroupRecord[]>([]);
   const [peers, setPeers] = useState<SyncPeerStatus[]>([]);
   const [itemsById, setItemsById] = useState(
@@ -125,7 +129,15 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
   const activeCount = transferTasks.filter((task) => {
     return isTransferActive(task);
   }).length;
-  const sorted = sortTransferTasksForDisplay(transferTasks).slice(0, 10);
+  const sorted = sortTransferTasksForDisplay(
+    transferTasks.filter((task) => {
+      return (
+        task.target !== "import" ||
+        (task.phase !== "queued" && task.phase !== "completed")
+      );
+    }),
+  );
+  const recentCount = sorted.length - activeCount;
   const visibleItemIds = sorted.map((task) => {
     return task.itemId;
   });
@@ -213,101 +225,183 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
     if (nextOpen) void refreshSyncTransferActivity();
   }
 
+  async function handleClearFinished(event: MouseEvent<HTMLElement>) {
+    event.stopPropagation();
+    if (clearing) return;
+
+    setClearing(true);
+    try {
+      await clearFinishedSyncTransfers();
+      await refreshSyncTransferActivity();
+    } catch {
+      // 命令层已统一显示错误。
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  function renderTransferTask(index: number, task: TransferTask) {
+    const active = isTransferActive(task);
+    const section =
+      index === 0 && activeCount > 0
+        ? t("transferCenter.active")
+        : index === activeCount
+          ? t("transferCenter.recent")
+          : null;
+    const item = itemsById.get(task.itemId);
+    const itemTitle = getTransferItemTitle(task, item, t);
+    const groupName = item?.groupId
+      ? groups.find((group) => {
+          return group.id === item.groupId && !group.isHidden;
+        })?.name
+      : null;
+    const location = item ? (groupName ?? t(`groups.${item.kind}`)) : null;
+    const phase =
+      task.target === "import"
+        ? t(`transferCenter.import.${task.phase}`)
+        : t(`transferCenter.${task.direction}.${task.phase}`);
+    const route = getTransferRouteLabel(task, peers, t);
+    const alreadyAvailable = task.phase === "available";
+    const startedAt = new Date(task.startedAtMs);
+    const percent = task.totalBytes
+      ? Math.min(
+          100,
+          Math.round((task.transferredBytes / task.totalBytes) * 100),
+        )
+      : 0;
+
+    return (
+      <div className="pb-2">
+        {section && (
+          <div
+            className={cn("mb-2", {
+              "mt-3 border-ant-border border-t pt-3": index > 0,
+            })}
+          >
+            <div className="flex items-center justify-between rounded-1.5 bg-ant-fill-tertiary px-2 py-1.5">
+              <span className="font-medium text-sm">{section}</span>
+              <span className="text-ant-secondary text-xs tabular-nums">
+                {active ? activeCount : recentCount}
+              </span>
+            </div>
+          </div>
+        )}
+        {/* biome-ignore lint/a11y/useSemanticElements: 任务卡片内含取消和重试按钮，不能使用嵌套 button。 */}
+        <div
+          className="cursor-pointer rounded-2 border border-ant-border bg-ant-container p-2 transition-colors hover:bg-ant-fill-tertiary"
+          data-item-id={task.itemId}
+          onClick={handleLocate}
+          onKeyDown={handleLocateKeyDown}
+          role="button"
+          tabIndex={0}
+        >
+          <div className="flex items-center gap-1 text-sm">
+            <i
+              className={cn("size-3.5 shrink-0", transferRouteIconClass(task))}
+            />
+            <span className="min-w-0 flex-1 truncate">{itemTitle}</span>
+            {active && task.cancellable ? (
+              <button
+                className="cursor-pointer border-0 bg-transparent p-0 text-ant-primary text-xs"
+                data-task-id={task.id}
+                onClick={handleCancel}
+                type="button"
+              >
+                {t("remoteFile.cancel")}
+              </button>
+            ) : (task.phase === "failed" || task.phase === "canceled") &&
+              task.target !== "import" ? (
+              <button
+                className="cursor-pointer border-0 bg-transparent p-0 text-ant-primary text-xs"
+                data-task-id={task.id}
+                onClick={handleRetry}
+                type="button"
+              >
+                {t("transferCenter.retry")}
+              </button>
+            ) : null}
+          </div>
+          <div className="truncate text-ant-secondary text-xs">
+            {location ? `${location} · ` : ""}
+            {route} · {phase}
+          </div>
+          {!alreadyAvailable && (
+            <Progress percent={percent} showInfo={false} size="small" />
+          )}
+          {active && (
+            <div className="text-ant-secondary text-xs">
+              {formatBytes(task.speedBytesPerSecond)}/s ·{" "}
+              {formatDuration(task.elapsedMs)}
+              {task.etaSeconds !== null
+                ? ` · ${t("remoteFile.eta", { seconds: task.etaSeconds })}`
+                : ""}
+            </div>
+          )}
+          {task.error && (
+            <div className="truncate text-ant-error text-xs" title={task.error}>
+              {task.error}
+            </div>
+          )}
+          <div className="mt-1 flex items-center justify-between gap-2 whitespace-nowrap text-ant-secondary text-xs tabular-nums">
+            <span>
+              {alreadyAvailable
+                ? formatBytes(task.totalBytes)
+                : formatBytes(task.transferredBytes)}
+              {!alreadyAvailable &&
+                task.totalBytes > 0 &&
+                ` / ${formatBytes(task.totalBytes)}`}
+            </span>
+            <span
+              className="shrink-0"
+              title={t("transferCenter.startedAt", {
+                time: startedAt.toLocaleString(i18n.resolvedLanguage),
+              })}
+            >
+              {startedAt.toLocaleString(i18n.resolvedLanguage, {
+                day: "2-digit",
+                hour: "2-digit",
+                hour12: false,
+                minute: "2-digit",
+                month: "2-digit",
+                second: "2-digit",
+              })}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const content = (
-    <HeaderActionPopoverPanel className="gap-2 overflow-y-auto">
+    <HeaderActionPopoverPanel className="gap-2">
+      <div className="flex shrink-0 items-center justify-between gap-2">
+        <span className="text-ant-secondary text-sm">
+          {t("transferCenter.title")}
+        </span>
+        <Tooltip title={t("transferCenter.clearFinished")}>
+          <Button
+            aria-label={t("transferCenter.clearFinished")}
+            disabled={recentCount === 0}
+            icon={<i className="i-lucide:trash-2 size-4" />}
+            loading={clearing}
+            onClick={handleClearFinished}
+            shape="circle"
+            size="small"
+            type="text"
+          />
+        </Tooltip>
+      </div>
       {sorted.length === 0 ? (
         <span className="flex flex-1 items-center justify-center text-center text-ant-secondary text-sm">
           {t("transferCenter.empty")}
         </span>
       ) : (
-        sorted.map((task) => {
-          const active = isTransferActive(task);
-          const item = itemsById.get(task.itemId);
-          const itemTitle = getTransferItemTitle(task, item, t);
-          const groupName = item?.groupId
-            ? groups.find((group) => {
-                return group.id === item.groupId && !group.isHidden;
-              })?.name
-            : null;
-          const location = item
-            ? (groupName ?? t(`groups.${item.kind}`))
-            : null;
-          const phase =
-            task.target === "import"
-              ? t(`transferCenter.import.${task.phase}`)
-              : t(`transferCenter.${task.direction}.${task.phase}`);
-          const route = getTransferRouteLabel(task, peers, t);
-          const percent = task.totalBytes
-            ? Math.min(
-                100,
-                Math.round((task.transferredBytes / task.totalBytes) * 100),
-              )
-            : 0;
-          return (
-            // biome-ignore lint/a11y/useSemanticElements: 任务卡片内含取消和重试按钮，不能使用嵌套 button。
-            <div
-              className="cursor-pointer rounded-2 border border-ant-border bg-ant-container p-2 transition-colors hover:bg-ant-fill-tertiary"
-              data-item-id={task.itemId}
-              key={task.id}
-              onClick={handleLocate}
-              onKeyDown={handleLocateKeyDown}
-              role="button"
-              tabIndex={0}
-            >
-              <div className="flex items-center gap-1 text-sm">
-                <i
-                  className={cn(
-                    "size-3.5 shrink-0",
-                    transferRouteIconClass(task),
-                  )}
-                />
-                <span className="min-w-0 flex-1 truncate">{itemTitle}</span>
-                {active && task.cancellable ? (
-                  <button
-                    className="cursor-pointer border-0 bg-transparent p-0 text-ant-primary text-xs"
-                    data-task-id={task.id}
-                    onClick={handleCancel}
-                    type="button"
-                  >
-                    {t("remoteFile.cancel")}
-                  </button>
-                ) : (task.phase === "failed" || task.phase === "canceled") &&
-                  task.target !== "import" ? (
-                  <button
-                    className="cursor-pointer border-0 bg-transparent p-0 text-ant-primary text-xs"
-                    data-task-id={task.id}
-                    onClick={handleRetry}
-                    type="button"
-                  >
-                    {t("transferCenter.retry")}
-                  </button>
-                ) : null}
-              </div>
-              <div className="truncate text-ant-secondary text-xs">
-                {location ? `${location} · ` : ""}
-                {route} · {phase}
-              </div>
-              <Progress percent={percent} showInfo={false} size="small" />
-              <div className="truncate text-ant-secondary text-xs">
-                {formatBytes(task.transferredBytes)}
-                {task.totalBytes > 0 && ` / ${formatBytes(task.totalBytes)}`}
-                {active &&
-                  ` · ${formatBytes(task.speedBytesPerSecond)}/s · ${formatDuration(task.elapsedMs)}`}
-                {active && task.etaSeconds !== null
-                  ? ` · ${t("remoteFile.eta", { seconds: task.etaSeconds })}`
-                  : ""}
-              </div>
-              {task.error && (
-                <div
-                  className="truncate text-ant-error text-xs"
-                  title={task.error}
-                >
-                  {task.error}
-                </div>
-              )}
-            </div>
-          );
-        })
+        <Virtuoso
+          className="min-h-0 flex-1"
+          computeItemKey={getTransferTaskKey}
+          data={sorted}
+          itemContent={renderTransferTask}
+        />
       )}
     </HeaderActionPopoverPanel>
   );
@@ -345,6 +439,10 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
     </Popover>
   );
 };
+
+function getTransferTaskKey(_index: number, task: TransferTask) {
+  return task.id;
+}
 
 function getTransferItemTitle(
   task: TransferTask,

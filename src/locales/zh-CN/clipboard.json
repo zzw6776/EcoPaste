@@ -149,14 +149,14 @@
       "error": "云端同步失败，点击重试",
       "errorWithReason": "云端：{{reason}}，等待重试或点击重试",
       "idle": "云端：本次未使用",
-      "manual": "云端：超过自动上传上限，点击上传文件",
+      "manual": "云端：文件尚未上传，点击上传",
       "metadataOnly": "云端：仅记录已同步，点击上传文件",
       "partial": "云端：部分内容已就绪（{{content}}/{{total}}）",
       "queued": "云端：等待同步",
       "remoteMetadataOnly": "云端：仅同步记录，文件内容尚未上传",
       "remoteSuccess": "云端：文件内容已就绪",
       "remoteSyncing": "云端：正在启动文件下载",
-      "started": "已开始云端同步",
+      "started": "已加入云端同步队列",
       "success": "云端：文件内容已同步",
       "syncing": "云端：正在上传"
     },
@@ -173,7 +173,7 @@
       "remoteMetadataOnly": "局域网：仅同步记录，文件内容尚未投递",
       "remoteSuccess": "局域网：文件内容已就绪",
       "remoteSyncing": "局域网：正在启动文件下载",
-      "started": "已开始局域网同步",
+      "started": "已加入局域网同步队列",
       "success": "局域网：完整内容已投递到 {{delivered}}/{{total}} 台设备",
       "syncing": "局域网：正在投递"
     }
@@ -263,10 +263,11 @@
       "connecting": "正在准备导入",
       "failed": "导入失败",
       "preparing": "正在导入",
-      "queued": "导入完成",
+      "queued": "等待上传",
       "transferring": "正在导入"
     },
     "upload": {
+      "available": "文件已存在，无需上传",
       "canceled": "上传已取消",
       "completed": "上传完成",
       "confirming": "等待对端确认",
@@ -278,6 +279,8 @@
     }
   },
   "transferCenter": {
+    "active": "进行中",
+    "clearFinished": "清空已结束",
     "download": {
       "canceled": "下载已取消",
       "completed": "下载完成",
@@ -295,11 +298,12 @@
       "connecting": "正在准备导入",
       "failed": "导入失败",
       "preparing": "正在导入",
-      "queued": "导入完成",
+      "queued": "等待上传",
       "transferring": "正在导入"
     },
     "item": "文件传输",
     "itemCount": "{{count}} 个项目",
+    "recent": "最近记录",
     "retry": "重试",
     "route": {
       "cloud": "云端",
@@ -307,8 +311,10 @@
       "lanDevice": "Wi-Fi · {{device}}",
       "local": "本地"
     },
+    "startedAt": "开始时间：{{time}}",
     "title": "文件传输",
     "upload": {
+      "available": "文件已存在，无需上传",
       "canceled": "上传已取消",
       "completed": "上传完成",
       "confirming": "等待确认",

@@ -1,8 +1,11 @@
 //! Pure projection from durable synchronization facts into the card status contract.
 
-use super::model::{
-    SyncContentAvailability, SyncItemAction, SyncItemActivity, SyncItemChannelStatus,
-    SyncItemOrigin, SyncItemStatus, SyncLocalContentState,
+use super::{
+    delivery_plan::{channel_action, ChannelActionContext},
+    model::{
+        SyncContentAvailability, SyncItemActivity, SyncItemChannelStatus, SyncItemOrigin,
+        SyncItemStatus, SyncLocalContentState, SyncTarget,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,6 +44,7 @@ impl ContentLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliveryStatus {
     Pending,
+    AwaitingReceipt,
     Confirmed,
     Blocked,
     Canceled,
@@ -49,6 +53,7 @@ pub(super) enum DeliveryStatus {
 impl DeliveryStatus {
     pub fn parse(value: &str) -> Self {
         match value {
+            "awaiting_receipt" => Self::AwaitingReceipt,
             "confirmed" => Self::Confirmed,
             "blocked" => Self::Blocked,
             "canceled" => Self::Canceled,
@@ -73,6 +78,8 @@ pub(super) struct ItemStatusFacts {
     pub local_state: SyncLocalContentState,
     pub queued_lan: bool,
     pub queued_cloud: bool,
+    pub preparation_error: Option<String>,
+    pub lan_available: bool,
     pub remote_file_available: bool,
     pub deliveries: Vec<DeliveryFact>,
 }
@@ -109,7 +116,7 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
             channel.content_targets = channel.content_targets.saturating_add(1);
         }
         match delivery.status {
-            DeliveryStatus::Pending => {
+            DeliveryStatus::Pending | DeliveryStatus::AwaitingReceipt => {
                 if delivery.last_error.is_some() && !satisfied {
                     channel.activity = SyncItemActivity::Error;
                     channel.last_error = delivery.last_error.clone();
@@ -168,6 +175,12 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
     if queued && channel.activity == SyncItemActivity::Idle {
         channel.activity = SyncItemActivity::Queued;
     }
+    if queued {
+        if let Some(error) = &facts.preparation_error {
+            channel.activity = SyncItemActivity::Error;
+            channel.last_error = Some(error.clone());
+        }
+    }
 
     let needs_complete_delivery = facts.deliveries.iter().any(|delivery| {
         let same_channel = if cloud {
@@ -179,26 +192,20 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
             && delivery.desired == ContentLevel::Complete
             && delivery.confirmed != ContentLevel::Complete
     });
-    channel.action = if facts.origin == SyncItemOrigin::Remote {
-        if facts.remote_file_available
-            && matches!(
-                channel.availability,
-                SyncContentAvailability::Complete | SyncContentAvailability::Partial
-            )
-        {
-            SyncItemAction::Download
+    channel.action = channel_action(ChannelActionContext {
+        origin: facts.origin,
+        local_state: facts.local_state,
+        target: if cloud {
+            SyncTarget::Cloud
         } else {
-            SyncItemAction::None
-        }
-    } else if channel.activity == SyncItemActivity::Error {
-        SyncItemAction::Retry
-    } else if channel.availability == SyncContentAvailability::MetadataOnly
-        || needs_complete_delivery
-    {
-        SyncItemAction::Upload
-    } else {
-        SyncItemAction::None
-    };
+            SyncTarget::Lan
+        },
+        target_available: cloud || facts.lan_available,
+        activity: channel.activity,
+        availability: channel.availability,
+        remote_file_available: facts.remote_file_available,
+        needs_complete_delivery,
+    });
 
     channel
 }
@@ -206,6 +213,7 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::model::SyncItemAction;
 
     fn local_facts(delivery: DeliveryFact) -> ItemStatusFacts {
         ItemStatusFacts {
@@ -214,6 +222,8 @@ mod tests {
             local_state: SyncLocalContentState::Managed,
             queued_lan: false,
             queued_cloud: false,
+            preparation_error: None,
+            lan_available: true,
             remote_file_available: false,
             deliveries: vec![delivery],
         }

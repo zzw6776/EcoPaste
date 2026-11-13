@@ -527,7 +527,7 @@ async fn unified_delivery_schema_is_current(pool: &SqlitePool) -> AnyResult<bool
              WHERE event.event_id IS NULL
                 OR delivery.desired_content NOT IN ('metadata', 'complete')
                 OR delivery.confirmed_content NOT IN ('none', 'metadata', 'complete')
-                OR delivery.status NOT IN ('pending', 'confirmed', 'blocked', 'canceled')
+                OR delivery.status NOT IN ('pending', 'awaiting_receipt', 'confirmed', 'blocked', 'canceled')
                 OR delivery.receipt_pending NOT IN (0, 1)) +
             (SELECT COUNT(*) FROM sync_local_content local
              LEFT JOIN sync_events event ON event.event_id = local.event_id

@@ -371,10 +371,14 @@ async fn handle_peer_stream(
     drop(admission_permits);
     let result = dispatch_peer(&manager, &connection, &mut send, &mut recv, request).await;
     if let Err(error) = result {
+        let code = error
+            .downcast_ref::<RemoteSyncError>()
+            .map(|failure| failure.code)
+            .unwrap_or(ErrorCode::InvalidRequest);
         write_frame(
             &mut send,
             &Response::Error {
-                code: ErrorCode::InvalidRequest,
+                code,
                 message: error.to_string(),
             },
         )
@@ -441,16 +445,26 @@ async fn dispatch_peer(
                     .source_revision
                     .as_deref()
                     .unwrap_or(&event.event_id);
-                if available_materialized_file_item(
+                let existing = available_materialized_file_item(
                     &pool,
                     &resources,
                     &envelope.item.sync_key,
                     source_revision,
                     envelope.content_identity.as_deref(),
                 )
-                .await?
-                .is_some()
-                {
+                .await;
+                let existing = match existing {
+                    Ok(item) => item,
+                    Err(error) => {
+                        log::warn!(
+                            "defer LAN card content plan: eventId={} error={error:#}",
+                            event.event_id
+                        );
+                        metadata_only_event_ids.push(event.event_id);
+                        continue;
+                    }
+                };
+                if existing.is_some() {
                     available_event_ids.push(event.event_id);
                 } else if should_defer_remote_file_download(
                     &envelope,
@@ -516,7 +530,9 @@ async fn dispatch_peer(
             manager.peer_connection_ready(&device.device_id);
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Online, None, true);
             manager.emit_updated();
-            let stored = repository::store_remote_batch(
+            let key = group.content_key_bytes()?;
+            let metadata_only_event_ids = metadata_only_content_event_ids(&events, &key);
+            let stored = repository::store_remote_batch_with_content_policy(
                 &pool,
                 repository::RemoteBatchSource::Peer {
                     device_id: &device.device_id,
@@ -524,6 +540,8 @@ async fn dispatch_peer(
                 None,
                 &events,
                 &manager.identity.snapshot().device_id,
+                &[],
+                &metadata_only_event_ids,
             )
             .await?;
             for (event_id, origin_device_id) in stored.conflicts {
@@ -532,36 +550,65 @@ async fn dispatch_peer(
                 );
             }
             let accepted = stored.inserted_event_ids;
-            let received_new_events = !accepted.is_empty();
-            let (outgoing, scanned_cursor) = repository::peer_events_after_cursor(
-                &pool,
-                &device.device_id,
-                after_cursor,
-                limit.clamp(1, MAX_EVENTS_PER_BATCH),
-            )
-            .await?;
-            let cursor_events = outgoing
-                .into_iter()
-                .map(|value| CursorEvent {
-                    cursor: value.cursor,
-                    event: value.event,
-                })
-                .collect::<Vec<_>>();
-            let only_filtered_events = cursor_events.is_empty() && scanned_cursor > after_cursor;
-            let mut response = Response::Synced {
-                accepted_event_ids: accepted,
-                events: cursor_events,
-                peers: Vec::new(),
-                latest_cursor: scanned_cursor,
-                has_more: false,
-            };
-            limit_sync_response(&mut response, after_cursor, limit)?;
-            if only_filtered_events {
-                let Response::Synced { latest_cursor, .. } = &mut response else {
-                    unreachable!();
+            let received_events = !events.is_empty();
+            let mut response_cursor = after_cursor;
+            let response = loop {
+                let (mut outgoing, scanned_cursor) = repository::peer_events_after_cursor(
+                    &pool,
+                    &device.device_id,
+                    response_cursor,
+                    limit.clamp(1, MAX_EVENTS_PER_BATCH),
+                )
+                .await?;
+                let first = outgoing
+                    .first()
+                    .map(|stored| (stored.cursor, stored.event.event_id.clone()));
+                let routed_away =
+                    repository::event_ids_routed_away_from(&pool, &outgoing, "lan").await?;
+                repository::attach_event_blob_ids(&pool, &mut outgoing).await?;
+                mark_metadata_only_blob_refs(&mut outgoing, &key, &routed_away);
+                let cursor_events = outgoing
+                    .into_iter()
+                    .map(|value| CursorEvent {
+                        cursor: value.cursor,
+                        event: value.event,
+                    })
+                    .collect::<Vec<_>>();
+                let only_filtered_events =
+                    cursor_events.is_empty() && scanned_cursor > response_cursor;
+                let mut response = Response::Synced {
+                    accepted_event_ids: accepted.clone(),
+                    events: cursor_events,
+                    peers: Vec::new(),
+                    latest_cursor: scanned_cursor,
+                    has_more: false,
                 };
-                *latest_cursor = scanned_cursor;
-            }
+                if let Err(error) = limit_sync_response(&mut response, response_cursor, limit) {
+                    let Some((cursor, event_id)) = first else {
+                        return Err(error.into());
+                    };
+                    log::warn!("skip oversized LAN card: eventId={event_id} error={error}");
+                    manager
+                        .delivery
+                        .blocked(
+                            &pool,
+                            source.delivery_target(),
+                            std::slice::from_ref(&event_id),
+                            &error.to_string(),
+                        )
+                        .await?;
+                    manager.emit_updated();
+                    response_cursor = cursor;
+                    continue;
+                }
+                if only_filtered_events {
+                    let Response::Synced { latest_cursor, .. } = &mut response else {
+                        unreachable!();
+                    };
+                    *latest_cursor = scanned_cursor;
+                }
+                break response;
+            };
             write_frame(send, &response).await?;
             let content_has_more = manager
                 .apply_pending_events(
@@ -573,7 +620,7 @@ async fn dispatch_peer(
                     events_complete,
                 )
                 .await?;
-            if received_new_events || content_has_more {
+            if received_events || content_has_more {
                 manager.wake_lan_transfer();
             }
         }
@@ -612,6 +659,9 @@ async fn dispatch_peer(
                 &complete_event_ids,
             )
             .await?;
+            manager
+                .release_staging_for_events(&pool, &event_ids)
+                .await?;
             manager.emit_updated();
             write_frame(send, &Response::LanAcknowledged).await?;
         }
@@ -731,7 +781,7 @@ async fn dispatch_peer(
                     .stream_nonce
                     .as_deref()
                     .context("streaming blob nonce is unavailable")?;
-                Some((PathBuf::from(source), nonce.to_vec()))
+                Some((source.to_owned(), nonce.to_vec()))
             } else {
                 None
             };
@@ -766,7 +816,7 @@ async fn dispatch_peer(
             let result = async {
                 if let Some((source, nonce)) = streaming_source {
                     write_frame(send, &Response::BlobReady { size: blob.size }).await?;
-                    super::super::upload::encrypt_file(
+                    encrypt_upload_source(
                         &source,
                         send,
                         super::super::upload::FileEncryptionSpec {
@@ -887,6 +937,7 @@ async fn begin_lan_pull_upload(
         .start_transient(super::super::progress::TransferTask {
             id: task_id.clone(),
             revision: 0,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
             operation_id: stored.event.event_id,
             item_id,
             direction: super::super::progress::TransferDirection::Upload,

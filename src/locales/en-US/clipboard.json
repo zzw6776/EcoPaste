@@ -149,14 +149,14 @@
       "error": "Cloud sync failed; click to retry",
       "errorWithReason": "Cloud: {{reason}}; retrying automatically, or click to retry",
       "idle": "Cloud: not used for this item",
-      "manual": "Cloud: exceeds the automatic upload limit; click to upload the file",
+      "manual": "Cloud: file not uploaded; click to upload",
       "metadataOnly": "Cloud: record only synced; click to upload the file",
       "partial": "Cloud: content ready on {{content}}/{{total}} targets",
       "queued": "Cloud: waiting to sync",
       "remoteMetadataOnly": "Cloud: record synced; file content is not uploaded",
       "remoteSuccess": "Cloud: file content is ready",
       "remoteSyncing": "Cloud: starting file download",
-      "started": "Cloud sync started",
+      "started": "Cloud sync queued",
       "success": "Cloud: file content synced",
       "syncing": "Cloud: uploading"
     },
@@ -173,7 +173,7 @@
       "remoteMetadataOnly": "LAN: record synced; file content is not delivered",
       "remoteSuccess": "LAN: file content is ready",
       "remoteSyncing": "LAN: starting file download",
-      "started": "LAN sync started",
+      "started": "LAN sync queued",
       "success": "LAN: complete content delivered to {{delivered}}/{{total}} devices",
       "syncing": "LAN: delivering"
     }
@@ -263,10 +263,11 @@
       "connecting": "Preparing import",
       "failed": "Import failed",
       "preparing": "Importing",
-      "queued": "Import complete",
+      "queued": "Waiting to upload",
       "transferring": "Importing"
     },
     "upload": {
+      "available": "File already available; no upload needed",
       "canceled": "Upload canceled",
       "completed": "Upload complete",
       "confirming": "Waiting for confirmation",
@@ -278,6 +279,8 @@
     }
   },
   "transferCenter": {
+    "active": "In progress",
+    "clearFinished": "Clear finished",
     "download": {
       "canceled": "Download canceled",
       "completed": "Download complete",
@@ -295,11 +298,12 @@
       "connecting": "Preparing import",
       "failed": "Import failed",
       "preparing": "Importing",
-      "queued": "Import complete",
+      "queued": "Waiting to upload",
       "transferring": "Importing"
     },
     "item": "File transfer",
     "itemCount": "{{count}} items",
+    "recent": "Recent activity",
     "retry": "Retry",
     "route": {
       "cloud": "Cloud",
@@ -307,8 +311,10 @@
       "lanDevice": "Wi-Fi · {{device}}",
       "local": "Local"
     },
+    "startedAt": "Started: {{time}}",
     "title": "File transfers",
     "upload": {
+      "available": "File already available; no upload needed",
       "canceled": "Upload canceled",
       "completed": "Upload complete",
       "confirming": "Waiting for confirmation",

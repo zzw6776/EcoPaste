@@ -50,7 +50,7 @@ const SyncItemIndicators: FC<SyncItemIndicatorsProps> = (props) => {
   ) {
     event.stopPropagation();
     const channel = resolvedStatus[target];
-    if (channel.action === "none") return;
+    if (activeTarget !== null || channel.action === "none") return;
 
     setActiveTarget(target);
     try {
@@ -165,15 +165,16 @@ const ChannelButton: FC<ChannelButtonProps> = (props) => {
     <Tooltip mouseEnterDelay={0.3} title={title}>
       <span className="inline-flex size-5">
         <button
+          aria-disabled={!actionable}
           aria-label={title}
           className={cn(
             "flex size-full items-center justify-center rounded-1.5 border-0 bg-transparent transition-colors",
             channelClassName(channel, activity),
             actionable && "cursor-pointer hover:bg-ant-fill-tertiary",
           )}
-          disabled={!actionable}
           onClick={onClick}
           onMouseDown={onMouseDown}
+          tabIndex={actionable ? 0 : -1}
           type="button"
         >
           <i
@@ -194,6 +195,7 @@ function channelClassName(
   activity: SyncItemChannelStatus["activity"] | "syncing",
 ) {
   if (activity === "error") return "text-ant-error";
+  if (activity === "syncing") return "text-ant-info";
 
   switch (channel.availability) {
     case "complete":
@@ -204,7 +206,6 @@ function channelClassName(
     default:
       break;
   }
-  if (activity === "syncing") return "text-ant-info";
   if (activity === "queued") return "text-ant-secondary";
   return channel.action === "upload" ? "text-ant-warning" : "text-ant-tertiary";
 }
@@ -219,6 +220,9 @@ function channelTitleState(
     return "downloading";
   }
   if (activity !== "idle") return activity;
+  if (channel.action === "upload") {
+    return channel.availability === "metadataOnly" ? "metadataOnly" : "manual";
+  }
   if (origin === "remote") {
     if (channel.availability === "complete") return "remoteSuccess";
     if (channel.availability === "metadataOnly") return "remoteMetadataOnly";
@@ -227,7 +231,6 @@ function channelTitleState(
   if (channel.availability === "complete") return "success";
   if (channel.availability === "partial") return "partial";
   if (channel.availability === "metadataOnly") return "metadataOnly";
-  if (channel.action === "upload") return "manual";
   return "idle";
 }
 

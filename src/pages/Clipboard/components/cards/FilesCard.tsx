@@ -184,8 +184,7 @@ const RemoteDownloadStatus: FC<RemoteDownloadStatusProps> = (props) => {
     task,
     t,
   } = props;
-  const active =
-    task && !["completed", "failed", "canceled"].includes(task.phase);
+  const active = task && isTransferActive(task);
   const percent = task?.totalBytes
     ? Math.min(100, Math.round((task.transferredBytes / task.totalBytes) * 100))
     : 0;

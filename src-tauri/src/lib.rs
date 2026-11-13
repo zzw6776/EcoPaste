@@ -210,6 +210,7 @@ pub fn run() {
             commands::respond_incoming_sync_join_request,
             commands::get_sync_item_statuses,
             commands::list_sync_transfers,
+            commands::clear_finished_sync_transfers,
             commands::cancel_sync_transfer,
             commands::download_remote_files,
             commands::sync_item_now,

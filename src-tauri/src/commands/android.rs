@@ -1376,6 +1376,27 @@ mod jni_bridge {
         })
     }
 
+    pub fn open_remote_download_source(uri: &str) -> Result<i32> {
+        with_jni_env(|env, context, bridge_class| {
+            let uri = env
+                .new_string(uri)
+                .map_err(|error| anyhow!("encode remote document URI failed: {error}"))?;
+            let fd = env
+                .call_static_method(
+                    bridge_class,
+                    "openRemoteDownloadSource",
+                    "(Landroid/content/Context;Ljava/lang/String;)I",
+                    &[JValue::Object(context), JValue::Object(&uri)],
+                )
+                .and_then(|value| value.i())
+                .map_err(|error| anyhow!("open remote document source failed: {error}"))?;
+            if fd < 0 {
+                return Err(anyhow!("remote document source is unavailable").into());
+            }
+            Ok(fd)
+        })
+    }
+
     pub fn open_package_installer(path: &std::path::Path) -> Result<()> {
         let result = file_action("openPackageInstaller", path)?;
         if result.status == "success" {
@@ -1612,6 +1633,15 @@ pub fn is_android_remote_download_document_available(
     directory: bool,
 ) -> Result<bool> {
     jni_bridge::is_remote_download_document_available(uri, expected_size, directory)
+}
+
+/// Opens a persisted SAF document descriptor and transfers ownership to Rust.
+#[cfg(target_os = "android")]
+pub fn open_android_remote_download_source(uri: &str) -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let fd = jni_bridge::open_remote_download_source(uri)?;
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Opens Android's package installer for an APK downloaded into app-private storage.

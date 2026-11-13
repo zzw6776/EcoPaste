@@ -28,6 +28,13 @@ struct LanContentPlan {
     available_event_ids: HashSet<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct OutgoingCardError {
+    event_id: String,
+    source: anyhow::Error,
+}
+
 impl SyncManager {
     pub(super) async fn start_preparation_transfer(
         &self,
@@ -39,15 +46,35 @@ impl SyncManager {
         auto_upload_max_mb: u32,
     ) -> Result<Option<super::super::progress::TransferHandle>> {
         let resources = crate::core::paths::resources_dir(&self.app)?;
-        let Some(total_bytes) = calculate_current_file_item_size(pool, item, &resources).await?
-        else {
-            return Ok(None);
+        let total_bytes = if item.remote_file_state.is_some() {
+            repository::external_download_sessions(pool, std::slice::from_ref(&item.id))
+                .await?
+                .into_iter()
+                .next()
+                .context(crate::i18n::commands::label(
+                    crate::i18n::current_language(&self.app),
+                    crate::i18n::commands::Key::RemoteFileNotDownloaded,
+                ))?
+                .targets
+                .into_iter()
+                .fold(0_u64, |total, target| {
+                    total.saturating_add(target.expected_size)
+                })
+        } else {
+            let Some(total_bytes) =
+                calculate_current_file_item_size(pool, item, &resources).await?
+            else {
+                return Ok(None);
+            };
+            u64::try_from(total_bytes).context("invalid clipboard file size")?
         };
-        let total_bytes = u64::try_from(total_bytes).context("invalid clipboard file size")?;
         if target.route == super::super::progress::TransferRoute::Cloud
             && !(operation.force_files || operation.manual_share)
             && !permits_automatic_file_upload(total_bytes, auto_upload_max_mb)
         {
+            return Ok(None);
+        }
+        if target.route == super::super::progress::TransferRoute::Lan {
             return Ok(None);
         }
         if let Some(handle) =
@@ -64,15 +91,13 @@ impl SyncManager {
         {
             return Ok(Some(handle));
         }
-        if target.route == super::super::progress::TransferRoute::Lan {
-            return Ok(None);
-        }
         let task_key = format!("{event_id}\0prepare");
         let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
         Ok(Some(self.delivery.start_preparation(
             super::super::progress::TransferTask {
                 id: task_id,
                 revision: 0,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
                 operation_id: event_id.to_owned(),
                 item_id: item.id.clone(),
                 direction: super::super::progress::TransferDirection::Upload,
@@ -107,7 +132,19 @@ impl SyncManager {
             device_id: device_id.to_owned(),
             events: events.iter().map(|stored| stored.event.clone()).collect(),
         };
-        let planned_count = limit_lan_content_plan(&mut request)?;
+        let planned_count = match limit_lan_content_plan(&mut request) {
+            Ok(count) => count,
+            Err(error) => {
+                if let Some(stored) = events.first() {
+                    return Err(OutgoingCardError {
+                        event_id: stored.event.event_id.clone(),
+                        source: error.into(),
+                    }
+                    .into());
+                }
+                return Err(error.into());
+            }
+        };
         let planned_ids = match &request {
             Request::PlanLanContent { events, .. } => events
                 .iter()
@@ -121,8 +158,8 @@ impl SyncManager {
             available_event_ids,
         } = response
         else {
-            if let Response::Error { message, .. } = response {
-                bail!(message);
+            if let Response::Error { code, message } = response {
+                return Err(RemoteSyncError { code, message }.into());
             }
             bail!("局域网设备返回了无效的文件接收计划");
         };
@@ -185,7 +222,9 @@ impl SyncManager {
                 Response::LanAcknowledged => {
                     repository::complete_peer_receipts(pool, peer_device_id, &receipts).await?;
                 }
-                Response::Error { message, .. } => bail!(message),
+                Response::Error { code, message } => {
+                    return Err(RemoteSyncError { code, message }.into());
+                }
                 _ => bail!("局域网设备返回了无效的投递回执响应"),
             }
         }
@@ -219,7 +258,9 @@ impl SyncManager {
                 } => bail!(
                     "局域网同步协议版本不一致：本机 {PROTOCOL_VERSION}，对端 {protocol_version}，请同时升级两台设备"
                 ),
-                Response::Error { message, .. } => bail!(message),
+                Response::Error { code, message } => {
+                    return Err(RemoteSyncError { code, message }.into());
+                }
                 _ => bail!("局域网设备返回了无效的协议版本响应"),
             }
         }
@@ -252,9 +293,10 @@ impl SyncManager {
             settings: &cycle.settings,
         };
         let mut cursor = after_cursor;
-        let mut has_more = availability_has_more;
+        let mut follow_up_needed = availability_has_more;
+        let mut has_more = false;
         if let Some(peer_device_id) = target.peer_device_id() {
-            has_more |= self
+            follow_up_needed |= self
                 .flush_lan_receipts(connection, &pool, group, &cycle.device, peer_device_id)
                 .await?;
         }
@@ -273,7 +315,7 @@ impl SyncManager {
             let local_materialized = materialization.processed > 0;
             let _materialized_staging = materialization.staging;
             let mut pending = if is_cloud {
-                repository::pending_origin_events_for_target(
+                repository::pending_cloud_events_for_target(
                     &pool,
                     target_id,
                     device_id,
@@ -292,6 +334,30 @@ impl SyncManager {
                 .await?
             };
             let mut more_available = pending.len() == usize::from(MAX_EVENTS_PER_BATCH);
+            let key = group.content_key_bytes()?;
+            let mut validated = Vec::with_capacity(pending.len());
+            for stored in pending {
+                let validation = crypto::decrypt_sync_event(&key, &stored.event)
+                    .and_then(|event| validate_decrypted_sync_event(&event));
+                if let Err(error) = validation {
+                    log::warn!(
+                        "skip invalid outgoing card: eventId={} error={error:#}",
+                        stored.event.event_id
+                    );
+                    self.delivery
+                        .blocked(
+                            &pool,
+                            target_id,
+                            std::slice::from_ref(&stored.event.event_id),
+                            &error.to_string(),
+                        )
+                        .await?;
+                    self.emit_updated();
+                    continue;
+                }
+                validated.push(stored);
+            }
+            pending = validated;
             if is_cloud {
                 let key = group.content_key_bytes()?;
                 for stored in &mut pending {
@@ -303,47 +369,67 @@ impl SyncManager {
                 || pending.is_empty()
             {
                 if is_cloud {
-                    let mut forced_event_ids =
-                        repository::event_ids_with_delivery_route(&pool, &pending, "cloud").await?;
-                    forced_event_ids.extend(
-                        repository::event_ids_with_forced_content_delivery(
-                            &pool, &pending, target_id,
-                        )
-                        .await?,
-                    );
-                    (
-                        deferred_cloud_file_events(
-                            &pending,
-                            &group.content_key_bytes()?,
-                            cycle.settings.auto_upload_max_mb,
-                            &forced_event_ids,
-                        )?,
-                        HashSet::new(),
+                    let forced_event_ids = repository::event_ids_with_requested_content(
+                        &pool, &pending, target_id, "cloud",
                     )
+                    .await?;
+                    let mut metadata_only_event_ids = deferred_cloud_file_events(
+                        &pending,
+                        &group.content_key_bytes()?,
+                        cycle.settings.auto_upload_max_mb,
+                        &forced_event_ids,
+                    )?;
+                    let routed_away =
+                        repository::event_ids_routed_away_from(&pool, &pending, "cloud").await?;
+                    metadata_only_event_ids
+                        .extend(routed_away.difference(&forced_event_ids).cloned());
+                    (metadata_only_event_ids, HashSet::new())
                 } else {
                     (HashSet::new(), HashSet::new())
                 }
             } else {
                 let original_count = pending.len();
-                let mut plan = self
-                    .plan_lan_content(connection, group, device_id, &pending)
-                    .await?;
+                let mut plan = loop {
+                    match self
+                        .plan_lan_content(connection, group, device_id, &pending)
+                        .await
+                    {
+                        Ok(plan) => break plan,
+                        Err(error) => {
+                            let Some(card) = error.downcast_ref::<OutgoingCardError>() else {
+                                return Err(error);
+                            };
+                            self.delivery
+                                .blocked(
+                                    &pool,
+                                    target_id,
+                                    std::slice::from_ref(&card.event_id),
+                                    &card.to_string(),
+                                )
+                                .await?;
+                            pending.retain(|stored| stored.event.event_id != card.event_id);
+                            self.emit_updated();
+                        }
+                    }
+                };
                 pending.truncate(plan.planned_count);
                 more_available |= plan.planned_count < original_count;
-                let forced_event_ids =
-                    repository::event_ids_with_forced_content_delivery(&pool, &pending, target_id)
+                let routed_away =
+                    repository::event_ids_routed_away_from(&pool, &pending, "lan").await?;
+                let requested =
+                    repository::event_ids_with_requested_content(&pool, &pending, target_id, "lan")
                         .await?;
                 plan.metadata_only_event_ids
-                    .retain(|event_id| !forced_event_ids.contains(event_id));
+                    .extend(routed_away.difference(&requested).cloned());
                 (plan.metadata_only_event_ids, plan.available_event_ids)
             };
+            repository::attach_event_blob_ids(&pool, &mut pending).await?;
+            mark_metadata_only_blob_refs(
+                &mut pending,
+                &group.content_key_bytes()?,
+                &metadata_only_event_ids,
+            );
             if is_cloud {
-                repository::attach_event_blob_ids(&pool, &mut pending).await?;
-                mark_deferred_file_blob_refs(
-                    &mut pending,
-                    &group.content_key_bytes()?,
-                    &metadata_only_event_ids,
-                );
                 mark_optional_source_icon_refs(&mut pending, &group.content_key_bytes()?);
             }
             let route = if is_cloud {
@@ -366,6 +452,98 @@ impl SyncManager {
             self.delivery
                 .queued(&pool, target_id, &ids, &metadata_only_event_ids)
                 .await?;
+            let mut content_event_ids = HashSet::new();
+            for stored in &pending {
+                if let DecryptedSyncEvent::Clipboard(envelope) =
+                    crypto::decrypt_sync_event(&key, &stored.event)?
+                {
+                    if !envelope.blobs.is_empty() {
+                        content_event_ids.insert(stored.event.event_id.clone());
+                    }
+                }
+            }
+            let missing_records =
+                repository::event_ids_without_record(&pool, &pending, target_id).await?;
+            let mut records = pending
+                .iter()
+                .filter(|stored| {
+                    !content_event_ids.contains(&stored.event.event_id)
+                        || missing_records.contains(&stored.event.event_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            has_more = more_available || local_materialized;
+            let mut records_exchanged = false;
+            while !records.is_empty() {
+                let mut ready = records.clone();
+                mark_metadata_only_blob_refs(&mut ready, &key, &content_event_ids);
+                match self
+                    .exchange_ready_events(&context, cursor, &mut ready, &content_event_ids)
+                    .await
+                {
+                    Ok(outcome) => {
+                        records_exchanged = true;
+                        cursor = outcome.latest_cursor;
+                        has_more |= outcome.has_more;
+                        if outcome.event_ids.is_empty() {
+                            return Ok(SyncConnectionOutcome { has_more: true });
+                        }
+                        records
+                            .retain(|stored| !outcome.event_ids.contains(&stored.event.event_id));
+                    }
+                    Err(error) => {
+                        if let Some(card) = error.downcast_ref::<OutgoingCardError>() {
+                            self.delivery
+                                .blocked(
+                                    &pool,
+                                    target_id,
+                                    std::slice::from_ref(&card.event_id),
+                                    &card.to_string(),
+                                )
+                                .await?;
+                            records.retain(|stored| stored.event.event_id != card.event_id);
+                            pending.retain(|stored| stored.event.event_id != card.event_id);
+                            self.emit_updated();
+                            continue;
+                        }
+                        let submitted = ready
+                            .iter()
+                            .map(|stored| stored.event.event_id.clone())
+                            .collect::<Vec<_>>();
+                        self.delivery
+                            .failed(&pool, target_id, &submitted, &error.to_string())
+                            .await?;
+                        self.emit_updated();
+                        return Err(error);
+                    }
+                }
+            }
+            self.delivery.complete_metadata_only(
+                &metadata_only_event_ids.iter().cloned().collect::<Vec<_>>(),
+                route,
+                target_id,
+            );
+            pending.retain(|stored| {
+                content_event_ids.contains(&stored.event.event_id)
+                    && !metadata_only_event_ids.contains(&stored.event.event_id)
+            });
+            if pending.is_empty() {
+                if !records_exchanged {
+                    let outcome = self
+                        .exchange_ready_events(&context, cursor, &mut Vec::new(), &HashSet::new())
+                        .await?;
+                    cursor = outcome.latest_cursor;
+                    has_more |= outcome.has_more;
+                }
+                if has_more {
+                    continue;
+                }
+                break;
+            }
+            let ids = pending
+                .iter()
+                .map(|stored| stored.event.event_id.clone())
+                .collect::<Vec<_>>();
             let blobs = repository::blobs_for_events(&pool, &ids).await?;
             let skip_content_event_ids = metadata_only_event_ids
                 .union(&available_event_ids)
@@ -383,7 +561,9 @@ impl SyncManager {
             let mut blocked_event_ids = HashSet::new();
             for (id, reason) in queue.take_failures() {
                 log::warn!("skip undeliverable sync event: eventId={id} error={reason}");
-                repository::block_delivery(&pool, target_id, &id, &reason).await?;
+                self.delivery
+                    .blocked(&pool, target_id, std::slice::from_ref(&id), &reason)
+                    .await?;
                 blocked_event_ids.insert(id);
             }
             if !blocked_event_ids.is_empty() {
@@ -440,6 +620,7 @@ impl SyncManager {
                         transfer,
                     };
                     uploads.spawn(async move {
+                        let transfer = options.transfer.clone();
                         let result = async {
                             let (staged, _staging_lease) = if blob.encrypted_path.is_empty() {
                                 (blob.clone(), None)
@@ -451,22 +632,21 @@ impl SyncManager {
                             upload_blob(&connection, &group, &staged, options).await
                         }
                         .await;
+                        if let (Err(error), Some(transfer)) = (&result, &transfer) {
+                            if transfer.canceled() {
+                                transfer.mark_canceled(0);
+                            } else {
+                                transfer.failed(0, error.to_string());
+                            }
+                        }
                         (blob_id, result)
                     });
                 }
                 self.emit_updated();
-                let prepared = self
+                let mut ready = self
                     .delivery
-                    .prepare_ready_events(
-                        &pool,
-                        target_id,
-                        route,
-                        &metadata_only_event_ids,
-                        &mut queue,
-                    )
+                    .prepare_ready_events(&pool, target_id, &mut queue)
                     .await?;
-                let mut ready = prepared.events;
-                let metadata_only_deliveries = prepared.metadata_only_operations;
                 if ready.is_empty() && !pull_needed {
                     let result = tokio::select! {
                         Some(blob_id) = upload_notifications.recv() => {
@@ -494,54 +674,49 @@ impl SyncManager {
                                 "sync attachment upload failed: blobRef={} error={error:#}",
                                 blob_log_ref(&blob_id)
                             );
-                            self.delivery
-                                .failed(&pool, target_id, &ids, &error.to_string())
-                                .await?;
-                            self.emit_updated();
-                            let message = error.to_string();
-                            failure.get_or_insert(error);
-                            if connection.close_reason().is_some() {
+                            if is_shared_sync_failure(connection, &error) {
+                                let message = error.to_string();
+                                self.delivery
+                                    .failed(&pool, target_id, &ids, &message)
+                                    .await?;
                                 self.delivery
                                     .failed(&pool, target_id, &queue.active_events(), &message)
                                     .await?;
+                                failure.get_or_insert(error);
                                 break;
                             }
+                            self.delivery
+                                .blocked(&pool, target_id, &ids, &error.to_string())
+                                .await?;
+                            queue.cancel_events(&ids.into_iter().collect());
+                            self.emit_updated();
                         }
                     }
                     continue;
                 }
                 pull_needed = false;
-                let more_outgoing = more_available || queue.has_pending();
                 match self
-                    .exchange_ready_events(
-                        &context,
-                        cursor,
-                        &mut ready,
-                        more_outgoing,
-                        &metadata_only_event_ids,
-                    )
+                    .exchange_ready_events(&context, cursor, &mut ready, &metadata_only_event_ids)
                     .await
                 {
                     Ok(outcome) => {
-                        self.delivery.complete_metadata_only(
-                            &metadata_only_deliveries,
-                            &outcome.event_ids,
-                            route,
-                            target_id,
-                        );
                         queue.confirm_events(&outcome.event_ids);
                         cursor = outcome.latest_cursor;
-                        has_more = outcome.has_more || local_materialized;
+                        has_more = outcome.has_more || local_materialized || more_available;
                     }
                     Err(error) => {
-                        self.delivery.retry_metadata_only(
-                            &metadata_only_deliveries,
-                            route,
-                            target_id,
-                        );
-                        if is_cloud && should_invalidate_cloud_connection(connection, &error) {
-                            self.invalidate_cloud_connection(connection.stable_id());
-                            self.runtime_state.watch_wake.notify_one();
+                        if let Some(card) = error.downcast_ref::<OutgoingCardError>() {
+                            self.delivery
+                                .blocked(
+                                    &pool,
+                                    target_id,
+                                    std::slice::from_ref(&card.event_id),
+                                    &card.to_string(),
+                                )
+                                .await?;
+                            queue.cancel_events(&HashSet::from([card.event_id.clone()]));
+                            self.emit_updated();
+                            continue;
                         }
                         let submitted = ready
                             .iter()
@@ -575,17 +750,17 @@ impl SyncManager {
                 .refresh_cloud_retention(connection, &pool, group, &cycle.device, 1)
                 .await?;
         }
+        has_more |= follow_up_needed;
         self.runtime_state.source_asset_wake.notify_one();
         Ok(SyncConnectionOutcome { has_more })
     }
 
-    /// Publishes only attachment-ready records and applies the Hub/peer acknowledgement immediately.
+    /// Publishes records or ready-content confirmations and applies their acknowledgement.
     async fn exchange_ready_events(
         self: &Arc<Self>,
         context: &SyncExchange<'_>,
         after_cursor: u64,
         pending: &mut Vec<StoredSyncEvent>,
-        more_outgoing: bool,
         metadata_only_event_ids: &HashSet<String>,
     ) -> Result<SyncReadyOutcome> {
         let SyncExchange {
@@ -638,10 +813,17 @@ impl SyncManager {
             Ok(count) => count,
             Err(error) => {
                 pending.truncate(1);
+                if let Some(stored) = pending.first() {
+                    return Err(OutgoingCardError {
+                        event_id: stored.event.event_id.clone(),
+                        source: error.into(),
+                    }
+                    .into());
+                }
                 return Err(error.into());
             }
         };
-        let outgoing_has_more = more_outgoing || pending_count < available_count;
+        let outgoing_has_more = pending_count < available_count;
         if let Request::Sync {
             events_complete, ..
         } = &mut request
@@ -723,7 +905,9 @@ impl SyncManager {
                     code: ErrorCode::HistoryGap,
                     ..
                 } if is_cloud => return Err(anyhow::Error::new(CloudHistoryGap)),
-                Response::Error { message, .. } => bail!(message),
+                Response::Error { code, message } => {
+                    return Err(RemoteSyncError { code, message }.into());
+                }
                 _ => bail!("同步端返回了无效响应"),
             };
             Ok::<_, anyhow::Error>((response, protocol))
@@ -742,6 +926,10 @@ impl SyncManager {
                         has_more: true,
                         event_ids: Vec::new(),
                     });
+                }
+                if is_cloud && should_invalidate_cloud_connection(connection, &error) {
+                    self.invalidate_cloud_connection(connection.stable_id());
+                    self.runtime_state.watch_wake.notify_one();
                 }
                 return Err(error);
             }
@@ -772,7 +960,6 @@ impl SyncManager {
             .completed(&pool, target_id, &event_ids, metadata_only_event_ids)
             .await?;
         self.release_staging_for_events(&pool, &event_ids).await?;
-        self.emit_updated();
         for peer in response.peers {
             if peer.device_id != device_id {
                 repository::upsert_peer_identity(&pool, &peer).await?;
@@ -797,6 +984,9 @@ impl SyncManager {
             has_more |= self
                 .flush_lan_receipts(connection, &pool, group, device, peer_device_id)
                 .await?;
+        }
+        if !event_ids.is_empty() || received_count > 0 {
+            self.emit_updated();
         }
         let apply_elapsed = apply_started_at.elapsed();
         if is_cloud {

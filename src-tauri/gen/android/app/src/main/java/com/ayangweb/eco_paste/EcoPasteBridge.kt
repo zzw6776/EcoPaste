@@ -670,8 +670,12 @@ object EcoPasteBridge {
                 if (isDirectory) return false
 
                 val sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-                if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
-                    return cursor.getLong(sizeIndex) == expectedSize
+                if (
+                    sizeIndex >= 0 &&
+                    !cursor.isNull(sizeIndex) &&
+                    cursor.getLong(sizeIndex) == expectedSize
+                ) {
+                    return true
                 }
             } ?: return false
 
@@ -680,6 +684,22 @@ object EcoPasteBridge {
             } ?: false
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    /** Opens one persisted SAF document for Rust's streaming upload. */
+    @JvmStatic
+    fun openRemoteDownloadSource(context: Context, uriValue: String): Int {
+        return try {
+            val descriptor = requireNotNull(
+                context.contentResolver.openFileDescriptor(Uri.parse(uriValue), "r"),
+            ) { "source descriptor unavailable" }
+            val fd = descriptor.detachFd()
+            descriptor.close()
+            fd
+        } catch (error: Throwable) {
+            Log.e(FILE_ACTION_TAG, "open remote download source failed", error)
+            -1
         }
     }
 

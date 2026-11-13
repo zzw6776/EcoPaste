@@ -218,6 +218,12 @@ pub async fn list_sync_transfers(
 }
 
 #[tauri::command]
+pub async fn clear_finished_sync_transfers(manager: State<'_, Arc<SyncManager>>) -> Result<()> {
+    manager.clear_finished_transfers();
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn cancel_sync_transfer(
     manager: State<'_, Arc<SyncManager>>,
     task_id: String,

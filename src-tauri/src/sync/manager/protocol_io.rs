@@ -9,9 +9,16 @@ pub(super) fn authenticate_local(
         .identity
         .snapshot()
         .group
-        .context("device is not paired")?;
+        .ok_or_else(|| RemoteSyncError {
+            code: ErrorCode::Unauthorized,
+            message: "device is not paired".to_owned(),
+        })?;
     if group.group_id != group_id || group.access_token_bytes()? != access_token {
-        bail!("unauthorized");
+        return Err(RemoteSyncError {
+            code: ErrorCode::Unauthorized,
+            message: "unauthorized".to_owned(),
+        }
+        .into());
     }
     Ok(group)
 }
@@ -220,6 +227,14 @@ pub(super) fn should_invalidate_cloud_connection(
 
 pub(super) fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<LanAttemptTimeout>().is_some()
+}
+
+/// A failed card stream does not invalidate the shared connection while it remains authenticated.
+pub(super) fn is_shared_sync_failure(connection: &Connection, error: &anyhow::Error) -> bool {
+    connection.close_reason().is_some()
+        || error
+            .downcast_ref::<RemoteSyncError>()
+            .is_some_and(|failure| failure.code == ErrorCode::Unauthorized)
 }
 
 /// Validates an approval, waits for the approver's durable commit, then changes the local space.
