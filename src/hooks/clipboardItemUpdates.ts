@@ -30,7 +30,7 @@ export function upsertClipboardItemCache(
     return current.id === input.item.id;
   });
   const matches = itemMatchesQuery(input.item, input.query);
-  const boundary = prefix.at(-1);
+  const boundary = prefix[prefix.length - 1];
   if (
     matches &&
     prefix.length < input.total &&
