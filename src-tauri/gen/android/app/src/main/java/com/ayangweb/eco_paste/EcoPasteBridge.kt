@@ -229,6 +229,13 @@ object EcoPasteBridge {
     @JvmStatic
     fun getCurrentActivity(): Activity? = currentActivityRef?.get()
 
+    /** 复用前端页面就绪通知，结束当前主窗口的原生启动画面。 */
+    @JvmStatic
+    fun onWindowReady() {
+        val activity = getCurrentActivity() as? MainActivity ?: return
+        activity.runOnUiThread { activity.onStartupContentReady() }
+    }
+
     /** Stable logcat channel for end-to-end Android file action diagnostics. */
     @JvmStatic
     fun logFileAction(stage: String, message: String) {
@@ -1926,6 +1933,16 @@ object EcoPasteBridge {
                 listener(text)
             } catch (_: Exception) {}
         }
+    }
+
+    /** Reuses the clipboard source cache for explicit Android shares. */
+    fun shareSourceApp(packageName: String?): org.json.JSONObject? {
+        val source = resolveSourceApp(packageName)
+        if (source.packageName.isBlank()) return null
+        return org.json.JSONObject()
+            .put("packageName", source.packageName)
+            .put("appName", source.appName)
+            .put("iconPng", org.json.JSONArray(source.iconPng.map { it.toInt() and 0xff }))
     }
 
     private data class SourceAppMetadata(

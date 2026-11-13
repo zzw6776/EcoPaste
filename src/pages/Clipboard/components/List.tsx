@@ -1,3 +1,4 @@
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEventListener, useMount, useUnmount } from "ahooks";
 import { Empty, Spin } from "antd";
 import type { TFunction } from "i18next";
@@ -40,13 +41,12 @@ import {
   WINDOW_OPEN_SELECTION_PRESERVE,
 } from "@/constants/windowOpenSelection";
 import { WINDOW_LABEL } from "@/constants/windows";
-import { useClipboardItems } from "@/hooks/useClipboardItems";
+import type { useClipboardItems } from "@/hooks/useClipboardItems";
 import {
   allowsEditableGlobalKeyboard,
   useKeyboardEvent,
 } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
-import { useWindowReady } from "@/hooks/useWindowReady";
 import { hasActiveClipboardItemDownload } from "@/stores/clipboardItemActivity";
 import {
   type ClipboardItemLocationRequest,
@@ -68,6 +68,8 @@ import type {
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
 import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
+import { log } from "@/utils/log";
+import { recordStartupTiming } from "@/utils/startupTiming";
 import { listClipboardGroupsShared } from "../dataRequests";
 import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
@@ -77,6 +79,7 @@ import {
 import { useClipboardSyncStatuses } from "../hooks/useClipboardSyncStatuses";
 import AndroidFileDetailsDrawer from "./AndroidFileDetailsDrawer";
 import ClipboardCard from "./cards/ClipboardCard";
+import type { ClipboardListProps } from "./ClipboardList";
 import NoteModal from "./NoteModal";
 
 /** 前 10 项的快捷键：index 0-8 对应 1-9，index 9 对应 0 */
@@ -104,15 +107,9 @@ interface ClipboardMenuActionPayload {
   itemId: string;
 }
 
-export interface ClipboardListView {
-  category: ClipboardKind | null;
-  groupId: string | null;
-  range: ClipboardRange;
-}
-
-interface ListProps {
-  active?: boolean;
-  view?: ClipboardListView;
+interface ListProps extends ClipboardListProps {
+  items: ReturnType<typeof useClipboardItems>;
+  onMounted: () => void;
 }
 
 /**
@@ -120,7 +117,7 @@ interface ListProps {
  * 跟随关键词（Header 已防抖）检索。
  */
 const List: FC<ListProps> = (props) => {
-  const { active = true, view } = props;
+  const { active = true, items, onMounted, view } = props;
   const { t } = useTranslation("clipboard");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
@@ -155,10 +152,9 @@ const List: FC<ListProps> = (props) => {
   const hiddenRangeRefreshTimerRef = useRef<number | null>(null);
   const hiddenRangeRefreshInFlightRef = useRef(false);
   const hiddenRangeRefreshPendingRef = useRef(false);
-  // 剪贴板窗口启动即隐藏，初值取 false；首个 `window://visibility` show 事件会翻正。
-  // 隐藏期间在 WebView 内预刷新当前可视范围，避免 show 后才用新数据挤开旧卡片。
-  // Android 移动端与 Web 预览模式下首屏直接处于激活态，初值置为 true。
+  // 外壳可先显示；桌面端用原生快照及显隐事件确定列表挂载时的可见性。
   const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
+  const windowVisibilityObservedRef = useRef(false);
 
   useEventListener(
     "wheel",
@@ -228,14 +224,28 @@ const List: FC<ListProps> = (props) => {
     removeItemById,
     total,
     upsertItem,
-  } = useClipboardItems({
-    favorite: range === "favorite" ? true : void 0,
-    groupId: groupId ?? void 0,
-    keyword,
-    kind: category ?? void 0,
-    sort,
-  });
+  } = items;
   const locatingRequestRef = useRef<number | null>(null);
+  const startupPresentedRef = useRef(false);
+
+  useEffect(() => {
+    if (!active || !loadedInitial || startupPresentedRef.current) return;
+
+    let paintFrame = 0;
+    const frame = requestAnimationFrame(() => {
+      paintFrame = requestAnimationFrame(() => {
+        recordStartupTiming("clipboard-painted", {
+          loadedItems: loadedItems.size,
+          total,
+        });
+        startupPresentedRef.current = true;
+      });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      cancelAnimationFrame(paintFrame);
+    };
+  }, [active, loadedInitial, loadedItems.size, total]);
 
   /** 按后端权威排序定位记录，虚拟列表只加载目标附近的一页。 */
   async function locateRequestedItem(request: ClipboardItemLocationRequest) {
@@ -304,8 +314,6 @@ const List: FC<ListProps> = (props) => {
     [getItem],
   );
 
-  useWindowReady(active && loadedInitial);
-
   const refreshSyncStatuses = useClipboardSyncStatuses(
     loadedItems,
     active,
@@ -367,10 +375,13 @@ const List: FC<ListProps> = (props) => {
    * 首次挂载时拉取分组名称。
    */
   useMount(() => {
+    onMounted();
     void loadGroups();
+    void initializeWindowVisibility();
   });
 
   useUnmount(() => {
+    windowVisibilityObservedRef.current = true;
     hiddenRangeRefreshPendingRef.current = false;
     clearHiddenRangeRefreshTimer();
   });
@@ -520,6 +531,22 @@ const List: FC<ListProps> = (props) => {
     }
   }
 
+  /** 外壳先显示时，列表挂载后补齐首次显隐；已收到事件就保留事件的新状态。 */
+  async function initializeWindowVisibility() {
+    if (!isTauri || isAndroid) return;
+
+    try {
+      const visible = await getCurrentWebviewWindow().isVisible();
+      if (windowVisibilityObservedRef.current) return;
+
+      handleWindowVisibility({
+        payload: { label: WINDOW_LABEL.CLIPBOARD, visible },
+      });
+    } catch (error) {
+      log.warn("read initial clipboard window visibility failed", error);
+    }
+  }
+
   /**
    * 剪贴板窗口显隐变化：更新可见性镜像；显示时按偏好重置分组与滚动位置。
    * 可见性 ref 供 `handleClipboardUpdated` 判断是否处于冻结态——隐藏期间只记 pending，不立即 reload。
@@ -586,6 +613,9 @@ const List: FC<ListProps> = (props) => {
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
     (event) => {
+      if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
+
+      windowVisibilityObservedRef.current = true;
       handleWindowVisibility(event);
     },
   );

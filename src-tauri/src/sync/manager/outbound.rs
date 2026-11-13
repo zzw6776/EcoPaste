@@ -769,6 +769,11 @@ impl SyncManager {
                     sync_key: item.sync_key.clone(),
                     updated_at_ms: Some(item.updated_at.timestamp_millis()),
                     source_revision: Some(item.source_revision.clone()),
+                    source_device_id: item.source_device_id.clone(),
+                    source_device_name: item.source_device_name.clone(),
+                    source_updated_at_ms: item
+                        .source_updated_at
+                        .map(|value| value.timestamp_millis()),
                 },
                 blobs: manifests,
                 source_app,

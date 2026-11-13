@@ -1248,6 +1248,11 @@ impl SyncManager {
         self.wake_cloud_transfer();
     }
 
+    pub(crate) fn local_source_device(&self) -> (String, String) {
+        let identity = self.identity.snapshot();
+        (identity.device_id, identity.device_name)
+    }
+
     /// Android 原生 Context 晚于 Rust setup 就绪，完成注入后刷新自动设备名。
     #[cfg(target_os = "android")]
     pub fn refresh_system_device_name(&self, name: String) -> Result<()> {
@@ -3070,6 +3075,9 @@ mod tests {
                 sync_key: "c".repeat(64),
                 updated_at_ms: Some(100),
                 source_revision: Some("revision".into()),
+                source_device_id: None,
+                source_device_name: None,
+                source_updated_at_ms: None,
             },
             blobs: vec![BlobManifest {
                 blob_id: content_id.clone(),
@@ -3189,6 +3197,9 @@ mod tests {
                 sync_key: "hash".into(),
                 updated_at_ms: Some(1_700_000_000_000),
                 source_revision: Some("revision".into()),
+                source_device_id: None,
+                source_device_name: None,
+                source_updated_at_ms: None,
             },
             blobs: Vec::new(),
             source_app: None,

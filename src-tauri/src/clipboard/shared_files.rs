@@ -15,6 +15,7 @@ use crate::db::models::{ClipboardItem, ClipboardKind};
 pub(crate) const DIRECTORY: &str = "shared-files";
 pub(crate) const SYNC_DIRECTORY: &str = "sync-files";
 pub(crate) const REFERENCE_PREFIX: &str = "ecopaste-resource://";
+const REFERENCE_MIGRATION_MARKER: &str = ".references-v1";
 
 /// Serializes attachment creation through database commit with reclamation and storage replacement.
 pub(crate) async fn lock() -> MutexGuard<'static, ()> {
@@ -259,6 +260,18 @@ pub(crate) struct ReferenceMigration {
 }
 
 impl ReferenceMigration {
+    /// 普通启动只处理尚未完成的当前版本；显式导入和目录迁移仍完整执行 apply。
+    pub(crate) async fn apply_on_startup(&self, pool: &SqlitePool) -> Result<bool> {
+        let marker = self.resources.join(REFERENCE_MIGRATION_MARKER);
+        let root = self.resources.to_string_lossy();
+        if fs::read_to_string(marker).ok().as_deref() == Some(root.as_ref()) {
+            return Ok(false);
+        }
+
+        self.apply(pool).await?;
+        Ok(true)
+    }
+
     /// Migrates current roots and validates stale roots left by older storage moves.
     pub(crate) fn current(resources: PathBuf) -> Self {
         let shared = resources.join(DIRECTORY).to_string_lossy().into_owned();
@@ -396,6 +409,16 @@ impl ReferenceMigration {
         tx.commit()
             .await
             .context("commit managed resource reference migration")?;
+        let marker_result = (|| -> Result<()> {
+            fs::create_dir_all(&self.resources)?;
+            let marker = tempfile::NamedTempFile::new_in(&self.resources)?;
+            fs::write(marker.path(), self.resources.to_string_lossy().as_bytes())?;
+            marker.persist(self.resources.join(REFERENCE_MIGRATION_MARKER))?;
+            Ok(())
+        })();
+        if let Err(error) = marker_result {
+            log::warn!("persist resource reference migration marker failed: {error:#}");
+        }
         Ok(())
     }
 

@@ -1,12 +1,15 @@
+import { useMount, useUnmount } from "ahooks";
 import { Progress } from "antd";
 import type { TFunction } from "i18next";
 import type { FC, MouseEvent } from "react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSnapshot } from "valtio";
 import {
   cancelSyncTransfer,
   downloadRemoteFiles,
+  type FileIconResult,
+  getFileIconPath,
   type TransferTask,
 } from "@/commands";
 import AssetImage from "@/components/AssetImage";
@@ -19,6 +22,7 @@ import { formatBytes } from "@/pages/Preference/utils/storageUsage";
 import { clipboardViewState } from "@/stores/clipboardView";
 import type { ClipboardItem, FileEntry } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
+import { isTauri } from "@/utils/is";
 import ImageCard from "./ImageCard";
 
 type FilesCardProps = ClipboardItem & {
@@ -29,6 +33,7 @@ type FilesCardProps = ClipboardItem & {
 
 /**
  * 文件类卡片：`fileEntries` 与 `filesPreviewKind` 均由 Rust 命令层预处理，
+ * 缺失的系统图标在可见文件行挂载后向 Rust 按需读取。
  * 前端只按 kind 分支渲染：`imagePreview` 走单图预览，`list` 走文件列表；
  * 路径已删除（`exists = false`）的条目一律走 list 并对文件名划删除线。
  */
@@ -268,10 +273,42 @@ interface FileRowProps {
 
 const FileRow: FC<FileRowProps> = (props) => {
   const { entry, keyword } = props;
+  const [details, setDetails] = useState<FileIconResult>();
+  const mountedRef = useRef(false);
+  const iconPath = entry.iconPath ?? details?.iconPath;
+
+  async function loadIcon() {
+    if (!isTauri || entry.iconPath || entry.isRemote || !entry.exists) return;
+
+    try {
+      const result = await getFileIconPath(entry.path, entry.isDir);
+      if (mountedRef.current) setDetails(result);
+    } catch {
+      // 命令层已记录错误，文件行继续显示通用图标。
+    }
+  }
+
+  useMount(() => {
+    mountedRef.current = true;
+    void loadIcon();
+  });
+
+  useUnmount(() => {
+    mountedRef.current = false;
+  });
 
   return (
     <div className="flex items-center gap-1 truncate" title={entry.path}>
-      <AssetImage className="size-5" src={entry.iconPath} />
+      {iconPath ? (
+        <AssetImage className="size-5 shrink-0" src={iconPath} />
+      ) : (
+        <i
+          className={cn("size-5 shrink-0 text-ant-tertiary", {
+            "i-lucide:file": !entry.isDir,
+            "i-lucide:folder": entry.isDir,
+          })}
+        />
+      )}
 
       <Highlight
         className={cn("truncate", {

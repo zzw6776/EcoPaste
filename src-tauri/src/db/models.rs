@@ -45,6 +45,17 @@ pub struct ClipboardItem {
     pub source_app_id: Option<String>,
     /// 同内容多来源冲突的稳定决胜字段；同步事件必须原样携带。
     pub source_revision: String,
+    /// 实际采集设备，随来源应用一起合并；上传或下载不改变来源。
+    #[serde(default)]
+    pub source_device_id: Option<String>,
+    #[serde(default)]
+    pub source_device_name: Option<String>,
+    /// 独立于历史使用时间的实际采集时间，读取旧备份时可为空。
+    #[serde(default)]
+    pub source_updated_at: Option<DateTime<Utc>>,
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub source_device_is_local: bool,
     pub content: String,
     /// 去重指纹：`blake3(kind:content)`，由 `db::items::content_hash` 计算并在入库前比对。
     pub content_hash: String,

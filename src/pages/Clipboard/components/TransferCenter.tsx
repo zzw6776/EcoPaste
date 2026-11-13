@@ -110,8 +110,6 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
 
   useMount(() => {
     mountedRef.current = true;
-    void loadGroups();
-    void loadPeers();
   });
 
   useUnmount(() => {
@@ -119,12 +117,20 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
   });
 
   useTauriListen(TAURI_EVENT.CLIPBOARD_GROUPS_UPDATED, () => {
-    void loadGroups();
+    if (open) void loadGroups();
   });
 
   useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
-    void loadPeers();
+    if (open) void loadPeers();
   });
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 每次打开读取当前详情，关闭期间不查询展示数据。
+  useEffect(() => {
+    if (!open) return;
+
+    void loadGroups();
+    void loadPeers();
+  }, [open]);
 
   const activeCount = transferTasks.filter((task) => {
     return isTransferActive(task);
@@ -143,10 +149,12 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
   });
   const visibleItemIdsKey = visibleItemIds.join("\0");
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: key 只在可见任务集合变化时触发条目补载。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 仅在弹窗打开且任务集合变化时补载，进度变化不重复查询。
   useEffect(() => {
+    if (!open) return;
+
     void loadItemContexts(visibleItemIds);
-  }, [visibleItemIdsKey]);
+  }, [open, visibleItemIdsKey]);
 
   async function handleCancel(event: MouseEvent<HTMLButtonElement>) {
     event.stopPropagation();

@@ -238,6 +238,9 @@ mod tests {
                 sync_key: key.into(),
                 updated_at_ms: Some(1),
                 source_revision: None,
+                source_device_id: None,
+                source_device_name: None,
+                source_updated_at_ms: None,
             },
             blobs: blobs
                 .iter()

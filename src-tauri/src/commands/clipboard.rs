@@ -2,7 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Instant;
 
 use chrono::{DateTime, Datelike, Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -497,9 +501,10 @@ pub async fn get_file_icon_path(
     index: usize,
 ) -> Result<FileIconResult> {
     let pool = db.pool().await;
-    let (icon_path, exists) =
-        resolve_file_icon_path(&pool, &file_icon_store, &path, file_types.as_deref(), index)
-            .await?;
+    let (icon_path, exists) = resolve_file_icon_path(
+        &pool, &file_icon_store, &path, file_types.as_deref(), index, true,
+    )
+    .await?;
 
     Ok(FileIconResult { icon_path, exists })
 }
@@ -825,14 +830,23 @@ pub async fn list_clipboard_items(
     file_icon_store: State<'_, FileIconStore>,
     query: Option<ClipboardItemQuery>,
 ) -> Result<ClipboardItemPage> {
+    static FIRST_PAGE_LOGGED: AtomicBool = AtomicBool::new(false);
+    let started_at = Instant::now();
     let pool = db.pool().await;
     let q = query.unwrap_or_default();
     let (mut items, total) = crate::db::items::query_items_page(&pool, &q).await?;
+    let query_ms = started_at.elapsed().as_millis();
     let now = Local::now();
     let settings = app.state::<SettingsStore>().snapshot();
     let file_entry_limit = settings.clipboard.display.file_entry_limit();
     let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
+    let local_device_id = app
+        .try_state::<Arc<crate::sync::SyncManager>>()
+        .map(|manager| manager.local_source_device().0);
     for item in &mut items {
+        item.source_device_is_local = local_device_id.as_ref().is_some_and(|id| {
+            item.source_device_id.as_deref() == Some(id.as_str())
+        });
         resolve_managed_file_content(&app, item)?;
         attach_source_app_icon_path(&app_icon_store, item);
         attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
@@ -843,6 +857,15 @@ pub async fn list_clipboard_items(
         item.available_actions = compute_available_actions(item);
     }
     let has_more = q.offset + (items.len() as i64) < total;
+    if !FIRST_PAGE_LOGGED.swap(true, Ordering::Relaxed) {
+        let total_ms = started_at.elapsed().as_millis();
+        log::info!(
+            "startup timing: stage=first-history-page rows={} total={} queryMs={query_ms} enrichMs={} totalMs={total_ms}",
+            items.len(),
+            total,
+            total_ms.saturating_sub(query_ms)
+        );
+    }
     Ok(ClipboardItemPage {
         list: items,
         total,
@@ -878,6 +901,12 @@ pub async fn get_clipboard_item(
     let pool = db.pool().await;
     let mut item = find_item_for_list_by_id(&pool, &id).await?;
     if let Some(item) = item.as_mut() {
+        let local_device_id = app
+            .try_state::<Arc<crate::sync::SyncManager>>()
+            .map(|manager| manager.local_source_device().0);
+        item.source_device_is_local = local_device_id.as_ref().is_some_and(|id| {
+            item.source_device_id.as_deref() == Some(id.as_str())
+        });
         resolve_managed_file_content(&app, item)?;
         let settings = app.state::<SettingsStore>().snapshot();
         let file_entry_limit = settings.clipboard.display.file_entry_limit();
@@ -1179,7 +1208,7 @@ async fn attach_file_entries(
         let (icon_path, exists) = if is_remote {
             (None, false)
         } else {
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, false).await?
         };
         let is_dir = types.get(index).copied() == Some("d");
         let name = std::path::Path::new(path)
@@ -1282,7 +1311,7 @@ async fn build_preview_file_entries(
         let (icon_path, exists) = if is_remote {
             (None, false)
         } else {
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index).await?
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, true).await?
         };
         let path_obj = Path::new(path);
         let is_dir = resolve_preview_file_is_dir(path_obj, item.file_types.as_deref(), index);
@@ -1372,6 +1401,7 @@ fn is_image_path(path: &str) -> bool {
 }
 
 /// 解析文件 icon 路径：优先命中缓存，未命中时在路径存在的前提下抽取并落盘缓存。
+/// 列表不等待缓存补建，可见文件行及显式预览按需调用完整解析。
 /// 返回 `(icon_path, exists)`，其中 `icon_path` 可能为 `None`（抽取失败或已删除且无缓存）。
 async fn resolve_file_icon_path(
     pool: &SqlitePool,
@@ -1379,6 +1409,7 @@ async fn resolve_file_icon_path(
     path: &str,
     file_types: Option<&str>,
     index: usize,
+    extract_if_missing: bool,
 ) -> Result<(Option<String>, bool)> {
     let path_obj = Path::new(path);
     let exists = path_obj.exists();
@@ -1408,8 +1439,8 @@ async fn resolve_file_icon_path(
         }
     }
 
-    if !exists {
-        return Ok((None, false));
+    if !exists || !extract_if_missing {
+        return Ok((None, exists));
     }
 
     let path_for_extract = path_obj.to_path_buf();
@@ -1978,6 +2009,10 @@ mod tests {
             group_id: None,
             source_app_id: None,
             source_revision: uuid::Uuid::new_v4().simple().to_string(),
+            source_device_id: None,
+            source_device_name: None,
+            source_updated_at: None,
+            source_device_is_local: false,
             content_hash: content_hash(ClipboardKind::Text, &content),
             sync_key: content_hash(ClipboardKind::Text, &content),
             content,

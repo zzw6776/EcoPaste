@@ -4,12 +4,18 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.core.splashscreen.SplashScreenViewProvider
 
 class MainActivity : TauriActivity() {
     override val handleBackNavigation: Boolean = false
 
+    private var startupContentReady = false
+    private var startupSplash: SplashScreenViewProvider? = null
+    private var startupWebView: WebView? = null
     private var createDocumentCallback: ((Uri?) -> Unit)? = null
     private var openDocumentTreeCallback: ((Uri?) -> Unit)? = null
     private val createDocumentLauncher = registerForActivityResult(
@@ -40,8 +46,23 @@ class MainActivity : TauriActivity() {
     private external fun initNdkContext(context: Context)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val createStartedAt = android.os.SystemClock.elapsedRealtime()
+        val createWallTime = System.currentTimeMillis()
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-activity-begin atMs=$createWallTime",
+        )
+        val splashScreen = installSplashScreen()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        splashScreen.setOnExitAnimationListener { splash ->
+            startupSplash = splash
+            dismissStartupSplashIfReady()
+        }
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-super-ready atMs=${System.currentTimeMillis()} elapsedMs=${android.os.SystemClock.elapsedRealtime() - createStartedAt}",
+        )
         try {
             initNdkContext(applicationContext)
             EcoPasteBridge.initNdkContext(applicationContext)
@@ -54,9 +75,56 @@ class MainActivity : TauriActivity() {
         }
         EcoPasteBridge.setCurrentActivity(this)
         EcoPasteBridge.initialize(applicationContext)
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-bridge-ready atMs=${System.currentTimeMillis()} elapsedMs=${android.os.SystemClock.elapsedRealtime() - createStartedAt}",
+        )
         if (savedInstanceState == null) {
             EcoPasteShareReceiver.receive(this, intent)
         }
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-activity startedAtMs=$createWallTime createMs=${android.os.SystemClock.elapsedRealtime() - createStartedAt}",
+        )
+    }
+
+    /** WebView 尚未绘制网页时沿用原生窗口背景，避免短暂露出默认白色。 */
+    override fun onWebViewCreate(webView: WebView) {
+        super.onWebViewCreate(webView)
+        startupWebView = webView
+        webView.setBackgroundColor(resources.getColor(R.color.app_background, theme))
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-webview-created atMs=${System.currentTimeMillis()}",
+        )
+    }
+
+    /** 页面外壳提交后，等待对应网页内容可绘制再撤掉原生 Logo。 */
+    fun onStartupContentReady() {
+        val webView = startupWebView ?: return
+        webView.postVisualStateCallback(0L, object : WebView.VisualStateCallback() {
+            override fun onComplete(requestId: Long) {
+                startupContentReady = true
+                webView.invalidate()
+                android.util.Log.i(
+                    "EcoPasteStartup",
+                    "startup timing: stage=android-content-drawable atMs=${System.currentTimeMillis()}",
+                )
+                dismissStartupSplashIfReady()
+            }
+        })
+    }
+
+    /** Logo 覆盖初始化过程，同时允许下方 WebView 正常绘制。 */
+    private fun dismissStartupSplashIfReady() {
+        if (!startupContentReady) return
+        val splash = startupSplash ?: return
+        startupSplash = null
+        splash.remove()
+        android.util.Log.i(
+            "EcoPasteStartup",
+            "startup timing: stage=android-splash-dismissed atMs=${System.currentTimeMillis()}",
+        )
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -83,6 +151,8 @@ class MainActivity : TauriActivity() {
     }
 
     override fun onDestroy() {
+        startupSplash = null
+        startupWebView = null
         createDocumentCallback?.invoke(null)
         createDocumentCallback = null
         openDocumentTreeCallback?.invoke(null)

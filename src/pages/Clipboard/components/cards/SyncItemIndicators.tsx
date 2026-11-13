@@ -207,7 +207,7 @@ function channelClassName(
       break;
   }
   if (activity === "queued") return "text-ant-secondary";
-  return channel.action === "upload" ? "text-ant-warning" : "text-ant-tertiary";
+  return "text-ant-tertiary";
 }
 
 function channelTitleState(

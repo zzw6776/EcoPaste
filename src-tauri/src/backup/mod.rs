@@ -1343,17 +1343,12 @@ async fn merge_items(
     .await
     .context("failed to inspect backup schema")?;
     let select_items = if has_remote_file_metadata != 0 {
-        "SELECT item.id, item.kind, item.sub_kind, item.group_id, item.source_app_id, item.content, \
-         item.content_hash, item.sync_key, item.search_text, item.summary, item.file_types, item.size, \
-         item.width, item.height, item.use_count, item.is_favorite, item.is_pinned, item.is_sensitive, \
-         item.platform, item.note, item.created_at, item.updated_at, remote.item_id AS remote_item_id \
+        "SELECT item.*, remote.item_id AS remote_item_id \
          FROM clipboard_items item \
          LEFT JOIN sync_remote_file_items remote ON remote.item_id = item.id \
          ORDER BY item.created_at ASC"
     } else {
-        "SELECT id, kind, sub_kind, group_id, source_app_id, content, content_hash, sync_key, search_text, \
-         summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
-         created_at, updated_at, CAST(NULL AS TEXT) AS remote_item_id \
+        "SELECT *, CAST(NULL AS TEXT) AS remote_item_id \
          FROM clipboard_items ORDER BY created_at ASC"
     };
     let mut rows = sqlx::query_as::<_, BackupItemRow>(select_items).fetch(backup);
@@ -1392,18 +1387,20 @@ async fn merge_items(
 
         sqlx::query(
             "INSERT OR IGNORE INTO clipboard_items \
-             (id, kind, sub_kind, group_id, source_app_id, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
+             (id, kind, sub_kind, group_id, source_app_id, source_device_id, source_device_name, source_revision, source_updated_at, content, content_hash, sync_key, search_text, \
               summary, file_types, size, width, height, use_count, is_favorite, is_pinned, is_sensitive, platform, note, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(row.kind)
         .bind(row.sub_kind)
         .bind(row.group_id)
         .bind(row.source_app_id)
-        .bind(&row.id)
-        .bind(row.updated_at)
+        .bind(row.source_device_id)
+        .bind(row.source_device_name)
+        .bind(row.source_revision.as_deref().unwrap_or(&row.id))
+        .bind(row.source_updated_at.unwrap_or(row.updated_at))
         .bind(row.content)
         .bind(&row.content_hash)
         .bind(row.sync_key)
@@ -1440,6 +1437,14 @@ struct BackupItemRow {
     sub_kind: Option<String>,
     group_id: Option<String>,
     source_app_id: Option<String>,
+    #[sqlx(default)]
+    source_device_id: Option<String>,
+    #[sqlx(default)]
+    source_device_name: Option<String>,
+    #[sqlx(default)]
+    source_revision: Option<String>,
+    #[sqlx(default)]
+    source_updated_at: Option<DateTime<Utc>>,
     content: String,
     content_hash: String,
     sync_key: String,
@@ -2099,6 +2104,10 @@ mod tests {
             group_id: None,
             source_app_id: None,
             source_revision: uuid::Uuid::new_v4().simple().to_string(),
+            source_device_id: None,
+            source_device_name: None,
+            source_updated_at: None,
+            source_device_is_local: false,
             content_hash: content_hash(ClipboardKind::Text, &content),
             sync_key: "f".repeat(64),
             content,

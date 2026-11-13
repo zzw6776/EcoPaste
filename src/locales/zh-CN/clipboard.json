@@ -10,6 +10,11 @@
     "items": "{{count}} 个项目",
     "useCount": "已使用 {{count}} 次"
   },
+  "cardSource": {
+    "thisDevice": "本机",
+    "unknownApp": "未知应用",
+    "unknownDevice": "未知设备"
+  },
   "empty": {
     "categories": {
       "files": "文件",
@@ -148,12 +153,12 @@
       "downloading": "云端：正在下载文件",
       "error": "云端同步失败，点击重试",
       "errorWithReason": "云端：{{reason}}，等待重试或点击重试",
-      "idle": "云端：本次未使用",
-      "manual": "云端：文件尚未上传，点击上传",
+      "idle": "云端：尚无同步确认",
+      "manual": "云端：内容状态尚未确认，点击上传",
       "metadataOnly": "云端：仅记录已同步，点击上传文件",
       "partial": "云端：部分内容已就绪（{{content}}/{{total}}）",
       "queued": "云端：等待同步",
-      "remoteMetadataOnly": "云端：仅同步记录，文件内容尚未上传",
+      "remoteMetadataOnly": "云端：记录已同步，内容尚未完整就绪",
       "remoteSuccess": "云端：文件内容已就绪",
       "remoteSyncing": "云端：正在启动文件下载",
       "started": "已加入云端同步队列",
@@ -165,8 +170,8 @@
       "downloading": "局域网：正在下载文件",
       "error": "局域网同步失败，点击重试",
       "errorWithReason": "局域网：{{reason}}，等待重试或点击重试",
-      "idle": "局域网：当前无在线设备，已跳过",
-      "manual": "局域网：需要手动同步，点击传输",
+      "idle": "局域网：尚无投递确认",
+      "manual": "局域网：投递状态尚未确认，点击传输",
       "metadataOnly": "局域网：仅记录已同步到 {{delivered}}/{{total}} 台设备，请在接收设备下载",
       "partial": "局域网：文件内容已到达 {{content}}/{{total}} 台设备",
       "queued": "局域网：等待同步",

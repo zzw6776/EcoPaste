@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./i18n";
 import { log } from "./utils/log";
+import { recordStartupTiming } from "./utils/startupTiming";
 
 import "overlayscrollbars/overlayscrollbars.css";
 import "virtual:uno.css";
@@ -26,22 +27,11 @@ function installGlobalErrorLogging() {
   });
 }
 
-const StartupFallback = () => {
-  return (
-    <div
-      aria-label="EcoPaste 正在启动"
-      className="app-startup-shell flex size-full min-h-screen items-center justify-center"
-      role="status"
-    >
-      <div className="size-8 animate-pulse rounded-2 bg-ant-primary" />
-    </div>
-  );
-};
-
 installGlobalErrorLogging();
+recordStartupTiming("frontend-entry");
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <Suspense fallback={<StartupFallback />}>
+  <Suspense fallback={null}>
     <App />
   </Suspense>,
 );

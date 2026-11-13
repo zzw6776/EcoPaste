@@ -260,6 +260,12 @@ pub(crate) async fn persist_and_notify_with_sync(
     sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
 ) -> crate::core::Result<UpsertResult> {
     let mut item_to_write = item.clone();
+    if let Some(manager) = app.try_state::<Arc<crate::sync::SyncManager>>() {
+        let (device_id, device_name) = manager.local_source_device();
+        item_to_write.source_device_id = Some(device_id);
+        item_to_write.source_device_name = Some(device_name);
+    }
+    item_to_write.source_updated_at = Some(item.updated_at);
     let resources = crate::core::paths::resources_dir(app)?;
     super::shared_files::normalize_new_item(&resources, &mut item_to_write)?;
     if let Some(src) = source_app {

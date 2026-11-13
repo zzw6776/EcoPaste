@@ -802,6 +802,7 @@ export const getSettings = () => {
   return call<Settings>(
     TAURI_COMMAND.GET_SETTINGS,
     "commands:labels.loadSettings",
+    { requestedAtMs: Date.now() },
   );
 };
 
@@ -1296,6 +1297,20 @@ export const listClipboardItems = (query: ClipboardItemQuery) => {
     TAURI_COMMAND.LIST_CLIPBOARD_ITEMS,
     "commands:labels.loadClipboardList",
     { query },
+  );
+};
+
+export interface FileIconResult {
+  iconPath: string | null;
+  exists: boolean;
+}
+
+/** 可见文件行挂载后按需补齐系统图标，复用 Rust 的文件类型缓存。 */
+export const getFileIconPath = (path: string, isDirectory: boolean) => {
+  return call<FileIconResult>(
+    TAURI_COMMAND.GET_FILE_ICON_PATH,
+    "commands:labels.loadClipboardList",
+    { fileTypes: isDirectory ? "d" : "f", index: 0, path },
   );
 };
 
