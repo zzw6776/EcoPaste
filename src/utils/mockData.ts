@@ -34,6 +34,7 @@ export const DEFAULT_MOCK_SETTINGS: Settings = {
       text: true,
     },
     content: {
+      alwaysShowItemActions: false,
       autoFavorite: false,
       autoPaste: "doubleClickPaste",
       copyPlain: false,

@@ -172,6 +172,10 @@
         }
       },
       "actions": {
+        "alwaysShow": {
+          "description": "开启后桌面卡片的快捷按钮常驻显示；关闭后仅在鼠标悬停底栏时显示。切换立即生效。",
+          "title": "常驻显示快捷按钮"
+        },
         "deleteConfirm": {
           "description": "删除普通历史记录前先弹出确认，收藏和置顶记录不受此开关影响。",
           "title": "普通条目删除前确认"
@@ -198,7 +202,7 @@
         },
         "visible": {
           "controlLabel": "管理",
-          "description": "选择鼠标悬停在记录上时显示的操作按钮。",
+          "description": "选择卡片底栏显示的快捷按钮，并调整顺序。",
           "title": "显示的快捷动作"
         }
       },

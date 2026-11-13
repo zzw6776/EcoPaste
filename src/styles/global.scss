@@ -73,33 +73,17 @@ html.dark .app-startup-shell {
   border-radius: calc(1rem + var(--clipboard-card-selection-frame));
 }
 
-.clipboard-card {
-  container-name: clipboard-card;
-  container-type: inline-size;
-}
-
 .clipboard-card__desktop-actions {
   display: none;
 }
 
-.clipboard-card__status-row:hover {
-  .clipboard-card__desktop-actions {
-    display: flex;
-  }
-
-  .clipboard-card__hint {
-    display: none;
-  }
+.clipboard-card__status-row--actions-always-visible .clipboard-card__desktop-actions,
+.clipboard-card__status-row:hover .clipboard-card__desktop-actions {
+  display: flex;
 }
 
-@container clipboard-card (min-width: 19rem) {
-  .clipboard-card__desktop-actions {
-    display: flex;
-  }
-
-  .clipboard-card__status-row:hover .clipboard-card__hint {
-    display: flex;
-  }
+.clipboard-card__status-row:not(.clipboard-card__status-row--actions-always-visible):hover .clipboard-card__hint {
+  display: none;
 }
 
 .clipboard-header-content {

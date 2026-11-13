@@ -8,6 +8,7 @@ const SETTING_ICON_MAP: Record<string, string> = {
   "about.checkUpdates": "i-lucide:refresh-cw",
   "about.github": "i-lucide:github",
   "about.sponsor": "i-ph:hand-heart",
+  "actions.alwaysShow": "i-lucide:eye",
   "actions.deleteConfirm": "i-lucide:trash-2",
   "actions.deleteFavoriteConfirm": "i-lucide:shield-alert",
   "actions.deleteFavoriteItems": "i-lucide:star-off",

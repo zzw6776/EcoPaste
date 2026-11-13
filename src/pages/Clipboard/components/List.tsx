@@ -202,6 +202,7 @@ const List: FC<ListProps> = (props) => {
   const sort = settings.clipboard.content.sort;
   const redactSecrets = settings.clipboard.sensitive.redactSecrets;
   const quickActions = settings.clipboard.content.itemActions;
+  const alwaysShowItemActions = settings.clipboard.content.alwaysShowItemActions;
   const deleteFavoriteItems = settings.clipboard.content.deleteFavoriteItems;
   const deletePinnedItems = settings.clipboard.content.deletePinnedItems;
   const deleteFavoriteItemsOnlyInFavoriteGroup =
@@ -1577,6 +1578,7 @@ const List: FC<ListProps> = (props) => {
           )}
         >
           <ClipboardCard
+            alwaysShowItemActions={alwaysShowItemActions}
             availableActions={availableActions}
             hintKey={hintKey}
             isLinkActive={isModifierPressed}
