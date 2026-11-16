@@ -36,11 +36,11 @@ pub fn init(app: &AppHandle) -> Result<()> {
     manager::init(app)
 }
 
-/// Returns whether this local capture should create a durable automatic-sync operation.
+/// Keeps eligible captures in the durable outbox even while synchronization is paused.
 pub fn should_stage_local_item(app: &AppHandle, item: &ClipboardItem) -> bool {
     app.try_state::<SettingsStore>().is_some_and(|store| {
         let settings = store.snapshot().sync;
-        settings.enabled && (!item.is_sensitive || settings.sync_sensitive)
+        !item.is_sensitive || settings.sync_sensitive
     })
 }
 

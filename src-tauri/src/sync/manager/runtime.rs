@@ -72,7 +72,7 @@ impl SyncManager {
         };
         {
             let _maintenance_guard = self.maintenance_lock.lock().await;
-            self.backfill_recent_history(&pool, &group).await?;
+            self.backfill_local_history(&pool, &group).await?;
             let _ = self
                 .materialize_local_operations(false, false, 0, None, Some(&cycle))
                 .await?;
@@ -389,8 +389,7 @@ impl SyncManager {
             }
             Err(error) => {
                 let message = error.to_string();
-                let connection_failed =
-                    is_lan_attempt_timeout(&error) || connection.close_reason().is_some();
+                let connection_failed = connection.close_reason().is_some();
                 let invalidate = connection_failed || is_shared_sync_failure(&connection, &error);
                 if invalidate && self.invalidate_lan_connection(&device_id, connection.stable_id())
                 {

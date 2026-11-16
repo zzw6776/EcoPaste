@@ -3,10 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -88,6 +85,19 @@ async fn write_bytes<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Res
     Ok(())
 }
 
+/// Consumes FIN before releasing a successful stream; dropping it earlier sends STOP_SENDING.
+async fn finish_read(recv: &mut RecvStream) -> Result<()> {
+    let mut trailing = [0u8; 1];
+    let count = tokio::time::timeout(IDLE_TIMEOUT, AsyncReadExt::read(recv, &mut trailing))
+        .await
+        .context("wait for transfer part finish timeout")?
+        .context("read transfer part finish")?;
+    if count != 0 {
+        bail!("unexpected trailing transfer part data");
+    }
+    Ok(())
+}
+
 /// Attachment admission is independent for each direction and content category.
 pub struct TransferLimits([Arc<Semaphore>; 4]);
 
@@ -116,9 +126,7 @@ struct PartRequest {
 
 struct Session {
     size: u64,
-    receiving: bool,
     queues: [mpsc::Sender<PartRequest>; PARALLEL_PARTS],
-    completed: [AtomicU64; PARALLEL_PARTS],
 }
 
 /// Registry belongs to one authenticated connection; identifiers never cross connections.
@@ -128,7 +136,6 @@ pub struct Transfers(Mutex<HashMap<u64, Arc<Session>>>);
 pub struct RegisteredTransfer {
     registry: Arc<Transfers>,
     id: u64,
-    session: Arc<Session>,
     receivers: [Arc<tokio::sync::Mutex<mpsc::Receiver<PartRequest>>>; PARALLEL_PARTS],
 }
 
@@ -144,12 +151,7 @@ impl Drop for RegisteredTransfer {
 
 impl Transfers {
     /// The parent request authenticates and reserves storage before publishing this session.
-    pub fn register(
-        self: &Arc<Self>,
-        id: u64,
-        size: u64,
-        receiving: bool,
-    ) -> Result<RegisteredTransfer> {
+    pub fn register(self: &Arc<Self>, id: u64, size: u64) -> Result<RegisteredTransfer> {
         let mut registry = self.0.lock().expect("transfer registry poisoned");
         if registry.contains_key(&id) {
             bail!("duplicate transfer identifier");
@@ -158,15 +160,12 @@ impl Transfers {
         let (senders, receivers): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
         let session = Arc::new(Session {
             size,
-            receiving,
             queues: senders.try_into().ok().expect("part channels"),
-            completed: std::array::from_fn(|_| AtomicU64::new(0)),
         });
-        registry.insert(id, session.clone());
+        registry.insert(id, session);
         Ok(RegisteredTransfer {
             registry: self.clone(),
             id,
-            session,
             receivers: receivers
                 .into_iter()
                 .map(|rx| Arc::new(tokio::sync::Mutex::new(rx)))
@@ -182,8 +181,8 @@ impl Transfers {
         &self,
         id: u64,
         index: u64,
-        mut send: SendStream,
-        mut recv: RecvStream,
+        send: SendStream,
+        recv: RecvStream,
     ) -> Result<()> {
         let session = self
             .0
@@ -196,19 +195,6 @@ impl Transfers {
             bail!("invalid transfer part");
         }
         let lane = index as usize % PARALLEL_PARTS;
-        if session.receiving && session.completed[lane].load(Ordering::Acquire) > index {
-            // A lost acknowledgement may retry a committed part; never append it twice.
-            let mut remaining = part_size(session.size, index);
-            let mut buffer = [0u8; 64 * 1024];
-            while remaining > 0 {
-                let count = remaining.min(buffer.len());
-                read_bytes(&mut recv, &mut buffer[..count]).await?;
-                remaining -= count;
-            }
-            write_frame(&mut send, &Response::BlobStored).await?;
-            send.finish()?;
-            return Ok(());
-        }
         session.queues[lane]
             .try_send(PartRequest { index, send, recv })
             .map_err(|_| anyhow::anyhow!("transfer part is already pending"))?;
@@ -226,7 +212,6 @@ enum Peer {
         transfer_id: u64,
     },
     Server {
-        session: Arc<Session>,
         receivers: [Arc<tokio::sync::Mutex<mpsc::Receiver<PartRequest>>>; PARALLEL_PARTS],
     },
 }
@@ -234,7 +219,6 @@ enum Peer {
 impl RegisteredTransfer {
     pub fn peer(&self) -> PartPeer {
         PartPeer(Peer::Server {
-            session: self.session.clone(),
             receivers: self.receivers.clone(),
         })
     }
@@ -264,61 +248,44 @@ impl PartPeer {
                 .await?;
                 Ok((send, recv))
             }
-            Peer::Server { receivers, .. } => {
+            Peer::Server { receivers } => {
                 let mut receiver = receivers[index as usize % PARALLEL_PARTS].lock().await;
-                loop {
-                    let request = receiver.recv().await.context("transfer ended")?;
-                    if request.index == index {
-                        return Ok((request.send, request.recv));
-                    }
-                    // Only retries of an older stream may still be queued here.
-                    if request.index > index {
-                        bail!("unexpected transfer part order");
-                    }
+                let request = receiver.recv().await.context("transfer ended")?;
+                if request.index != index {
+                    bail!("unexpected transfer part order");
                 }
+                Ok((request.send, request.recv))
             }
         }
     }
 
     async fn send_part(&self, index: u64, data: &[u8]) -> Result<()> {
-        let mut failure = None;
-        for _ in 0..3 {
-            let result = async {
-                let (mut send, mut recv) =
-                    tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
-                write_bytes(&mut send, data).await?;
-                send.finish()?;
-                match tokio::time::timeout(IDLE_TIMEOUT, read_frame(&mut recv)).await?? {
-                    Response::BlobStored => Ok(()),
-                    _ => bail!("invalid part acknowledgement"),
-                }
-            }
-            .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => failure = Some(error),
-            }
+        let (mut send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
+        // Leave control frames and receipts ahead of buffered attachment bytes.
+        send.set_priority(-1)?;
+        write_bytes(&mut send, data).await?;
+        send.finish()?;
+        // FIN only queues the remaining bytes. QUIC owns loss recovery until peer receipt;
+        // ordered consumption can then wait for earlier parts without a wall-clock deadline.
+        if let Some(code) = send
+            .stopped()
+            .await
+            .context("wait for transfer part delivery")?
+        {
+            bail!("transfer part stopped by peer: {code}");
         }
-        Err(failure.expect("part attempt"))
+        match read_frame(&mut recv).await? {
+            Response::BlobStored => finish_read(&mut recv).await,
+            _ => bail!("invalid part acknowledgement"),
+        }
     }
 
     async fn receive_part(&self, index: u64, size: usize) -> Result<(Vec<u8>, SendStream)> {
-        let mut failure = None;
-        for _ in 0..3 {
-            let result = async {
-                let (send, mut recv) =
-                    tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
-                let mut data = vec![0u8; size];
-                read_bytes(&mut recv, &mut data).await?;
-                Ok((data, send))
-            }
-            .await;
-            match result {
-                Ok(value) => return Ok(value),
-                Err(error) => failure = Some(error),
-            }
-        }
-        Err(failure.expect("part attempt"))
+        let (send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
+        let mut data = vec![0u8; size];
+        read_bytes(&mut recv, &mut data).await?;
+        finish_read(&mut recv).await?;
+        Ok((data, send))
     }
 }
 
@@ -374,10 +341,7 @@ pub async fn receive<W: AsyncWrite + Unpin>(
                     .await
                     .map_err(|_| anyhow::anyhow!("transfer canceled"))?;
                 wait_written.await.context("transfer canceled")?;
-                if let Peer::Server { session, .. } = &peer.0 {
-                    session.completed[lane].store(index + 1, Ordering::Release);
-                }
-                // Retransmission of a lost ACK is handled by the server registry.
+                // Per-part credit keeps the buffer bounded; final commit stays with the parent.
                 write_frame(&mut send, &Response::BlobStored).await?;
                 send.finish()?;
                 index += PARALLEL_PARTS as u64;

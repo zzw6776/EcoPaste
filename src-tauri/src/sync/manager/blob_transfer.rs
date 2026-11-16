@@ -94,7 +94,7 @@ pub(super) struct BlobUploadOptions {
     pub(super) transfer: Option<super::super::progress::TransferHandle>,
 }
 
-/// Uploads one attachment, checking a stalled cloud path before discarding its connection.
+/// Uploads one attachment without closing the connection used by other queues on a task timeout.
 pub(super) async fn upload_blob(
     connection: &Connection,
     group: &GroupSecrets,
@@ -144,7 +144,7 @@ pub(super) async fn upload_blob(
     result.map(|_| ())
 }
 
-/// A successful bounded control exchange distinguishes one stalled stream from a dead connection.
+/// Diagnoses a stalled upload; the watch supervisor owns connection recovery.
 pub(super) async fn check_stalled_cloud_upload(connection: &Connection) -> &'static str {
     if connection.close_reason().is_some() {
         return "already-closed";
@@ -158,14 +158,10 @@ pub(super) async fn check_stalled_cloud_upload(connection: &Connection) -> &'sta
         return "healthy";
     }
     log::warn!(
-        "cloud attachment stalled and health probe failed: connectionId={}",
+        "cloud attachment stalled and health probe failed; retaining shared connection: connectionId={}",
         connection.stable_id()
     );
-    connection.close(
-        0_u32.into(),
-        b"cloud upload stalled and health probe failed",
-    );
-    "failed-closed"
+    "failed-retained"
 }
 
 pub(super) async fn upload_blob_inner(
@@ -921,7 +917,7 @@ where
             expected_hash: &manifest.blob_id,
             stream_commitment: manifest.stream_commitment,
             key: context.key,
-            idle_timeout: BLOB_IDLE_TIMEOUT,
+            write_timeout: BLOB_IDLE_TIMEOUT,
         },
         |current| {
             let total = context.completed_bytes.saturating_add(current);
@@ -1068,9 +1064,8 @@ pub(super) async fn receive_blob<R: AsyncRead + Unpin>(
             }
             let requested =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
-                .await
-                .context("blob download idle timeout")??;
+            // Multipart owns the network deadline; this pipe waits for an entire ordered part.
+            let read = recv.read(&mut buffer[..requested]).await?;
             if read == 0 {
                 bail!("blob ended early");
             }

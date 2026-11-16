@@ -187,33 +187,54 @@ pub(super) async fn call_cloud(
     request: Request,
     language: Language,
 ) -> Result<Response> {
-    let (mut send, mut recv) =
-        match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, connection.open_bi()).await {
-            Ok(result) => result.context("open cloud sync stream")?,
-            Err(_) => {
-                return Err(cloud_attempt_timeout(
-                    CloudAttemptPhase::OpenStream,
-                    language,
-                ));
-            }
-        };
-    write_cloud_request(
-        &mut send,
-        &request,
-        CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT,
-        language,
-    )
-    .await?;
-    send.finish()?;
-    read_cloud_response(
-        &mut recv,
-        CLOUD_CONTROL_REQUEST_TIMEOUT,
-        BLOB_IDLE_TIMEOUT,
-        language,
-    )
-    .await
+    let request_kind = match &request {
+        Request::CloudSync { .. } => "records",
+        Request::SyncCloudAvailability { .. } => "availability",
+        Request::CheckCloudAvailability { .. } => "check-availability",
+        Request::RetentionPlan { .. } => "retention-plan",
+        Request::SetRetention { .. } => "set-retention",
+        Request::BootstrapPlan { .. } => "bootstrap-plan",
+        _ => "control",
+    };
+    let started = Instant::now();
+    let result = async {
+        let (mut send, mut recv) =
+            match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, connection.open_bi()).await {
+                Ok(result) => result.context("open cloud sync stream")?,
+                Err(_) => {
+                    return Err(cloud_attempt_timeout(
+                        CloudAttemptPhase::OpenStream,
+                        language,
+                    ));
+                }
+            };
+        write_cloud_request(
+            &mut send,
+            &request,
+            CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT,
+            language,
+        )
+        .await?;
+        send.finish()?;
+        read_cloud_response(
+            &mut recv,
+            CLOUD_CONTROL_REQUEST_TIMEOUT,
+            BLOB_IDLE_TIMEOUT,
+            language,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = &result {
+        log::warn!(
+            "cloud control request failed: request={request_kind} connectionId={} elapsedMs={} closeReason={:?} error={error:#}",
+            connection.stable_id(), started.elapsed().as_millis(), connection.close_reason(),
+        );
+    }
+    result
 }
 
+#[cfg(test)]
 pub(super) fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
 }
@@ -222,11 +243,7 @@ pub(super) fn should_invalidate_cloud_connection(
     connection: &Connection,
     error: &anyhow::Error,
 ) -> bool {
-    connection.close_reason().is_some() || is_cloud_attempt_timeout(error)
-}
-
-pub(super) fn is_lan_attempt_timeout(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<LanAttemptTimeout>().is_some()
+    is_shared_sync_failure(connection, error)
 }
 
 /// A failed card stream does not invalidate the shared connection while it remains authenticated.
