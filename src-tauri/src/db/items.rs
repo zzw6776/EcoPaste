@@ -1420,7 +1420,7 @@ mod tests {
         .await
         .unwrap();
         assert!(staged);
-        let first = sync_queue::next_ready_content(&pool, false)
+        let first = sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1437,7 +1437,7 @@ mod tests {
         sync_queue::complete_content(&pool, first.operation_order)
             .await
             .unwrap();
-        let current = sync_queue::next_ready_content(&pool, false)
+        let current = sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1451,7 +1451,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!staged);
-        assert!(sync_queue::next_ready_content(&pool, false)
+        assert!(sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .is_none());
@@ -1513,7 +1513,7 @@ mod tests {
             1
         );
         assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
-        let pending = sync_queue::next_ready_content(&pool, false)
+        let pending = sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();

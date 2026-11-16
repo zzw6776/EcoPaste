@@ -39,6 +39,7 @@ use std::{
 use crate::clipboard::cleanup::CleanupTrigger;
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
+use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer, TransferLimits, Transfers};
 use ecopaste_sync_protocol::{
     limit_lan_content_plan, limit_sync_request, limit_sync_response, read_frame, write_frame,
     CloudEvent, CursorEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent,
@@ -608,6 +609,44 @@ fn conclude_remote_blob_failure(error: anyhow::Error, only_unavailable: bool) ->
     error
 }
 
+/// Notifies a deferred cleanup after a shared transport lease is actually released.
+struct SyncReadGuard<'a> {
+    guard: Option<tokio::sync::RwLockReadGuard<'a, ()>>,
+    runtime: &'a RuntimeCoordinator,
+}
+
+impl Drop for SyncReadGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        notify_cleanup_ready(self.runtime);
+    }
+}
+
+struct CleanupWakeGuard<'a>(&'a RuntimeCoordinator);
+
+impl Drop for CleanupWakeGuard<'_> {
+    fn drop(&mut self) {
+        notify_cleanup_ready(self.0);
+    }
+}
+
+/// Retries bootstrap cleanup only when active transfers no longer prevent it.
+fn notify_cleanup_ready(runtime: &RuntimeCoordinator) {
+    runtime.cleanup_ready.notify_one();
+    if !runtime.bootstrap_cleanup_pending.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(_guard) = runtime.lan_cycle_lock.try_write() else {
+        return;
+    };
+    if runtime
+        .bootstrap_cleanup_pending
+        .swap(false, Ordering::AcqRel)
+    {
+        runtime.cloud_transfer_wake.notify_one();
+    }
+}
+
 struct MaterializationRun {
     processed: usize,
     deferred_content: bool,
@@ -773,7 +812,14 @@ async fn start_runtime(manager: Arc<SyncManager>) {
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
     tauri::async_runtime::spawn(source_asset_worker(manager.clone()));
-    tauri::async_runtime::spawn(local_outbox_worker(manager.clone()));
+    for files in [false, true] {
+        tauri::async_runtime::spawn(local_outbox_worker(manager.clone(), files));
+    }
+    for files in [false, true] {
+        for sending in [false, true] {
+            tauri::async_runtime::spawn(attachment_worker(manager.clone(), files, sending));
+        }
+    }
     manager.wake();
 }
 
@@ -949,7 +995,7 @@ impl SyncManager {
         self.wake_transfer();
         self.runtime_state.watch_wake.notify_one();
         self.runtime_state.source_asset_wake.notify_one();
-        self.runtime_state.local_outbox_wake.notify_one();
+        self.notify_local_outbox();
     }
 
     /// Reconnects LAN peers after an endpoint address or mDNS presence change.
@@ -1222,7 +1268,28 @@ impl SyncManager {
         });
     }
 
+    async fn sync_activity_guard(&self) -> SyncReadGuard<'_> {
+        SyncReadGuard {
+            guard: Some(self.runtime_state.lan_cycle_lock.read().await),
+            runtime: &self.runtime_state,
+        }
+    }
+
+    fn notify_local_outbox(&self) {
+        for wake in &self.runtime_state.local_outbox_wake {
+            wake.notify_one();
+        }
+    }
+
+    fn wake_attachments(&self) {
+        for wake in &self.runtime_state.attachment_wakes {
+            wake.notify_one();
+        }
+    }
+
     fn wake_lan_transfer(&self) {
+        self.runtime_state.local_outbox_wake[1].notify_one();
+        self.wake_attachments();
         let actors = self
             .runtime_state
             .lan_peer_actors
@@ -1238,6 +1305,8 @@ impl SyncManager {
     }
 
     fn wake_cloud_transfer(&self) {
+        self.runtime_state.local_outbox_wake[1].notify_one();
+        self.wake_attachments();
         self.runtime_state.cloud_transfer_wake.notify_one();
     }
 
@@ -1560,13 +1629,13 @@ impl SyncManager {
     /// Content is materialized inside an active route cycle, so both the ordering worker and
     /// transport workers must wake after a durable content operation becomes ready.
     pub fn wake_content_outbox(&self) {
-        self.runtime_state.local_outbox_wake.notify_one();
+        self.notify_local_outbox();
         self.wake_transfer();
     }
 
     /// Item-state events can be materialized without opening a content transfer route.
     pub fn wake_local_outbox(&self) {
-        self.runtime_state.local_outbox_wake.notify_one();
+        self.notify_local_outbox();
     }
 
     pub async fn sync_item_now(
@@ -1629,7 +1698,10 @@ impl SyncManager {
         if target == SyncTarget::Lan && !repository::has_online_peer(&pool).await? {
             bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
-        let _enqueue_guard = self.delivery.lock_enqueue().await;
+        let _enqueue_guard = self
+            .delivery
+            .lock_materialization(item.kind == ClipboardKind::Files)
+            .await;
         let content_pending =
             db::sync_queue::has_pending_content(&pool, &item.id, &item.source_revision).await?;
         let external_local_event_exists =
@@ -2463,6 +2535,7 @@ mod tests {
             &blob,
             BlobUploadOptions {
                 kind: BlobUploadKind::Content,
+                file_content: true,
                 managed_hub_blob: true,
                 is_cloud: true,
                 language: Language::ZhCN,
@@ -2537,6 +2610,7 @@ mod tests {
             &blob,
             BlobUploadOptions {
                 kind: BlobUploadKind::Content,
+                file_content: true,
                 managed_hub_blob: true,
                 is_cloud: true,
                 language: Language::ZhCN,

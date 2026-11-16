@@ -38,6 +38,7 @@ impl SyncManager {
     /// Materializes durable local operations while keeping blob work inside an active connection.
     pub(super) async fn materialize_local_operations(
         &self,
+        files: bool,
         allow_content: bool,
         max_content: usize,
         preparation_target: Option<&PreparationTarget>,
@@ -59,7 +60,7 @@ impl SyncManager {
         } else {
             self.pool().await
         };
-        let _enqueue_guard = self.delivery.lock_enqueue().await;
+        let _enqueue_guard = self.delivery.lock_materialization(files).await;
         let (device_id, group) = if let Some(cycle) = cycle {
             (cycle.device_id.clone(), cycle.group.clone())
         } else {
@@ -82,11 +83,11 @@ impl SyncManager {
         let materialize_result: Result<()> = async {
             for _ in 0..max_operations {
                 let content =
-                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive).await?;
-                let state = db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
+                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive, Some(files)).await?;
+                let state = if files { None } else { db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
                     .await?
                     .into_iter()
-                    .next();
+                    .next() };
                 let materialize_content = match (&content, &state) {
                     (Some(content), Some(state)) => content.operation_order <= state.pending_order,
                     (Some(_), None) => true,
@@ -542,7 +543,7 @@ impl SyncManager {
         TaskStagingCleanup,
     )> {
         let _sync_activity = SyncActivityGuard::acquire();
-        let _resource_guard = if item.kind == ClipboardKind::Text {
+        let _resource_guard = if item.kind != ClipboardKind::Image {
             None
         } else {
             Some(crate::clipboard::shared_files::lock().await)
@@ -896,7 +897,7 @@ impl SyncManager {
             .await?;
         }
         repository::mark_history_backfill_completed(pool, &group.group_id).await?;
-        self.runtime_state.local_outbox_wake.notify_one();
+        self.notify_local_outbox();
         self.emit_updated();
         Ok(())
     }

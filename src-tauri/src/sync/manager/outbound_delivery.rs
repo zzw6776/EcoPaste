@@ -242,13 +242,28 @@ impl SyncManager {
         after_cursor: u64,
         cycle: &SyncCycleContext,
     ) -> Result<SyncConnectionOutcome> {
+        self.sync_connection_lane(connection, target, after_cursor, cycle, None)
+            .await
+    }
+
+    /// Reuses the existing delivery pipeline with a disjoint file-body queue.
+    pub(super) async fn sync_connection_lane(
+        self: &Arc<Self>,
+        connection: &Connection,
+        target: &SyncConnectionTarget,
+        after_cursor: u64,
+        cycle: &SyncCycleContext,
+        content: Option<bool>,
+    ) -> Result<SyncConnectionOutcome> {
         let _sync_activity = SyncActivityGuard::acquire();
+        let files = content.unwrap_or(false);
+        let attachments = content.is_some();
         let is_cloud = target.is_cloud();
         let target_id = target.delivery_target();
         let pool = cycle.pool.clone();
         let group = &cycle.group;
         let device_id = &cycle.device_id;
-        if !is_cloud {
+        if !attachments && !is_cloud {
             match call_lan(connection, Request::Health).await? {
                 Response::Health {
                     protocol_version, ..
@@ -264,7 +279,8 @@ impl SyncManager {
                 _ => bail!("局域网设备返回了无效的协议版本响应"),
             }
         }
-        if is_cloud
+        if !attachments
+            && is_cloud
             && self
                 .refresh_cloud_retention(
                     connection,
@@ -277,7 +293,7 @@ impl SyncManager {
         {
             return Ok(SyncConnectionOutcome { has_more: true });
         }
-        let availability_has_more = if is_cloud {
+        let availability_has_more = if !attachments && is_cloud {
             self.sync_cloud_availability(connection, &pool, group)
                 .await?
         } else {
@@ -309,17 +325,39 @@ impl SyncManager {
                 },
                 target: target_id.to_owned(),
             };
-            let materialization = self
-                .materialize_local_operations(true, 1, Some(&preparation_target), Some(cycle))
-                .await?;
-            let local_materialized = materialization.processed > 0;
-            let _materialized_staging = materialization.staging;
+            let materialization = if attachments {
+                None
+            } else {
+                Some(
+                    self.materialize_local_operations(
+                        false,
+                        true,
+                        1,
+                        Some(&preparation_target),
+                        Some(cycle),
+                    )
+                    .await?,
+                )
+            };
+            let local_materialized = materialization
+                .as_ref()
+                .is_some_and(|run| run.processed > 0);
+            let _materialized_staging = materialization.map(|run| run.staging);
             let mut pending = if is_cloud {
                 repository::pending_cloud_events_for_target(
                     &pool,
                     target_id,
                     device_id,
                     MAX_EVENTS_PER_BATCH,
+                    Some(if attachments {
+                        if files {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        0
+                    }),
                 )
                 .await?
             } else {
@@ -330,10 +368,40 @@ impl SyncManager {
                         .peer_device_id()
                         .context("missing LAN peer device identity")?,
                     MAX_EVENTS_PER_BATCH,
+                    Some(if attachments {
+                        if files {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        0
+                    }),
                 )
                 .await?
             };
-            let mut more_available = pending.len() == usize::from(MAX_EVENTS_PER_BATCH);
+            if attachments && pending.is_empty() {
+                break;
+            }
+            let mut attachment_claim = None;
+            if attachments {
+                pending = pending
+                    .into_iter()
+                    .filter(|event| {
+                        if attachment_claim.is_some() {
+                            return false;
+                        }
+                        attachment_claim =
+                            self.delivery.claim_upload(target_id, &event.event.event_id);
+                        attachment_claim.is_some()
+                    })
+                    .collect();
+                if pending.is_empty() {
+                    break;
+                }
+            }
+            let mut more_available =
+                attachments || pending.len() == usize::from(MAX_EVENTS_PER_BATCH);
             let key = group.content_key_bytes()?;
             let mut validated = Vec::with_capacity(pending.len());
             for stored in pending {
@@ -453,10 +521,14 @@ impl SyncManager {
                 .queued(&pool, target_id, &ids, &metadata_only_event_ids)
                 .await?;
             let mut content_event_ids = HashSet::new();
+            let mut file_event_ids = HashSet::new();
             for stored in &pending {
                 if let DecryptedSyncEvent::Clipboard(envelope) =
                     crypto::decrypt_sync_event(&key, &stored.event)?
                 {
+                    if envelope.item.kind == "files" {
+                        file_event_ids.insert(stored.event.event_id.clone());
+                    }
                     if !envelope.blobs.is_empty() {
                         content_event_ids.insert(stored.event.event_id.clone());
                     }
@@ -525,6 +597,8 @@ impl SyncManager {
             );
             pending.retain(|stored| {
                 content_event_ids.contains(&stored.event.event_id)
+                    && attachments
+                    && (files == file_event_ids.contains(&stored.event.event_id))
                     && !metadata_only_event_ids.contains(&stored.event.event_id)
             });
             if pending.is_empty() {
@@ -613,6 +687,7 @@ impl SyncManager {
                     let blob_id = blob.blob_id.clone();
                     let options = BlobUploadOptions {
                         kind: BlobUploadKind::Content,
+                        file_content: files,
                         managed_hub_blob: is_cloud,
                         is_cloud,
                         language: crate::i18n::current_language(&self.app),
@@ -741,11 +816,11 @@ impl SyncManager {
             if let Some(error) = failure {
                 return Err(error);
             }
-            if !has_more {
+            if attachments || !has_more {
                 break;
             }
         }
-        if is_cloud {
+        if !attachments && is_cloud {
             has_more |= self
                 .refresh_cloud_retention(connection, &pool, group, &cycle.device, 1)
                 .await?;
@@ -783,6 +858,26 @@ impl SyncManager {
                 .await?;
             Vec::new()
         };
+        let exchange_lock = self
+            .runtime_state
+            .exchange_locks
+            .lock()
+            .await
+            .entry(target_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _exchange_guard = exchange_lock.lock().await;
+        let current_cursor = if is_cloud {
+            repository::cloud_cursor(&pool).await?
+        } else {
+            repository::list_peers(&pool)
+                .await?
+                .into_iter()
+                .find(|peer| Some(peer.announcement.device_id.as_str()) == target.peer_device_id())
+                .map(|peer| peer.pull_cursor)
+                .unwrap_or(0)
+        };
+        let after_cursor = after_cursor.max(current_cursor);
         let batch_started_at = Instant::now();
         let available_count = pending.len();
         let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
@@ -845,26 +940,6 @@ impl SyncManager {
         let blob_elapsed = blob_started_at.elapsed();
         let mut deferred_source_icon_blobs = source_icon_blobs;
         let mut queued_source_icon_count = 0;
-        if !is_cloud {
-            if let Err(error) = upload_blobs(
-                self.clone(),
-                connection,
-                group,
-                std::mem::take(&mut deferred_source_icon_blobs),
-                BlobUploadOptions {
-                    kind: BlobUploadKind::SourceIcon,
-                    managed_hub_blob: false,
-                    is_cloud,
-                    language,
-                    started: None,
-                    transfer: None,
-                },
-            )
-            .await
-            {
-                log::warn!("publish optional source app icons failed: {error}");
-            }
-        }
         let request_started_at = Instant::now();
         let result = async {
             let protocol = if is_cloud { "cloud" } else { "lan" };
@@ -934,6 +1009,34 @@ impl SyncManager {
                 return Err(error);
             }
         };
+        if !is_cloud && !deferred_source_icon_blobs.is_empty() {
+            let manager = self.clone();
+            let connection = connection.clone();
+            let group = group.clone();
+            let icons = std::mem::take(&mut deferred_source_icon_blobs);
+            tauri::async_runtime::spawn(async move {
+                let _guard = manager.sync_activity_guard().await;
+                if let Err(error) = upload_blobs(
+                    manager.clone(),
+                    &connection,
+                    &group,
+                    icons,
+                    BlobUploadOptions {
+                        kind: BlobUploadKind::SourceIcon,
+                        file_content: false,
+                        managed_hub_blob: false,
+                        is_cloud: false,
+                        language,
+                        started: None,
+                        transfer: None,
+                    },
+                )
+                .await
+                {
+                    log::debug!("optional LAN source icons deferred: {error:#}");
+                }
+            });
+        }
         let request_elapsed = request_started_at.elapsed();
         let received_count = response.events.len();
         let incoming_has_more = response.has_more;
@@ -987,6 +1090,7 @@ impl SyncManager {
         }
         if !event_ids.is_empty() || received_count > 0 {
             self.emit_updated();
+            self.wake_attachments();
         }
         let apply_elapsed = apply_started_at.elapsed();
         if is_cloud {

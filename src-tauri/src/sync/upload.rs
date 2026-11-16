@@ -78,6 +78,7 @@ where
 pub(super) struct UploadProgress {
     pub phase: UploadPhase,
     pub written_bytes: u64,
+    pub report_transferred: bool,
     pub first_write_ms: Option<u128>,
     connection_id: usize,
     blob_ref: String,
@@ -103,6 +104,7 @@ impl UploadProgress {
         Self {
             phase: UploadPhase::OpenStream,
             written_bytes: 0,
+            report_transferred: true,
             first_write_ms: None,
             connection_id,
             blob_ref: blob_ref.to_owned(),
@@ -130,8 +132,10 @@ impl UploadProgress {
             );
         }
         self.written_bytes += size as u64;
-        if let Some(transfer) = &self.transfer {
-            transfer.transferred(self.written_bytes);
+        if self.report_transferred {
+            if let Some(transfer) = &self.transfer {
+                transfer.transferred(self.written_bytes);
+            }
         }
     }
 }

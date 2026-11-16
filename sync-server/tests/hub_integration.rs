@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer};
 use ecopaste_sync_protocol::{
     ALPN, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice,
     Request, Response, RetentionMapping, SyncEventKind, read_frame, write_frame,
@@ -252,6 +253,8 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
                 group_id: group_id.clone(),
                 access_token: access_token.clone(),
                 blob_id: uncommitted_blob_id,
+                transfer_id: next_transfer_id(),
+                file_content: true,
             },
         )
         .await?,
@@ -673,6 +676,11 @@ async fn call(connection: &Connection, request: Request) -> Result<Response> {
     read_frame(&mut recv).await.context("read server response")
 }
 
+fn next_transfer_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn upload_blob(
     connection: &Connection,
     group_id: &str,
@@ -680,6 +688,7 @@ async fn upload_blob(
     blob_id: &str,
     blob: &[u8],
 ) -> Result<()> {
+    let transfer_id = next_transfer_id();
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -688,6 +697,8 @@ async fn upload_blob(
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),
             size: blob.len() as u64,
+            transfer_id,
+            file_content: true,
         },
     )
     .await?;
@@ -695,7 +706,13 @@ async fn upload_blob(
         read_frame::<_, Response>(&mut recv).await?,
         Response::BlobReady { size: 0 }
     );
-    send.write_all(blob).await?;
+    multipart::send(
+        &mut &blob[..],
+        PartPeer::client(connection.clone(), transfer_id),
+        blob.len() as u64,
+        |_| {},
+    )
+    .await?;
     send.finish()?;
     assert_eq!(
         read_frame::<_, Response>(&mut recv).await?,
@@ -711,6 +728,7 @@ async fn upload_stream_blob(
     blob_id: &str,
     blob: &[u8],
 ) -> Result<()> {
+    let transfer_id = next_transfer_id();
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -719,6 +737,8 @@ async fn upload_stream_blob(
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),
             size: blob.len() as u64,
+            transfer_id,
+            file_content: true,
         },
     )
     .await?;
@@ -726,7 +746,13 @@ async fn upload_stream_blob(
         read_frame::<_, Response>(&mut recv).await?,
         Response::BlobReady { size: 0 }
     );
-    send.write_all(blob).await?;
+    multipart::send(
+        &mut &blob[..],
+        PartPeer::client(connection.clone(), transfer_id),
+        blob.len() as u64,
+        |_| {},
+    )
+    .await?;
     write_frame(
         &mut send,
         &Request::CommitStreamBlob {
@@ -749,6 +775,7 @@ async fn upload_invalid_stream_blob(
     blob_id: &str,
     blob: &[u8],
 ) -> Result<Response> {
+    let transfer_id = next_transfer_id();
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -757,6 +784,8 @@ async fn upload_invalid_stream_blob(
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),
             size: blob.len() as u64,
+            transfer_id,
+            file_content: true,
         },
     )
     .await?;
@@ -764,7 +793,13 @@ async fn upload_invalid_stream_blob(
         read_frame::<_, Response>(&mut recv).await?,
         Response::BlobReady { size: 0 }
     );
-    send.write_all(blob).await?;
+    multipart::send(
+        &mut &blob[..],
+        PartPeer::client(connection.clone(), transfer_id),
+        blob.len() as u64,
+        |_| {},
+    )
+    .await?;
     write_frame(
         &mut send,
         &Request::CommitStreamBlob {
@@ -785,6 +820,7 @@ async fn upload_source_icon(
     blob_id: &str,
     blob: &[u8],
 ) -> Result<()> {
+    let transfer_id = next_transfer_id();
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -793,6 +829,8 @@ async fn upload_source_icon(
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),
             size: blob.len() as u64,
+            transfer_id,
+            file_content: true,
         },
     )
     .await?;
@@ -800,7 +838,13 @@ async fn upload_source_icon(
         read_frame::<_, Response>(&mut recv).await?,
         Response::BlobReady { size: 0 }
     );
-    send.write_all(blob).await?;
+    multipart::send(
+        &mut &blob[..],
+        PartPeer::client(connection.clone(), transfer_id),
+        blob.len() as u64,
+        |_| {},
+    )
+    .await?;
     send.finish()?;
     assert_eq!(
         read_frame::<_, Response>(&mut recv).await?,
@@ -815,6 +859,7 @@ async fn download_blob(
     access_token: &[u8],
     blob_id: &str,
 ) -> Result<Vec<u8>> {
+    let transfer_id = next_transfer_id();
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(
         &mut send,
@@ -822,6 +867,8 @@ async fn download_blob(
             group_id: group_id.into(),
             access_token: access_token.to_vec(),
             blob_id: blob_id.into(),
+            transfer_id,
+            file_content: true,
         },
     )
     .await?;
@@ -829,7 +876,17 @@ async fn download_blob(
     let Response::BlobReady { size } = read_frame(&mut recv).await? else {
         anyhow::bail!("expected blob header");
     };
-    recv.read_to_end(size as usize)
-        .await
-        .context("read encrypted blob")
+    let mut bytes = Vec::new();
+    multipart::receive(
+        &mut bytes,
+        PartPeer::client(connection.clone(), transfer_id),
+        size,
+        |_| {},
+    )
+    .await?;
+    assert_eq!(
+        read_frame::<_, Response>(&mut recv).await?,
+        Response::BlobStored
+    );
+    Ok(bytes)
 }

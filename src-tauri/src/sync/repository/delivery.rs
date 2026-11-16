@@ -523,11 +523,34 @@ pub async fn unapplied_events_by_kind(
     rows.into_iter().map(event_from_row).collect()
 }
 
+/// Rechecks a body claimed after its event was selected, including concurrent manual completion.
+pub async fn content_event_pending(pool: &SqlitePool, event_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT is_applied = 0 AND apply_state = 'pending' FROM sync_events WHERE event_id = ?",
+    )
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false))
+}
+
+/// A delayed attachment must not replace a more recently used clipboard item.
+pub async fn is_latest_clipboard_item(pool: &SqlitePool, item_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT id FROM clipboard_items ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .as_deref()
+        == Some(item_id))
+}
+
 /// Lists pending content that the active source actually advertised to this device.
 pub async fn unapplied_content_events_for_target(
     pool: &SqlitePool,
     target_id: &str,
     limit: u16,
+    files: Option<bool>,
 ) -> Result<Vec<StoredSyncEvent>> {
     let rows = sqlx::query(
         r#"
@@ -540,6 +563,7 @@ pub async fn unapplied_content_events_for_target(
           AND event.event_kind = ?
           AND target.target_id = ?
           AND (event.next_apply_at IS NULL OR event.next_apply_at <= ?)
+          AND (? IS NULL OR EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = event.event_id AND item.kind = 'files') = ?)
         ORDER BY event.cursor ASC
         LIMIT ?
         "#,
@@ -547,6 +571,8 @@ pub async fn unapplied_content_events_for_target(
     .bind(SyncEventKind::Content.as_i64())
     .bind(target_id)
     .bind(Utc::now())
+    .bind(files)
+    .bind(files)
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -554,28 +580,16 @@ pub async fn unapplied_content_events_for_target(
     rows.into_iter().map(event_from_row).collect()
 }
 
-pub async fn has_unapplied_content_for_target(pool: &SqlitePool, target_id: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM sync_events event
-            JOIN sync_delivery_targets target ON target.event_id = event.event_id
-            WHERE event.is_applied = 0
-              AND event.apply_state = 'pending'
-              AND event.event_kind = ?
-              AND target.target_id = ?
-              AND (event.next_apply_at IS NULL OR event.next_apply_at <= ?)
-        )
-        "#,
+pub async fn has_unapplied_content_for_target(
+    pool: &SqlitePool,
+    target_id: &str,
+    files: bool,
+) -> Result<bool> {
+    Ok(
+        !unapplied_content_events_for_target(pool, target_id, 1, Some(files))
+            .await?
+            .is_empty(),
     )
-    .bind(SyncEventKind::Content.as_i64())
-    .bind(target_id)
-    .bind(Utc::now())
-    .fetch_one(pool)
-    .await
-    .context("check unapplied sync content for source")?
-        != 0)
 }
 
 /// Lists records for one LAN peer without echoing events that originated from that peer.
@@ -586,6 +600,7 @@ pub async fn pending_peer_events_for_target(
     target_id: &str,
     peer_device_id: &str,
     limit: u16,
+    lane: Option<i64>,
 ) -> Result<Vec<StoredSyncEvent>> {
     let rows = sqlx::query(
         r#"
@@ -605,12 +620,15 @@ pub async fn pending_peer_events_for_target(
               )
           )
           AND e.origin_device_id <> ?
+          AND (? IS NULL OR CASE WHEN COALESCE(d.confirmed_content, 'none') = 'none' THEN 0 WHEN EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = e.event_id AND item.kind = 'files') THEN 2 ELSE 1 END = ?)
         ORDER BY e.cursor ASC
         LIMIT ?
         "#,
     )
     .bind(target_id)
     .bind(peer_device_id)
+    .bind(lane)
+    .bind(lane)
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -624,6 +642,7 @@ pub async fn pending_cloud_events_for_target(
     target_id: &str,
     origin_device_id: &str,
     limit: u16,
+    lane: Option<i64>,
 ) -> Result<Vec<StoredSyncEvent>> {
     let rows = sqlx::query(
         r#"
@@ -650,6 +669,7 @@ pub async fn pending_cloud_events_for_target(
               )
           )
           AND substr(e.ciphertext, 1, 8) = ?
+          AND (? IS NULL OR CASE WHEN COALESCE(d.confirmed_content, 'none') = 'none' THEN 0 WHEN EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = e.event_id AND item.kind = 'files') THEN 2 ELSE 1 END = ?)
         ORDER BY e.cursor ASC
         LIMIT ?
         "#,
@@ -657,6 +677,8 @@ pub async fn pending_cloud_events_for_target(
     .bind(target_id)
     .bind(origin_device_id)
     .bind(crate::sync::crypto::EVENT_AAD_MAGIC.as_slice())
+    .bind(lane)
+    .bind(lane)
     .bind(i64::from(limit))
     .fetch_all(pool)
     .await
@@ -2095,5 +2117,58 @@ async fn set_delivery_pending_on(
         .await
         .context("record sync delivery state")?;
     }
+    Ok(())
+}
+
+/// Finds pending copies of one file card without introducing another durable transfer queue.
+pub async fn pending_file_events_for_item(
+    pool: &SqlitePool,
+    event_id: &str,
+    target_id: &str,
+) -> Result<Vec<(StoredSyncEvent, Option<chrono::DateTime<Utc>>)>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
+                  e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind, e.next_apply_at
+           FROM sync_events e
+           JOIN sync_item_events link ON link.event_id = e.event_id
+           JOIN sync_item_events current ON current.item_id = link.item_id
+           JOIN sync_delivery_targets target ON target.event_id = e.event_id
+           WHERE current.event_id = ? AND target.target_id = ?
+             AND e.is_applied = 0 AND e.apply_state = 'pending' AND e.event_kind = 0
+           ORDER BY e.cursor"#,
+    )
+    .bind(event_id)
+    .bind(target_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let retry_at = row.try_get("next_apply_at")?;
+            Ok((event_from_row(row)?, retry_at))
+        })
+        .collect()
+}
+
+/// Gives equivalent pending copies exactly the representative download's retry deadline.
+pub async fn copy_apply_retry(
+    pool: &SqlitePool,
+    event_ids: &[String],
+    representative: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for id in event_ids {
+        sqlx::query(
+            r#"UPDATE sync_events SET
+                   (apply_attempt_count, next_apply_at, last_apply_error, updated_at) =
+                   (SELECT apply_attempt_count, next_apply_at, last_apply_error, updated_at
+                    FROM sync_events WHERE event_id = ?)
+               WHERE event_id = ? AND is_applied = 0"#,
+        )
+        .bind(representative)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }

@@ -86,6 +86,7 @@ impl BlobUploadKind {
 #[derive(Clone)]
 pub(super) struct BlobUploadOptions {
     pub(super) kind: BlobUploadKind,
+    pub(super) file_content: bool,
     pub(super) managed_hub_blob: bool,
     pub(super) is_cloud: bool,
     pub(super) language: Language,
@@ -100,6 +101,8 @@ pub(super) async fn upload_blob(
     blob: &StoredBlob,
     options: BlobUploadOptions,
 ) -> Result<()> {
+    let limits = attachment_limits(connection);
+    let _slot = limits.acquire(options.file_content, true).await?;
     let _sync_activity = SyncActivityGuard::acquire();
     let started_at = Instant::now();
     if let Some(transfer) = &options.transfer {
@@ -192,42 +195,55 @@ pub(super) async fn upload_blob_inner(
     let result = async {
         let write_started_at = Instant::now();
         let streaming = blob.encrypted_path.is_empty();
+        let transfer_id = rand::random();
         let request = match (options.kind, options.managed_hub_blob, streaming) {
             (BlobUploadKind::Content, true, true) => Request::PutManagedStreamBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::Content, false, true) => Request::PutStreamBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::SourceIcon, true, false) => Request::PutManagedSourceIcon {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::SourceIcon, false, false) => Request::PutSourceIcon {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::Content, true, false) => Request::PutManagedBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::Content, false, false) => Request::PutBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
                 size: blob.size,
+                transfer_id,
+                file_content: options.file_content,
             },
             (BlobUploadKind::SourceIcon, _, true) => {
                 bail!("source icons cannot use streaming upload")
@@ -298,45 +314,68 @@ pub(super) async fn upload_blob_inner(
         } else {
             BLOB_IDLE_TIMEOUT
         };
-        if streaming {
-            let source = blob
-                .source_path
-                .as_deref()
-                .context("streaming upload source is unavailable")?;
-            let stream_nonce = blob
-                .stream_nonce
-                .as_deref()
-                .context("streaming upload nonce is unavailable")?;
-            encrypt_upload_source(
-                source,
-                &mut send,
-                upload::FileEncryptionSpec {
-                    expected_encrypted_size: blob.size,
-                    expected_blob_id: &blob.blob_id,
-                    key: group.content_key_bytes()?,
-                    stream_nonce,
+        let peer = PartPeer::client(connection.clone(), transfer_id);
+        let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(64 * 1024);
+        progress.report_transferred = false;
+        let produce = async {
+            if streaming {
+                encrypt_upload_source(
+                    blob.source_path
+                        .as_deref()
+                        .context("streaming upload source is unavailable")?,
+                    &mut encrypted_writer,
+                    upload::FileEncryptionSpec {
+                        expected_encrypted_size: blob.size,
+                        expected_blob_id: &blob.blob_id,
+                        key: group.content_key_bytes()?,
+                        stream_nonce: blob
+                            .stream_nonce
+                            .as_deref()
+                            .context("streaming upload nonce is unavailable")?,
+                        idle_timeout,
+                        language: options.language,
+                    },
+                    progress,
+                )
+                .await?;
+            } else {
+                let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
+                upload::copy(
+                    &mut file,
+                    &mut encrypted_writer,
                     idle_timeout,
-                    language: options.language,
-                },
-                progress,
-            )
-            .await?;
+                    options.language,
+                    progress,
+                )
+                .await?;
+            }
+            encrypted_writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let transmit = multipart::send(&mut encrypted_reader, peer, blob.size, |bytes| {
+            if let Some(handle) = &options.transfer {
+                handle.transferred(bytes);
+            }
+        });
+        cancelable_transfer(
+            async {
+                tokio::try_join!(produce, transmit)?;
+                Ok(())
+            },
+            || {
+                options
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|handle| handle.canceled())
+            },
+        )
+        .await?;
+        if streaming {
             write_frame(
                 &mut send,
                 &Request::CommitStreamBlob {
                     blob_id: blob.blob_id.clone(),
                 },
-            )
-            .await?;
-        } else {
-            progress.phase = UploadPhase::ReadFile;
-            let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
-            upload::copy(
-                &mut file,
-                &mut send,
-                idle_timeout,
-                options.language,
-                progress,
             )
             .await?;
         }
@@ -567,6 +606,10 @@ pub(super) async fn download_blob(
     destination: &Path,
     progress: Option<BlobDownloadProgress<'_>>,
 ) -> Result<()> {
+    let limits = attachment_limits(connection);
+    let _slot = limits
+        .acquire(manifest.role == BlobRole::File, false)
+        .await?;
     let _sync_activity = SyncActivityGuard::acquire();
     if progress.is_some_and(BlobDownloadProgress::canceled) {
         bail!("transfer canceled");
@@ -574,12 +617,15 @@ pub(super) async fn download_blob(
     let (mut send, mut recv) = tokio::time::timeout(FIRST_FRAME_TIMEOUT, connection.open_bi())
         .await
         .context("open blob download stream timeout")??;
+    let transfer_id = rand::random();
     write_frame(
         &mut send,
         &Request::GetBlob {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
             blob_id: manifest.blob_id.clone(),
+            transfer_id,
+            file_content: manifest.role == BlobRole::File,
         },
     )
     .await?;
@@ -593,15 +639,28 @@ pub(super) async fn download_blob(
     if size != manifest.encrypted_size {
         bail!("encrypted blob size mismatch");
     }
-    let stream_commitment = manifest.stream_commitment;
-    receive_blob(
-        &mut recv,
+    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+    let receive = multipart::receive(
+        &mut writer,
+        PartPeer::client(connection.clone(), transfer_id),
+        size,
+        |_| {},
+    );
+    let save = receive_blob(
+        &mut reader,
+        None,
         destination,
         &manifest.blob_id,
         size,
-        !stream_commitment,
-        false,
+        !manifest.stream_commitment,
         progress,
+    );
+    cancelable_transfer(
+        async {
+            tokio::try_join!(receive, save)?;
+            confirm_download(&mut recv).await
+        },
+        || progress.is_some_and(BlobDownloadProgress::canceled),
     )
     .await
 }
@@ -808,17 +867,24 @@ pub(super) async fn stream_remote_blob_to_writer<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let limits = attachment_limits(context.connection);
+    let _slot = limits
+        .acquire(manifest.role == BlobRole::File, false)
+        .await?;
     validate_blob_manifest(manifest)?;
     let (mut send, mut recv) =
         tokio::time::timeout(FIRST_FRAME_TIMEOUT, context.connection.open_bi())
             .await
             .context("open remote file download stream timeout")??;
+    let transfer_id = rand::random();
     write_frame(
         &mut send,
         &Request::GetBlob {
             group_id: context.group.group_id.clone(),
             access_token: context.group.access_token_bytes()?,
             blob_id: manifest.blob_id.clone(),
+            transfer_id,
+            file_content: manifest.role == BlobRole::File,
         },
     )
     .await?;
@@ -839,8 +905,15 @@ where
         bail!("encrypted blob size mismatch");
     }
 
-    crypto::decrypt_blob_stream(
-        &mut recv,
+    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+    let receive = multipart::receive(
+        &mut writer,
+        PartPeer::client(context.connection.clone(), transfer_id),
+        size,
+        |_| {},
+    );
+    let decrypt = crypto::decrypt_blob_stream(
+        &mut reader,
         output,
         crypto::BlobStreamSpec {
             original_size: manifest.original_size,
@@ -856,9 +929,15 @@ where
             context.handle.transferred(total);
         },
         || context.handle.canceled(),
+    );
+    cancelable_transfer(
+        async {
+            tokio::try_join!(receive, decrypt)?;
+            confirm_download(&mut recv).await
+        },
+        || context.handle.canceled(),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 #[cfg(target_os = "android")]
@@ -961,13 +1040,13 @@ pub(super) fn non_conflicting_external_path(root: &Path, name: &str) -> PathBuf 
     root.join(format!("{stem}-{}", Uuid::new_v4().simple()))
 }
 
-pub(super) async fn receive_blob(
-    recv: &mut RecvStream,
+pub(super) async fn receive_blob<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    commit: Option<&mut RecvStream>,
     destination: &Path,
     expected_hash: &str,
     size: u64,
     verify_ciphertext_hash: bool,
-    expect_commit: bool,
     progress: Option<BlobDownloadProgress<'_>>,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
@@ -991,8 +1070,10 @@ pub(super) async fn receive_blob(
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
             let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
                 .await
-                .context("blob download idle timeout")??
-                .context("blob ended early")?;
+                .context("blob download idle timeout")??;
+            if read == 0 {
+                bail!("blob ended early");
+            }
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
             remaining -= read as u64;
@@ -1008,8 +1089,8 @@ pub(super) async fn receive_blob(
         if verify_ciphertext_hash && hasher.finalize().to_hex().as_str() != expected_hash {
             bail!("blob hash mismatch");
         }
-        if expect_commit {
-            let commit: Request = tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(recv))
+        if let Some(control) = commit {
+            let commit: Request = tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(control))
                 .await
                 .context("streaming blob commit timeout")??;
             if commit
@@ -1052,6 +1133,52 @@ impl Drop for TemporaryDirectoryCleanup {
     fn drop(&mut self) {
         if self.armed {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Keeps the parent stream alive until the sender has validated its source and finished all parts.
+async fn confirm_download(recv: &mut RecvStream) -> Result<()> {
+    match tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(recv))
+        .await
+        .context("download confirmation timeout")??
+    {
+        Response::BlobStored => Ok(()),
+        Response::Error { code, message } => Err(RemoteSyncError { code, message }.into()),
+        _ => bail!("invalid download confirmation"),
+    }
+}
+
+/// Shares attachment limits across automatic and manual transfers on the same connection.
+fn attachment_limits(connection: &Connection) -> Arc<TransferLimits> {
+    static LIMITS: std::sync::OnceLock<StdMutex<HashMap<usize, Weak<TransferLimits>>>> =
+        std::sync::OnceLock::new();
+    let mut limits = LIMITS
+        .get_or_init(StdMutex::default)
+        .lock()
+        .expect("transfer limits poisoned");
+    limits.retain(|_, value| value.strong_count() > 0);
+    let entry = limits.entry(connection.stable_id()).or_default();
+    if let Some(existing) = entry.upgrade() {
+        return existing;
+    }
+    let value = Arc::new(TransferLimits::default());
+    *entry = Arc::downgrade(&value);
+    value
+}
+
+/// Cancels all part streams even while network I/O is waiting for a response.
+pub(super) async fn cancelable_transfer<F, T>(work: F, canceled: impl Fn() -> bool) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if canceled() { bail!("transfer canceled"); }
+            }
         }
     }
 }

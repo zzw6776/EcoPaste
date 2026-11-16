@@ -4,12 +4,32 @@ impl SyncManager {
     /// Applies local history retention while transfers are paused, then reclaims encrypted content
     /// that no current route can still need.
     pub(crate) async fn run_local_retention_cleanup(&self, trigger: CleanupTrigger) -> bool {
-        let _cloud_guard = if trigger == CleanupTrigger::CloudBootstrap {
-            None
-        } else {
-            Some(self.runtime_state.cloud_cycle_lock.lock().await)
+        let _cleanup_wake = CleanupWakeGuard(&self.runtime_state);
+        if trigger == CleanupTrigger::CloudBootstrap {
+            self.runtime_state
+                .bootstrap_cleanup_pending
+                .store(true, Ordering::Release);
+        }
+        let (_lan_guard, _cloud_guard) = loop {
+            let ready = self.runtime_state.cleanup_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Ok(lan) = self.runtime_state.lan_cycle_lock.try_write() {
+                if trigger == CleanupTrigger::CloudBootstrap {
+                    self.runtime_state
+                        .bootstrap_cleanup_pending
+                        .store(false, Ordering::Release);
+                    break (lan, None);
+                }
+                if let Ok(cloud) = self.runtime_state.cloud_cycle_lock.try_lock() {
+                    break (lan, Some(cloud));
+                }
+            }
+            if trigger == CleanupTrigger::CloudBootstrap {
+                return false;
+            }
+            ready.await;
         };
-        let _lan_guard = self.runtime_state.lan_cycle_lock.write().await;
         let _enqueue_guard = self.delivery.lock_enqueue().await;
         let _apply_guard = self.apply_lock.lock().await;
         let _files_guard = crate::clipboard::shared_files::lock().await;

@@ -3,6 +3,8 @@
 //! The cloud service only handles encrypted event and blob payloads. Clipboard
 //! plaintext and the group content key never cross this boundary.
 
+pub mod transfer;
+
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod batch_tests;
 
 pub const ALPN: &[u8] = b"ecopaste/sync/2";
-pub const PROTOCOL_VERSION: u16 = 27;
+pub const PROTOCOL_VERSION: u16 = 28;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -312,6 +314,14 @@ pub struct ServerTicket {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum Request {
+    /// One bounded part of a transfer authenticated by its parent request on this connection.
+    #[n(32)]
+    BlobPart {
+        #[n(0)]
+        transfer_id: u64,
+        #[n(1)]
+        index: u64,
+    },
     #[n(0)]
     Health,
     #[n(1)]
@@ -349,6 +359,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     #[n(4)]
     GetBlob {
@@ -358,6 +372,10 @@ pub enum Request {
         access_token: Vec<u8>,
         #[n(2)]
         blob_id: String,
+        #[n(3)]
+        transfer_id: u64,
+        #[n(4)]
+        file_content: bool,
     },
     #[n(6)]
     ListEvents {
@@ -416,6 +434,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     /// Keeps one cloud change stream open for the current device.
     #[n(14)]
@@ -458,6 +480,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     /// Reads a bounded page of legacy events whose retention identity is still unknown.
     #[n(19)]
@@ -498,6 +524,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     /// Lets a LAN receiver choose metadata-only or already available content before transfer.
     #[n(21)]
@@ -522,6 +552,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     /// Streaming counterpart of `PutManagedBlob` for bounded Hub retention.
     #[n(23)]
@@ -534,6 +568,10 @@ pub enum Request {
         blob_id: String,
         #[n(3)]
         size: u64,
+        #[n(4)]
+        transfer_id: u64,
+        #[n(5)]
+        file_content: bool,
     },
     /// Commits a fully received streaming blob after the sender validates its source hash.
     #[n(24)]
@@ -577,6 +615,22 @@ pub enum Request {
         #[n(2)]
         event_ids: Vec<String>,
     },
+}
+
+impl Request {
+    /// Direction is relative to the endpoint serving the request.
+    pub fn attachment_lane(&self) -> Option<(bool, bool)> {
+        match self {
+            Self::PutBlob { file_content, .. }
+            | Self::PutManagedBlob { file_content, .. }
+            | Self::PutStreamBlob { file_content, .. }
+            | Self::PutManagedStreamBlob { file_content, .. }
+            | Self::PutSourceIcon { file_content, .. }
+            | Self::PutManagedSourceIcon { file_content, .. } => Some((*file_content, false)),
+            Self::GetBlob { file_content, .. } => Some((*file_content, true)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -1074,12 +1128,16 @@ mod tests {
                 access_token: vec![1; 32],
                 blob_id: "a".repeat(64),
                 size: 1024,
+                transfer_id: 1,
+                file_content: true,
             },
             Request::PutManagedStreamBlob {
                 group_id: "group".into(),
                 access_token: vec![1; 32],
                 blob_id: "b".repeat(64),
                 size: 2048,
+                transfer_id: 2,
+                file_content: true,
             },
             Request::CommitStreamBlob {
                 blob_id: "c".repeat(64),
@@ -1089,7 +1147,7 @@ mod tests {
             let decoded: Request = minicbor::decode(&encoded).unwrap();
             assert_eq!(decoded, request);
         }
-        assert_eq!(PROTOCOL_VERSION, 27);
+        assert_eq!(PROTOCOL_VERSION, 28);
     }
 
     #[tokio::test]

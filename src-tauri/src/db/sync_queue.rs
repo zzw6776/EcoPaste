@@ -171,6 +171,7 @@ pub async fn has_pending_content(
 pub async fn next_ready_content(
     pool: &SqlitePool,
     sync_sensitive: bool,
+    files: Option<bool>,
 ) -> Result<Option<ContentOutboxOperation>> {
     let now = Utc::now();
     sqlx::query_as::<_, ContentOutboxOperation>(
@@ -206,12 +207,15 @@ pub async fn next_ready_content(
                 AND state.dirty_mask <> 0
                 AND state.pending_order < current.operation_order
           )
+          AND (? IS NULL OR COALESCE(item.kind = 'files', 0) = ?)
         ORDER BY operation_order ASC
         LIMIT 1
         "#,
     )
     .bind(now)
     .bind(sync_sensitive)
+    .bind(files)
+    .bind(files)
     .fetch_optional(pool)
     .await
     .context("load next clipboard content sync operation")
@@ -263,6 +267,7 @@ pub async fn fail_content(
 pub async fn next_content_retry_at(
     pool: &SqlitePool,
     sync_sensitive: bool,
+    files: bool,
 ) -> Result<Option<chrono::DateTime<Utc>>> {
     sqlx::query_scalar(
         r#"
@@ -270,6 +275,8 @@ pub async fn next_content_retry_at(
         FROM sync_content_outbox current
         LEFT JOIN clipboard_items item ON item.id = current.item_id
         WHERE current.next_attempt_at IS NOT NULL
+          AND current.next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          AND COALESCE(item.kind = 'files', 0) = ?
           AND (
               ? OR item.is_sensitive = 0 OR item.id IS NULL
               OR EXISTS (
@@ -280,6 +287,7 @@ pub async fn next_content_retry_at(
           )
         "#,
     )
+    .bind(files)
     .bind(sync_sensitive)
     .fetch_one(pool)
     .await
@@ -354,7 +362,10 @@ mod tests {
             .connect_with(options)
             .await
             .unwrap();
-        let operation = next_ready_content(&reopened, false).await.unwrap().unwrap();
+        let operation = next_ready_content(&reopened, false, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(operation.manual_share && operation.force_files);
         assert!(
             items::find_item_by_id(&reopened, &item.id)
@@ -366,11 +377,11 @@ mod tests {
         fail_content(&reopened, operation.operation_order, "temporary failure")
             .await
             .unwrap();
-        assert!(next_ready_content(&reopened, false)
+        assert!(next_ready_content(&reopened, false, None)
             .await
             .unwrap()
             .is_none());
-        assert!(next_content_retry_at(&reopened, false)
+        assert!(next_content_retry_at(&reopened, false, false)
             .await
             .unwrap()
             .is_some());
@@ -380,7 +391,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            next_ready_content(&reopened, false).await.unwrap(),
+            next_ready_content(&reopened, false, None).await.unwrap(),
             Some(operation)
         );
         reopened.close().await;
@@ -393,15 +404,24 @@ mod tests {
         items::upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
             .await
             .unwrap();
-        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
-        assert!(next_ready_content(&pool, true).await.unwrap().is_some());
+        assert!(next_ready_content(&pool, false, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(next_ready_content(&pool, true, None)
+            .await
+            .unwrap()
+            .is_some());
 
         item.updated_at += Duration::seconds(1);
         item.source_revision = "recaptured".to_owned();
         items::upsert_item_with_sync_outbox(&pool, &item, None)
             .await
             .unwrap();
-        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
+        assert!(next_ready_content(&pool, false, None)
+            .await
+            .unwrap()
+            .is_none());
 
         let shared = stage_existing_content(
             &pool,
@@ -415,12 +435,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let earlier = next_ready_content(&pool, false).await.unwrap().unwrap();
+        let earlier = next_ready_content(&pool, false, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(earlier.operation_order < shared);
         complete_content(&pool, earlier.operation_order)
             .await
             .unwrap();
-        let manual = next_ready_content(&pool, false).await.unwrap().unwrap();
+        let manual = next_ready_content(&pool, false, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(manual.operation_order, shared);
         assert!(manual.force_files && manual.manual_share);
         let restaged = stage_existing_content(
@@ -437,7 +463,7 @@ mod tests {
         .unwrap();
         assert_eq!(restaged, shared);
         assert!(
-            next_ready_content(&pool, false)
+            next_ready_content(&pool, false, None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -454,7 +480,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(next_ready_content(&pool, false).await.unwrap().is_none());
+        assert!(next_ready_content(&pool, false, None)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

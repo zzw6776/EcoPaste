@@ -171,6 +171,11 @@ impl TaskStagingCleanup {
             .push((blob.blob_id.clone(), PathBuf::from(&blob.encrypted_path)));
     }
 
+    /// After committing an outbox event, its delivery/retention cleanup owns staged content.
+    pub fn retain_for_delivery(mut self) {
+        self.entries.clear();
+    }
+
     pub fn extend(&mut self, mut other: Self) {
         self.entries.append(&mut other.entries);
     }
@@ -312,6 +317,7 @@ pub(super) struct DeliveryCoordinator {
     app: AppHandle,
     /// Serializes local event materialization with group changes and retention cleanup.
     enqueue_lock: Mutex<()>,
+    file_enqueue_lock: Mutex<()>,
     /// Closes the cancel/confirm boundary without holding a lock during network I/O.
     transition_lock: Mutex<()>,
     registry: TransferRegistry,
@@ -325,14 +331,25 @@ impl DeliveryCoordinator {
             registry: TransferRegistry::new(app.clone()),
             app,
             enqueue_lock: Mutex::new(()),
+            file_enqueue_lock: Mutex::new(()),
             transition_lock: Mutex::new(()),
             staging: OutgoingStagingLeases::default(),
             remote_download_claims: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
-    pub async fn lock_enqueue(&self) -> MutexGuard<'_, ()> {
-        self.enqueue_lock.lock().await
+    pub async fn lock_enqueue(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
+        let files = self.file_enqueue_lock.lock().await;
+        (files, self.enqueue_lock.lock().await)
+    }
+
+    /// Serializes only the matching preparation lane during ordinary synchronization.
+    pub async fn lock_materialization(&self, files: bool) -> MutexGuard<'_, ()> {
+        if files {
+            self.file_enqueue_lock.lock().await
+        } else {
+            self.enqueue_lock.lock().await
+        }
     }
 
     pub fn tasks(&self) -> Vec<TransferTask> {
@@ -412,6 +429,14 @@ impl DeliveryCoordinator {
         self.staging.rebuild_lock(blob_id)
     }
 
+    /// Claims one outgoing card for a target while other cards keep filling free slots.
+    pub fn claim_upload(&self, target: &str, event: &str) -> Option<RemoteDownloadClaim> {
+        claim_remote_download(
+            &self.remote_download_claims,
+            &format!("upload:{target}:{event}"),
+        )
+    }
+
     pub fn claim_remote_download(&self, item_id: &str) -> Option<RemoteDownloadClaim> {
         claim_remote_download(&self.remote_download_claims, item_id)
     }
@@ -447,7 +472,7 @@ impl DeliveryCoordinator {
 
         let _transition_guard = self.transition_lock.lock().await;
         let _commit_guard = if self.registry.preparation_committing(task_id) {
-            Some(self.enqueue_lock.lock().await)
+            Some(self.file_enqueue_lock.lock().await)
         } else {
             None
         };

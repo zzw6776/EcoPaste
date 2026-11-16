@@ -3,9 +3,12 @@ use super::*;
 impl SyncManager {
     pub(super) async fn run_cloud_cycle(self: &Arc<Self>) -> Result<()> {
         let _guard = self.runtime_state.cloud_cycle_lock.lock().await;
-        self.run_cycle_locked(SyncTarget::Cloud, None, Duration::ZERO)
-            .await?;
-        Ok(())
+        let result = self
+            .run_cycle_locked(SyncTarget::Cloud, None, Duration::ZERO)
+            .await;
+        drop(_guard);
+        notify_cleanup_ready(&self.runtime_state);
+        result.map(|_| ())
     }
 
     /// Runs one actor-owned peer cycle and preserves the transport failure category.
@@ -14,7 +17,7 @@ impl SyncManager {
         device_id: &str,
         connect_timeout: Duration,
     ) -> Result<LanPeerSyncOutcome> {
-        let _guard = self.runtime_state.lan_cycle_lock.read().await;
+        let _guard = self.sync_activity_guard().await;
         self.run_cycle_locked(SyncTarget::Lan, Some(device_id), connect_timeout)
             .await?
             .context("LAN peer cycle produced no outcome")
@@ -71,7 +74,7 @@ impl SyncManager {
             let _maintenance_guard = self.maintenance_lock.lock().await;
             self.backfill_recent_history(&pool, &group).await?;
             let _ = self
-                .materialize_local_operations(false, 0, None, Some(&cycle))
+                .materialize_local_operations(false, false, 0, None, Some(&cycle))
                 .await?;
             self.repair_history_timestamps(&pool, &group).await?;
         }
@@ -227,6 +230,7 @@ impl SyncManager {
                             CLOUD_TARGET,
                             &identity.device_id,
                             MAX_EVENTS_PER_BATCH,
+                            None,
                         )
                         .await?;
                         let event_ids = pending

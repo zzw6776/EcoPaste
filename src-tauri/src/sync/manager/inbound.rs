@@ -146,6 +146,7 @@ impl SyncManager {
         } else {
             Vec::new()
         };
+        let received_content = !events.is_empty();
         let encrypted_events = events
             .into_iter()
             .map(|received| received.event)
@@ -177,6 +178,9 @@ impl SyncManager {
                 allow_content,
             )
             .await?;
+        if received_content {
+            self.wake_attachments();
+        }
         if stored.received_new_events && source.is_cloud() {
             self.wake_lan_transfer();
         }
@@ -202,16 +206,58 @@ impl SyncManager {
         source: &SyncConnectionTarget,
         allow_content: bool,
     ) -> Result<bool> {
-        // LAN 入站请求与本机主动拉取可能同时看到同一事件；从查询到标记完成必须串行，
-        // 否则同一远端事件会被并发写入剪贴板历史两次。
-        let _apply_guard = self.apply_lock.lock().await;
+        self.apply_pending_events_lane(
+            connection,
+            pool,
+            group,
+            sync_settings,
+            source,
+            allow_content,
+            false,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn apply_pending_attachment_events(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        settings: &SyncSettings,
+        source: &SyncConnectionTarget,
+        files: bool,
+    ) -> Result<bool> {
+        self.apply_pending_events_lane(connection, pool, group, settings, source, true, files, true)
+            .await
+    }
+
+    /// Keeps large downloads off the lock used to apply text, images and card state.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_pending_events_lane(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        sync_settings: &SyncSettings,
+        source: &SyncConnectionTarget,
+        allow_content: bool,
+        files: bool,
+        attachments: bool,
+    ) -> Result<bool> {
+        // 仅串行选取任务与写入元数据；附件认领后释放锁，网络 I/O 不阻塞记录同步。
+        let mut apply_guard = Some(self.apply_lock.lock().await);
+        let clipboard_generation = self
+            .app
+            .state::<Arc<ClipboardFingerprintState>>()
+            .generation();
         let key = group.content_key_bytes()?;
         let mut source_assets_pending = false;
         let mut latest_clipboard_item = None;
         #[cfg(target_os = "android")]
         let mut applied_any = false;
 
-        loop {
+        while !attachments {
             let pending_states = repository::unapplied_events_by_kind(
                 pool,
                 SyncEventKind::ItemState,
@@ -273,7 +319,7 @@ impl SyncManager {
         }
 
         if !allow_content {
-            drop(_apply_guard);
+            drop(apply_guard.take());
             #[cfg(target_os = "android")]
             if applied_any {
                 crate::commands::android::notify_overlay_clipboard_changed();
@@ -287,6 +333,7 @@ impl SyncManager {
             pool,
             source.delivery_target(),
             MAX_EVENTS_PER_BATCH,
+            Some(files),
         )
         .await?;
         let complete_content_source_event_ids = repository::event_ids_with_complete_content_source(
@@ -406,6 +453,11 @@ impl SyncManager {
                 {
                     return Ok(());
                 }
+                if !attachments && envelope.item.kind != "files" && !envelope.blobs.is_empty() {
+                    self.wake_attachments();
+                    return Ok(());
+                }
+                if attachments && envelope.blobs.is_empty() { return Ok(()); }
                 let local_file_available = envelope.item.kind == "files"
                     && available_materialized_file_item(
                         pool,
@@ -418,6 +470,10 @@ impl SyncManager {
                     .is_some();
                 if local_file_available {
                     deduplicated_content.push((event, envelope));
+                } else if envelope.item.kind == "files" && !files {
+                    let download_pending = complete_content_source_event_ids.contains(&event.event_id)
+                        && !should_defer_remote_file_download(&envelope, sync_settings.auto_download_max_mb, local_storage_limit_bytes);
+                    metadata_only_content.push((event, envelope, download_pending));
                 } else if envelope.item.kind == "files"
                     && (!complete_content_source_event_ids.contains(&event.event_id)
                         || should_defer_remote_file_download(
@@ -426,7 +482,7 @@ impl SyncManager {
                             local_storage_limit_bytes,
                         ))
                 {
-                    metadata_only_content.push((event, envelope));
+                    metadata_only_content.push((event, envelope, false));
                 } else {
                     let item_id = if envelope.item.kind == "files" {
                         let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
@@ -454,7 +510,7 @@ impl SyncManager {
             }
         }
 
-        for (event, envelope) in metadata_only_content {
+        for (event, envelope, download_pending) in metadata_only_content {
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
             let applied: Result<()> = async {
                 self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
@@ -466,7 +522,11 @@ impl SyncManager {
                     repository::InboundContentOutcome::Metadata,
                 )
                 .await?;
-                repository::mark_applied(pool, &event.event_id).await?;
+                if download_pending {
+                    self.wake_attachments();
+                } else {
+                    repository::mark_applied(pool, &event.event_id).await?;
+                }
                 Ok(())
             }
             .await;
@@ -518,6 +578,54 @@ impl SyncManager {
             }
         }
 
+        let mut file_groups: Vec<ClipboardEnvelope> = Vec::new();
+        ready_content.retain(|(_, envelope, _)| {
+            if envelope.item.kind != "files" {
+                return true;
+            }
+            if file_groups
+                .iter()
+                .any(|other| same_file_content(envelope, other))
+            {
+                return false;
+            }
+            file_groups.push(envelope.clone());
+            true
+        });
+        let mut waiting_files = HashSet::new();
+        for (event, envelope, _) in &ready_content {
+            if envelope.item.kind != "files" {
+                continue;
+            }
+            let (ids, retry) = self
+                .equivalent_pending_files(pool, &event.event_id, envelope, &key, source)
+                .await?;
+            if let Some((deadline, representative)) = retry {
+                repository::copy_apply_retry(pool, &ids, &representative).await?;
+                self.schedule_transfer_wake(deadline - Utc::now());
+                waiting_files.insert(event.event_id.clone());
+            }
+        }
+        ready_content.retain(|(event, _, _)| !waiting_files.contains(&event.event_id));
+        let mut body_claim = None;
+        if attachments {
+            let mut selected = Vec::new();
+            for entry in ready_content {
+                let claim_key = format!("apply:{}", entry.1.item.sync_key);
+                let Some(claim) = self.delivery.claim_remote_download(&claim_key) else {
+                    continue;
+                };
+                if !repository::content_event_pending(pool, &entry.0.event_id).await? {
+                    continue;
+                }
+                body_claim = Some(claim);
+                selected.push(entry);
+                break;
+            }
+            ready_content = selected;
+            drop(apply_guard.take());
+        }
+        let _body_claim = body_claim;
         let download_route = if source.is_cloud() {
             super::super::progress::TransferRoute::Cloud
         } else {
@@ -538,7 +646,9 @@ impl SyncManager {
                         });
                         let task_key = format!(
                             "{}\0{}\0{}\0auto-download",
-                            event.event_id, download_target, total_bytes
+                            file_transfer_key(&envelope),
+                            download_target,
+                            total_bytes
                         );
                         let handle = self.delivery.start(super::super::progress::TransferTask {
                             id: blake3::hash(task_key.as_bytes()).to_hex().to_string(),
@@ -635,7 +745,7 @@ impl SyncManager {
                     ))
                 }
             })
-            .buffered_ordered(2);
+            .buffered_unordered(2);
         let mut preparations = std::pin::pin!(preparations);
         let mut consumed_staging = Vec::new();
         while let Some(prepared) = preparations.next().await {
@@ -643,9 +753,19 @@ impl SyncManager {
                 continue;
             };
             let (event, envelope, stored_blobs, blob_error, download, canceled) = prepared;
+            let aliases = if envelope.item.kind == "files" {
+                self.equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
+                    .await?
+                    .0
+            } else {
+                Vec::new()
+            };
             if let Some(error) = blob_error {
                 if canceled {
                     repository::mark_applied(pool, &event.event_id).await?;
+                    for alias in &aliases {
+                        repository::mark_applied(pool, alias).await?;
+                    }
                     consumed_staging.extend(
                         stored_blobs
                             .into_iter()
@@ -659,6 +779,7 @@ impl SyncManager {
                     continue;
                 }
                 self.defer_card_apply(pool, &event.event_id, &error).await?;
+                repository::copy_apply_retry(pool, &aliases, &event.event_id).await?;
                 continue;
             }
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
@@ -692,13 +813,31 @@ impl SyncManager {
                 )
                 .await?;
                 repository::mark_applied(pool, &event.event_id).await?;
+                for alias in &aliases {
+                    repository::record_inbound_outcome(
+                        pool,
+                        source.remote_batch_source(),
+                        alias,
+                        repository::InboundContentOutcome::Deduplicated,
+                    )
+                    .await?;
+                    repository::mark_applied(pool, alias).await?;
+                }
                 Ok((item_id, item, fingerprint, deduplicated))
             }
             .await;
             match applied {
                 Ok((item_id, item, fingerprint, deduplicated)) => {
                     if !item_id.is_empty() {
-                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
+                        if latest_clipboard_item.as_ref().is_none_or(
+                            |(latest, _, _): &(
+                                ClipboardItem,
+                                Option<ClipboardFingerprint>,
+                                bool,
+                            )| item.updated_at >= latest.updated_at,
+                        ) {
+                            latest_clipboard_item = Some((item, fingerprint, deduplicated));
+                        }
                     }
                     if let Some((handle, total_bytes, _)) = &download {
                         handle.completed(*total_bytes);
@@ -721,6 +860,7 @@ impl SyncManager {
                     }
                     self.defer_card_apply(pool, &event.event_id, &error.to_string())
                         .await?;
+                    repository::copy_apply_retry(pool, &aliases, &event.event_id).await?;
                 }
             }
         }
@@ -740,7 +880,13 @@ impl SyncManager {
             self.write_latest_synced_item_to_clipboard(
                 item,
                 fingerprint.as_ref(),
-                sync_settings.auto_write_clipboard,
+                sync_settings.auto_write_clipboard
+                    && self
+                        .app
+                        .state::<Arc<ClipboardFingerprintState>>()
+                        .generation()
+                        == clipboard_generation
+                    && repository::is_latest_clipboard_item(pool, &item.id).await?,
             );
             if let Err(error) = self.app.emit(
                 crate::clipboard::CLIPBOARD_UPDATED_EVENT,
@@ -757,7 +903,7 @@ impl SyncManager {
                 );
             }
         }
-        drop(_apply_guard);
+        drop(apply_guard.take());
         #[cfg(target_os = "android")]
         if applied_any {
             crate::commands::android::notify_overlay_clipboard_changed();
@@ -765,8 +911,47 @@ impl SyncManager {
         if source_assets_pending {
             self.runtime_state.source_asset_wake.notify_one();
         }
+        // Attachment receipts are created after the record exchange has already finished.
+        if attachments && made_content_progress {
+            self.wake_lan_transfer();
+        }
         Ok(made_content_progress
-            && repository::has_unapplied_content_for_target(pool, source.delivery_target()).await?)
+            && repository::has_unapplied_content_for_target(pool, source.delivery_target(), files)
+                .await?)
+    }
+
+    /// Includes copies received during an active download and preserves their shared backoff.
+    async fn equivalent_pending_files(
+        &self,
+        pool: &SqlitePool,
+        event_id: &str,
+        envelope: &ClipboardEnvelope,
+        key: &[u8; 32],
+        source: &SyncConnectionTarget,
+    ) -> Result<(Vec<String>, Option<(chrono::DateTime<Utc>, String)>)> {
+        let mut ids = Vec::new();
+        let mut retry: Option<(chrono::DateTime<Utc>, String)> = None;
+        for (alias, retry_at) in
+            repository::pending_file_events_for_item(pool, event_id, source.delivery_target())
+                .await?
+        {
+            if let Ok(DecryptedSyncEvent::Clipboard(other)) =
+                crypto::decrypt_sync_event(key, &alias.event)
+            {
+                if same_file_content(envelope, &other) {
+                    if let Some(deadline) = retry_at.filter(|deadline| *deadline > Utc::now()) {
+                        if retry
+                            .as_ref()
+                            .is_none_or(|(current, _)| deadline > *current)
+                        {
+                            retry = Some((deadline, alias.event.event_id.clone()));
+                        }
+                    }
+                    ids.push(alias.event.event_id);
+                }
+            }
+        }
+        Ok((ids, retry))
     }
 
     /// Maps a materialized item back to its plaintext sources for future task-scoped staging.
@@ -1163,13 +1348,19 @@ impl SyncManager {
         let kind = parse_kind(&envelope.item.kind)?;
         // Resource GC uses the same lock. Keep materialized files alive until their database
         // references commit, while preserving the global apply_lock -> resource lock order.
-        let _resource_guard = if kind == ClipboardKind::Text {
+        let image_apply_guard = if kind == ClipboardKind::Image {
+            Some(self.apply_lock.lock().await)
+        } else {
+            None
+        };
+        let mut resource_guard = if kind != ClipboardKind::Image {
             None
         } else {
             Some(crate::clipboard::shared_files::lock().await)
         };
         let resources = crate::core::paths::resources_dir(&self.app)?;
         let blob_root = resources.join(SYNC_STAGING_DIR);
+        let mut file_apply_guard = None;
         let (content, files_fingerprint) = match kind {
             ClipboardKind::Text => (envelope.item.content.clone(), None),
             ClipboardKind::Image => {
@@ -1191,7 +1382,13 @@ impl SyncManager {
                 (image_name, None)
             }
             ClipboardKind::Files => {
-                let directory = resources.join("sync-files").join(&event.event_id);
+                let temporary = tempfile::Builder::new()
+                    .prefix("sync-receive-")
+                    .tempdir_in(&resources)?;
+                let directory = temporary.path().join("files");
+                let final_directory = resources
+                    .join("sync-files")
+                    .join(Uuid::new_v4().to_string());
                 let mut paths = Vec::new();
                 let mut file_fingerprints = Vec::new();
                 for manifest in &envelope.blobs {
@@ -1251,7 +1448,24 @@ impl SyncManager {
                     });
                     paths.push(destination.to_string_lossy().into_owned());
                 }
-                let physical_content = paths.join("\n");
+                file_apply_guard = Some(self.apply_lock.lock().await);
+                resource_guard = Some(crate::clipboard::shared_files::lock().await);
+                tokio::fs::create_dir_all(resources.join("sync-files")).await?;
+                tokio::fs::rename(&directory, &final_directory).await?;
+                let physical_content = paths
+                    .iter()
+                    .map(|path| {
+                        final_directory
+                            .join(
+                                Path::new(path)
+                                    .strip_prefix(&directory)
+                                    .expect("received file is inside temporary directory"),
+                            )
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let content = crate::clipboard::shared_files::normalize_owned_content(
                     &resources,
                     &physical_content,
@@ -1349,6 +1563,9 @@ impl SyncManager {
             display_created_at: String::new(),
         };
         let result = db::items::upsert_materialized_synced_item(&pool, &item).await?;
+        drop(resource_guard);
+        drop(file_apply_guard);
+        drop(image_apply_guard);
         if result.id.is_empty() {
             return Ok((String::new(), item, None, result.deduplicated));
         }
@@ -1443,8 +1660,13 @@ async fn apply_cloud_availability_updates(
             })
         })
         .collect::<Vec<_>>();
-    repository::record_cloud_availability_batch(pool, &availability, missing_event_ids, latest_cursor)
-        .await?;
+    repository::record_cloud_availability_batch(
+        pool,
+        &availability,
+        missing_event_ids,
+        latest_cursor,
+    )
+    .await?;
     Ok(!availability.is_empty() || !missing_event_ids.is_empty())
 }
 
@@ -1479,4 +1701,28 @@ fn cloud_event_content_availability(
     } else {
         repository::RouteContentAvailability::Metadata
     })
+}
+
+/// Identifies the authenticated file manifest, independent of copy events and retry attempts.
+fn file_transfer_key(envelope: &ClipboardEnvelope) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(envelope.item.sync_key.as_bytes());
+    for blob in &envelope.blobs {
+        hasher.update(blob.blob_id.as_bytes());
+        hasher.update(blob.name.as_bytes());
+        hasher.update(&blob.file_index.unwrap_or(0).to_le_bytes());
+        hasher.update(&blob.original_size.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Uses the existing content fingerprint, with manifest identity for older stored events.
+fn same_file_content(left: &ClipboardEnvelope, right: &ClipboardEnvelope) -> bool {
+    left.item.sync_key == right.item.sync_key
+        && (left
+            .content_identity
+            .as_ref()
+            .zip(right.content_identity.as_ref())
+            .is_some_and(|(left, right)| left == right)
+            || file_transfer_key(left) == file_transfer_key(right))
 }
