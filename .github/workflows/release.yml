@@ -502,6 +502,7 @@ jobs:
       - build-android
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout release notes
@@ -543,6 +544,44 @@ jobs:
             args+=(--prerelease=false)
           fi
           gh release edit "${args[@]}"
+
+      - name: Clean superseded failed release drafts
+        if: needs.release-metadata.outputs.prerelease == 'false'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          drafts="$(gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft) | [.id, .tag_name, .target_commitish] | @tsv')"
+
+          while IFS=$'\t' read -r release_id tag_name commit_sha; do
+            [[ -n "${release_id}" && "${tag_name}" != "${TAG_NAME}" ]] || continue
+            [[ "${tag_name}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || continue
+            [[ "${commit_sha}" =~ ^[0-9a-f]{40}$ ]] || continue
+
+            # Only releases from earlier commits on this release's history are superseded.
+            comparison="$(gh api "repos/${GH_REPO}/compare/${commit_sha}...${GITHUB_SHA}" --jq .status)"
+            [[ "${comparison}" == "ahead" ]] || continue
+
+            runs="$(gh api --method GET --paginate \
+              "repos/${GH_REPO}/actions/workflows/release.yml/runs" \
+              -f head_sha="${commit_sha}" -f per_page=100 \
+              --jq '.workflow_runs' | jq -s 'add')"
+            if ! jq -e 'length > 0 and all(.[]; .status == "completed") and .[0].conclusion != "success"' \
+              <<< "${runs}" >/dev/null; then
+              continue
+            fi
+
+            is_draft="$(gh api "repos/${GH_REPO}/releases/${release_id}" --jq .draft)"
+            [[ "${is_draft}" == "true" ]] || continue
+            gh api --method DELETE "repos/${GH_REPO}/releases/${release_id}"
+            echo "Removed superseded release draft ${tag_name}; Git tag retained."
+          done <<< "${drafts}"
 
   cleanup-caches:
     name: Clean Superseded Cargo Caches

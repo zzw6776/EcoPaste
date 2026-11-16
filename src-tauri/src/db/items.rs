@@ -749,14 +749,10 @@ pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Clipb
     Ok(item)
 }
 
-/// Reads only the ids of the most recent local-origin records for one-time sync backfill.
+/// Reads local-origin record ids for complete one-time sync backfill.
 /// Remote-only records are already owned by another endpoint and must not be re-originated here.
 /// Callers load the full records one at a time so large histories do not coexist in memory.
-pub async fn recent_item_ids_for_sync(pool: &SqlitePool, limit: u16) -> Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
+pub async fn local_item_ids_for_sync(pool: &SqlitePool) -> Result<Vec<String>> {
     let mut qb: QueryBuilder<Sqlite> =
         QueryBuilder::new("SELECT clipboard_items.id FROM clipboard_items");
     qb.push(
@@ -768,16 +764,15 @@ pub async fn recent_item_ids_for_sync(pool: &SqlitePool, limit: u16) -> Result<V
             SELECT 1 FROM sync_item_events local
             WHERE local.item_id = clipboard_items.id AND local.direction = 'local'
         )
-        ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC LIMIT
+        ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC
         "#,
-    )
-    .push_bind(i64::from(limit));
+    );
 
     Ok(qb
         .build_query_scalar::<String>()
         .fetch_all(pool)
         .await
-        .context("failed to query recent clipboard item ids for sync")?)
+        .context("failed to query local clipboard item ids for sync")?)
 }
 
 /// 返回尚未记录总大小的文件卡片，供升级后的后台回填使用。
@@ -1643,7 +1638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_item_ids_for_sync_uses_updated_order() {
+    async fn local_item_ids_for_sync_uses_updated_order() {
         let pool = memory_pool().await;
         for (id, updated_at) in [
             ("old", 1_700_000_001),
@@ -1655,13 +1650,13 @@ mod tests {
             insert_item(&pool, &item).await.unwrap();
         }
 
-        let item_ids = recent_item_ids_for_sync(&pool, 2).await.unwrap();
+        let item_ids = local_item_ids_for_sync(&pool).await.unwrap();
 
-        assert_eq!(item_ids, ["new", "mid"]);
+        assert_eq!(item_ids, ["new", "mid", "old"]);
     }
 
     #[tokio::test]
-    async fn recent_item_ids_for_sync_excludes_remote_only_records_before_limit() {
+    async fn local_item_ids_for_sync_excludes_remote_only_records() {
         let pool = memory_pool().await;
         for id in ["remote", "local", "unlinked"] {
             insert_item(&pool, &sample_item(id)).await.unwrap();
@@ -1690,7 +1685,7 @@ mod tests {
                 .unwrap();
         }
 
-        let ids = recent_item_ids_for_sync(&pool, 10).await.unwrap();
+        let ids = local_item_ids_for_sync(&pool).await.unwrap();
 
         assert!(ids.iter().any(|id| id == "local"));
         assert!(ids.iter().any(|id| id == "unlinked"));

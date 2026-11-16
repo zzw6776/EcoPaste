@@ -1006,7 +1006,7 @@ impl HubService {
                     );
                 } else {
                     let mut reservation = reservation.expect("missing blob quota reservation");
-                    let session = transfers.register(transfer_id, size, true)?;
+                    let session = transfers.register(transfer_id, size)?;
                     let readiness_started_at = Instant::now();
                     write_frame(send, &Response::BlobReady { size: 0 }).await?;
                     let readiness_elapsed = readiness_started_at.elapsed();
@@ -1085,7 +1085,7 @@ impl HubService {
                         .context("open encrypted blob")?;
                     (size, file)
                 };
-                let session = transfers.register(transfer_id, size, false)?;
+                let session = transfers.register(transfer_id, size)?;
                 write_frame(send, &Response::BlobReady { size }).await?;
                 multipart::until_stopped(
                     send,
@@ -1461,9 +1461,8 @@ async fn receive_blob<R: AsyncRead + Unpin>(
         while remaining > 0 {
             let requested =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
-                .await
-                .context("blob upload idle timeout")??;
+            // Multipart owns the network deadline; this pipe waits for an entire ordered part.
+            let read = recv.read(&mut buffer[..requested]).await?;
             if read == 0 {
                 bail!("blob ended early");
             }

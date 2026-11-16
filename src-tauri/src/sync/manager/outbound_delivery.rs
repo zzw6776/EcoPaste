@@ -332,7 +332,7 @@ impl SyncManager {
                     self.materialize_local_operations(
                         false,
                         true,
-                        1,
+                        usize::from(MAX_EVENTS_PER_BATCH),
                         Some(&preparation_target),
                         Some(cycle),
                     )

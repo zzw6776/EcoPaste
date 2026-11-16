@@ -128,7 +128,6 @@ const CLOUD_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_WATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
-const HISTORY_BACKFILL_LIMIT: u16 = 100;
 const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -664,7 +663,10 @@ struct ContentMaterializationContext<'a> {
 enum ContentMaterialization {
     Completed,
     Deferred,
-    Stored(TaskStagingCleanup),
+    Stored {
+        staging: TaskStagingCleanup,
+        has_attachments: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -1615,6 +1617,9 @@ impl SyncManager {
         observation: Option<ClipboardObservation>,
         ready: bool,
     ) {
+        if !self.app.state::<SettingsStore>().snapshot().sync.enabled {
+            return;
+        }
         if let Some(observation) = observation {
             self.pending_observations
                 .lock()
@@ -2554,7 +2559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresponsive_upload_connection_is_closed_after_the_bounded_probe() {
+    async fn unresponsive_upload_probe_keeps_the_shared_connection() {
         let (_client, _server, connection, incoming) = upload_test_connection().await;
         let peer = tokio::spawn(async move {
             let (_send, mut recv) = incoming.accept_bi().await.unwrap();
@@ -2566,9 +2571,10 @@ mod tests {
         });
         assert_eq!(
             check_stalled_cloud_upload(&connection).await,
-            "failed-closed"
+            "failed-retained"
         );
-        assert!(connection.close_reason().is_some());
+        assert!(connection.close_reason().is_none());
+        connection.close(0_u32.into(), b"test complete");
         peer.await.unwrap();
     }
 

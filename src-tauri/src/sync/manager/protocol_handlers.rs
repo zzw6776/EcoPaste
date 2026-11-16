@@ -739,7 +739,7 @@ async fn dispatch_peer(
             if path.is_file() && path.metadata()?.len() == size {
                 write_frame(send, &Response::BlobStored).await?;
             } else {
-                let session = transfers.register(transfer_id, size, true)?;
+                let session = transfers.register(transfer_id, size)?;
                 write_frame(send, &Response::BlobReady { size: 0 }).await?;
                 let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
                 let receive = multipart::receive(&mut writer, session.peer(), size, |_| {});
@@ -833,7 +833,7 @@ async fn dispatch_peer(
             );
             progress.report_transferred = false;
             let result = async {
-                let session = transfers.register(transfer_id, blob.size, false)?;
+                let session = transfers.register(transfer_id, blob.size)?;
                 write_frame(send, &Response::BlobReady { size: blob.size }).await?;
                 let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
                 let produce = async {

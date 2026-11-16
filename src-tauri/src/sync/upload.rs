@@ -140,7 +140,7 @@ impl UploadProgress {
     }
 }
 
-/// Resets the write deadline on every accepted byte, including partial writes within one buffer.
+/// Feeds the bounded multipart pipe; waiting for its consumer is not a network timeout.
 pub(super) async fn copy<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -174,13 +174,7 @@ where
             if progress.canceled() {
                 anyhow::bail!("transfer canceled");
             }
-            let written = timed(
-                idle_timeout,
-                progress.phase,
-                language,
-                writer.write(remaining),
-            )
-            .await?;
+            let written = writer.write(remaining).await?;
             if written == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
             }
@@ -189,7 +183,8 @@ where
         }
     }
     progress.phase = UploadPhase::Flush;
-    timed(idle_timeout, progress.phase, language, writer.flush()).await
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Reads plaintext once, encrypts fixed-size authenticated chunks and writes them immediately.
@@ -253,14 +248,7 @@ where
         anyhow::bail!("sync source size changed before upload");
     }
     let mut encryptor = super::crypto::BlobStreamEncryptor::new(&key, stream_nonce, original_size)?;
-    write_encrypted_chunk(
-        writer,
-        &encryptor.header(),
-        idle_timeout,
-        language,
-        progress,
-    )
-    .await?;
+    write_encrypted_chunk(writer, &encryptor.header(), progress).await?;
 
     let mut remaining = original_size;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -284,7 +272,7 @@ where
             .await?;
         }
         let ciphertext = encryptor.encrypt_next(&buffer[..length])?;
-        write_encrypted_chunk(writer, &ciphertext, idle_timeout, language, progress).await?;
+        write_encrypted_chunk(writer, &ciphertext, progress).await?;
         remaining = remaining.saturating_sub(length as u64);
         if original_size == 0 || remaining == 0 {
             break;
@@ -304,7 +292,7 @@ where
         anyhow::bail!("sync source size changed before upload");
     }
     progress.phase = UploadPhase::Flush;
-    timed(idle_timeout, progress.phase, language, writer.flush()).await?;
+    writer.flush().await?;
     if progress.written_bytes != expected_encrypted_size {
         anyhow::bail!("encrypted sync blob size mismatch");
     }
@@ -314,8 +302,6 @@ where
 async fn write_encrypted_chunk<W>(
     writer: &mut W,
     mut bytes: &[u8],
-    idle_timeout: Duration,
-    language: Language,
     progress: &mut UploadProgress,
 ) -> Result<()>
 where
@@ -326,7 +312,7 @@ where
         if progress.canceled() {
             anyhow::bail!("transfer canceled");
         }
-        let written = timed(idle_timeout, progress.phase, language, writer.write(bytes)).await?;
+        let written = writer.write(bytes).await?;
         if written == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
         }
@@ -426,9 +412,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_network_write_reports_exact_partial_progress() {
+    async fn closed_multipart_pipe_reports_exact_partial_progress() {
         let bytes = [7_u8; 32];
-        let (mut writer, _receiver) = tokio::io::duplex(2);
+        let (mut writer, mut receiver) = tokio::io::duplex(2);
+        let consumer = tokio::spawn(async move {
+            let mut bytes = [0u8; 2];
+            receiver.read_exact(&mut bytes).await.unwrap();
+        });
         let mut progress = UploadProgress::new(0, "test", None);
         let error = copy(
             &mut bytes.as_slice(),
@@ -439,8 +429,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(is_network_timeout(&error));
-        assert_eq!(error.to_string(), "附件上传长时间没有进展");
+        consumer.await.unwrap();
+        assert!(!is_network_timeout(&error));
         assert_eq!(progress.written_bytes, 2);
         assert!(progress.first_write_ms.is_some());
     }

@@ -678,10 +678,10 @@ pub struct BlobStreamSpec<'a> {
     pub expected_hash: &'a str,
     pub stream_commitment: bool,
     pub key: &'a [u8; 32],
-    pub idle_timeout: Duration,
+    pub write_timeout: Duration,
 }
 
-/// Authenticates and decrypts one network blob directly into the caller's destination stream.
+/// Decrypts the ordered multipart output; its producer owns network timeouts and cancellation.
 pub async fn decrypt_blob_stream<R, W, F, C>(
     reader: &mut R,
     writer: &mut W,
@@ -702,7 +702,7 @@ where
         expected_hash,
         stream_commitment,
         key,
-        idle_timeout,
+        write_timeout,
     } = spec;
     let header_size = (BLOB_MAGIC.len() + STREAM_NONCE_LEN) as u64;
     if encrypted_size < header_size.saturating_add(TAG_SIZE as u64) {
@@ -711,23 +711,13 @@ where
 
     let mut ciphertext_hasher = blake3::Hasher::new();
     let mut magic = [0_u8; BLOB_MAGIC.len()];
-    tokio::time::timeout(
-        idle_timeout,
-        TokioAsyncReadExt::read_exact(reader, &mut magic),
-    )
-    .await
-    .context("remote blob download idle timeout")??;
+    TokioAsyncReadExt::read_exact(reader, &mut magic).await?;
     if &magic != BLOB_MAGIC {
         bail!("invalid encrypted sync blob");
     }
     ciphertext_hasher.update(&magic);
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
-    tokio::time::timeout(
-        idle_timeout,
-        TokioAsyncReadExt::read_exact(reader, &mut stream_nonce),
-    )
-    .await
-    .context("remote blob download idle timeout")??;
+    TokioAsyncReadExt::read_exact(reader, &mut stream_nonce).await?;
     ciphertext_hasher.update(&stream_nonce);
     let mut transferred = header_size;
     on_progress(transferred);
@@ -751,12 +741,7 @@ where
             usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE)
         };
         let encrypted_length = plaintext_length + TAG_SIZE;
-        tokio::time::timeout(
-            idle_timeout,
-            TokioAsyncReadExt::read_exact(reader, &mut buffer[..encrypted_length]),
-        )
-        .await
-        .context("remote blob download idle timeout")??;
+        TokioAsyncReadExt::read_exact(reader, &mut buffer[..encrypted_length]).await?;
         ciphertext_hasher.update(&buffer[..encrypted_length]);
         transferred = transferred.saturating_add(encrypted_length as u64);
         on_progress(transferred);
@@ -777,7 +762,7 @@ where
         };
         plaintext_hasher.update(&plaintext);
         tokio::time::timeout(
-            idle_timeout,
+            write_timeout,
             TokioAsyncWriteExt::write_all(writer, &plaintext),
         )
         .await
@@ -786,7 +771,7 @@ where
             break;
         }
     }
-    tokio::time::timeout(idle_timeout, TokioAsyncWriteExt::flush(writer))
+    tokio::time::timeout(write_timeout, TokioAsyncWriteExt::flush(writer))
         .await
         .context("remote destination flush timeout")??;
     if transferred != encrypted_size {
@@ -1231,7 +1216,7 @@ mod tests {
                 expected_hash: &encrypted.blob_id,
                 stream_commitment: false,
                 key: &key,
-                idle_timeout: Duration::from_secs(1),
+                write_timeout: Duration::from_secs(1),
             },
             |current| transferred = current,
             || false,

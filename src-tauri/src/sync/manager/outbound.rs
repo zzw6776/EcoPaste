@@ -116,10 +116,19 @@ impl SyncManager {
                             deferred_content = true;
                             break;
                         }
-                        Ok(ContentMaterialization::Stored(content_staging)) => {
+                        Ok(ContentMaterialization::Stored {
+                            staging: content_staging,
+                            has_attachments,
+                        }) => {
                             stored_any = true;
                             staging.extend(content_staging);
                             materialized_content += 1;
+                            // Inline records can fill a batch; attachment preparation yields
+                            // after one record so a backlog of images cannot delay the exchange.
+                            if has_attachments {
+                                processed += 1;
+                                break;
+                            }
                         }
                         Err(error) => {
                             let retry_delay = db::sync_queue::fail_content(
@@ -346,7 +355,10 @@ impl SyncManager {
                 .state::<Arc<ClipboardFingerprintState>>()
                 .remember_synced_image(fingerprint);
         }
-        Ok(ContentMaterialization::Stored(staging))
+        Ok(ContentMaterialization::Stored {
+            staging,
+            has_attachments: !envelope.blobs.is_empty(),
+        })
     }
 
     pub(super) fn discard_pending_observation(&self, item_id: &str, source_revision: &str) {
@@ -860,8 +872,8 @@ impl SyncManager {
         }))
     }
 
-    /// Creates sync events for the latest local history once per sync space.
-    pub(super) async fn backfill_recent_history(
+    /// Recovers local history omitted before captures were retained while synchronization paused.
+    pub(super) async fn backfill_local_history(
         &self,
         pool: &SqlitePool,
         group: &GroupSecrets,
@@ -876,7 +888,7 @@ impl SyncManager {
             .snapshot()
             .sync
             .sync_sensitive;
-        let item_ids = db::items::recent_item_ids_for_sync(pool, HISTORY_BACKFILL_LIMIT).await?;
+        let item_ids = db::items::local_item_ids_for_sync(pool).await?;
         for item_id in item_ids.into_iter().rev() {
             let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
                 continue;
