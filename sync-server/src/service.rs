@@ -1,3 +1,4 @@
+use ecopaste_sync_protocol::transfer::{self as multipart, TransferLimits, Transfers};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -17,7 +18,7 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tracing::{debug, info, warn};
 
@@ -32,7 +33,6 @@ const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const GLOBAL_STREAM_ADMISSION: usize = 256;
 const GLOBAL_REQUEST_CONCURRENCY: usize = 128;
-const GLOBAL_BLOB_CONCURRENCY: usize = 8;
 const GLOBAL_WATCH_CONCURRENCY: usize = 512;
 const HUB_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HUB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -69,7 +69,8 @@ type ActiveWatchRegistry = Arc<Mutex<HashMap<(String, String), ActiveWatch>>>;
 #[derive(Clone)]
 struct ConnectionLimits {
     requests: Arc<Semaphore>,
-    blobs: Arc<Semaphore>,
+    blobs: Arc<TransferLimits>,
+    transfers: Arc<Transfers>,
     watches: Arc<Semaphore>,
 }
 
@@ -159,7 +160,6 @@ pub struct HubService {
     group_sync_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     stream_admission: Arc<Semaphore>,
     request_concurrency: Arc<Semaphore>,
-    blob_concurrency: Arc<Semaphore>,
     watch_concurrency: Arc<Semaphore>,
     active_watches: ActiveWatchRegistry,
 }
@@ -187,7 +187,6 @@ impl HubService {
             group_sync_locks: Arc::new(Mutex::new(HashMap::new())),
             stream_admission: Arc::new(Semaphore::new(GLOBAL_STREAM_ADMISSION)),
             request_concurrency: Arc::new(Semaphore::new(GLOBAL_REQUEST_CONCURRENCY)),
-            blob_concurrency: Arc::new(Semaphore::new(GLOBAL_BLOB_CONCURRENCY)),
             watch_concurrency: Arc::new(Semaphore::new(GLOBAL_WATCH_CONCURRENCY)),
             active_watches: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -645,31 +644,39 @@ impl HubService {
             .await
             .context("read request frame timeout")?
             .context("read request frame")?;
+        drop(admission_permits);
+        if let Request::BlobPart { transfer_id, index } = request {
+            return connection_limits
+                .transfers
+                .route(transfer_id, index, send, recv)
+                .await;
+        }
+        let _attachment_permit = if let Some((files, sending)) = request.attachment_lane() {
+            Some(connection_limits.blobs.acquire(files, sending).await?)
+        } else {
+            None
+        };
         let _request_permits = if matches!(&request, Request::WatchCloud { .. }) {
             Some((
                 self.watch_concurrency.clone().acquire_owned().await?,
                 connection_limits.watches.acquire_owned().await?,
             ))
-        } else if matches!(
-            &request,
-            Request::PutManagedBlob { .. }
-                | Request::PutManagedSourceIcon { .. }
-                | Request::PutManagedStreamBlob { .. }
-                | Request::GetBlob { .. }
-        ) {
-            Some((
-                self.blob_concurrency.clone().acquire_owned().await?,
-                connection_limits.blobs.acquire_owned().await?,
-            ))
-        } else {
+        } else if _attachment_permit.is_none() {
             Some((
                 self.request_concurrency.clone().acquire_owned().await?,
                 connection_limits.requests.acquire_owned().await?,
             ))
+        } else {
+            None
         };
-        drop(admission_permits);
         if let Err(error) = self
-            .dispatch(remote_endpoint_id, &mut send, &mut recv, request)
+            .dispatch(
+                remote_endpoint_id,
+                &mut send,
+                &mut recv,
+                request,
+                &connection_limits.transfers,
+            )
             .await
         {
             if is_frame_io_error(&error) {
@@ -695,6 +702,7 @@ impl HubService {
         send: &mut SendStream,
         recv: &mut RecvStream,
         request: Request,
+        transfers: &Arc<Transfers>,
     ) -> Result<()> {
         match request {
             Request::CloudHealth => {
@@ -924,25 +932,31 @@ impl HubService {
             | Request::PutManagedStreamBlob { .. }) => {
                 let notify_source_icon = matches!(request, Request::PutManagedSourceIcon { .. });
                 let streaming = matches!(request, Request::PutManagedStreamBlob { .. });
-                let (group_id, access_token, blob_id, size) = match request {
+                let (group_id, access_token, blob_id, size, transfer_id) = match request {
                     Request::PutManagedBlob {
                         group_id,
                         access_token,
                         blob_id,
                         size,
+                        transfer_id,
+                        file_content: _,
                     }
                     | Request::PutManagedSourceIcon {
                         group_id,
                         access_token,
                         blob_id,
                         size,
+                        transfer_id,
+                        file_content: _,
                     }
                     | Request::PutManagedStreamBlob {
                         group_id,
                         access_token,
                         blob_id,
                         size,
-                    } => (group_id, access_token, blob_id, size),
+                        transfer_id,
+                        file_content: _,
+                    } => (group_id, access_token, blob_id, size, transfer_id),
                     _ => unreachable!(),
                 };
                 let started_at = Instant::now();
@@ -992,18 +1006,26 @@ impl HubService {
                     );
                 } else {
                     let mut reservation = reservation.expect("missing blob quota reservation");
+                    let session = transfers.register(transfer_id, size, true)?;
                     let readiness_started_at = Instant::now();
                     write_frame(send, &Response::BlobReady { size: 0 }).await?;
                     let readiness_elapsed = readiness_started_at.elapsed();
                     let receive_started_at = Instant::now();
-                    receive_blob(
-                        recv,
+                    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+                    let receive = multipart::receive(&mut writer, session.peer(), size, |_| {});
+                    let save = receive_blob(
+                        &mut reader,
+                        if streaming { Some(recv) } else { None },
                         &destination,
                         &blob_id,
                         size,
                         &mut reservation,
                         streaming,
-                    )
+                    );
+                    multipart::until_stopped(send, async {
+                        tokio::try_join!(receive, save)?;
+                        Ok(())
+                    })
                     .await?;
                     let receive_elapsed = receive_started_at.elapsed();
                     {
@@ -1040,6 +1062,8 @@ impl HubService {
                 group_id,
                 access_token,
                 blob_id,
+                transfer_id,
+                file_content: _,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
@@ -1061,10 +1085,15 @@ impl HubService {
                         .context("open encrypted blob")?;
                     (size, file)
                 };
+                let session = transfers.register(transfer_id, size, false)?;
                 write_frame(send, &Response::BlobReady { size }).await?;
-                copy_with_idle_timeout(&mut file, send, BLOB_IDLE_TIMEOUT)
-                    .await
-                    .context("send encrypted blob")?;
+                multipart::until_stopped(
+                    send,
+                    multipart::send(&mut file, session.peer(), size, |_| {}),
+                )
+                .await
+                .context("send encrypted blob")?;
+                write_frame(send, &Response::BlobStored).await?;
             }
             Request::SyncCloudAvailability {
                 group_id,
@@ -1302,6 +1331,7 @@ impl HubService {
             }
             Request::Health
             | Request::Sync { .. }
+            | Request::BlobPart { .. }
             | Request::PutBlob { .. }
             | Request::PutSourceIcon { .. }
             | Request::PutStreamBlob { .. }
@@ -1334,7 +1364,8 @@ impl ProtocolHandler for HubService {
         let connection_admission = Arc::new(Semaphore::new(8));
         let connection_limits = ConnectionLimits {
             requests: Arc::new(Semaphore::new(16)),
-            blobs: Arc::new(Semaphore::new(2)),
+            blobs: Arc::new(TransferLimits::default()),
+            transfers: Arc::new(Transfers::default()),
             watches: Arc::new(Semaphore::new(4)),
         };
         loop {
@@ -1401,8 +1432,9 @@ fn blob_path(root: &Path, group_id: &str, blob_id: &str) -> PathBuf {
     root.join(group_directory).join(&blob_id[..2]).join(blob_id)
 }
 
-async fn receive_blob(
-    recv: &mut RecvStream,
+async fn receive_blob<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    commit: Option<&mut RecvStream>,
     destination: &Path,
     expected_hash: &str,
     size: u64,
@@ -1431,8 +1463,10 @@ async fn receive_blob(
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
             let read = tokio::time::timeout(BLOB_IDLE_TIMEOUT, recv.read(&mut buffer[..requested]))
                 .await
-                .context("blob upload idle timeout")??
-                .context("blob ended early")?;
+                .context("blob upload idle timeout")??;
+            if read == 0 {
+                bail!("blob ended early");
+            }
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
             remaining -= read as u64;
@@ -1444,8 +1478,8 @@ async fn receive_blob(
         if !streaming && actual_hash != expected_hash {
             bail!("blob hash mismatch");
         }
-        if streaming {
-            let commit: Request = tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(recv))
+        if let Some(control) = commit {
+            let commit: Request = tokio::time::timeout(BLOB_IDLE_TIMEOUT, read_frame(control))
                 .await
                 .context("streaming blob commit timeout")??;
             if commit
@@ -1463,33 +1497,6 @@ async fn receive_blob(
         Ok(())
     }
     .await
-}
-
-async fn copy_with_idle_timeout<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    idle_timeout: Duration,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut copied = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = tokio::time::timeout(idle_timeout, reader.read(&mut buffer))
-            .await
-            .context("blob read idle timeout")??;
-        if read == 0 {
-            break;
-        }
-        tokio::time::timeout(idle_timeout, writer.write_all(&buffer[..read]))
-            .await
-            .context("blob write idle timeout")??;
-        copied += read as u64;
-    }
-    writer.flush().await?;
-    Ok(copied)
 }
 
 fn response_for_error(error: &anyhow::Error) -> Response {

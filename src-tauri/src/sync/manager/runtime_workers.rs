@@ -1,13 +1,51 @@
 use super::*;
 
-pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>) {
+pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) {
     loop {
-        manager.runtime_state.local_outbox_wake.notified().await;
+        manager.runtime_state.local_outbox_wake[usize::from(files)]
+            .notified()
+            .await;
         loop {
-            match manager
-                .materialize_local_operations(false, 0, None, None)
-                .await
-            {
+            let target = if files {
+                let lan = manager
+                    .runtime_state
+                    .lan_connections
+                    .read()
+                    .expect("LAN connections poisoned")
+                    .iter()
+                    .find(|(_, connection)| connection.close_reason().is_none())
+                    .map(|(id, _)| PreparationTarget {
+                        route: super::super::progress::TransferRoute::Lan,
+                        target: SyncConnectionTarget::peer(id.clone())
+                            .delivery_target()
+                            .to_owned(),
+                    });
+                lan.or_else(|| {
+                    manager
+                        .cached_cloud_connection()
+                        .map(|_| PreparationTarget {
+                            route: super::super::progress::TransferRoute::Cloud,
+                            target: CLOUD_TARGET.to_owned(),
+                        })
+                })
+            } else {
+                None
+            };
+            if files && target.is_none() {
+                break;
+            }
+            let activity = manager.sync_activity_guard().await;
+            let prepared = manager
+                .materialize_local_operations(
+                    files,
+                    files,
+                    usize::from(files),
+                    target.as_ref(),
+                    None,
+                )
+                .await;
+            drop(activity);
+            match prepared {
                 Ok(result) if result.deferred_content => break,
                 Ok(result) if result.processed == 0 => {
                     let settings = manager.app.state::<SettingsStore>().snapshot().sync;
@@ -15,30 +53,38 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>) {
                         break;
                     }
                     let pool = manager.pool().await;
-                    let retry_at =
-                        match db::sync_queue::next_content_retry_at(&pool, settings.sync_sensitive)
-                            .await
-                        {
-                            Ok(retry_at) => retry_at,
-                            Err(error) => {
-                                log::warn!("read local sync outbox retry failed: {error:#}");
-                                None
-                            }
-                        };
+                    let retry_at = match db::sync_queue::next_content_retry_at(
+                        &pool,
+                        settings.sync_sensitive,
+                        files,
+                    )
+                    .await
+                    {
+                        Ok(retry_at) => retry_at,
+                        Err(error) => {
+                            log::warn!("read local sync outbox retry failed: {error:#}");
+                            None
+                        }
+                    };
                     let Some(retry_at) = retry_at else {
                         break;
                     };
                     let delay = (retry_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake.notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[usize::from(files)].notified() => {}
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
-                Ok(_) => continue,
+                Ok(result) => {
+                    if files {
+                        result.staging.retain_for_delivery();
+                    }
+                    continue;
+                }
                 Err(error) => {
                     log::warn!("materialize local sync outbox failed: {error:#}");
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake.notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[usize::from(files)].notified() => {}
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     }
                 }
@@ -585,7 +631,7 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
         }
 
         // Local retention takes the write side before reclaiming temporary ciphertext.
-        let _staging_guard = manager.runtime_state.lan_cycle_lock.read().await;
+        let _staging_guard = manager.sync_activity_guard().await;
         let connection = manager.cached_cloud_connection();
         if settings.cloud_enabled {
             let publish_started_at = Instant::now();
@@ -893,4 +939,106 @@ pub(super) fn next_cloud_watch_failure_count(failure_count: usize, watch_ready: 
         return 1;
     }
     failure_count.saturating_add(1)
+}
+
+/// Keeps each attachment direction/category running independently and refills a freed slot.
+pub(super) async fn attachment_worker(manager: Arc<SyncManager>, files: bool, sending: bool) {
+    let lane = usize::from(files) * 2 + usize::from(sending);
+    let mut jobs = tokio::task::JoinSet::<(String, bool)>::new();
+    let mut active: HashMap<String, usize> = HashMap::new();
+    loop {
+        {
+            tokio::select! {
+                _ = manager.runtime_state.attachment_wakes[lane].notified() => {},
+                completed = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(Ok((target, more))) = completed {
+                        if let Some(count) = active.get_mut(&target) { *count = count.saturating_sub(1); }
+                        if !more { continue; }
+                    }
+                }
+            }
+        }
+        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+        let identity = manager.identity.snapshot();
+        let Some(group) = identity.group else {
+            continue;
+        };
+        if !settings.enabled {
+            continue;
+        }
+        let mut routes = Vec::new();
+        if settings.lan_enabled {
+            for (device_id, connection) in manager
+                .runtime_state
+                .lan_connections
+                .read()
+                .expect("LAN connections poisoned")
+                .iter()
+            {
+                if connection.close_reason().is_none() {
+                    routes.push((
+                        SyncConnectionTarget::peer(device_id.clone()),
+                        connection.clone(),
+                    ));
+                }
+            }
+        }
+        if server_is_configured(&settings) {
+            if let Some(connection) = manager.cached_cloud_connection() {
+                routes.push((SyncConnectionTarget::Cloud, connection));
+            }
+        }
+        if routes.is_empty() {
+            continue;
+        }
+        let endpoint = match manager.ensure_endpoint(&settings).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                log::warn!("prepare attachment endpoint failed: {error:#}");
+                continue;
+            }
+        };
+        let cycle = SyncCycleContext {
+            target: SyncTarget::Lan,
+            device: manager.device_announcement_for(
+                &endpoint,
+                &identity.device_id,
+                &identity.device_name,
+            ),
+            device_id: identity.device_id,
+            settings,
+            group,
+            endpoint,
+            pool: manager.pool().await,
+        };
+        for (target, connection) in routes {
+            let target_id = target.delivery_target().to_owned();
+            let count = active.entry(target_id.clone()).or_default();
+            while *count < multipart::ATTACHMENTS_PER_DIRECTION {
+                *count += 1;
+                let manager = manager.clone();
+                let cycle = cycle.clone();
+                let connection = connection.clone();
+                let target = target.clone();
+                let target_id = target_id.clone();
+                jobs.spawn(async move {
+                    let _guard = manager.sync_activity_guard().await;
+                    let result = if sending {
+                        manager.sync_connection_lane(&connection, &target, 0, &cycle, Some(files)).await.map(|outcome| outcome.has_more)
+                    } else {
+                        manager.apply_pending_attachment_events(&connection, &cycle.pool, &cycle.group, &cycle.settings, &target, files).await
+                    };
+                    let more = match result {
+                        Ok(more) => more,
+                        Err(error) => {
+                            log::warn!("attachment deferred: target={target_id} files={files} sending={sending} error={error:#}");
+                            manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                            false
+                        }
+                    };
+                    (target_id, more)
+                });
+            }
+        }
+    }
 }

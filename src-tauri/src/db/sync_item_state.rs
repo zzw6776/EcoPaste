@@ -1200,7 +1200,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let content = crate::db::sync_queue::next_ready_content(&pool, false)
+        let content = crate::db::sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1250,10 +1250,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::sync_queue::next_ready_content(&pool, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let states = dirty_states(&pool, 10, false).await.unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].sync_key, item.sync_key);
@@ -1286,10 +1288,12 @@ mod tests {
         .unwrap();
         transaction.commit().await.unwrap();
 
-        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::sync_queue::next_ready_content(&pool, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             dirty_states(&pool, 1, false)
                 .await
@@ -1329,10 +1333,12 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        assert!(crate::db::sync_queue::next_ready_content(&pool, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::sync_queue::next_ready_content(&pool, false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let state = dirty_states(&pool, 1, false).await.unwrap().pop().unwrap();
         let patch = state.patch();
         assert_eq!(patch.is_present, Some(false));

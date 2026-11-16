@@ -81,6 +81,7 @@ impl SyncManager {
         preserve_runtime: bool,
     ) -> Result<()> {
         self.validate_pairing_bootstrap(bootstrap, replace_existing)?;
+        let _cleanup_wake = CleanupWakeGuard(&self.runtime_state);
         let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
         let _lan_guard = self.runtime_state.lan_cycle_lock.write().await;
         let current_group = self.identity.snapshot().group;
@@ -148,6 +149,7 @@ impl SyncManager {
         self: &Arc<Self>,
         peer: &PeerAnnouncement,
     ) -> Result<()> {
+        let _cleanup_wake = CleanupWakeGuard(&self.runtime_state);
         let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
         let pool = self.pool().await;
         repository::restore_and_upsert_peer(&pool, peer).await?;
@@ -176,6 +178,7 @@ impl SyncManager {
         if device_id.is_empty() || device_id == self.identity.snapshot().device_id {
             bail!("无法删除该设备");
         }
+        let _cleanup_wake = CleanupWakeGuard(&self.runtime_state);
         let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
         let _lan_guard = self.runtime_state.lan_cycle_lock.write().await;
         let pool = self.pool().await;
@@ -223,6 +226,7 @@ impl SyncManager {
     }
 
     pub async fn leave_group(&self) -> Result<()> {
+        let _cleanup_wake = CleanupWakeGuard(&self.runtime_state);
         let _cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
         let _lan_guard = self.runtime_state.lan_cycle_lock.write().await;
         self.stop_runtime().await?;

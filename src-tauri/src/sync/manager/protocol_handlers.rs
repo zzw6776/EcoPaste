@@ -291,7 +291,8 @@ async fn serve_claimed_peer_connection(
         bail!("rejected non-LAN sync connection: {error}");
     }
     let connection_admission = Arc::new(Semaphore::new(8));
-    let connection_blobs = Arc::new(Semaphore::new(2));
+    let connection_blobs = Arc::new(TransferLimits::default());
+    let transfers = Arc::new(Transfers::default());
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(value) => value,
@@ -314,6 +315,7 @@ async fn serve_claimed_peer_connection(
         let manager = manager.clone();
         let connection = connection.clone();
         let connection_blobs = connection_blobs.clone();
+        let transfers = transfers.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_peer_stream(
                 manager,
@@ -322,6 +324,7 @@ async fn serve_claimed_peer_connection(
                 recv,
                 (global_admission, connection_admission),
                 connection_blobs,
+                transfers,
             )
             .await
             {
@@ -338,38 +341,37 @@ async fn handle_peer_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     admission_permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
-    connection_blobs: Arc<Semaphore>,
+    connection_blobs: Arc<TransferLimits>,
+    transfers: Arc<Transfers>,
 ) -> Result<()> {
     let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
         .await
         .context("LAN request frame timeout")??;
-    let blob_request = matches!(
-        &request,
-        Request::PutBlob { .. }
-            | Request::PutSourceIcon { .. }
-            | Request::PutStreamBlob { .. }
-            | Request::GetBlob { .. }
-    );
-    let _blob_permits = if blob_request {
-        Some((
-            manager
-                .runtime_state
-                .inbound_blob_concurrency
-                .clone()
-                .acquire_owned()
-                .await?,
-            connection_blobs.acquire_owned().await?,
-        ))
+    drop(admission_permits);
+    if let Request::BlobPart { transfer_id, index } = request {
+        return transfers.route(transfer_id, index, send, recv).await;
+    }
+    let lane = request.attachment_lane();
+    let blob_request = lane.is_some();
+    let _blob_permit = if let Some((files, sending)) = lane {
+        Some(connection_blobs.acquire(files, sending).await?)
     } else {
         None
     };
     let _cleanup_guard = if blob_request {
-        Some(manager.runtime_state.lan_cycle_lock.read().await)
+        Some(manager.sync_activity_guard().await)
     } else {
         None
     };
-    drop(admission_permits);
-    let result = dispatch_peer(&manager, &connection, &mut send, &mut recv, request).await;
+    let result = dispatch_peer(
+        &manager,
+        &connection,
+        &mut send,
+        &mut recv,
+        request,
+        &transfers,
+    )
+    .await;
     if let Err(error) = result {
         let code = error
             .downcast_ref::<RemoteSyncError>()
@@ -394,6 +396,7 @@ async fn dispatch_peer(
     send: &mut SendStream,
     recv: &mut RecvStream,
     request: Request,
+    transfers: &Arc<Transfers>,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
     let settings = manager.app.state::<SettingsStore>().snapshot();
@@ -704,18 +707,24 @@ async fn dispatch_peer(
             access_token,
             blob_id,
             size,
+            transfer_id,
+            file_content: _,
         }
         | Request::PutSourceIcon {
             group_id,
             access_token,
             blob_id,
             size,
+            transfer_id,
+            file_content: _,
         }
         | Request::PutStreamBlob {
             group_id,
             access_token,
             blob_id,
             size,
+            transfer_id,
+            file_content: _,
         } => {
             authenticate_local(manager, &group_id, &access_token)?;
             let pool = manager.pool().await;
@@ -730,16 +739,23 @@ async fn dispatch_peer(
             if path.is_file() && path.metadata()?.len() == size {
                 write_frame(send, &Response::BlobStored).await?;
             } else {
+                let session = transfers.register(transfer_id, size, true)?;
                 write_frame(send, &Response::BlobReady { size: 0 }).await?;
-                receive_blob(
-                    recv,
+                let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+                let receive = multipart::receive(&mut writer, session.peer(), size, |_| {});
+                let save = receive_blob(
+                    &mut reader,
+                    if streaming_request { Some(recv) } else { None },
                     &path,
                     &blob_id,
                     size,
                     !streaming_request,
-                    streaming_request,
                     None,
-                )
+                );
+                multipart::until_stopped(send, async {
+                    tokio::try_join!(receive, save)?;
+                    Ok(())
+                })
                 .await?;
                 write_frame(send, &Response::BlobStored).await?;
             }
@@ -748,6 +764,8 @@ async fn dispatch_peer(
             group_id,
             access_token,
             blob_id,
+            transfer_id,
+            file_content: _,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             let pool = manager.pool().await;
@@ -813,38 +831,61 @@ async fn dispatch_peer(
                 blob_log_ref(&blob.blob_id),
                 upload.as_ref().map(|upload| upload.handle.clone()),
             );
+            progress.report_transferred = false;
             let result = async {
-                if let Some((source, nonce)) = streaming_source {
-                    write_frame(send, &Response::BlobReady { size: blob.size }).await?;
-                    encrypt_upload_source(
-                        &source,
-                        send,
-                        super::super::upload::FileEncryptionSpec {
-                            expected_encrypted_size: blob.size,
-                            expected_blob_id: &blob.blob_id,
-                            key: group.content_key_bytes()?,
-                            stream_nonce: &nonce,
-                            idle_timeout: BLOB_IDLE_TIMEOUT,
-                            language: crate::i18n::current_language(&manager.app),
-                        },
-                        &mut progress,
-                    )
-                    .await?;
-                } else if let Some((staged, _staging_lease)) = staged {
-                    let path = PathBuf::from(&staged.encrypted_path);
-                    let size = path.metadata()?.len();
-                    write_frame(send, &Response::BlobReady { size }).await?;
-                    let mut file = tokio::fs::File::open(path).await?;
-                    super::super::upload::copy(
-                        &mut file,
-                        send,
-                        BLOB_IDLE_TIMEOUT,
-                        crate::i18n::current_language(&manager.app),
-                        &mut progress,
-                    )
-                    .await?;
-                }
-                Ok::<(), anyhow::Error>(())
+                let session = transfers.register(transfer_id, blob.size, false)?;
+                write_frame(send, &Response::BlobReady { size: blob.size }).await?;
+                let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+                let produce = async {
+                    if let Some((source, nonce)) = streaming_source {
+                        encrypt_upload_source(
+                            &source,
+                            &mut writer,
+                            super::super::upload::FileEncryptionSpec {
+                                expected_encrypted_size: blob.size,
+                                expected_blob_id: &blob.blob_id,
+                                key: group.content_key_bytes()?,
+                                stream_nonce: &nonce,
+                                idle_timeout: BLOB_IDLE_TIMEOUT,
+                                language: crate::i18n::current_language(&manager.app),
+                            },
+                            &mut progress,
+                        )
+                        .await?;
+                    } else if let Some((staged, _staging_lease)) = staged {
+                        let path = PathBuf::from(&staged.encrypted_path);
+                        let mut file = tokio::fs::File::open(path).await?;
+                        super::super::upload::copy(
+                            &mut file,
+                            &mut writer,
+                            BLOB_IDLE_TIMEOUT,
+                            crate::i18n::current_language(&manager.app),
+                            &mut progress,
+                        )
+                        .await?;
+                    }
+                    writer.shutdown().await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |bytes| {
+                    if let Some(upload) = &upload {
+                        upload.handle.transferred(bytes);
+                    }
+                });
+                cancelable_transfer(
+                    multipart::until_stopped(send, async {
+                        tokio::try_join!(produce, transmit)?;
+                        Ok(())
+                    }),
+                    || {
+                        upload
+                            .as_ref()
+                            .is_some_and(|upload| upload.handle.canceled())
+                    },
+                )
+                .await?;
+                write_frame(send, &Response::BlobStored).await?;
+                Ok::<_, anyhow::Error>(())
             }
             .await;
             if let Some(upload) = upload {
@@ -863,7 +904,8 @@ async fn dispatch_peer(
             }
             result?;
         }
-        Request::CreateGroup { .. }
+        Request::BlobPart { .. }
+        | Request::CreateGroup { .. }
         | Request::CloudHealth
         | Request::WatchCloud { .. }
         | Request::ListEvents { .. }

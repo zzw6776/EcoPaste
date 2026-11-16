@@ -335,6 +335,14 @@ impl ClipboardFingerprintState {
         }
     }
 
+    /// Captures clipboard changes while an asynchronous sync download is running.
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("clipboard fingerprint state poisoned")
+            .generation
+    }
+
     pub fn matches(&self, fingerprint: &ClipboardFingerprint) -> bool {
         let state = self
             .inner

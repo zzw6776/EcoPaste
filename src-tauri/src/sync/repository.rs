@@ -943,7 +943,7 @@ mod tests {
             ["favorite", "pinned", "remote-protected"]
         );
         assert_eq!(cloud_cursor(&pool).await.unwrap(), 42);
-        let pending = crate::db::sync_queue::next_ready_content(&pool, false)
+        let pending = crate::db::sync_queue::next_ready_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -988,9 +988,11 @@ mod tests {
                 .map(|stored| stored.event.event_id)
                 .collect::<Vec<_>>()
         };
-        let before = ids(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
-            .await
-            .unwrap());
+        let before = ids(
+            pending_cloud_events_for_target(&pool, "cloud", "local", 10, None)
+                .await
+                .unwrap(),
+        );
         sqlx::query(
             "CREATE INDEX idx_sync_events_origin_cursor \
              ON sync_events(origin_device_id, cursor)",
@@ -999,15 +1001,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ids(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
-                .await
-                .unwrap()),
+            ids(
+                pending_cloud_events_for_target(&pool, "cloud", "local", 10, None)
+                    .await
+                    .unwrap()
+            ),
             before
         );
         assert_eq!(before, ["last"]);
         assert_eq!(
             ids(
-                pending_cloud_events_for_target(&pool, "another", "local", 10)
+                pending_cloud_events_for_target(&pool, "another", "local", 10, None)
                     .await
                     .unwrap()
             ),
@@ -1015,7 +1019,7 @@ mod tests {
         );
         assert_eq!(
             ids(
-                pending_cloud_events_for_target(&pool, "another", "local", 1)
+                pending_cloud_events_for_target(&pool, "another", "local", 1, None)
                     .await
                     .unwrap()
             ),
@@ -1198,13 +1202,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            pending_peer_events_for_target(&pool, "peer:android", "android", 10)
+            pending_peer_events_for_target(&pool, "peer:android", "android", 10, None)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
                 .await
                 .unwrap()
                 .len(),
@@ -1228,7 +1232,7 @@ mod tests {
         .await
         .unwrap();
 
-        let pending = pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
+        let pending = pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1254,7 +1258,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
                 .await
                 .unwrap()
                 .into_iter()
@@ -1323,12 +1327,14 @@ mod tests {
             status.cloud.last_error.as_deref(),
             Some("transfer canceled")
         );
-        assert!(pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            pending_peer_events_for_target(&pool, "peer:phone", "phone", 10)
+            pending_peer_events_for_target(&pool, "peer:phone", "phone", 10, None)
                 .await
                 .unwrap()
                 .len(),
@@ -1337,7 +1343,7 @@ mod tests {
 
         assert!(request_item_delivery(&pool, "item", true).await.unwrap());
         assert_eq!(
-            pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
                 .await
                 .unwrap()
                 .len(),
@@ -1361,10 +1367,12 @@ mod tests {
             status.cloud.last_error.as_deref(),
             Some("missing local attachment for sync event")
         );
-        assert!(pending_cloud_events_for_target(&pool, "cloud", "mac", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            pending_cloud_events_for_target(&pool, "cloud", "mac", 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2476,10 +2484,12 @@ mod tests {
             SyncContentAvailability::MetadataOnly
         );
         assert_eq!(status.cloud.availability, SyncContentAvailability::None);
-        assert!(pending_cloud_events_for_target(&pool, "cloud", "local", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            pending_cloud_events_for_target(&pool, "cloud", "local", 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         store_remote_batch(&pool, RemoteBatchSource::Cloud, Some(42), &[event], "local")
             .await
             .unwrap();

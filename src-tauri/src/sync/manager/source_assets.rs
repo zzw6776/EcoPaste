@@ -135,6 +135,7 @@ impl SyncManager {
             blobs,
             BlobUploadOptions {
                 kind: BlobUploadKind::SourceIcon,
+                file_content: false,
                 managed_hub_blob: true,
                 is_cloud: true,
                 language: crate::i18n::current_language(&self.app),
