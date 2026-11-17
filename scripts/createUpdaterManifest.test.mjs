@@ -88,58 +88,24 @@ test("rejects Android updater assets without a SHA-256 digest", () => {
   );
 });
 
-test("publishes the parallel Apple Silicon candidate", async () => {
+test("builds desktop targets in parallel and publishes one updater manifest", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/release.yml", import.meta.url),
-    "utf8",
-  );
-  const candidateWorkflow = await readFile(
-    new URL("../.github/workflows/macos-apple-candidates.yml", import.meta.url),
     "utf8",
   );
 
   assert.doesNotMatch(workflow, /max-parallel:\s*1/);
   assert.match(
     workflow,
-    /gh workflow run macos-apple-candidates\.yml[\s\S]*?-f "tag_name=\$\{TAG_NAME\}"/,
+    /label: macOS Apple Silicon\n\s+os: macos-15[\s\S]*?target: aarch64-apple-darwin/,
   );
-  assert.match(
-    workflow,
-    /CANDIDATE_RUN_ID: \$\{\{ needs\.start-macos-apple-candidates\.outputs\.run_id }}/,
-  );
-  assert.match(workflow, /artifact_name='macos-aarch64-native'/);
-  assert.match(
-    workflow,
-    /The Apple Silicon build did not produce a complete candidate/,
-  );
-  const candidateStartJob = workflow.slice(
-    workflow.indexOf("  start-macos-apple-candidates:"),
-    workflow.indexOf("  upload-macos-apple:"),
-  );
-  assert.match(candidateStartJob, /GH_REPO: \$\{\{ github\.repository }}/);
-  const appleUploadJob = workflow.slice(
-    workflow.indexOf("  upload-macos-apple:"),
-    workflow.indexOf("  build-android:"),
-  );
-  assert.match(appleUploadJob, /- build-desktop/);
-  assert.match(appleUploadJob, /- start-macos-apple-candidates/);
-  assert.equal(
-    appleUploadJob.match(/GH_REPO: \$\{\{ github\.repository }}/g)?.length,
-    2,
-  );
-  assert.match(candidateWorkflow, /name: Build macOS Apple Silicon/);
-  assert.match(candidateWorkflow, /runs-on: macos-14/);
-  assert.match(candidateWorkflow, /name: macos-aarch64-native/);
-  assert.doesNotMatch(candidateWorkflow, /macos-26-intel/);
-  assert.match(candidateWorkflow, /targets: aarch64-apple-darwin/);
-  assert.match(
-    candidateWorkflow,
-    /run: bash scripts\/trustMacosReleaseCertificate\.sh/,
-  );
-  assert.match(workflow, /EcoPaste_\$\{RELEASE_VERSION}_aarch64\.app\.tar\.gz/);
   assert.match(
     workflow,
     /label: macOS Intel\n\s+os: macos-26-intel[\s\S]*?target: x86_64-apple-darwin/,
+  );
+  assert.match(
+    workflow,
+    /label: Windows x64\n\s+os: windows-latest[\s\S]*?target: x86_64-pc-windows-msvc/,
   );
   assert.match(workflow, /uploadUpdaterJson: false/);
   assert.match(workflow, /GITHUB_SERVER_URL: \$\{\{ github\.server_url }}/);
