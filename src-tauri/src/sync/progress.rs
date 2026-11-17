@@ -752,16 +752,16 @@ impl TransferRegistry {
         }
     }
 
-    fn update_handle(
-        &self,
-        id: &str,
-        component: &ComponentProgress,
-        phase: TransferPhase,
-        bytes: u64,
-        completion_bytes: Option<u64>,
-        error: Option<String>,
-        force_emit: bool,
-    ) {
+    fn update_handle(&self, update: ComponentHandleUpdate<'_>) {
+        let ComponentHandleUpdate {
+            id,
+            component,
+            phase,
+            bytes,
+            completion_bytes,
+            error,
+            force_emit,
+        } = update;
         if component.terminal.load(Ordering::Acquire) {
             return;
         }
@@ -1035,6 +1035,16 @@ pub(super) struct TransferHandle {
     registry: TransferRegistry,
 }
 
+struct ComponentHandleUpdate<'a> {
+    id: &'a str,
+    component: &'a ComponentProgress,
+    phase: TransferPhase,
+    bytes: u64,
+    completion_bytes: Option<u64>,
+    error: Option<String>,
+    force_emit: bool,
+}
+
 impl TransferHandle {
     pub fn canceled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
@@ -1097,15 +1107,15 @@ impl TransferHandle {
         error: Option<String>,
         force_emit: bool,
     ) {
-        self.registry.update_handle(
-            &self.entry_id,
-            &self.component,
+        self.registry.update_handle(ComponentHandleUpdate {
+            id: &self.entry_id,
+            component: &self.component,
             phase,
             bytes,
             completion_bytes,
             error,
             force_emit,
-        );
+        });
     }
 }
 

@@ -608,7 +608,12 @@ pub(crate) async fn receive(
             manager.start_shared_file_import(&item.id, pending.declared_bytes, initial_route)
         });
         match super::watcher::persist_and_notify_with_sync(
-            app, &pool, &item, source_app.as_ref(), None, None,
+            app,
+            &pool,
+            &item,
+            source_app.as_ref(),
+            None,
+            None,
         )
         .await
         {

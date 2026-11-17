@@ -1,5 +1,26 @@
 use super::*;
 
+fn is_missing_local_source_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            || cause
+                .downcast_ref::<walkdir::Error>()
+                .and_then(|walk| walk.io_error())
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("does not exist")
+        || message.contains("no such file")
+        || message.contains("cannot find the path")
+        || message.contains("系统找不到")
+        || message.contains("不存在")
+        || message.contains("没有可同步的文件")
+}
+
 #[derive(Clone)]
 enum FileUploadLocation {
     Path(PathBuf),
@@ -35,102 +56,164 @@ impl FileUploadSource {
 }
 
 impl SyncManager {
-    /// Materializes durable local operations while keeping blob work inside an active connection.
-    pub(super) async fn materialize_local_operations(
+    async fn resolve_materialization_scope(
         &self,
-        files: bool,
-        allow_content: bool,
-        max_content: usize,
-        preparation_target: Option<&PreparationTarget>,
         cycle: Option<&SyncCycleContext>,
-    ) -> Result<MaterializationRun> {
-        let mut staging = self.delivery.new_staging_cleanup();
+    ) -> Option<(SyncSettings, SqlitePool, String, GroupSecrets)> {
         let settings = cycle
             .map(|cycle| cycle.settings.clone())
             .unwrap_or_else(|| self.app.state::<SettingsStore>().snapshot().sync);
         if !settings.enabled {
-            return Ok(MaterializationRun {
-                processed: 0,
-                deferred_content: false,
-                staging,
-            });
+            return None;
         }
         let pool = if let Some(cycle) = cycle {
             cycle.pool.clone()
         } else {
             self.pool().await
         };
-        let _enqueue_guard = self.delivery.lock_materialization(files).await;
         let (device_id, group) = if let Some(cycle) = cycle {
             (cycle.device_id.clone(), cycle.group.clone())
         } else {
             let identity = self.identity.snapshot();
-            let Some(group) = identity.group else {
-                return Ok(MaterializationRun {
-                    processed: 0,
-                    deferred_content: false,
-                    staging,
-                });
-            };
+            let group = identity.group?;
             (identity.device_id, group)
         };
-        let mut processed = 0;
+        Some((settings, pool, device_id, group))
+    }
+
+    /// Materializes dirty per-item metadata state patches independently of attachment backlogs.
+    pub(super) async fn materialize_dirty_states(
+        &self,
+        cycle: Option<&SyncCycleContext>,
+    ) -> Result<usize> {
+        let Some((settings, pool, device_id, group)) =
+            self.resolve_materialization_scope(cycle).await
+        else {
+            return Ok(0);
+        };
+        let _enqueue_guard = self.delivery.lock_materialization(None).await;
+        let max_operations = usize::from(MAX_EVENTS_PER_BATCH) * MAX_SYNC_BATCHES_PER_CONNECTION;
+        let mut processed = 0_usize;
+
+        let materialize_result: Result<()> = async {
+            for _ in 0..max_operations {
+                let Some(state) =
+                    db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
+                        .await?
+                        .into_iter()
+                        .next()
+                else {
+                    break;
+                };
+                let sequence = repository::next_origin_sequence(&pool).await?;
+                let event = crypto::encrypt_item_state(
+                    &group.content_key_bytes()?,
+                    Uuid::new_v4().simple().to_string(),
+                    device_id.clone(),
+                    sequence,
+                    Utc::now().timestamp_millis(),
+                    &state.patch(),
+                )?;
+                repository::commit_item_state_event(&pool, &event, &state).await?;
+                processed += 1;
+            }
+            Ok(())
+        }
+        .await;
+
+        if processed > 0 {
+            self.wake_transfer();
+            self.emit_updated();
+        }
+        materialize_result?;
+        Ok(processed)
+    }
+
+    /// Materializes durable content outbox operations for a single payload lane.
+    pub(super) async fn materialize_content_lane(
+        &self,
+        lane: db::sync_queue::OutboxContentLane,
+        max_content: usize,
+        preparation_target: Option<&PreparationTarget>,
+        cycle: Option<&SyncCycleContext>,
+    ) -> Result<MaterializationRun> {
+        let mut staging = self.delivery.new_staging_cleanup();
+        if max_content == 0 {
+            return Ok(MaterializationRun {
+                processed: 0,
+                hit_limit: false,
+                staging,
+            });
+        }
+        let Some((settings, pool, device_id, group)) =
+            self.resolve_materialization_scope(cycle).await
+        else {
+            return Ok(MaterializationRun {
+                processed: 0,
+                hit_limit: false,
+                staging,
+            });
+        };
+        let _enqueue_guard = self.delivery.lock_materialization(Some(lane)).await;
+        let mut processed = 0_usize;
         let mut stored_any = false;
-        let mut deferred_content = false;
+        let mut hit_limit = false;
         let mut materialized_content = 0_usize;
         let max_operations = usize::from(MAX_EVENTS_PER_BATCH) * MAX_SYNC_BATCHES_PER_CONNECTION;
 
         let materialize_result: Result<()> = async {
             for _ in 0..max_operations {
-                let content =
-                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive, Some(files)).await?;
-                let state = if files { None } else { db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
-                    .await?
-                    .into_iter()
-                    .next() };
-                let materialize_content = match (&content, &state) {
-                    (Some(content), Some(state)) => content.operation_order <= state.pending_order,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
+                let Some(operation) =
+                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive, Some(lane))
+                        .await?
+                else {
+                    break;
                 };
-
-                if materialize_content {
-                    let operation = content.expect("content operation selected above");
-                    match self
-                        .materialize_content_operation(
-                            &pool,
-                            &operation,
-                            ContentMaterializationContext {
-                                settings: &settings,
-                                device_id: &device_id,
-                                group: &group,
-                                allow_content,
-                                preparation_target,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(ContentMaterialization::Completed) => {}
-                        Ok(ContentMaterialization::Deferred) => {
-                            deferred_content = true;
+                processed += 1;
+                match self
+                    .materialize_content_operation(
+                        &pool,
+                        &operation,
+                        ContentMaterializationContext {
+                            settings: &settings,
+                            device_id: &device_id,
+                            group: &group,
+                            preparation_target,
+                        },
+                    )
+                    .await
+                {
+                    Ok(ContentMaterialization::Completed) => {}
+                    Ok(ContentMaterialization::Stored {
+                        staging: content_staging,
+                        has_attachments,
+                    }) => {
+                        stored_any = true;
+                        staging.extend(content_staging);
+                        materialized_content += 1;
+                        // Attachment preparation yields after one record so a backlog never
+                        // starves active exchange or pre-builds staging copies out of order.
+                        if has_attachments || materialized_content >= max_content {
+                            hit_limit = true;
                             break;
                         }
-                        Ok(ContentMaterialization::Stored {
-                            staging: content_staging,
-                            has_attachments,
-                        }) => {
-                            stored_any = true;
-                            staging.extend(content_staging);
-                            materialized_content += 1;
-                            // Inline records can fill a batch; attachment preparation yields
-                            // after one record so a backlog of images cannot delay the exchange.
-                            if has_attachments {
-                                processed += 1;
-                                break;
-                            }
-                        }
-                        Err(error) => {
+                    }
+                    Err(error) => {
+                        if operation.history_backfill
+                            || (!operation.manual_share && is_missing_local_source_error(&error))
+                        {
+                            log::warn!(
+                                "skip unavailable local sync content preparation: operationOrder={} backfill={} error={error:#}",
+                                operation.operation_order,
+                                operation.history_backfill,
+                            );
+                            db::sync_queue::complete_content(&pool, operation.operation_order)
+                                .await?;
+                            self.discard_pending_observation(
+                                &operation.item_id,
+                                &operation.source_revision,
+                            );
+                        } else {
                             let retry_delay = db::sync_queue::fail_content(
                                 &pool,
                                 operation.operation_order,
@@ -146,25 +229,10 @@ impl SyncManager {
                             self.emit_updated();
                         }
                     }
-                    if materialized_content >= max_content {
-                        processed += 1;
-                        break;
-                    }
-                } else {
-                    let state = state.expect("item-state operation selected above");
-                    let sequence = repository::next_origin_sequence(&pool).await?;
-                    let event = crypto::encrypt_item_state(
-                        &group.content_key_bytes()?,
-                        Uuid::new_v4().simple().to_string(),
-                        device_id.clone(),
-                        sequence,
-                        Utc::now().timestamp_millis(),
-                        &state.patch(),
-                    )?;
-                    repository::commit_item_state_event(&pool, &event, &state).await?;
-                    stored_any = true;
                 }
-                processed += 1;
+            }
+            if !hit_limit && processed >= max_operations {
+                hit_limit = true;
             }
             Ok(())
         }
@@ -177,7 +245,7 @@ impl SyncManager {
         materialize_result?;
         Ok(MaterializationRun {
             processed,
-            deferred_content,
+            hit_limit,
             staging,
         })
     }
@@ -192,7 +260,6 @@ impl SyncManager {
             settings,
             device_id,
             group,
-            allow_content,
             preparation_target,
         } = context;
         let Some(item) = db::items::find_item_by_id(pool, &operation.item_id).await? else {
@@ -220,9 +287,6 @@ impl SyncManager {
             db::sync_queue::complete_content(pool, operation.operation_order).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
             return Ok(ContentMaterialization::Completed);
-        }
-        if !allow_content {
-            return Ok(ContentMaterialization::Deferred);
         }
         let event_id = uuid::Uuid::new_v4().simple().to_string();
         let preparation = if item.kind == ClipboardKind::Files {
@@ -297,7 +361,8 @@ impl SyncManager {
             }
         }
         let sequence = repository::next_origin_sequence(pool).await?;
-        let created_at_ms = Utc::now().timestamp_millis();
+        let item_updated_at_ms = item.updated_at.timestamp_millis();
+        let created_at_ms = item_updated_at_ms.min(Utc::now().timestamp_millis());
         let key = group.content_key_bytes()?;
         let event = crypto::encrypt_event(
             &key,
@@ -322,7 +387,9 @@ impl SyncManager {
                 item_id: &item.id,
                 event: &event,
                 blobs: &blobs,
+                payload_kind: kind_string(item.kind),
                 sync_key: &item.sync_key,
+                payload_updated_at_ms: item_updated_at_ms,
                 is_sensitive: item.is_sensitive,
                 delivery_route: operation.delivery_route.as_deref(),
                 group_id: &group.group_id,
@@ -573,19 +640,65 @@ impl SyncManager {
             ClipboardKind::Text => {}
             ClipboardKind::Image => {
                 let source = self.app.state::<ImageStore>().origin_path(&item.content);
+                let original_size = tokio::fs::metadata(&source)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to stat local sync image source {}",
+                            source.display()
+                        )
+                    })?
+                    .len();
+                let expected_encrypted_size = crypto::encrypted_blob_size(original_size)?;
+                let reusable = repository::reusable_content_object(
+                    pool,
+                    &group.group_id,
+                    &item.content_hash,
+                    original_size,
+                )
+                .await?
+                .filter(|object| object.encrypted_size == expected_encrypted_size)
+                .map(|object| (object.blob_id, object.stream_nonce));
                 let source_for_task = source.clone();
                 let root_for_task = blob_root.clone();
-                let mut blob = tauri::async_runtime::spawn_blocking(move || {
-                    crypto::encrypt_blob(&source_for_task, &root_for_task, &key)
-                })
-                .await
-                .context("image encryption task failed")??;
+                let mut blob =
+                    tauri::async_runtime::spawn_blocking(move || -> Result<StoredBlob> {
+                        if let Some((expected_blob_id, stream_nonce)) = reusable {
+                            if let Ok(rebuilt) = crypto::encrypt_blob_with_stream_nonce(
+                                &source_for_task,
+                                &root_for_task,
+                                &key,
+                                &stream_nonce,
+                            ) {
+                                if rebuilt.blob_id == expected_blob_id
+                                    && rebuilt.size == expected_encrypted_size
+                                {
+                                    return Ok(rebuilt);
+                                }
+                                if rebuilt.blob_id != expected_blob_id {
+                                    let _ = fs::remove_file(&rebuilt.encrypted_path);
+                                }
+                            }
+                        }
+                        crypto::encrypt_blob(&source_for_task, &root_for_task, &key)
+                    })
+                    .await
+                    .context("image encryption task failed")??;
                 staging.track(&blob);
                 blob.source_path = Some(source.to_string_lossy().into_owned());
+                if let Some(stream_nonce) = blob.stream_nonce.clone() {
+                    content_objects.push(StoredContentObject {
+                        plaintext_hash: item.content_hash.clone(),
+                        blob_id: blob.blob_id.clone(),
+                        stream_nonce,
+                        original_size,
+                        encrypted_size: blob.size,
+                    });
+                }
                 manifests.push(BlobManifest {
                     blob_id: blob.blob_id.clone(),
                     name: item.content.clone(),
-                    original_size: source.metadata()?.len(),
+                    original_size,
                     encrypted_size: blob.size,
                     role: BlobRole::Image,
                     file_index: None,
@@ -872,6 +985,38 @@ impl SyncManager {
         }))
     }
 
+    /// Computes total byte size for a local file entry and rejects items with missing paths.
+    async fn backfill_file_item_size(
+        &self,
+        pool: &SqlitePool,
+        item: &ClipboardItem,
+        sources: &[FileUploadSource],
+        resources: &Path,
+    ) -> Result<Option<u64>> {
+        for source in sources {
+            if let Some(path) = source.path() {
+                if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(size) = item.size.and_then(|value| u64::try_from(value).ok()) {
+            return Ok(Some(size));
+        }
+        #[cfg(target_os = "android")]
+        if item.remote_file_state.is_some() {
+            let total = sources
+                .iter()
+                .filter_map(|source| source.expected_size)
+                .fold(0_u64, u64::saturating_add);
+            return Ok(Some(total));
+        }
+        match calculate_current_file_item_size(pool, item, resources).await {
+            Ok(Some(size)) => Ok(u64::try_from(size).ok()),
+            Ok(None) | Err(_) => Ok(None),
+        }
+    }
+
     /// Recovers local history omitted before captures were retained while synchronization paused.
     pub(super) async fn backfill_local_history(
         &self,
@@ -882,25 +1027,91 @@ impl SyncManager {
             return Ok(());
         }
 
-        let sync_sensitive = self
-            .app
-            .state::<SettingsStore>()
-            .snapshot()
-            .sync
-            .sync_sensitive;
+        struct BackfillCandidate {
+            id: String,
+            sync_key: String,
+            source_revision: String,
+        }
+
+        let snapshot = self.app.state::<SettingsStore>().snapshot();
+        let sync_sensitive = snapshot.sync.sync_sensitive;
+        let auto_upload_max_mb = snapshot.sync.auto_upload_max_mb;
+        let history = snapshot.clipboard.history;
+        let cutoff = crate::clipboard::cleanup::retention_cutoff(&history.retention, Utc::now());
+        let max_count = (history.max_count > 0).then_some(history.max_count as usize);
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let image_store = self.app.state::<ImageStore>();
+
         let item_ids = db::items::local_item_ids_for_sync(pool).await?;
-        for item_id in item_ids.into_iter().rev() {
+        let mut selected = Vec::new();
+        let mut valid_count = 0_usize;
+        for item_id in item_ids {
             let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
                 continue;
             };
+            if !item.is_favorite && !item.is_pinned {
+                if cutoff.is_some_and(|cutoff| item.created_at < cutoff)
+                    || max_count.is_some_and(|limit| valid_count >= limit)
+                {
+                    continue;
+                }
+                valid_count += 1;
+            }
             if item.is_sensitive && !sync_sensitive {
                 continue;
             }
+            match item.kind {
+                ClipboardKind::Text => selected.push(BackfillCandidate {
+                    id: item.id,
+                    sync_key: item.sync_key,
+                    source_revision: item.source_revision,
+                }),
+                ClipboardKind::Image => {
+                    let path = image_store.origin_path(&item.content);
+                    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                        continue;
+                    };
+                    if !metadata.is_file() {
+                        continue;
+                    }
+                    selected.push(BackfillCandidate {
+                        id: item.id,
+                        sync_key: item.sync_key,
+                        source_revision: item.source_revision,
+                    });
+                }
+                ClipboardKind::Files => {
+                    let Ok(sources) = self.file_upload_sources(pool, &item, &resources).await
+                    else {
+                        continue;
+                    };
+                    if sources.is_empty() {
+                        continue;
+                    }
+                    let Some(size) = self
+                        .backfill_file_item_size(pool, &item, &sources, &resources)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    if permits_automatic_file_upload(size, auto_upload_max_mb)
+                        || sources.iter().all(|source| !source.is_directory)
+                    {
+                        selected.push(BackfillCandidate {
+                            id: item.id,
+                            sync_key: item.sync_key,
+                            source_revision: item.source_revision,
+                        });
+                    }
+                }
+            }
+        }
+        for candidate in selected.into_iter().rev() {
             db::sync_queue::stage_existing_content(
                 pool,
-                &item.id,
-                &item.sync_key,
-                &item.source_revision,
+                &candidate.id,
+                &candidate.sync_key,
+                &candidate.source_revision,
                 db::sync_queue::ContentSyncOptions {
                     history_backfill: true,
                     ..Default::default()

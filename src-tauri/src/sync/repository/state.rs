@@ -28,7 +28,12 @@ pub async fn cloud_pruned_availability_cursor(pool: &SqlitePool) -> Result<u64> 
 }
 
 pub async fn mark_cloud_pruning_reconciled(pool: &SqlitePool, cursor: u64) -> Result<()> {
-    set_state_value(pool, CLOUD_PRUNED_AVAILABILITY_CURSOR_KEY, &cursor.to_string()).await
+    set_state_value(
+        pool,
+        CLOUD_PRUNED_AVAILABILITY_CURSOR_KEY,
+        &cursor.to_string(),
+    )
+    .await
 }
 
 pub async fn cloud_bootstrap_completed(pool: &SqlitePool, group_id: &str) -> Result<bool> {
@@ -654,5 +659,65 @@ async fn clear_group_runtime_on(
             .await
             .with_context(|| format!("run {statement}"))?;
     }
+    Ok(())
+}
+
+fn rewrite_resource_path(
+    raw: &str,
+    old_resources: &std::path::Path,
+    new_resources: &std::path::Path,
+) -> Option<String> {
+    let relative = std::path::Path::new(raw).strip_prefix(old_resources).ok()?;
+    Some(new_resources.join(relative).to_string_lossy().into_owned())
+}
+
+/// Rewrites queued sync blob and source-path prefixes after moving the local storage directory.
+pub async fn rebase_sync_resource_paths(
+    pool: &SqlitePool,
+    old_resources: &std::path::Path,
+    new_resources: &std::path::Path,
+) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin rebasing sync resource paths")?;
+    let now = Utc::now();
+    for (select_sql, update_sql) in [
+        (
+            "SELECT rowid, encrypted_path, source_path FROM sync_event_blobs",
+            "UPDATE sync_event_blobs SET encrypted_path = ?, source_path = ?, updated_at = ? WHERE rowid = ?",
+        ),
+        (
+            "SELECT rowid, encrypted_path, source_path FROM sync_source_icon_uploads",
+            "UPDATE sync_source_icon_uploads SET encrypted_path = ?, source_path = ?, updated_at = ? WHERE rowid = ?",
+        ),
+    ] {
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>)>(select_sql)
+            .fetch_all(&mut *transaction)
+            .await
+            .context("list queued sync resource paths")?;
+        for (rowid, encrypted_path, source_path) in rows {
+            let next_encrypted =
+                rewrite_resource_path(&encrypted_path, old_resources, new_resources);
+            let next_source = source_path
+                .as_deref()
+                .and_then(|value| rewrite_resource_path(value, old_resources, new_resources));
+            if next_encrypted.is_none() && next_source.is_none() {
+                continue;
+            }
+            sqlx::query(update_sql)
+                .bind(next_encrypted.as_deref().unwrap_or(&encrypted_path))
+                .bind(next_source.as_deref().or(source_path.as_deref()))
+                .bind(now)
+                .bind(rowid)
+                .execute(&mut *transaction)
+                .await
+                .context("rebase queued sync resource paths")?;
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit rebasing sync resource paths")?;
     Ok(())
 }

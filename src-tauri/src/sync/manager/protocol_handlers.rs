@@ -432,49 +432,78 @@ async fn dispatch_peer(
             }
             let key = group.content_key_bytes()?;
             let resources = crate::core::paths::resources_dir(&manager.app)?;
-            let mut metadata_only_event_ids = Vec::new();
-            let mut available_event_ids = Vec::new();
+            let mut quota = super::inbound::AttachmentQuotaInspector::for_history(
+                &manager.app,
+                &pool,
+                &settings.clipboard.history,
+            )
+            .await?;
+            let mut decoded = Vec::with_capacity(events.len());
             for event in events {
                 let decrypted = crypto::decrypt_sync_event(&key, &event)?;
                 let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
                     continue;
                 };
                 validate_envelope(&envelope)?;
-                if envelope.item.kind != "files" {
-                    continue;
-                }
-                let source_revision = envelope
-                    .item
-                    .source_revision
-                    .as_deref()
-                    .unwrap_or(&event.event_id);
-                let existing = available_materialized_file_item(
-                    &pool,
-                    &resources,
-                    &envelope.item.sync_key,
-                    source_revision,
-                    envelope.content_identity.as_deref(),
-                )
-                .await;
-                let existing = match existing {
-                    Ok(item) => item,
-                    Err(error) => {
-                        log::warn!(
-                            "defer LAN card content plan: eventId={} error={error:#}",
-                            event.event_id
-                        );
-                        metadata_only_event_ids.push(event.event_id);
-                        continue;
+                let (_, updated_at) =
+                    super::event_model::synced_item_timestamps(&envelope.item, event.created_at_ms);
+                quota.observe_timestamp(updated_at);
+                decoded.push((event, envelope, updated_at));
+            }
+            let mut metadata_only_event_ids = Vec::new();
+            let mut available_event_ids = Vec::new();
+            for (event, envelope, updated_at) in decoded {
+                let attachment_bytes = envelope.blobs.iter().fold(0_u64, |total, blob| {
+                    total.saturating_add(blob.original_size)
+                });
+                match envelope.item.kind.as_str() {
+                    "image" => {
+                        if !quota
+                            .admit_or_reject_historical(updated_at, attachment_bytes)
+                            .await
+                        {
+                            metadata_only_event_ids.push(event.event_id);
+                        }
                     }
-                };
-                if existing.is_some() {
-                    available_event_ids.push(event.event_id);
-                } else if should_defer_remote_file_download(
-                    &envelope,
-                    settings.sync.auto_download_max_mb,
-                    settings.clipboard.history.max_storage_bytes,
-                ) {
-                    metadata_only_event_ids.push(event.event_id);
+                    "files" => {
+                        let source_revision = envelope
+                            .item
+                            .source_revision
+                            .as_deref()
+                            .unwrap_or(&event.event_id);
+                        let existing = available_materialized_file_item(
+                            &pool,
+                            &resources,
+                            &envelope.item.sync_key,
+                            source_revision,
+                            envelope.content_identity.as_deref(),
+                        )
+                        .await;
+                        let existing = match existing {
+                            Ok(item) => item,
+                            Err(error) => {
+                                log::warn!(
+                                    "defer LAN card content plan: eventId={} error={error:#}",
+                                    event.event_id
+                                );
+                                metadata_only_event_ids.push(event.event_id);
+                                continue;
+                            }
+                        };
+                        if existing.is_some() {
+                            available_event_ids.push(event.event_id);
+                        } else if should_defer_remote_file_download(
+                            &envelope,
+                            settings.sync.auto_download_max_mb,
+                            settings.clipboard.history.max_storage_bytes,
+                        ) || !quota
+                            .admit_or_reject_historical(updated_at, attachment_bytes)
+                            .await
+                        {
+                            metadata_only_event_ids.push(event.event_id);
+                        }
+                    }
+                    _ => {}
                 }
             }
             write_frame(
@@ -493,7 +522,7 @@ async fn dispatch_peer(
             after_cursor,
             events,
             limit,
-            events_complete,
+            events_complete: _,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             let remote_endpoint_id = connection.remote_id().to_string();
@@ -535,6 +564,7 @@ async fn dispatch_peer(
             manager.emit_updated();
             let key = group.content_key_bytes()?;
             let metadata_only_event_ids = metadata_only_content_event_ids(&events, &key);
+            let event_metadata = super::inbound::extract_event_metadata(&events, &key);
             let stored = repository::store_remote_batch_with_content_policy(
                 &pool,
                 repository::RemoteBatchSource::Peer {
@@ -545,6 +575,7 @@ async fn dispatch_peer(
                 &manager.identity.snapshot().device_id,
                 &[],
                 &metadata_only_event_ids,
+                &event_metadata,
             )
             .await?;
             for (event_id, origin_device_id) in stored.conflicts {
@@ -614,14 +645,7 @@ async fn dispatch_peer(
             };
             write_frame(send, &response).await?;
             let content_has_more = manager
-                .apply_pending_events(
-                    connection,
-                    &pool,
-                    &group,
-                    &settings.sync,
-                    &source,
-                    events_complete,
-                )
+                .apply_pending_events(connection, &pool, &group, &settings.sync, &source, true)
                 .await?;
             if received_events || content_has_more {
                 manager.wake_lan_transfer();

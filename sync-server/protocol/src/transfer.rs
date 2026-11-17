@@ -160,7 +160,7 @@ impl Transfers {
         let (senders, receivers): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
         let session = Arc::new(Session {
             size,
-            queues: senders.try_into().ok().expect("part channels"),
+            queues: senders.try_into().expect("part channels"),
         });
         registry.insert(id, session);
         Ok(RegisteredTransfer {
@@ -171,7 +171,6 @@ impl Transfers {
                 .map(|rx| Arc::new(tokio::sync::Mutex::new(rx)))
                 .collect::<Vec<_>>()
                 .try_into()
-                .ok()
                 .expect("part receivers"),
         })
     }
@@ -265,17 +264,13 @@ impl PartPeer {
         send.set_priority(-1)?;
         write_bytes(&mut send, data).await?;
         send.finish()?;
-        // FIN only queues the remaining bytes. QUIC owns loss recovery until peer receipt;
-        // ordered consumption can then wait for earlier parts without a wall-clock deadline.
-        if let Some(code) = send
-            .stopped()
-            .await
-            .context("wait for transfer part delivery")?
-        {
-            bail!("transfer part stopped by peer: {code}");
-        }
-        match read_frame(&mut recv).await? {
-            Response::BlobStored => finish_read(&mut recv).await,
+        // Peer receivers acknowledge Response::BlobStored right after writing the part and
+        // may drop RecvStream before consuming FIN, which emits a benign STOP_SENDING(0).
+        match tokio::time::timeout(IDLE_TIMEOUT, read_frame(&mut recv)).await?? {
+            Response::BlobStored => {
+                let _ = finish_read(&mut recv).await;
+                Ok(())
+            }
             _ => bail!("invalid part acknowledgement"),
         }
     }

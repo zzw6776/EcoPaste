@@ -3,6 +3,8 @@ use super::*;
 /// Owns all volatile connection, worker and channel state for one sync manager.
 pub(super) struct RuntimeCoordinator {
     pub(super) update_notification_pending: Arc<AtomicBool>,
+    pub(super) storage_suspended: watch::Sender<bool>,
+    pub(super) storage_epoch: AtomicU64,
     pub(super) endpoint: Mutex<Option<EndpointRuntime>>,
     pub(super) lan_transfer_wake: Notify,
     pub(super) cloud_transfer_wake: Notify,
@@ -42,6 +44,8 @@ impl RuntimeCoordinator {
     pub(super) fn new(presence_nonce: u64) -> Self {
         Self {
             update_notification_pending: Arc::new(AtomicBool::new(false)),
+            storage_suspended: watch::channel(false).0,
+            storage_epoch: AtomicU64::new(0),
             endpoint: Mutex::new(None),
             lan_transfer_wake: Notify::new(),
             cloud_transfer_wake: Notify::new(),

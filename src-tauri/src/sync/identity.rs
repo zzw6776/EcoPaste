@@ -106,38 +106,37 @@ pub struct PairingCode {
     pub server_relay_urls: Vec<String>,
 }
 
-pub struct IdentityStore {
+struct IdentityState {
     path: PathBuf,
-    current: RwLock<PersistedIdentity>,
+    current: PersistedIdentity,
+}
+
+pub struct IdentityStore {
+    state: RwLock<IdentityState>,
 }
 
 impl IdentityStore {
     pub fn load_or_create(app: &AppHandle) -> Result<Self> {
-        let directory = crate::core::paths::config_dir(app)?;
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("failed to create sync identity directory {directory:?}"))?;
-        let path = directory.join(IDENTITY_FILENAME);
-        let mut current = if path.exists() {
-            let value = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read sync identity {path:?}"))?;
-            serde_json::from_str(&value).context("failed to parse sync identity")?
-        } else {
-            let identity = new_identity();
-            write_identity(&path, &identity)?;
-            identity
-        };
-        validate_identity(&current)?;
-        if refresh_automatic_device_name(&mut current) {
-            write_identity(&path, &current)?;
-        }
+        let state = load_identity_state(app)?;
         Ok(Self {
-            path,
-            current: RwLock::new(current),
+            state: RwLock::new(state),
         })
     }
 
+    /// Rebinds identity storage and reloads secrets after switching storage location.
+    pub fn rebase(&self, app: &AppHandle) -> Result<PersistedIdentity> {
+        let next = load_identity_state(app)?;
+        let snapshot = next.current.clone();
+        *self.state.write().expect("sync identity poisoned") = next;
+        Ok(snapshot)
+    }
+
     pub fn snapshot(&self) -> PersistedIdentity {
-        self.current.read().expect("sync identity poisoned").clone()
+        self.state
+            .read()
+            .expect("sync identity poisoned")
+            .current
+            .clone()
     }
 
     pub fn secret_key(&self) -> Result<SecretKey> {
@@ -149,10 +148,12 @@ impl IdentityStore {
         if let Some(group) = group.as_ref() {
             group.validate()?;
         }
-        let mut guard = self.current.write().expect("sync identity poisoned");
-        guard.group = group;
-        write_identity(&self.path, &guard)?;
-        Ok(guard.clone())
+        let mut guard = self.state.write().expect("sync identity poisoned");
+        let mut next = guard.current.clone();
+        next.group = group;
+        write_identity(&guard.path, &next)?;
+        guard.current = next.clone();
+        Ok(next)
     }
 
     pub fn update_device_name(&self, name: String) -> Result<PersistedIdentity> {
@@ -160,17 +161,20 @@ impl IdentityStore {
         if name.is_empty() || name.chars().count() > 80 {
             bail!("设备名称长度必须为 1 到 80 个字符");
         }
-        let mut guard = self.current.write().expect("sync identity poisoned");
-        guard.device_name = name.to_owned();
-        guard.device_name_customized = Some(true);
-        write_identity(&self.path, &guard)?;
-        Ok(guard.clone())
+        let mut guard = self.state.write().expect("sync identity poisoned");
+        let mut next = guard.current.clone();
+        next.device_name = name.to_owned();
+        next.device_name_customized = Some(true);
+        write_identity(&guard.path, &next)?;
+        guard.current = next.clone();
+        Ok(next)
     }
 
     pub fn cloud_relay_auth_token(&self) -> Option<String> {
-        self.current
+        self.state
             .read()
             .expect("sync identity poisoned")
+            .current
             .cloud_relay_auth_token
             .clone()
     }
@@ -185,9 +189,12 @@ impl IdentityStore {
         {
             bail!("Relay Token 格式无效");
         }
-        let mut guard = self.current.write().expect("sync identity poisoned");
-        guard.cloud_relay_auth_token = token;
-        write_identity(&self.path, &guard)
+        let mut guard = self.state.write().expect("sync identity poisoned");
+        let mut next = guard.current.clone();
+        next.cloud_relay_auth_token = token;
+        write_identity(&guard.path, &next)?;
+        guard.current = next;
+        Ok(())
     }
 
     /// Android Context 就绪后接收原生系统设备名，修正启动早期生成的回退名称。
@@ -198,14 +205,37 @@ impl IdentityStore {
             return Ok(false);
         }
 
-        let mut guard = self.current.write().expect("sync identity poisoned");
-        if !refresh_automatic_device_name_to(&mut guard, name) {
+        let mut guard = self.state.write().expect("sync identity poisoned");
+        let mut next = guard.current.clone();
+        if !refresh_automatic_device_name_to(&mut next, name) {
             return Ok(false);
         }
 
-        write_identity(&self.path, &guard)?;
+        write_identity(&guard.path, &next)?;
+        guard.current = next;
         Ok(true)
     }
+}
+
+fn load_identity_state(app: &AppHandle) -> Result<IdentityState> {
+    let directory = crate::core::paths::config_dir(app)?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create sync identity directory {directory:?}"))?;
+    let path = directory.join(IDENTITY_FILENAME);
+    let mut current = if path.exists() {
+        let value = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read sync identity {path:?}"))?;
+        serde_json::from_str(&value).context("failed to parse sync identity")?
+    } else {
+        let identity = new_identity();
+        write_identity(&path, &identity)?;
+        identity
+    };
+    validate_identity(&current)?;
+    if refresh_automatic_device_name(&mut current) {
+        write_identity(&path, &current)?;
+    }
+    Ok(IdentityState { path, current })
 }
 
 impl PairingCode {
@@ -513,6 +543,10 @@ fn validate_group(group: &GroupSecrets) -> Result<()> {
 }
 
 fn write_identity(path: &Path, identity: &PersistedIdentity) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create sync identity directory {parent:?}"))?;
+    }
     let json = serde_json::to_vec_pretty(identity).context("failed to encode sync identity")?;
     let temporary = path.with_extension("json.tmp");
     {

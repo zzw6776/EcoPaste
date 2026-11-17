@@ -213,8 +213,17 @@ impl SyncManager {
         let single_name = (manifests.len() == 1 && !manifests[0].is_directory_archive)
             .then(|| sanitize_name(&manifests[0].name));
         tauri::async_runtime::spawn_blocking(move || {
+            struct ClipboardAutoHideGuard;
+
+            impl Drop for ClipboardAutoHideGuard {
+                fn drop(&mut self) {
+                    crate::window::set_clipboard_window_auto_hide_suspended(false);
+                }
+            }
+
             crate::window::set_clipboard_window_auto_hide_suspended(true);
-            let result = if let Some(single_name) = single_name {
+            let _auto_hide_guard = ClipboardAutoHideGuard;
+            if let Some(single_name) = single_name {
                 let mut dialog = app
                     .dialog()
                     .file()
@@ -245,9 +254,7 @@ impl SyncManager {
                     .transpose()
                     .map(|path| path.map(RemoteDownloadDestination::Directory))
                     .with_context(|| label(language, Key::RemoteFileInvalidDirectory))
-            };
-            crate::window::set_clipboard_window_auto_hide_suspended(false);
-            result
+            }
         })
         .await
         .context("remote file destination picker task failed")?

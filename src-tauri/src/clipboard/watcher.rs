@@ -746,6 +746,11 @@ impl ClipboardHandler for ClipboardChangeHandler {
                 self.fingerprints
                     .commit_observation(&observation, fingerprint.clone());
                 if item.kind == ClipboardKind::Image {
+                    if settings.sync.enabled
+                        && crate::sync::should_stage_local_item(&self.app, &item)
+                    {
+                        self.fingerprints.remember_synced_image(&fingerprint);
+                    }
                     Some(observation.with_outbound_image(fingerprint))
                 } else {
                     None

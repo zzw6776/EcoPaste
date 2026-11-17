@@ -317,6 +317,7 @@ pub(super) struct DeliveryCoordinator {
     app: AppHandle,
     /// Serializes local event materialization with group changes and retention cleanup.
     enqueue_lock: Mutex<()>,
+    image_enqueue_lock: Mutex<()>,
     file_enqueue_lock: Mutex<()>,
     /// Closes the cancel/confirm boundary without holding a lock during network I/O.
     transition_lock: Mutex<()>,
@@ -331,6 +332,7 @@ impl DeliveryCoordinator {
             registry: TransferRegistry::new(app.clone()),
             app,
             enqueue_lock: Mutex::new(()),
+            image_enqueue_lock: Mutex::new(()),
             file_enqueue_lock: Mutex::new(()),
             transition_lock: Mutex::new(()),
             staging: OutgoingStagingLeases::default(),
@@ -338,17 +340,29 @@ impl DeliveryCoordinator {
         }
     }
 
-    pub async fn lock_enqueue(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
+    pub async fn lock_enqueue(
+        &self,
+    ) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
         let files = self.file_enqueue_lock.lock().await;
-        (files, self.enqueue_lock.lock().await)
+        let images = self.image_enqueue_lock.lock().await;
+        (files, images, self.enqueue_lock.lock().await)
     }
 
     /// Serializes only the matching preparation lane during ordinary synchronization.
-    pub async fn lock_materialization(&self, files: bool) -> MutexGuard<'_, ()> {
-        if files {
-            self.file_enqueue_lock.lock().await
-        } else {
-            self.enqueue_lock.lock().await
+    pub async fn lock_materialization(
+        &self,
+        lane: Option<crate::db::sync_queue::OutboxContentLane>,
+    ) -> MutexGuard<'_, ()> {
+        match lane {
+            Some(crate::db::sync_queue::OutboxContentLane::Files) => {
+                self.file_enqueue_lock.lock().await
+            }
+            Some(crate::db::sync_queue::OutboxContentLane::Image) => {
+                self.image_enqueue_lock.lock().await
+            }
+            Some(crate::db::sync_queue::OutboxContentLane::Text) | None => {
+                self.enqueue_lock.lock().await
+            }
         }
     }
 

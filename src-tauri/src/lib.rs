@@ -45,6 +45,11 @@ pub fn run() {
     }
 
     let log_plugin = tauri_plugin_log::Builder::new()
+        // One active file plus nine timestamped archives keeps logs within 10 MiB.
+        .max_file_size(1024 * 1024)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(9))
+        .file_open_strategy(tauri_plugin_log::FileOpenStrategy::Rotate)
+        .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
         .level(if cfg!(debug_assertions) {
             log::LevelFilter::Debug
         } else {

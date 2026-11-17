@@ -6,6 +6,7 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
             .notified()
             .await;
         loop {
+            manager.wait_while_storage_suspended().await;
             let target = if files {
                 let lan = manager
                     .runtime_state
@@ -35,35 +36,55 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                 break;
             }
             let activity = manager.sync_activity_guard().await;
+            if !files {
+                let prepared = manager.materialize_dirty_states(None).await;
+                drop(activity);
+                match prepared {
+                    Ok(processed) if processed > 0 => continue,
+                    Ok(_) => break,
+                    Err(error) => {
+                        log::warn!("materialize local sync outbox failed: {error:#}");
+                        tokio::select! {
+                            _ = manager.runtime_state.local_outbox_wake[0].notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        }
+                    }
+                }
+                continue;
+            }
             let prepared = manager
-                .materialize_local_operations(
-                    files,
-                    files,
-                    usize::from(files),
+                .materialize_content_lane(
+                    db::sync_queue::OutboxContentLane::Files,
+                    1,
                     target.as_ref(),
                     None,
                 )
                 .await;
             drop(activity);
             match prepared {
-                Ok(result) if result.deferred_content => break,
                 Ok(result) if result.processed == 0 => {
-                    let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-                    if !settings.enabled || manager.identity.snapshot().group.is_none() {
-                        break;
-                    }
-                    let pool = manager.pool().await;
-                    let retry_at = match db::sync_queue::next_content_retry_at(
-                        &pool,
-                        settings.sync_sensitive,
-                        files,
-                    )
-                    .await
-                    {
-                        Ok(retry_at) => retry_at,
-                        Err(error) => {
-                            log::warn!("read local sync outbox retry failed: {error:#}");
-                            None
+                    let retry_at = {
+                        let _activity = manager.sync_activity_guard().await;
+                        if manager.is_storage_suspended() {
+                            break;
+                        }
+                        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                        if !settings.enabled || manager.identity.snapshot().group.is_none() {
+                            break;
+                        }
+                        let pool = manager.pool().await;
+                        match db::sync_queue::next_content_retry_at(
+                            &pool,
+                            settings.sync_sensitive,
+                            db::sync_queue::OutboxContentLane::Files,
+                        )
+                        .await
+                        {
+                            Ok(retry_at) => retry_at,
+                            Err(error) => {
+                                log::warn!("read local sync outbox retry failed: {error:#}");
+                                None
+                            }
                         }
                     };
                     let Some(retry_at) = retry_at else {
@@ -71,20 +92,18 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                     };
                     let delay = (retry_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake[usize::from(files)].notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[1].notified() => {}
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
                 Ok(result) => {
-                    if files {
-                        result.staging.retain_for_delivery();
-                    }
+                    result.staging.retain_for_delivery();
                     continue;
                 }
                 Err(error) => {
                     log::warn!("materialize local sync outbox failed: {error:#}");
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake[usize::from(files)].notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[1].notified() => {}
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     }
                 }
@@ -117,6 +136,7 @@ pub(super) async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
                 .store(false, Ordering::Release);
         }
 
+        manager.wait_while_storage_suspended().await;
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !server_is_configured(&settings) {
             manager.set_channel_status(SyncTarget::Cloud, SyncChannelState::Disabled, None, false);
@@ -158,6 +178,7 @@ pub(super) async fn cloud_transfer_worker(manager: Arc<SyncManager>) {
 pub(super) async fn lan_transfer_worker(manager: Arc<SyncManager>) {
     loop {
         manager.runtime_state.lan_transfer_wake.notified().await;
+        manager.wait_while_storage_suspended().await;
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled {
             manager.set_channel_status(SyncTarget::Lan, SyncChannelState::Disabled, None, false);
@@ -189,6 +210,10 @@ pub(super) async fn dispatch_lan_peer_actors(manager: &Arc<SyncManager>) -> Resu
 pub(super) async fn reconcile_lan_peer_actors(
     manager: &Arc<SyncManager>,
 ) -> Result<Vec<Arc<LanPeerActor>>> {
+    let _lan_guard = manager.sync_activity_guard().await;
+    if manager.is_storage_suspended() {
+        return Ok(Vec::new());
+    }
     let pool = manager.pool().await;
     let own_device_id = manager.identity.snapshot().device_id;
     let device_ids = repository::list_peers(&pool)
@@ -306,6 +331,7 @@ pub(super) async fn lan_peer_worker(
             continue;
         }
 
+        manager.wait_while_storage_suspended().await;
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled {
             if let Some(reply) = reconnect_reply {
@@ -348,15 +374,26 @@ pub(super) async fn lan_peer_worker(
                 manager.emit_updated();
                 Err(message)
             }
+            Err(_) if manager.is_storage_suspended() => {
+                failure_count = 0;
+                phase = LanPeerPhase::Idle;
+                pending_work = true;
+                Err("同步存储切换中，已暂停连接".to_owned())
+            }
             Err(error) => {
-                let pool = manager.pool().await;
                 let message = error.to_string();
-                if let Err(state_error) =
-                    repository::mark_peer_error(&pool, &device_id, &message).await
                 {
-                    log::warn!(
-                        "record retryable LAN peer failure: deviceId={device_id} error={state_error:#}"
-                    );
+                    let _activity = manager.sync_activity_guard().await;
+                    if !manager.is_storage_suspended() {
+                        let pool = manager.pool().await;
+                        if let Err(state_error) =
+                            repository::mark_peer_error(&pool, &device_id, &message).await
+                        {
+                            log::warn!(
+                                "record retryable LAN peer failure: deviceId={device_id} error={state_error:#}"
+                            );
+                        }
+                    }
                 }
                 failure_count = failure_count.saturating_add(1);
                 let delay = retry_delay(failure_count);
@@ -540,6 +577,9 @@ pub(super) async fn process_mdns_event(manager: &Arc<SyncManager>, event: Pendin
                 .filter(|address| is_lan_ip(address.ip()))
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
+            if manager.is_storage_suspended() {
+                return;
+            }
             let pool = manager.pool().await;
             match repository::update_peer_routes(
                 &pool,
@@ -620,6 +660,12 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
                 _ = tokio::time::sleep(retry_delay(upload_failure_count)) => {},
             }
         }
+        manager.wait_while_storage_suspended().await;
+        // Local retention takes the write side before reclaiming temporary ciphertext.
+        let _staging_guard = manager.sync_activity_guard().await;
+        if manager.is_storage_suspended() {
+            continue;
+        }
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         let Some(group) = manager.identity.snapshot().group else {
             upload_failure_count = 0;
@@ -630,8 +676,6 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
             continue;
         }
 
-        // Local retention takes the write side before reclaiming temporary ciphertext.
-        let _staging_guard = manager.sync_activity_guard().await;
         let connection = manager.cached_cloud_connection();
         if settings.cloud_enabled {
             let publish_started_at = Instant::now();
@@ -682,6 +726,8 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
 pub(super) async fn cloud_watch_worker(manager: Arc<SyncManager>) {
     let mut failure_count = 0_usize;
     loop {
+        manager.wait_while_storage_suspended().await;
+        let watch_epoch = manager.storage_epoch();
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         let Some(group) = manager.identity.snapshot().group else {
             failure_count = 0;
@@ -730,8 +776,8 @@ pub(super) async fn cloud_watch_worker(manager: Arc<SyncManager>) {
                 manager.ensure_cloud_group(&connection, &group).await?;
                 manager.set_cloud_path(&connection);
                 manager.notify_cloud_connected();
-                let pool = manager.pool().await;
-                watch_cloud_group(&manager, &connection, &group, &pool, &mut watch_ready).await
+                watch_cloud_group(&manager, &connection, &group, watch_epoch, &mut watch_ready)
+                    .await
             }
             .await;
             if connection_result.is_err() {
@@ -742,6 +788,10 @@ pub(super) async fn cloud_watch_worker(manager: Arc<SyncManager>) {
         .await;
         match result {
             Ok(()) => failure_count = 0,
+            Err(_) if manager.is_storage_suspended() || manager.storage_epoch() != watch_epoch => {
+                failure_count = 0;
+                manager.wait_while_storage_suspended().await;
+            }
             Err(error) => {
                 failure_count = next_cloud_watch_failure_count(failure_count, watch_ready);
                 let (delay, next_retry_at) = retry_schedule(failure_count);
@@ -767,15 +817,21 @@ pub(super) async fn watch_cloud_group(
     manager: &SyncManager,
     connection: &Connection,
     group: &GroupSecrets,
-    pool: &SqlitePool,
+    watch_epoch: u64,
     watch_ready: &mut bool,
 ) -> Result<()> {
-    let cursor = repository::cloud_cursor(pool).await?;
-    let availability_cursor = repository::cloud_availability_cursor(pool).await?;
-    let removed_at_ms = repository::latest_removed_at_ms(pool).await?;
-    let mut cursor = cursor;
-    let mut availability_cursor = availability_cursor;
-    let mut removed_at_ms = removed_at_ms;
+    let (mut cursor, mut availability_cursor, mut removed_at_ms) = {
+        let _lan_guard = manager.sync_activity_guard().await;
+        if manager.is_storage_suspended() || manager.storage_epoch() != watch_epoch {
+            return Ok(());
+        }
+        let pool = manager.pool().await;
+        (
+            repository::cloud_cursor(&pool).await?,
+            repository::cloud_availability_cursor(&pool).await?,
+            repository::latest_removed_at_ms(&pool).await?,
+        )
+    };
     let request = Request::WatchCloud {
         group_id: group.group_id.clone(),
         access_token: group.access_token_bytes()?,
@@ -941,23 +997,49 @@ pub(super) fn next_cloud_watch_failure_count(failure_count: usize, watch_ready: 
     failure_count.saturating_add(1)
 }
 
+struct AttachmentSlotGuard {
+    active: Arc<StdMutex<HashMap<String, usize>>>,
+    target: String,
+}
+
+impl Drop for AttachmentSlotGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("attachment active slots poisoned");
+        if let Some(count) = active.get_mut(&self.target) {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
 /// Keeps each attachment direction/category running independently and refills a freed slot.
 pub(super) async fn attachment_worker(manager: Arc<SyncManager>, files: bool, sending: bool) {
     let lane = usize::from(files) * 2 + usize::from(sending);
-    let mut jobs = tokio::task::JoinSet::<(String, bool)>::new();
-    let mut active: HashMap<String, usize> = HashMap::new();
+    let mut jobs = tokio::task::JoinSet::<bool>::new();
+    let active = Arc::new(StdMutex::new(HashMap::<String, usize>::new()));
+    let mut retry_after_completion = false;
     loop {
-        {
+        loop {
             tokio::select! {
-                _ = manager.runtime_state.attachment_wakes[lane].notified() => {},
+                _ = manager.runtime_state.attachment_wakes[lane].notified() => {
+                    retry_after_completion = false;
+                    break;
+                }
                 completed = jobs.join_next(), if !jobs.is_empty() => {
-                    if let Some(Ok((target, more))) = completed {
-                        if let Some(count) = active.get_mut(&target) { *count = count.saturating_sub(1); }
-                        if !more { continue; }
+                    let more = matches!(completed, Some(Ok(true)));
+                    if let Some(Err(error)) = completed {
+                        log::warn!("attachment worker task failed: lane={lane} error={error}");
+                    }
+                    if more || std::mem::take(&mut retry_after_completion) {
+                        break;
                     }
                 }
             }
         }
+        manager.wait_while_storage_suspended().await;
+        let storage_epoch = manager.storage_epoch();
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         let identity = manager.identity.snapshot();
         let Some(group) = identity.group else {
@@ -998,6 +1080,13 @@ pub(super) async fn attachment_worker(manager: Arc<SyncManager>, files: bool, se
                 continue;
             }
         };
+        let pool = {
+            let _guard = manager.sync_activity_guard().await;
+            if manager.is_storage_suspended() || manager.storage_epoch() != storage_epoch {
+                continue;
+            }
+            manager.pool().await
+        };
         let cycle = SyncCycleContext {
             target: SyncTarget::Lan,
             device: manager.device_announcement_for(
@@ -1009,36 +1098,69 @@ pub(super) async fn attachment_worker(manager: Arc<SyncManager>, files: bool, se
             settings,
             group,
             endpoint,
-            pool: manager.pool().await,
+            pool,
         };
+        let mut spawned_any = false;
+        let mut any_saturated = false;
         for (target, connection) in routes {
             let target_id = target.delivery_target().to_owned();
-            let count = active.entry(target_id.clone()).or_default();
-            while *count < multipart::ATTACHMENTS_PER_DIRECTION {
-                *count += 1;
+            loop {
+                let slot = {
+                    let mut guard = active.lock().expect("attachment active slots poisoned");
+                    let count = guard.entry(target_id.clone()).or_default();
+                    if *count < multipart::ATTACHMENTS_PER_DIRECTION {
+                        *count += 1;
+                        Some(AttachmentSlotGuard {
+                            active: active.clone(),
+                            target: target_id.clone(),
+                        })
+                    } else {
+                        any_saturated = true;
+                        None
+                    }
+                };
+                let Some(slot_guard) = slot else {
+                    break;
+                };
+                spawned_any = true;
                 let manager = manager.clone();
                 let cycle = cycle.clone();
                 let connection = connection.clone();
                 let target = target.clone();
                 let target_id = target_id.clone();
                 jobs.spawn(async move {
+                    let _slot_guard = slot_guard;
                     let _guard = manager.sync_activity_guard().await;
                     let result = if sending {
-                        manager.sync_connection_lane(&connection, &target, 0, &cycle, Some(files)).await.map(|outcome| outcome.has_more)
+                        manager
+                            .sync_connection_lane(&connection, &target, 0, &cycle, Some(files))
+                            .await
+                            .map(|outcome| outcome.has_more)
                     } else {
-                        manager.apply_pending_attachment_events(&connection, &cycle.pool, &cycle.group, &cycle.settings, &target, files).await
+                        manager
+                            .apply_pending_attachment_events(
+                                &connection,
+                                &cycle.pool,
+                                &cycle.group,
+                                &cycle.settings,
+                                &target,
+                                files,
+                            )
+                            .await
                     };
-                    let more = match result {
+                    match result {
                         Ok(more) => more,
                         Err(error) => {
                             log::warn!("attachment deferred: target={target_id} files={files} sending={sending} error={error:#}");
                             manager.schedule_transfer_wake(chrono::Duration::seconds(5));
                             false
                         }
-                    };
-                    (target_id, more)
+                    }
                 });
             }
+        }
+        if !spawned_any && any_saturated {
+            retry_after_completion = true;
         }
     }
 }

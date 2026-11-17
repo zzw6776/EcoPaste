@@ -24,6 +24,7 @@ pub struct DirtyItemState {
     pub is_present: Option<bool>,
     pub dirty_mask: i64,
     pub local_revision: i64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pending_order: i64,
 }
 

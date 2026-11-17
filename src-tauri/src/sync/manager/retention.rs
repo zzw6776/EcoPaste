@@ -45,6 +45,15 @@ impl SyncManager {
 
     /// Reclaims encrypted events and blobs after their last local reference disappears.
     pub(crate) async fn reclaim_released_sync_content(&self, pool: &SqlitePool) -> Result<()> {
+        let _ = self.reclaim_released_sync_content_with_stats(pool).await?;
+        Ok(())
+    }
+
+    /// Reclaims released sync events and unreferenced staging blobs, returning freed file stats.
+    pub(crate) async fn reclaim_released_sync_content_with_stats(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<crate::clipboard::shared_files::CleanupStats> {
         let mut removed_events = 0_u64;
         loop {
             let removed =
@@ -58,7 +67,7 @@ impl SyncManager {
         let live_blob_ids = repository::live_sync_blob_ids(pool).await?;
         let resources = crate::core::paths::resources_dir(&self.app)?;
         let blob_root = resources.join(SYNC_STAGING_DIR);
-        let removed_blobs = tauri::async_runtime::spawn_blocking(move || {
+        let (removed_blobs, removed_bytes) = tauri::async_runtime::spawn_blocking(move || {
             remove_unreferenced_sync_staging(&blob_root, &live_blob_ids)
         })
         .await??;
@@ -67,7 +76,10 @@ impl SyncManager {
                 "local sync cleanup removed {removed_events} event(s) and {removed_blobs} blob(s)"
             );
         }
-        Ok(())
+        Ok(crate::clipboard::shared_files::CleanupStats {
+            files: removed_blobs,
+            bytes: removed_bytes,
+        })
     }
 
     /// Removes reproducible ciphertext after all currently known deliveries finish.
@@ -198,7 +210,10 @@ impl SyncManager {
                 match response {
                     Response::RetentionUpdated => {
                         if let Some(error) = first_decode_error {
-                            log::warn!("deferred unsupported cloud history: count={deferred_count} decoderRevision={} firstError={error}", crypto::RETENTION_DECODER_REVISION);
+                            log::warn!(
+                                "deferred unsupported cloud history: count={deferred_count} decoderRevision={} firstError={error}",
+                                crypto::RETENTION_DECODER_REVISION
+                            );
                         }
                         if changed {
                             repository::set_cloud_retention_snapshot(pool, &fingerprint).await?;

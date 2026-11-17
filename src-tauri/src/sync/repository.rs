@@ -247,6 +247,7 @@ async fn insert_event_with_content_presence(
         applied,
         blobs,
         content_presence.map(|(sync_key, is_sensitive)| (sync_key, is_sensitive, None)),
+        None,
     )
     .await?;
     transaction.commit().await.context("commit sync event")?;
@@ -259,16 +260,27 @@ async fn insert_event_on(
     applied: bool,
     blobs: &[StoredBlob],
     content_presence: Option<(&str, bool, Option<i64>)>,
+    payload_meta: Option<(&str, &str, i64)>,
 ) -> Result<InsertEventResult> {
     let now = Utc::now();
     let origin_sequence =
         i64::try_from(event.origin_sequence).context("sync origin sequence too large")?;
+    let payload_kind = payload_meta
+        .map(|(kind, _, _)| kind)
+        .or_else(|| (event.kind == SyncEventKind::ItemState).then_some("state"));
+    let sync_key = payload_meta
+        .map(|(_, key, _)| key)
+        .filter(|key| !key.is_empty());
+    let payload_updated_at_ms = payload_meta
+        .map(|(_, _, updated_at_ms)| updated_at_ms)
+        .or_else(|| (event.kind == SyncEventKind::ItemState).then_some(event.created_at_ms));
     let result = sqlx::query(
         r#"
         INSERT OR IGNORE INTO sync_events (
             event_id, origin_device_id, origin_sequence, event_created_at_ms,
-            nonce, ciphertext, event_kind, is_applied, apply_state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            nonce, ciphertext, event_kind, is_applied, apply_state,
+            payload_kind, sync_key, payload_updated_at_ms, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&event.event_id)
@@ -280,6 +292,9 @@ async fn insert_event_on(
     .bind(event.kind.as_i64())
     .bind(applied)
     .bind(if applied { "applied" } else { "pending" })
+    .bind(payload_kind)
+    .bind(sync_key)
+    .bind(payload_updated_at_ms)
     .bind(now)
     .bind(now)
     .execute(&mut *connection)
@@ -317,6 +332,27 @@ async fn insert_event_on(
     };
     if stored {
         observe_origin_sequence_on(connection, event.origin_sequence).await?;
+        if !inserted
+            && (payload_kind.is_some() || sync_key.is_some() || payload_updated_at_ms.is_some())
+        {
+            sqlx::query(
+                r#"
+                UPDATE sync_events
+                SET payload_kind = COALESCE(payload_kind, ?),
+                    sync_key = COALESCE(sync_key, ?),
+                    payload_updated_at_ms = COALESCE(payload_updated_at_ms, ?)
+                WHERE event_id = ?
+                  AND (payload_kind IS NULL OR sync_key IS NULL OR payload_updated_at_ms IS NULL)
+                "#,
+            )
+            .bind(payload_kind)
+            .bind(sync_key)
+            .bind(payload_updated_at_ms)
+            .bind(&event.event_id)
+            .execute(&mut *connection)
+            .await
+            .context("backfill existing sync event lane metadata")?;
+        }
     }
     if inserted {
         for blob in blobs {
@@ -366,7 +402,9 @@ pub struct ContentOutboxCommit<'a> {
     pub item_id: &'a str,
     pub event: &'a EncryptedEvent,
     pub blobs: &'a [StoredBlob],
+    pub payload_kind: &'a str,
     pub sync_key: &'a str,
+    pub payload_updated_at_ms: i64,
     pub is_sensitive: bool,
     pub delivery_route: Option<&'a str>,
     pub group_id: &'a str,
@@ -384,7 +422,9 @@ pub async fn commit_content_outbox_event(
         item_id,
         event,
         blobs,
+        payload_kind,
         sync_key,
+        payload_updated_at_ms,
         is_sensitive,
         delivery_route,
         group_id,
@@ -398,6 +438,7 @@ pub async fn commit_content_outbox_event(
         true,
         blobs,
         Some((sync_key, is_sensitive, Some(operation_order))),
+        Some((payload_kind, sync_key, payload_updated_at_ms)),
     )
     .await?;
     if !result.stored {
@@ -481,6 +522,38 @@ pub async fn commit_content_outbox_event(
         .execute(&mut *transaction)
         .await
         .context("complete content outbox entry")?;
+    if matches!(payload_kind, "image" | "files") && !sync_key.is_empty() {
+        sqlx::query(
+            r#"
+            UPDATE sync_delivery_targets
+            SET desired_content = 'metadata',
+                confirmed_content = CASE
+                    WHEN confirmed_content = 'none' THEN 'metadata'
+                    ELSE confirmed_content
+                END,
+                status = 'confirmed',
+                last_error = NULL,
+                retry_at = NULL,
+                updated_at = ?
+            WHERE confirmed_content <> 'complete'
+              AND event_id IN (
+                  SELECT event_id
+                  FROM sync_events
+                  WHERE event_kind = 0
+                    AND sync_key = ?
+                    AND event_id <> ?
+                    AND COALESCE(payload_updated_at_ms, event_created_at_ms) <= ?
+              )
+            "#,
+        )
+        .bind(now)
+        .bind(sync_key)
+        .bind(&event.event_id)
+        .bind(payload_updated_at_ms)
+        .execute(&mut *transaction)
+        .await
+        .context("supersede older unconfirmed attachment deliveries")?;
+    }
     transaction
         .commit()
         .await
@@ -535,7 +608,15 @@ pub async fn commit_item_state_event(
         .begin()
         .await
         .context("begin item-state outbox commit")?;
-    let result = insert_event_on(&mut transaction, event, true, &[], None).await?;
+    let result = insert_event_on(
+        &mut transaction,
+        event,
+        true,
+        &[],
+        None,
+        Some(("state", state.sync_key.as_str(), event.created_at_ms)),
+    )
+    .await?;
     if !result.stored {
         bail!("同步状态事件序号冲突");
     }
@@ -1853,7 +1934,9 @@ mod tests {
                 item_id: "item",
                 event: &test_event("event-1", 1),
                 blobs: &[],
+                payload_kind: "text",
                 sync_key: &sync_key,
+                payload_updated_at_ms: 1,
                 is_sensitive: false,
                 delivery_route: None,
                 group_id: "group-a",

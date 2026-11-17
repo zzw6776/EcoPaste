@@ -335,7 +335,7 @@ pub async fn linked_item_events(pool: &SqlitePool) -> Result<Vec<LinkedSyncEvent
         .collect()
 }
 
-pub async fn mark_applied(pool: &SqlitePool, event_id: &str) -> Result<()> {
+async fn mark_applied_on(connection: &mut SqliteConnection, event_id: &str) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE sync_events
@@ -350,10 +350,15 @@ pub async fn mark_applied(pool: &SqlitePool, event_id: &str) -> Result<()> {
     )
     .bind(Utc::now())
     .bind(event_id)
-    .execute(pool)
+    .execute(connection)
     .await
     .context("mark sync event applied")?;
     Ok(())
+}
+
+pub async fn mark_applied(pool: &SqlitePool, event_id: &str) -> Result<()> {
+    let mut connection = pool.acquire().await.context("acquire sync connection")?;
+    mark_applied_on(&mut connection, event_id).await
 }
 
 /// Permanently quarantines an authenticated event whose payload cannot be decoded or validated.
@@ -545,48 +550,253 @@ pub async fn is_latest_clipboard_item(pool: &SqlitePool, item_id: &str) -> Resul
         == Some(item_id))
 }
 
+/// Reads the newest item timestamp to distinguish historical backfill from live updates.
+pub async fn latest_clipboard_item_updated_at(
+    pool: &SqlitePool,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT updated_at FROM clipboard_items ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read latest clipboard item timestamp")
+}
+
+/// Decrypts any unindexed events in batches so lane queries use indexed payload metadata.
+pub async fn ensure_event_lanes_indexed(
+    pool: &SqlitePool,
+    group: &crate::sync::identity::GroupSecrets,
+) -> Result<usize> {
+    let has_unindexed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sync_events WHERE payload_kind IS NULL)")
+            .fetch_one(pool)
+            .await
+            .context("check unindexed sync events")?;
+    if !has_unindexed {
+        return Ok(0);
+    }
+    let key = group.content_key_bytes()?;
+    let mut indexed = 0_usize;
+    loop {
+        let rows = sqlx::query(
+            r#"
+            SELECT cursor, event_id, origin_device_id, origin_sequence,
+                   event_created_at_ms, nonce, ciphertext, event_kind
+            FROM sync_events
+            WHERE payload_kind IS NULL
+            ORDER BY cursor ASC
+            LIMIT 500
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("list unindexed sync events")?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let stored = event_from_row(row)?;
+            let meta = match crate::sync::crypto::decrypt_sync_event(&key, &stored.event) {
+                Ok(crate::sync::model::DecryptedSyncEvent::Clipboard(envelope)) => (
+                    envelope.item.kind,
+                    envelope.item.sync_key,
+                    envelope
+                        .item
+                        .updated_at_ms
+                        .unwrap_or(envelope.item.created_at_ms),
+                ),
+                Ok(crate::sync::model::DecryptedSyncEvent::ItemState(patch)) => (
+                    "state".to_owned(),
+                    patch.sync_key,
+                    stored.event.created_at_ms,
+                ),
+                Err(_) => (
+                    "corrupt".to_owned(),
+                    String::new(),
+                    stored.event.created_at_ms,
+                ),
+            };
+            updates.push((stored.event.event_id, meta.0, meta.1, meta.2));
+        }
+        let mut transaction = pool
+            .begin()
+            .await
+            .context("begin sync event index update")?;
+        let now = Utc::now();
+        for (event_id, payload_kind, sync_key, payload_updated_at_ms) in &updates {
+            sqlx::query(
+                "UPDATE sync_events SET payload_kind = ?, sync_key = COALESCE(NULLIF(sync_key, ''), ?), payload_updated_at_ms = COALESCE(payload_updated_at_ms, ?), updated_at = ? WHERE event_id = ?",
+            )
+            .bind(payload_kind)
+            .bind((!sync_key.is_empty()).then_some(sync_key.as_str()))
+            .bind(payload_updated_at_ms)
+            .bind(now)
+            .bind(event_id)
+            .execute(&mut *transaction)
+            .await
+            .context("update sync event lane index")?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit sync event lane index")?;
+        indexed = indexed.saturating_add(updates.len());
+    }
+    Ok(indexed)
+}
+
+fn push_outbound_lane_filter(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, lane: Option<i64>) {
+    let local_content_ready = "(EXISTS (SELECT 1 FROM sync_local_content c WHERE c.event_id = e.event_id AND c.state = 'managed') \
+        OR EXISTS (SELECT 1 FROM sync_item_events local_link WHERE local_link.event_id = e.event_id AND local_link.direction = 'local'))";
+    match lane {
+        None => {
+            qb.push(" ORDER BY e.cursor ASC LIMIT ");
+        }
+        Some(0) => {
+            qb.push(
+                " AND COALESCE(d.confirmed_content, 'none') = 'none' \
+                  AND COALESCE(e.payload_kind, '') <> 'image' \
+                  ORDER BY e.cursor ASC LIMIT ",
+            );
+        }
+        Some(1) => {
+            qb.push(
+                " AND e.event_kind = 0 \
+                  AND e.payload_kind = 'image' \
+                  AND COALESCE(d.confirmed_content, 'none') <> 'complete' \
+                  AND ",
+            );
+            qb.push(local_content_ready);
+            qb.push(
+                " AND NOT EXISTS (\
+                      SELECT 1 FROM sync_events newer \
+                      WHERE newer.event_kind = 0 \
+                        AND newer.payload_kind = 'image' \
+                        AND COALESCE(newer.sync_key, '') <> '' \
+                        AND newer.sync_key = e.sync_key \
+                        AND (\
+                            COALESCE(newer.payload_updated_at_ms, newer.event_created_at_ms) \
+                                > COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) \
+                            OR (\
+                                COALESCE(newer.payload_updated_at_ms, newer.event_created_at_ms) \
+                                    = COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) \
+                                AND newer.cursor > e.cursor\
+                            )\
+                        )\
+                  ) \
+                  ORDER BY COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) DESC, e.cursor ASC LIMIT ",
+            );
+        }
+        Some(2) => {
+            qb.push(
+                " AND e.event_kind = 0 \
+                  AND e.payload_kind = 'files' \
+                  AND COALESCE(d.confirmed_content, 'none') <> 'complete' \
+                  AND COALESCE(d.desired_content, 'complete') = 'complete' \
+                  AND ",
+            );
+            qb.push(local_content_ready);
+            qb.push(
+                " AND NOT EXISTS (\
+                      SELECT 1 FROM sync_events newer \
+                      WHERE newer.event_kind = 0 \
+                        AND newer.payload_kind = 'files' \
+                        AND COALESCE(newer.sync_key, '') <> '' \
+                        AND newer.sync_key = e.sync_key \
+                        AND (\
+                            COALESCE(newer.payload_updated_at_ms, newer.event_created_at_ms) \
+                                > COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) \
+                            OR (\
+                                COALESCE(newer.payload_updated_at_ms, newer.event_created_at_ms) \
+                                    = COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) \
+                                AND newer.cursor > e.cursor\
+                            )\
+                        )\
+                  ) \
+                  ORDER BY COALESCE(e.payload_updated_at_ms, e.event_created_at_ms) DESC, e.cursor ASC LIMIT ",
+            );
+        }
+        Some(other) => {
+            qb.push(" AND 0 = 1 AND ")
+                .push_bind(other)
+                .push(" IS NOT NULL ORDER BY e.cursor ASC LIMIT ");
+        }
+    }
+}
+
 /// Lists pending content that the active source actually advertised to this device.
 pub async fn unapplied_content_events_for_target(
     pool: &SqlitePool,
     target_id: &str,
     limit: u16,
+    attachments: bool,
     files: Option<bool>,
 ) -> Result<Vec<StoredSyncEvent>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT event.cursor, event.event_id, event.origin_device_id, event.origin_sequence,
-               event.event_created_at_ms, event.nonce, event.ciphertext, event.event_kind
-        FROM sync_events event
-        JOIN sync_delivery_targets target ON target.event_id = event.event_id
-        WHERE event.is_applied = 0
-          AND event.apply_state = 'pending'
-          AND event.event_kind = ?
-          AND target.target_id = ?
-          AND (event.next_apply_at IS NULL OR event.next_apply_at <= ?)
-          AND (? IS NULL OR EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = event.event_id AND item.kind = 'files') = ?)
-        ORDER BY event.cursor ASC
-        LIMIT ?
-        "#,
-    )
-    .bind(SyncEventKind::Content.as_i64())
-    .bind(target_id)
-    .bind(Utc::now())
-    .bind(files)
-    .bind(files)
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await
-    .context("list unapplied sync content for source")?;
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        "SELECT event.cursor, event.event_id, event.origin_device_id, event.origin_sequence, \
+                event.event_created_at_ms, event.nonce, event.ciphertext, event.event_kind \
+         FROM sync_events event \
+         JOIN sync_delivery_targets target ON target.event_id = event.event_id \
+         WHERE event.is_applied = 0 \
+           AND event.apply_state = 'pending' \
+           AND event.event_kind = ",
+    );
+    qb.push_bind(SyncEventKind::Content.as_i64())
+        .push(" AND target.target_id = ")
+        .push_bind(target_id)
+        .push(" AND (event.next_apply_at IS NULL OR event.next_apply_at <= ")
+        .push_bind(Utc::now())
+        .push(")");
+    if !attachments {
+        qb.push(
+            " AND (event.payload_kind = 'text' \
+                   OR event.payload_kind IS NULL \
+                   OR (event.payload_kind = 'files' AND NOT EXISTS (\
+                       SELECT 1 FROM sync_item_events link WHERE link.event_id = event.event_id\
+                   ))) \
+             ORDER BY event.cursor ASC LIMIT ",
+        );
+    } else {
+        match files {
+            Some(false) => {
+                qb.push(
+                    " AND event.payload_kind = 'image' \
+                      AND ((target.target_id = 'cloud' AND target.confirmed_content = 'complete') \
+                           OR (target.target_id <> 'cloud' AND target.desired_content = 'complete')) \
+                     ORDER BY COALESCE(event.payload_updated_at_ms, event.event_created_at_ms) DESC, event.cursor ASC LIMIT ",
+                );
+            }
+            Some(true) => {
+                qb.push(
+                    " AND event.payload_kind = 'files' \
+                      AND ((target.target_id = 'cloud' AND target.confirmed_content = 'complete') \
+                           OR (target.target_id <> 'cloud' AND target.desired_content = 'complete')) \
+                     ORDER BY COALESCE(event.payload_updated_at_ms, event.event_created_at_ms) DESC, event.cursor ASC LIMIT ",
+                );
+            }
+            None => {
+                qb.push(" ORDER BY event.cursor ASC LIMIT ");
+            }
+        }
+    }
+    qb.push_bind(i64::from(limit));
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("list unapplied sync content for source")?;
     rows.into_iter().map(event_from_row).collect()
 }
 
 pub async fn has_unapplied_content_for_target(
     pool: &SqlitePool,
     target_id: &str,
+    attachments: bool,
     files: bool,
 ) -> Result<bool> {
     Ok(
-        !unapplied_content_events_for_target(pool, target_id, 1, Some(files))
+        !unapplied_content_events_for_target(pool, target_id, 1, attachments, Some(files))
             .await?
             .is_empty(),
     )
@@ -602,37 +812,28 @@ pub async fn pending_peer_events_for_target(
     limit: u16,
     lane: Option<i64>,
 ) -> Result<Vec<StoredSyncEvent>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
-        FROM sync_events e
-        LEFT JOIN sync_delivery_targets d
-          ON d.event_id = e.event_id AND d.target_id = ?
-        WHERE (
-              d.event_id IS NULL
-              OR (
-                  d.status = 'pending'
-                  AND (
-                      d.confirmed_content = 'none'
-                      OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')
-                  )
-              )
-          )
-          AND e.origin_device_id <> ?
-          AND (? IS NULL OR CASE WHEN COALESCE(d.confirmed_content, 'none') = 'none' THEN 0 WHEN EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = e.event_id AND item.kind = 'files') THEN 2 ELSE 1 END = ?)
-        ORDER BY e.cursor ASC
-        LIMIT ?
-        "#,
-    )
-    .bind(target_id)
-    .bind(peer_device_id)
-    .bind(lane)
-    .bind(lane)
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await
-    .context("list pending sync events")?;
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        "SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence, \
+                e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind \
+         FROM sync_events e \
+         LEFT JOIN sync_delivery_targets d \
+           ON d.event_id = e.event_id AND d.target_id = ",
+    );
+    qb.push_bind(target_id).push(
+        " WHERE (d.event_id IS NULL \
+                 OR (d.status = 'pending' \
+                     AND (d.confirmed_content = 'none' \
+                          OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')))) \
+          AND e.origin_device_id <> ",
+    );
+    qb.push_bind(peer_device_id);
+    push_outbound_lane_filter(&mut qb, lane);
+    qb.push_bind(i64::from(limit));
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("list pending sync events")?;
     rows.into_iter().map(event_from_row).collect()
 }
 
@@ -644,45 +845,30 @@ pub async fn pending_cloud_events_for_target(
     limit: u16,
     lane: Option<i64>,
 ) -> Result<Vec<StoredSyncEvent>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-               e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind
-        FROM sync_events e
-        LEFT JOIN sync_delivery_targets d
-          ON d.event_id = e.event_id AND d.target_id = ?
-        WHERE (
-              d.event_id IS NULL
-              OR (
-                  d.status = 'pending'
-                  AND (
-                      d.confirmed_content = 'none'
-                      OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')
-                  )
-              )
-          )
-          AND (
-              e.origin_device_id = ?
-              OR (
-                  d.desired_content = 'complete'
-                  AND d.confirmed_content <> 'complete'
-              )
-          )
-          AND substr(e.ciphertext, 1, 8) = ?
-          AND (? IS NULL OR CASE WHEN COALESCE(d.confirmed_content, 'none') = 'none' THEN 0 WHEN EXISTS (SELECT 1 FROM sync_item_events link JOIN clipboard_items item ON item.id = link.item_id WHERE link.event_id = e.event_id AND item.kind = 'files') THEN 2 ELSE 1 END = ?)
-        ORDER BY e.cursor ASC
-        LIMIT ?
-        "#,
-    )
-    .bind(target_id)
-    .bind(origin_device_id)
-    .bind(crate::sync::crypto::EVENT_AAD_MAGIC.as_slice())
-    .bind(lane)
-    .bind(lane)
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await
-    .context("list pending origin sync events")?;
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        "SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence, \
+                e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind \
+         FROM sync_events e \
+         LEFT JOIN sync_delivery_targets d \
+           ON d.event_id = e.event_id AND d.target_id = ",
+    );
+    qb.push_bind(target_id).push(
+        " WHERE (d.event_id IS NULL \
+                 OR (d.status = 'pending' \
+                     AND (d.confirmed_content = 'none' \
+                          OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')))) \
+          AND (e.origin_device_id = ",
+    );
+    qb.push_bind(origin_device_id)
+        .push(" OR (d.desired_content = 'complete' AND d.confirmed_content <> 'complete')) AND substr(e.ciphertext, 1, 8) = ")
+        .push_bind(crate::sync::crypto::EVENT_AAD_MAGIC.as_slice());
+    push_outbound_lane_filter(&mut qb, lane);
+    qb.push_bind(i64::from(limit));
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("list pending origin sync events")?;
     rows.into_iter().map(event_from_row).collect()
 }
 
@@ -1836,11 +2022,13 @@ pub async fn store_remote_batch_with_availability(
         local_device_id,
         availability,
         &HashSet::new(),
+        &HashMap::new(),
     )
     .await
 }
 
 /// Stores a remote batch while keeping record delivery independent from file-body delivery.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_remote_batch_with_content_policy(
     pool: &SqlitePool,
     source: RemoteBatchSource<'_>,
@@ -1849,10 +2037,12 @@ pub async fn store_remote_batch_with_content_policy(
     local_device_id: &str,
     availability: &[(String, RouteContentAvailability)],
     metadata_only_event_ids: &HashSet<String>,
+    event_metadata: &HashMap<String, (String, String, i64)>,
 ) -> Result<StoreRemoteBatchResult> {
     let mut transaction = pool.begin().await.context("begin remote sync batch")?;
     let mut result = StoreRemoteBatchResult::default();
     let mut received_event_ids = Vec::new();
+    let mut auto_applied_existing_images = Vec::new();
     let complete_content_events = events
         .iter()
         .filter(|event| {
@@ -1863,12 +2053,20 @@ pub async fn store_remote_batch_with_content_policy(
         .collect::<HashSet<_>>();
 
     for event in events {
+        let payload_meta = event_metadata
+            .get(&event.event_id)
+            .map(|(kind, key, updated_at_ms)| (kind.as_str(), key.as_str(), *updated_at_ms));
+        let auto_applied_peer_image = matches!(source, RemoteBatchSource::Peer { .. })
+            && event.kind == SyncEventKind::Content
+            && payload_meta.is_some_and(|(kind, _, _)| kind == "image")
+            && metadata_only_event_ids.contains(&event.event_id);
         let inserted = insert_event_on(
             &mut transaction,
             event,
-            event.origin_device_id == local_device_id,
+            event.origin_device_id == local_device_id || auto_applied_peer_image,
             &[],
             None,
+            payload_meta,
         )
         .await?;
         if !inserted.stored {
@@ -1880,6 +2078,8 @@ pub async fn store_remote_batch_with_content_policy(
         received_event_ids.push(event.event_id.clone());
         if inserted.inserted {
             result.inserted_event_ids.push(event.event_id.clone());
+        } else if auto_applied_peer_image {
+            auto_applied_existing_images.push(event.event_id.clone());
         }
         if event.origin_device_id != local_device_id {
             result.received_new_events |= inserted.inserted;
@@ -1924,6 +2124,30 @@ pub async fn store_remote_batch_with_content_policy(
             RemoteBatchSource::Peer { .. } => {
                 confirm_delivery_on(&mut transaction, &source_id, event_id, content, false).await?;
             }
+        }
+    }
+    for event_id in &auto_applied_existing_images {
+        let should_mark_applied: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM sync_events event
+                WHERE event.event_id = ?
+                  AND event.is_applied = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sync_delivery_targets target
+                      WHERE target.event_id = event.event_id
+                        AND ((target.target_id = 'cloud' AND target.confirmed_content = 'complete')
+                             OR (target.target_id <> 'cloud' AND target.desired_content = 'complete'))
+                  )
+            )
+            "#,
+        )
+        .bind(event_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("check recoverable image delivery sources")?;
+        if should_mark_applied {
+            mark_applied_on(&mut transaction, event_id).await?;
         }
     }
     match source {
@@ -2120,7 +2344,7 @@ async fn set_delivery_pending_on(
     Ok(())
 }
 
-/// Finds pending copies of one file card without introducing another durable transfer queue.
+/// Finds pending copies of one attachment item (file card or image) without another queue.
 pub async fn pending_file_events_for_item(
     pool: &SqlitePool,
     event_id: &str,
@@ -2130,15 +2354,28 @@ pub async fn pending_file_events_for_item(
         r#"SELECT DISTINCT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
                   e.event_created_at_ms, e.nonce, e.ciphertext, e.event_kind, e.next_apply_at
            FROM sync_events e
-           JOIN sync_item_events link ON link.event_id = e.event_id
-           JOIN sync_item_events current ON current.item_id = link.item_id
            JOIN sync_delivery_targets target ON target.event_id = e.event_id
-           WHERE current.event_id = ? AND target.target_id = ?
-             AND e.is_applied = 0 AND e.apply_state = 'pending' AND e.event_kind = 0
+           WHERE target.target_id = ?
+             AND e.is_applied = 0
+             AND e.apply_state = 'pending'
+             AND e.event_kind = 0
+             AND (
+                 EXISTS (
+                     SELECT 1
+                     FROM sync_item_events link
+                     JOIN sync_item_events current ON current.item_id = link.item_id
+                     WHERE link.event_id = e.event_id AND current.event_id = ?
+                 )
+                 OR (
+                     COALESCE(e.sync_key, '') <> ''
+                     AND e.sync_key = (SELECT sync_key FROM sync_events WHERE event_id = ?)
+                 )
+             )
            ORDER BY e.cursor"#,
     )
-    .bind(event_id)
     .bind(target_id)
+    .bind(event_id)
+    .bind(event_id)
     .fetch_all(pool)
     .await?;
     rows.into_iter()

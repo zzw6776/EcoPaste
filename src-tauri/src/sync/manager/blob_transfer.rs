@@ -116,8 +116,14 @@ pub(super) async fn upload_blob(
     let (address, transport) = connection_path(connection);
     log::info!(
         "sync blob upload started: connectionId={} blobRef={} kind={} blobBytes={} cloud={} address={} transport={} atMs={}",
-        connection.stable_id(), blob_log_ref(&blob.blob_id), options.kind.label(), blob.size,
-        options.is_cloud, address.as_deref().unwrap_or("unknown"), transport.unwrap_or("unknown"), Utc::now().timestamp_millis(),
+        connection.stable_id(),
+        blob_log_ref(&blob.blob_id),
+        options.kind.label(),
+        blob.size,
+        options.is_cloud,
+        address.as_deref().unwrap_or("unknown"),
+        transport.unwrap_or("unknown"),
+        Utc::now().timestamp_millis(),
     );
     let result = upload_blob_inner(connection, group, blob, &options, &mut progress).await;
     if let Err(error) = &result {
@@ -128,9 +134,15 @@ pub(super) async fn upload_blob(
         };
         log::warn!(
             "sync blob upload failed: connectionId={} blobRef={} phase={:?} writtenBytes={} firstWriteMs={:?} totalMs={} probe={} closeReason={:?} stats={:?} error={error:#}",
-            connection.stable_id(), blob_log_ref(&blob.blob_id), progress.phase,
-            progress.written_bytes, progress.first_write_ms, started_at.elapsed().as_millis(),
-            probe, connection.close_reason(), connection.stats(),
+            connection.stable_id(),
+            blob_log_ref(&blob.blob_id),
+            progress.phase,
+            progress.written_bytes,
+            progress.first_write_ms,
+            started_at.elapsed().as_millis(),
+            probe,
+            connection.close_reason(),
+            connection.stats(),
         );
     }
     if let Some(transfer) = &options.transfer {
@@ -287,7 +299,7 @@ pub(super) async fn upload_blob_inner(
             }
             Response::BlobReady { .. } => {}
             Response::Error { code, message } => {
-                return Err(RemoteSyncError { code, message }.into())
+                return Err(RemoteSyncError { code, message }.into());
             }
             _ => bail!("invalid blob upload response"),
         }

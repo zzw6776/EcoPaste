@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod batch_tests;
 
 pub const ALPN: &[u8] = b"ecopaste/sync/2";
-pub const PROTOCOL_VERSION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 29;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u16 = 256;
 
@@ -1147,7 +1147,7 @@ mod tests {
             let decoded: Request = minicbor::decode(&encoded).unwrap();
             assert_eq!(decoded, request);
         }
-        assert_eq!(PROTOCOL_VERSION, 28);
+        assert_eq!(PROTOCOL_VERSION, 29);
     }
 
     #[tokio::test]

@@ -52,6 +52,10 @@ impl StorageQuota {
     }
 }
 
+pub(crate) fn history_target_bytes(history: &History) -> u64 {
+    StorageQuota::from_history(history).target_bytes()
+}
+
 #[derive(Clone, Copy)]
 struct CapacityPolicy {
     quota: StorageQuota,
@@ -157,7 +161,7 @@ async fn run_capacity_check(app: &AppHandle, manager: &SyncManager, quota: Stora
     }
 }
 
-async fn storage_bytes(app: &AppHandle) -> Result<u64> {
+pub(crate) async fn storage_bytes(app: &AppHandle) -> Result<u64> {
     let root = paths::app_data_dir(app)?;
     Ok(tauri::async_runtime::spawn_blocking(move || paths::dir_size(&root)).await??)
 }
@@ -305,7 +309,7 @@ async fn finish_deletion(
 
 /// `Retention` → 绝对截止时间。`Forever` 或 `value == 0` 表示禁用。
 /// 月份近似按 30 天处理（与前端展示口径一致，不引日历库）。
-fn retention_cutoff(r: &Retention, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub(crate) fn retention_cutoff(r: &Retention, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if r.value == 0 {
         return None;
     }
