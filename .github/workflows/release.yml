@@ -207,7 +207,6 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: release-metadata
     continue-on-error: true
-    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     permissions:
       actions: read
