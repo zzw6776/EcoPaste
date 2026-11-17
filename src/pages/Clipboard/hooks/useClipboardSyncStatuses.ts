@@ -43,11 +43,10 @@ export function useClipboardSyncStatuses(
             pendingRef.current = true;
             return;
           }
+          updateClipboardItemSyncStatuses(statuses);
           if (currentItems !== itemsRef.current) {
             pendingRef.current = true;
-            continue;
           }
-          updateClipboardItemSyncStatuses(statuses);
         } catch {
           // 命令层处理错误；查询期间的后续更新仍需消费。
         }
