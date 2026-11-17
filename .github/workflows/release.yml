@@ -137,9 +137,78 @@ jobs:
             echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
 
-  build-desktop:
+  build-windows:
+    name: Build Windows x64
+    needs: release-metadata
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-metadata.outputs.tag_name }}
+
+      - name: Check updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured."
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Tauri icons
+        run: pnpm icons:check
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-x86_64-pc-windows-msvc
+          workspaces: src-tauri
+
+      - name: Build desktop app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          CI: false
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          PLATFORM: windows-latest
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          args: --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json
+          prerelease: ${{ needs.release-metadata.outputs.prerelease }}
+          releaseDraft: true
+          releaseId: ${{ needs.release-metadata.outputs.release_id }}
+          retryAttempts: 3
+          tagName: ${{ needs.release-metadata.outputs.tag_name }}
+          uploadUpdaterJson: false
+
+  build-macos:
     name: Build ${{ matrix.label }}
     needs: release-metadata
+    continue-on-error: true
+    timeout-minutes: 30
+    runs-on: ${{ matrix.os }}
     permissions:
       actions: read
       contents: write
@@ -148,18 +217,13 @@ jobs:
       matrix:
         include:
           - label: macOS Apple Silicon
-            os: macos-15
+            os: macos-latest
             publish_release: true
             target: aarch64-apple-darwin
           - label: macOS Intel
             os: macos-26-intel
             publish_release: true
             target: x86_64-apple-darwin
-          - label: Windows x64
-            os: windows-latest
-            publish_release: true
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout release
         uses: actions/checkout@v4
@@ -203,7 +267,6 @@ jobs:
           workspaces: src-tauri
 
       - name: Trust macOS release signing certificate
-        if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
@@ -213,9 +276,9 @@ jobs:
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v1
         env:
-          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD || '' }}
-          APPLE_SIGNING_IDENTITY: "${{ runner.os == 'macOS' && 'Mac Development: EcoPaste Self-Signed' || '' }}"
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: "Mac Development: EcoPaste Self-Signed"
           CI: false
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           PLATFORM: ${{ matrix.os }}
@@ -231,7 +294,6 @@ jobs:
           uploadUpdaterJson: false
 
       - name: Verify macOS app signatures and DMG contents before publishing
-        if: runner.os == 'macOS'
         shell: bash
         env:
           TAURI_TARGET: ${{ matrix.target }}
@@ -342,8 +404,10 @@ jobs:
     name: Publish Release
     needs:
       - release-metadata
-      - build-desktop
+      - build-windows
+      - build-macos
       - build-android
+    if: ${{ always() && needs.release-metadata.result == 'success' && needs.build-windows.result == 'success' && needs.build-android.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read

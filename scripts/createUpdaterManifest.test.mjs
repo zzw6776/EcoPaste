@@ -60,15 +60,33 @@ test("builds one updater manifest for every supported target", () => {
   assert.equal(manifest.platforms["android-aarch64"].sha256, "a".repeat(64));
 });
 
-test("rejects incomplete updater assets", () => {
+test("rejects incomplete required updater assets", () => {
+  const assetsWithoutWindows = assets.filter(
+    (asset) => asset.name !== "EcoPaste_1.2.3_x64-setup.exe",
+  );
   assert.throws(
     () =>
-      buildUpdaterManifest(version, assets.slice(1), signatures, {
+      buildUpdaterManifest(version, assetsWithoutWindows, signatures, {
         releaseDownloadBaseUrl:
           "https://github.com/example/EcoPaste/releases/download/v1.2.3",
       }),
-    /Missing updater asset: EcoPaste_1\.2\.3_aarch64\.app\.tar\.gz/,
+    /Missing updater asset: EcoPaste_1\.2\.3_x64-setup\.exe/,
   );
+});
+
+test("allows missing macOS updater assets", () => {
+  const assetsWithoutMac = assets.filter(
+    (asset) => !asset.name.includes(".app.tar.gz"),
+  );
+  const manifest = buildUpdaterManifest(version, assetsWithoutMac, signatures, {
+    publishedAt: new Date("2026-10-20T12:00:00.000Z"),
+    releaseDownloadBaseUrl:
+      "https://github.com/example/EcoPaste/releases/download/v1.2.3",
+  });
+  assert.equal(manifest.platforms["darwin-aarch64"], undefined);
+  assert.equal(manifest.platforms["darwin-x86_64"], undefined);
+  assert.ok(manifest.platforms["windows-x86_64"]);
+  assert.ok(manifest.platforms["android-aarch64"]);
 });
 
 test("rejects Android updater assets without a SHA-256 digest", () => {
@@ -97,7 +115,7 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
   assert.doesNotMatch(workflow, /max-parallel:\s*1/);
   assert.match(
     workflow,
-    /label: macOS Apple Silicon\n\s+os: macos-15[\s\S]*?target: aarch64-apple-darwin/,
+    /label: macOS Apple Silicon\n\s+os: macos-latest[\s\S]*?target: aarch64-apple-darwin/,
   );
   assert.match(
     workflow,
@@ -105,7 +123,7 @@ test("builds desktop targets in parallel and publishes one updater manifest", as
   );
   assert.match(
     workflow,
-    /label: Windows x64\n\s+os: windows-latest[\s\S]*?target: x86_64-pc-windows-msvc/,
+    /name: Build Windows x64[\s\S]*?runs-on: windows-latest/,
   );
   assert.match(workflow, /uploadUpdaterJson: false/);
   assert.match(workflow, /GITHUB_SERVER_URL: \$\{\{ github\.server_url }}/);

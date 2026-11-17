@@ -4,10 +4,12 @@ import { pathToFileURL } from "node:url";
 
 const updaterBundles = [
   {
+    optional: true,
     platforms: ["darwin-aarch64", "darwin-aarch64-app"],
     suffix: "_aarch64.app.tar.gz",
   },
   {
+    optional: true,
     platforms: ["darwin-x86_64", "darwin-x86_64-app"],
     suffix: "_x64.app.tar.gz",
   },
@@ -39,12 +41,18 @@ export function buildUpdaterManifest(
     const name = `EcoPaste_${version}${bundle.suffix}`;
     const asset = assets.find((candidate) => candidate.name === name);
     if (!asset?.url) {
+      if (bundle.optional) {
+        continue;
+      }
       throw new Error(`Missing updater asset: ${name}`);
     }
 
     const signature =
       bundle.signed === false ? "" : (signatures[`${name}.sig`]?.trim() ?? "");
     if (bundle.signed !== false && !signature) {
+      if (bundle.optional) {
+        continue;
+      }
       throw new Error(`Missing updater signature: ${name}.sig`);
     }
     const digest = bundle.signed === false ? asset.digest?.trim() : "";
@@ -124,6 +132,12 @@ async function main() {
   for (const name of signatureNames) {
     const asset = assets.find((candidate) => candidate.name === name);
     if (!asset?.url) {
+      const bundle = updaterBundles.find(
+        (candidate) => `EcoPaste_${version}${candidate.suffix}.sig` === name,
+      );
+      if (bundle?.optional) {
+        continue;
+      }
       throw new Error(`Missing updater signature: ${name}`);
     }
 
