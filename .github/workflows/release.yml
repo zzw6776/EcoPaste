@@ -303,7 +303,7 @@ jobs:
 
           deadline=$((SECONDS + 3600))
           artifact_id=''
-          artifact_name=''
+          artifact_name='macos-aarch64-native'
           while (( SECONDS < deadline )); do
             artifacts="$(
               gh api \
@@ -314,19 +314,8 @@ jobs:
                 <<< "${artifacts}" \
                 | head -n 1
             )"
-            cross_id="$(
-              jq -r '.artifacts[] | select(.expired == false and .name == "macos-aarch64-cross") | .id' \
-                <<< "${artifacts}" \
-                | head -n 1
-            )"
             if [[ -n "${native_id}" ]]; then
               artifact_id="${native_id}"
-              artifact_name='macos-aarch64-native'
-              break
-            fi
-            if [[ -n "${cross_id}" ]]; then
-              artifact_id="${cross_id}"
-              artifact_name='macos-aarch64-cross'
               break
             fi
 
@@ -335,7 +324,7 @@ jobs:
                 --jq '.status'
             )"
             if [[ "${run_status}" == "completed" ]]; then
-              echo '::error::Neither Apple Silicon build route produced a complete candidate.'
+              echo '::error::The Apple Silicon build did not produce a complete candidate.'
               exit 1
             fi
             sleep 10
@@ -352,11 +341,6 @@ jobs:
             --name "${artifact_name}" \
             --dir "${destination}"
           echo "Selected ${artifact_name}."
-
-          gh api \
-            --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/cancel" \
-            >/dev/null 2>&1 || true
 
       - name: Upload successful candidate
         shell: bash

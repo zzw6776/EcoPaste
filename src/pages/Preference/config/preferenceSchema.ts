@@ -409,7 +409,11 @@ export const preferenceTabs: PreferenceTab[] = [
                   control: { type: "switch" } as const,
                   id: "actions.alwaysShow",
                   keywords: ["action", "hover", "buttons", "always", "visible"],
-                  path: ["clipboard", "content", "alwaysShowItemActions"] as const,
+                  path: [
+                    "clipboard",
+                    "content",
+                    "alwaysShowItemActions",
+                  ] as const,
                   value: (settings: Settings) => {
                     return settings.clipboard.content.alwaysShowItemActions;
                   },

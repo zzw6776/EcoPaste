@@ -63,7 +63,8 @@ const syncTauriWindowTheme = async (
 export const useAppTheme = (mode: SettingsTheme): ThemeConfig => {
   const themeUnlistenRef = useRef<UnlistenFn | null>(null);
   const themeMountedRef = useRef(false);
-  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(readSystemTheme);
+  const [systemTheme, setSystemTheme] =
+    useState<ResolvedTheme>(readSystemTheme);
   const resolvedTheme = resolveTheme(mode, systemTheme);
   const algorithm =
     resolvedTheme === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm;
