@@ -78,8 +78,8 @@ import {
 } from "../hooks/useClipboardPreviewController";
 import { useClipboardSyncStatuses } from "../hooks/useClipboardSyncStatuses";
 import AndroidFileDetailsDrawer from "./AndroidFileDetailsDrawer";
-import ClipboardCard from "./cards/ClipboardCard";
 import type { ClipboardListProps } from "./ClipboardList";
+import ClipboardCard from "./cards/ClipboardCard";
 import NoteModal from "./NoteModal";
 
 /** 前 10 项的快捷键：index 0-8 对应 1-9，index 9 对应 0 */
@@ -198,7 +198,8 @@ const List: FC<ListProps> = (props) => {
   const sort = settings.clipboard.content.sort;
   const redactSecrets = settings.clipboard.sensitive.redactSecrets;
   const quickActions = settings.clipboard.content.itemActions;
-  const alwaysShowItemActions = settings.clipboard.content.alwaysShowItemActions;
+  const alwaysShowItemActions =
+    settings.clipboard.content.alwaysShowItemActions;
   const deleteFavoriteItems = settings.clipboard.content.deleteFavoriteItems;
   const deletePinnedItems = settings.clipboard.content.deletePinnedItems;
   const deleteFavoriteItemsOnlyInFavoriteGroup =

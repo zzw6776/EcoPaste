@@ -88,7 +88,7 @@ test("rejects Android updater assets without a SHA-256 digest", () => {
   );
 });
 
-test("publishes the first parallel Apple Silicon candidate", async () => {
+test("publishes the parallel Apple Silicon candidate", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/release.yml", import.meta.url),
     "utf8",
@@ -107,12 +107,11 @@ test("publishes the first parallel Apple Silicon candidate", async () => {
     workflow,
     /CANDIDATE_RUN_ID: \$\{\{ needs\.start-macos-apple-candidates\.outputs\.run_id }}/,
   );
-  assert.ok(
-    workflow.indexOf("artifact_name='macos-aarch64-native'") <
-      workflow.indexOf("artifact_name='macos-aarch64-cross'"),
+  assert.match(workflow, /artifact_name='macos-aarch64-native'/);
+  assert.match(
+    workflow,
+    /The Apple Silicon build did not produce a complete candidate/,
   );
-  assert.match(workflow, /Neither Apple Silicon build route produced/);
-  assert.match(workflow, /actions\/runs\/\$\{CANDIDATE_RUN_ID\}\/cancel/);
   const candidateStartJob = workflow.slice(
     workflow.indexOf("  start-macos-apple-candidates:"),
     workflow.indexOf("  upload-macos-apple:"),
@@ -128,16 +127,10 @@ test("publishes the first parallel Apple Silicon candidate", async () => {
     appleUploadJob.match(/GH_REPO: \$\{\{ github\.repository }}/g)?.length,
     2,
   );
-  assert.match(candidateWorkflow, /continue-on-error: true/);
-  assert.match(candidateWorkflow, /fail-fast: false/);
-  assert.match(
-    candidateWorkflow,
-    /artifact_name: macos-aarch64-native[\s\S]*?runner: macos-15/,
-  );
-  assert.match(
-    candidateWorkflow,
-    /artifact_name: macos-aarch64-cross[\s\S]*?runner: macos-26-intel/,
-  );
+  assert.match(candidateWorkflow, /name: Build macOS Apple Silicon/);
+  assert.match(candidateWorkflow, /runs-on: macos-14/);
+  assert.match(candidateWorkflow, /name: macos-aarch64-native/);
+  assert.doesNotMatch(candidateWorkflow, /macos-26-intel/);
   assert.match(candidateWorkflow, /targets: aarch64-apple-darwin/);
   assert.match(
     candidateWorkflow,

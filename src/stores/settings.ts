@@ -10,8 +10,8 @@ import { TAURI_EVENT } from "@/constants/events";
 import type { Settings, SettingsPatch } from "@/types/settings";
 import { isTauri } from "@/utils/is";
 import { log } from "@/utils/log";
-import { recordStartupTiming } from "@/utils/startupTiming";
 import { DEFAULT_MOCK_SETTINGS } from "@/utils/mockData";
+import { recordStartupTiming } from "@/utils/startupTiming";
 
 const SETTINGS_STARTUP_TIMEOUT_MS = 1500;
 
