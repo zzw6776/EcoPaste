@@ -147,6 +147,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - label: macOS Apple Silicon
+            os: macos-15
+            publish_release: true
+            target: aarch64-apple-darwin
           - label: macOS Intel
             os: macos-26-intel
             publish_release: true
@@ -232,150 +236,6 @@ jobs:
         env:
           TAURI_TARGET: ${{ matrix.target }}
         run: bash scripts/verifyMacosBundle.sh "src-tauri/target/${TAURI_TARGET}/release/bundle"
-
-  start-macos-apple-candidates:
-    name: Start macOS Apple Silicon candidates
-    needs: release-metadata
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    outputs:
-      run_id: ${{ steps.candidates.outputs.run_id }}
-    steps:
-      - name: Start parallel candidate builds
-        id: candidates
-        shell: bash
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-
-          title="macOS Apple Silicon ${TAG_NAME}"
-          gh workflow run macos-apple-candidates.yml \
-            --ref "${TAG_NAME}" \
-            -f "tag_name=${TAG_NAME}"
-
-          deadline=$((SECONDS + 120))
-          while (( SECONDS < deadline )); do
-            run_id="$(
-              gh run list \
-                --workflow macos-apple-candidates.yml \
-                --event workflow_dispatch \
-                --limit 20 \
-                --json databaseId,displayTitle \
-                | jq -r --arg title "${title}" \
-                    '.[] | select(.displayTitle == $title) | .databaseId' \
-                | head -n 1
-            )"
-            if [[ -n "${run_id}" ]]; then
-              echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo '::error::The Apple Silicon candidate workflow did not start.'
-          exit 1
-
-  upload-macos-apple:
-    name: Upload macOS Apple Silicon
-    needs:
-      - release-metadata
-      - build-desktop
-      - start-macos-apple-candidates
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: write
-    steps:
-      - name: Download first successful Apple Silicon candidate
-        id: candidate
-        shell: bash
-        env:
-          CANDIDATE_RUN_ID: ${{ needs.start-macos-apple-candidates.outputs.run_id }}
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          deadline=$((SECONDS + 3600))
-          artifact_id=''
-          artifact_name='macos-aarch64-native'
-          while (( SECONDS < deadline )); do
-            artifacts="$(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/artifacts?per_page=100"
-            )"
-            native_id="$(
-              jq -r '.artifacts[] | select(.expired == false and .name == "macos-aarch64-native") | .id' \
-                <<< "${artifacts}" \
-                | head -n 1
-            )"
-            if [[ -n "${native_id}" ]]; then
-              artifact_id="${native_id}"
-              break
-            fi
-
-            run_status="$(
-              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" \
-                --jq '.status'
-            )"
-            if [[ "${run_status}" == "completed" ]]; then
-              echo '::error::The Apple Silicon build did not produce a complete candidate.'
-              exit 1
-            fi
-            sleep 10
-          done
-
-          if [[ -z "${artifact_id}" ]]; then
-            echo '::error::No Apple Silicon candidate completed within 60 minutes.'
-            exit 1
-          fi
-
-          destination="${RUNNER_TEMP}/macos-aarch64"
-          mkdir -p "${destination}"
-          gh run download "${CANDIDATE_RUN_ID}" \
-            --name "${artifact_name}" \
-            --dir "${destination}"
-          echo "Selected ${artifact_name}."
-
-      - name: Upload successful candidate
-        shell: bash
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
-          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-
-          selected="${RUNNER_TEMP}/macos-aarch64"
-
-          source_assets=(
-            "${selected}/dmg/EcoPaste_${RELEASE_VERSION}_aarch64.dmg"
-            "${selected}/macos/EcoPaste.app.tar.gz"
-            "${selected}/macos/EcoPaste.app.tar.gz.sig"
-          )
-          for asset in "${source_assets[@]}"; do
-            if [[ ! -f "${asset}" ]]; then
-              echo "::error::Missing Apple Silicon release asset: ${asset}"
-              exit 1
-            fi
-          done
-
-          release_assets="${RUNNER_TEMP}/macos-aarch64-release"
-          mkdir -p "${release_assets}"
-          cp "${source_assets[1]}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz"
-          cp "${source_assets[2]}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"
-          assets=(
-            "${source_assets[0]}"
-            "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz"
-            "${release_assets}/EcoPaste_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"
-          )
-          gh release upload "${TAG_NAME}" "${assets[@]}" --clobber
 
   build-android:
     name: Build Android ${{ matrix.label }}
@@ -482,7 +342,7 @@ jobs:
     name: Publish Release
     needs:
       - release-metadata
-      - upload-macos-apple
+      - build-desktop
       - build-android
     runs-on: ubuntu-latest
     permissions:
