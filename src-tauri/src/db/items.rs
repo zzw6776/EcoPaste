@@ -749,7 +749,7 @@ pub async fn find_item_by_id(pool: &SqlitePool, id: &str) -> Result<Option<Clipb
     Ok(item)
 }
 
-/// Reads local-origin record ids for complete one-time sync backfill.
+/// Reads local-origin record ids ordered from newest to oldest for full one-time sync backfill.
 /// Remote-only records are already owned by another endpoint and must not be re-originated here.
 /// Callers load the full records one at a time so large histories do not coexist in memory.
 pub async fn local_item_ids_for_sync(pool: &SqlitePool) -> Result<Vec<String>> {

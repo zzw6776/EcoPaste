@@ -152,7 +152,7 @@ impl SyncManager {
                 .collect::<HashSet<_>>(),
             _ => unreachable!(),
         };
-        let response = call(connection, request).await?;
+        let response = call_lan(connection, request).await?;
         let Response::LanContentPlan {
             metadata_only_event_ids,
             available_event_ids,
@@ -279,20 +279,6 @@ impl SyncManager {
                 _ => bail!("局域网设备返回了无效的协议版本响应"),
             }
         }
-        if !attachments
-            && is_cloud
-            && self
-                .refresh_cloud_retention(
-                    connection,
-                    &pool,
-                    group,
-                    &cycle.device,
-                    MAX_SYNC_BATCHES_PER_CONNECTION,
-                )
-                .await?
-        {
-            return Ok(SyncConnectionOutcome { has_more: true });
-        }
         let availability_has_more = if !attachments && is_cloud {
             self.sync_cloud_availability(connection, &pool, group)
                 .await?
@@ -311,6 +297,7 @@ impl SyncManager {
         let mut cursor = after_cursor;
         let mut follow_up_needed = availability_has_more;
         let mut has_more = false;
+        let mut remote_pull_needed = !attachments;
         if let Some(peer_device_id) = target.peer_device_id() {
             follow_up_needed |= self
                 .flush_lan_receipts(connection, &pool, group, &cycle.device, peer_device_id)
@@ -325,39 +312,38 @@ impl SyncManager {
                 },
                 target: target_id.to_owned(),
             };
-            let materialization = if attachments {
-                None
+            let mut local_has_more = if attachments {
+                false
             } else {
-                Some(
-                    self.materialize_local_operations(
-                        false,
-                        true,
+                let _ = self.materialize_dirty_states(Some(cycle)).await?;
+                let run = self
+                    .materialize_content_lane(
+                        db::sync_queue::OutboxContentLane::Text,
                         usize::from(MAX_EVENTS_PER_BATCH),
                         Some(&preparation_target),
                         Some(cycle),
                     )
-                    .await?,
-                )
+                    .await?;
+                let hit_limit = run.hit_limit;
+                run.staging.retain_for_delivery();
+                hit_limit
             };
-            let local_materialized = materialization
-                .as_ref()
-                .is_some_and(|run| run.processed > 0);
-            let _materialized_staging = materialization.map(|run| run.staging);
+            let lane = Some(if attachments {
+                if files {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            });
             let mut pending = if is_cloud {
                 repository::pending_cloud_events_for_target(
                     &pool,
                     target_id,
                     device_id,
                     MAX_EVENTS_PER_BATCH,
-                    Some(if attachments {
-                        if files {
-                            2
-                        } else {
-                            1
-                        }
-                    } else {
-                        0
-                    }),
+                    lane,
                 )
                 .await?
             } else {
@@ -368,40 +354,80 @@ impl SyncManager {
                         .peer_device_id()
                         .context("missing LAN peer device identity")?,
                     MAX_EVENTS_PER_BATCH,
-                    Some(if attachments {
-                        if files {
-                            2
-                        } else {
-                            1
-                        }
-                    } else {
-                        0
-                    }),
+                    lane,
                 )
                 .await?
             };
             if attachments && pending.is_empty() {
-                break;
+                let outbox_lane = if files {
+                    db::sync_queue::OutboxContentLane::Files
+                } else {
+                    db::sync_queue::OutboxContentLane::Image
+                };
+                let extra = self
+                    .materialize_content_lane(
+                        outbox_lane,
+                        1,
+                        Some(&preparation_target),
+                        Some(cycle),
+                    )
+                    .await?;
+                let extra_processed = extra.processed;
+                if extra.hit_limit {
+                    local_has_more = true;
+                }
+                extra.staging.retain_for_delivery();
+                if extra_processed > 0 {
+                    pending = if is_cloud {
+                        repository::pending_cloud_events_for_target(
+                            &pool,
+                            target_id,
+                            device_id,
+                            MAX_EVENTS_PER_BATCH,
+                            lane,
+                        )
+                        .await?
+                    } else {
+                        repository::pending_peer_events_for_target(
+                            &pool,
+                            target_id,
+                            target
+                                .peer_device_id()
+                                .context("missing LAN peer device identity")?,
+                            MAX_EVENTS_PER_BATCH,
+                            lane,
+                        )
+                        .await?
+                    };
+                }
+                if pending.is_empty() {
+                    if extra_processed > 0 {
+                        has_more = true;
+                        continue;
+                    }
+                    has_more = false;
+                    break;
+                }
             }
+            let pending_total = pending.len();
             let mut attachment_claim = None;
             if attachments {
-                pending = pending
-                    .into_iter()
-                    .filter(|event| {
-                        if attachment_claim.is_some() {
-                            return false;
-                        }
-                        attachment_claim =
-                            self.delivery.claim_upload(target_id, &event.event.event_id);
-                        attachment_claim.is_some()
-                    })
-                    .collect();
+                pending.retain(|event| {
+                    if attachment_claim.is_some() {
+                        return false;
+                    }
+                    attachment_claim = self.delivery.claim_upload(target_id, &event.event.event_id);
+                    attachment_claim.is_some()
+                });
                 if pending.is_empty() {
                     break;
                 }
             }
-            let mut more_available =
-                attachments || pending.len() == usize::from(MAX_EVENTS_PER_BATCH);
+            let mut more_available = if attachments {
+                pending_total > pending.len()
+            } else {
+                pending.len() == usize::from(MAX_EVENTS_PER_BATCH)
+            };
             let key = group.content_key_bytes()?;
             let mut validated = Vec::with_capacity(pending.len());
             for stored in pending {
@@ -540,11 +566,14 @@ impl SyncManager {
                 .iter()
                 .filter(|stored| {
                     !content_event_ids.contains(&stored.event.event_id)
-                        || missing_records.contains(&stored.event.event_id)
+                        || ((metadata_only_event_ids.contains(&stored.event.event_id)
+                            || !attachments
+                            || files)
+                            && missing_records.contains(&stored.event.event_id))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            has_more = more_available || local_materialized;
+            has_more = more_available || local_has_more || remote_pull_needed;
             let mut records_exchanged = false;
             while !records.is_empty() {
                 let mut ready = records.clone();
@@ -556,6 +585,9 @@ impl SyncManager {
                     Ok(outcome) => {
                         records_exchanged = true;
                         cursor = outcome.latest_cursor;
+                        if !attachments {
+                            remote_pull_needed = outcome.has_more;
+                        }
                         has_more |= outcome.has_more;
                         if outcome.event_ids.is_empty() {
                             return Ok(SyncConnectionOutcome { has_more: true });
@@ -602,11 +634,12 @@ impl SyncManager {
                     && !metadata_only_event_ids.contains(&stored.event.event_id)
             });
             if pending.is_empty() {
-                if !records_exchanged {
+                if !records_exchanged && remote_pull_needed {
                     let outcome = self
                         .exchange_ready_events(&context, cursor, &mut Vec::new(), &HashSet::new())
                         .await?;
                     cursor = outcome.latest_cursor;
+                    remote_pull_needed = outcome.has_more;
                     has_more |= outcome.has_more;
                 }
                 if has_more {
@@ -777,7 +810,27 @@ impl SyncManager {
                     Ok(outcome) => {
                         queue.confirm_events(&outcome.event_ids);
                         cursor = outcome.latest_cursor;
-                        has_more = outcome.has_more || local_materialized || more_available;
+                        if !attachments {
+                            remote_pull_needed = outcome.has_more;
+                        }
+                        let outbox_has_more = if attachments && !more_available && !local_has_more {
+                            let outbox_lane = if files {
+                                db::sync_queue::OutboxContentLane::Files
+                            } else {
+                                db::sync_queue::OutboxContentLane::Image
+                            };
+                            db::sync_queue::next_ready_content(
+                                &pool,
+                                cycle.settings.sync_sensitive,
+                                Some(outbox_lane),
+                            )
+                            .await?
+                            .is_some()
+                        } else {
+                            false
+                        };
+                        has_more =
+                            outcome.has_more || local_has_more || more_available || outbox_has_more;
                     }
                     Err(error) => {
                         if let Some(card) = error.downcast_ref::<OutgoingCardError>() {
@@ -821,9 +874,15 @@ impl SyncManager {
             }
         }
         if !attachments && is_cloud {
-            has_more |= self
+            match self
                 .refresh_cloud_retention(connection, &pool, group, &cycle.device, 1)
-                .await?;
+                .await
+            {
+                Ok(retention_has_more) => has_more |= retention_has_more,
+                Err(error) => {
+                    log::warn!("cloud retention sync skipped after exchange: {error:#}");
+                }
+            }
         }
         has_more |= follow_up_needed;
         self.runtime_state.source_asset_wake.notify_one();
@@ -866,7 +925,7 @@ impl SyncManager {
             .entry(target_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let _exchange_guard = exchange_lock.lock().await;
+        let exchange_guard = exchange_lock.lock().await;
         let current_cursor = if is_cloud {
             repository::cloud_cursor(&pool).await?
         } else {
@@ -1069,17 +1128,27 @@ impl SyncManager {
             }
         }
         let apply_started_at = Instant::now();
-        let content_has_more = self
-            .accept_remote_events(
-                connection,
+        let (received_content, stored_batch) = self
+            .store_remote_events(
                 &pool,
-                settings,
                 device_id,
                 response.events,
                 group,
                 target,
                 response.latest_cursor,
-                !incoming_has_more,
+            )
+            .await?;
+        drop(exchange_guard);
+        let content_has_more = self
+            .apply_stored_remote_events(
+                connection,
+                &pool,
+                settings,
+                target,
+                received_content,
+                &stored_batch,
+                group,
+                true,
             )
             .await?;
         has_more |= content_has_more;

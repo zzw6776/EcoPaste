@@ -72,10 +72,9 @@ impl SyncManager {
         };
         {
             let _maintenance_guard = self.maintenance_lock.lock().await;
+            repository::ensure_event_lanes_indexed(&pool, &group).await?;
             self.backfill_local_history(&pool, &group).await?;
-            let _ = self
-                .materialize_local_operations(false, false, 0, None, Some(&cycle))
-                .await?;
+            let _ = self.materialize_dirty_states(Some(&cycle)).await?;
             self.repair_history_timestamps(&pool, &group).await?;
         }
         let mut lan_succeeded = false;
@@ -210,6 +209,10 @@ impl SyncManager {
                             );
                         }
                         Err(error) => {
+                            log::warn!(
+                                "cloud sync cycle failed: connectionId={} error={error:#}",
+                                connection.stable_id(),
+                            );
                             if should_invalidate_cloud_connection(&connection, &error) {
                                 self.invalidate_cloud_connection(connection.stable_id());
                                 self.runtime_state.watch_wake.notify_one();

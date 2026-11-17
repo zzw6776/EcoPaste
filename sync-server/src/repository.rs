@@ -1062,7 +1062,8 @@ impl Repository {
                 .map(|update| update.cursor)
                 .unwrap_or(after_cursor)
         } else {
-            u64::try_from(availability_cursor).context("negative latest cloud availability cursor")?
+            u64::try_from(availability_cursor)
+                .context("negative latest cloud availability cursor")?
         };
         transaction
             .commit()
@@ -1111,13 +1112,14 @@ impl Repository {
             let event_id: String = row.try_get("event_id")?;
             let cursor = u64::try_from(row.try_get::<i64, _>("availability_cursor")?)
                 .context("negative cloud availability cursor")?;
-            let update = updates
-                .entry(event_id.clone())
-                .or_insert_with(|| CloudAvailabilityUpdate {
-                    cursor,
-                    event_id,
-                    available_blob_ids: Vec::new(),
-                });
+            let update =
+                updates
+                    .entry(event_id.clone())
+                    .or_insert_with(|| CloudAvailabilityUpdate {
+                        cursor,
+                        event_id,
+                        available_blob_ids: Vec::new(),
+                    });
             if let Some(blob_id) = row.try_get::<Option<String>, _>("blob_id")? {
                 update.available_blob_ids.push(blob_id);
             }
@@ -1346,25 +1348,37 @@ impl Repository {
         .context("read Hub cleanup usage")?;
         let used_bytes = u64::try_from(usage_row.try_get::<i64, _>("used_bytes")?)
             .context("negative Hub cleanup usage")?;
-        let candidates = sqlx::query(
+        struct CleanupCandidate {
+            cursor: i64,
+            event_id: String,
+            received_at_ms: i64,
+            event_bytes: u64,
+        }
+
+        let rows = sqlx::query(
             r#"
-            SELECT cursor, length(nonce) + length(ciphertext) AS event_bytes
+            SELECT cursor, event_id, received_at_ms, length(nonce) + length(ciphertext) AS event_bytes
             FROM events e
             WHERE group_id = ? AND retention_key IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM retention_protections p
                   WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
               )
-            ORDER BY cursor ASC
+            ORDER BY
+                CASE WHEN ? IS NOT NULL AND received_at_ms < ? THEN 0 ELSE 1 END ASC,
+                created_at_ms ASC,
+                cursor ASC
             LIMIT ?
             "#,
         )
         .bind(group_id)
+        .bind(policy.retention_cutoff_ms)
+        .bind(policy.retention_cutoff_ms)
         .bind(i64::from(batch_size))
         .fetch_all(&mut *transaction)
         .await
         .context("list Hub cleanup candidates")?;
-        if candidates.is_empty() {
+        if rows.is_empty() {
             transaction
                 .commit()
                 .await
@@ -1375,6 +1389,18 @@ impl Repository {
                 ..CleanupResult::default()
             });
         }
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok(CleanupCandidate {
+                    cursor: row.try_get("cursor")?,
+                    event_id: row.try_get("event_id")?,
+                    received_at_ms: row.try_get("received_at_ms")?,
+                    event_bytes: u64::try_from(row.try_get::<i64, _>("event_bytes")?)
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let count_excess =
             if let Some(maximum) = policy.max_events {
@@ -1389,89 +1415,80 @@ impl Repository {
             } else {
                 0
             };
-        let time_boundary = if let Some(cutoff) = policy.retention_cutoff_ms {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT MAX(cursor) FROM events WHERE group_id = ? AND received_at_ms < ?",
-            )
-            .bind(group_id)
-            .bind(cutoff)
-            .fetch_one(&mut *transaction)
-            .await
-            .context("read Hub retention time boundary")?
-        } else {
-            None
-        };
-        let time_excess = time_boundary.map_or(0, |boundary| {
+        let time_excess = policy.retention_cutoff_ms.map_or(0, |cutoff| {
             candidates
                 .iter()
-                .take_while(|row| row.get::<i64, _>("cursor") <= boundary)
+                .take_while(|candidate| candidate.received_at_ms < cutoff)
                 .count() as u64
         });
-        let mut delete_count = count_excess.max(time_excess).min(u64::from(batch_size)) as usize;
+        let mut delete_count = count_excess.max(time_excess).min(candidates.len() as u64) as usize;
         let quota_excess = policy
             .target_bytes
             .map_or(0, |maximum| used_bytes.saturating_sub(maximum));
 
-        if quota_excess > 0 {
-            let last_candidate_cursor: i64 = candidates
-                .last()
-                .expect("cleanup candidates are non-empty")
-                .get("cursor");
-            let orphanable = sqlx::query(
-                r#"
-                SELECT r.blob_id, b.size, MAX(e.cursor) AS last_cursor
-                FROM event_blob_refs r
-                JOIN events e
-                  ON e.group_id = r.group_id AND e.event_id = r.event_id
-                JOIN blobs b
-                  ON b.group_id = r.group_id AND b.blob_id = r.blob_id
-                WHERE r.group_id = ? AND b.gc_protected = 0
-                GROUP BY r.blob_id, b.size
-                HAVING MAX(e.cursor) <= ? AND MIN(CASE
-                    WHEN e.retention_key IS NOT NULL AND NOT EXISTS(
-                        SELECT 1 FROM retention_protections p
-                        WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
-                    ) THEN 1 ELSE 0 END) = 1
-                "#,
-            )
-            .bind(group_id)
-            .bind(last_candidate_cursor)
+        let mut candidate_rank = HashMap::with_capacity(candidates.len());
+        for (index, candidate) in candidates.iter().enumerate() {
+            candidate_rank.insert(candidate.event_id.clone(), index);
+        }
+        let mut ref_query = sqlx::QueryBuilder::new(
+            "SELECT r.blob_id, b.size, r.event_id \
+             FROM event_blob_refs r \
+             JOIN blobs b ON b.group_id = r.group_id AND b.blob_id = r.blob_id \
+             WHERE r.group_id = ",
+        );
+        ref_query
+            .push_bind(group_id)
+            .push(" AND b.gc_protected = 0 AND r.blob_id IN (SELECT DISTINCT blob_id FROM event_blob_refs WHERE group_id = ")
+            .push_bind(group_id)
+            .push(" AND event_id IN (");
+        let mut separated = ref_query.separated(", ");
+        for candidate in &candidates {
+            separated.push_bind(&candidate.event_id);
+        }
+        ref_query.push("))");
+        let blob_ref_rows = ref_query
+            .build()
             .fetch_all(&mut *transaction)
             .await
-            .context("list blobs released by Hub cleanup")?;
-            let mut released_by_cursor: HashMap<i64, (u64, Vec<String>)> = HashMap::new();
-            for row in orphanable {
-                let cursor: i64 = row.try_get("last_cursor")?;
-                let size = u64::try_from(row.try_get::<i64, _>("size")?)
-                    .context("negative Hub blob size")?;
-                let entry = released_by_cursor.entry(cursor).or_default();
-                entry.0 = entry.0.saturating_add(size);
-                entry.1.push(row.try_get("blob_id")?);
+            .context("list blobs referenced by Hub cleanup candidates")?;
+
+        let mut blob_refs: HashMap<String, (u64, bool, usize)> = HashMap::new();
+        for row in blob_ref_rows {
+            let blob_id: String = row.try_get("blob_id")?;
+            let size =
+                u64::try_from(row.try_get::<i64, _>("size")?).context("negative Hub blob size")?;
+            let event_id: String = row.try_get("event_id")?;
+            let entry = blob_refs.entry(blob_id).or_insert((size, true, 0));
+            if let Some(&rank) = candidate_rank.get(&event_id) {
+                entry.2 = entry.2.max(rank);
+            } else {
+                entry.1 = false;
             }
+        }
+        let mut released_by_rank: HashMap<usize, (u64, Vec<(String, u64)>)> = HashMap::new();
+        for (blob_id, (size, all_in_candidates, release_rank)) in blob_refs {
+            if !all_in_candidates {
+                continue;
+            }
+            let entry = released_by_rank.entry(release_rank).or_default();
+            entry.0 = entry.0.saturating_add(size);
+            entry.1.push((blob_id, size));
+        }
+
+        if quota_excess > 0 {
             let mut released = 0_u64;
-            for (index, row) in candidates.iter().enumerate() {
-                released = released.saturating_add(
-                    u64::try_from(row.get::<i64, _>("event_bytes")).unwrap_or_default(),
-                );
-                let cursor: i64 = row.get("cursor");
-                if let Some((bytes, _)) = released_by_cursor.get(&cursor) {
+            let mut quota_delete_count = candidates.len();
+            for (index, candidate) in candidates.iter().enumerate() {
+                released = released.saturating_add(candidate.event_bytes);
+                if let Some((bytes, _)) = released_by_rank.get(&index) {
                     released = released.saturating_add(*bytes);
                 }
                 if released >= quota_excess {
-                    delete_count = delete_count.max(index + 1);
+                    quota_delete_count = index + 1;
                     break;
                 }
-                delete_count = candidates.len();
             }
-
-            if delete_count > 0 {
-                let deleted_through: i64 = candidates[delete_count - 1].get("cursor");
-                for (cursor, (_, blob_ids)) in released_by_cursor {
-                    if cursor <= deleted_through {
-                        deleted_blob_ids.extend(blob_ids);
-                    }
-                }
-            }
+            delete_count = delete_count.max(quota_delete_count);
         }
 
         if delete_count == 0 {
@@ -1486,64 +1503,39 @@ impl Repository {
             });
         }
 
-        let deleted_through: i64 = candidates[delete_count - 1].get("cursor");
-        let deleted_event_bytes = candidates[..delete_count]
+        let selected = &candidates[..delete_count];
+        let deleted_through = selected
             .iter()
-            .map(|row| u64::try_from(row.get::<i64, _>("event_bytes")).unwrap_or_default())
+            .map(|candidate| candidate.cursor)
+            .max()
+            .unwrap_or(0);
+        let deleted_event_bytes = selected
+            .iter()
+            .map(|candidate| candidate.event_bytes)
             .sum::<u64>();
-        let released_blob_rows = sqlx::query(
-            r#"
-            SELECT r.blob_id, b.size
-            FROM event_blob_refs r
-            JOIN events e
-              ON e.group_id = r.group_id AND e.event_id = r.event_id
-            JOIN blobs b
-              ON b.group_id = r.group_id AND b.blob_id = r.blob_id
-            WHERE r.group_id = ? AND b.gc_protected = 0
-            GROUP BY r.blob_id
-            HAVING MAX(e.cursor) <= ? AND MIN(CASE
-                WHEN e.retention_key IS NOT NULL AND NOT EXISTS(
-                    SELECT 1 FROM retention_protections p
-                    WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
-                ) THEN 1 ELSE 0 END) = 1
-            "#,
-        )
-        .bind(group_id)
-        .bind(deleted_through)
-        .fetch_all(&mut *transaction)
-        .await
-        .context("list blobs released by retained event deletion")?;
-        let released_blob_sizes = released_blob_rows
-            .into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<String, _>("blob_id")?,
-                    u64::try_from(row.try_get::<i64, _>("size")?)
-                        .context("negative released Hub blob size")?,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        deleted_blob_ids.extend(released_blob_sizes.keys().cloned());
-        sqlx::query(
-            "DELETE FROM events WHERE group_id = ? AND cursor <= ? AND retention_key IS NOT NULL \
-                     AND NOT EXISTS(SELECT 1 FROM retention_protections p \
-                         WHERE p.group_id = events.group_id AND p.item_key = events.retention_key)",
-        )
-        .bind(group_id)
-        .bind(deleted_through)
-        .execute(&mut *transaction)
-        .await
-        .context("delete retained Hub events")?;
-        sqlx::query(
-            "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?), \
-             availability_cursor = availability_cursor + 1, \
-             pruned_availability_cursor = availability_cursor + 1 WHERE group_id = ?",
-        )
-        .bind(deleted_through)
-        .bind(group_id)
-        .execute(&mut *transaction)
-        .await
-        .context("advance retained Hub cursor floor")?;
+        let mut released_blob_candidates = HashMap::new();
+        for (rank, (_, blobs)) in released_by_rank {
+            if rank < delete_count {
+                for (blob_id, size) in blobs {
+                    released_blob_candidates.insert(blob_id.clone(), size);
+                    deleted_blob_ids.push(blob_id);
+                }
+            }
+        }
+
+        let mut delete_events = sqlx::QueryBuilder::new("DELETE FROM events WHERE group_id = ");
+        delete_events.push_bind(group_id).push(" AND event_id IN (");
+        let mut separated = delete_events.separated(", ");
+        for candidate in selected {
+            separated.push_bind(&candidate.event_id);
+        }
+        delete_events.push(")");
+        delete_events
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .context("delete retained Hub events")?;
+
         deleted_blob_ids.sort_unstable();
         deleted_blob_ids.dedup();
         let mut released_blob_bytes = 0_u64;
@@ -1566,13 +1558,35 @@ impl Repository {
             .context("delete released Hub blob metadata")?;
             if deleted.rows_affected() > 0 {
                 released_blob_bytes = released_blob_bytes.saturating_add(
-                    released_blob_sizes
+                    released_blob_candidates
                         .get(blob_id)
                         .copied()
                         .unwrap_or_default(),
                 );
                 released_blob_count = released_blob_count.saturating_add(1);
             }
+        }
+        if released_blob_count > 0 {
+            sqlx::query(
+                "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?), \
+                 availability_cursor = availability_cursor + 1, \
+                 pruned_availability_cursor = availability_cursor + 1 WHERE group_id = ?",
+            )
+            .bind(deleted_through)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await
+            .context("advance retained Hub cursor floor and availability watermark")?;
+        } else {
+            sqlx::query(
+                "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?) \
+                 WHERE group_id = ?",
+            )
+            .bind(deleted_through)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await
+            .context("advance retained Hub cursor floor")?;
         }
         sqlx::query(
             r#"
@@ -1596,7 +1610,8 @@ impl Repository {
         Ok(CleanupResult {
             deleted_events: delete_count as u64,
             deleted_blob_ids,
-            has_more: stale_blob_batch_full || delete_count == candidates.len(),
+            has_more: stale_blob_batch_full
+                || (candidates.len() == batch_size as usize && delete_count == candidates.len()),
         })
     }
 

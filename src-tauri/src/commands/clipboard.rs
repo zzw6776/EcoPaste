@@ -502,7 +502,12 @@ pub async fn get_file_icon_path(
 ) -> Result<FileIconResult> {
     let pool = db.pool().await;
     let (icon_path, exists) = resolve_file_icon_path(
-        &pool, &file_icon_store, &path, file_types.as_deref(), index, true,
+        &pool,
+        &file_icon_store,
+        &path,
+        file_types.as_deref(),
+        index,
+        true,
     )
     .await?;
 
@@ -844,9 +849,9 @@ pub async fn list_clipboard_items(
         .try_state::<Arc<crate::sync::SyncManager>>()
         .map(|manager| manager.local_source_device().0);
     for item in &mut items {
-        item.source_device_is_local = local_device_id.as_ref().is_some_and(|id| {
-            item.source_device_id.as_deref() == Some(id.as_str())
-        });
+        item.source_device_is_local = local_device_id
+            .as_ref()
+            .is_some_and(|id| item.source_device_id.as_deref() == Some(id.as_str()));
         resolve_managed_file_content(&app, item)?;
         attach_source_app_icon_path(&app_icon_store, item);
         attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
@@ -904,9 +909,9 @@ pub async fn get_clipboard_item(
         let local_device_id = app
             .try_state::<Arc<crate::sync::SyncManager>>()
             .map(|manager| manager.local_source_device().0);
-        item.source_device_is_local = local_device_id.as_ref().is_some_and(|id| {
-            item.source_device_id.as_deref() == Some(id.as_str())
-        });
+        item.source_device_is_local = local_device_id
+            .as_ref()
+            .is_some_and(|id| item.source_device_id.as_deref() == Some(id.as_str()));
         resolve_managed_file_content(&app, item)?;
         let settings = app.state::<SettingsStore>().snapshot();
         let file_entry_limit = settings.clipboard.display.file_entry_limit();
@@ -1208,7 +1213,8 @@ async fn attach_file_entries(
         let (icon_path, exists) = if is_remote {
             (None, false)
         } else {
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, false).await?
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, false)
+                .await?
         };
         let is_dir = types.get(index).copied() == Some("d");
         let name = std::path::Path::new(path)
@@ -1311,7 +1317,8 @@ async fn build_preview_file_entries(
         let (icon_path, exists) = if is_remote {
             (None, false)
         } else {
-            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, true).await?
+            resolve_file_icon_path(pool, store, path, item.file_types.as_deref(), index, true)
+                .await?
         };
         let path_obj = Path::new(path);
         let is_dir = resolve_preview_file_is_dir(path_obj, item.file_types.as_deref(), index);

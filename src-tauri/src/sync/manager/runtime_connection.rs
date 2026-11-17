@@ -6,11 +6,17 @@ impl SyncManager {
         self: &Arc<Self>,
         settings: &SyncSettings,
     ) -> Result<Endpoint> {
+        if self.is_storage_suspended() {
+            bail!("同步存储切换中，请稍后再试");
+        }
         let relay_token = self.identity.cloud_relay_auth_token();
         let config = endpoint_runtime_config(settings, relay_token.as_deref());
         let relay_mode = cloud_relay_mode(settings, relay_token.as_deref())?;
         let secret_key = self.identity.secret_key()?;
         let mut runtime = self.runtime_state.endpoint.lock().await;
+        if self.is_storage_suspended() {
+            bail!("同步存储切换中，请稍后再试");
+        }
         if let Some(runtime) = runtime.as_ref() {
             if runtime.config == config {
                 self.update_discovery_metadata(&runtime.endpoint, settings.lan_enabled)?;

@@ -228,7 +228,9 @@ pub(super) async fn call_cloud(
     if let Err(error) = &result {
         log::warn!(
             "cloud control request failed: request={request_kind} connectionId={} elapsedMs={} closeReason={:?} error={error:#}",
-            connection.stable_id(), started.elapsed().as_millis(), connection.close_reason(),
+            connection.stable_id(),
+            started.elapsed().as_millis(),
+            connection.close_reason(),
         );
     }
     result

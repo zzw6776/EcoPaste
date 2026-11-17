@@ -107,9 +107,20 @@ pub async fn stage_content(
     .bind(options.delivery_route.map(ContentDeliveryRoute::as_str))
     .bind(now)
     .bind(now)
-    .fetch_one(connection)
+    .fetch_one(&mut *connection)
     .await
     .context("stage clipboard content sync operation")?;
+    if !options.manual_share {
+        sqlx::query(
+            "DELETE FROM sync_content_outbox \
+             WHERE sync_key = ? AND manual_share = 0 AND operation_order < ?",
+        )
+        .bind(sync_key)
+        .bind(stored_order)
+        .execute(&mut *connection)
+        .await
+        .context("coalesce duplicated clipboard content sync operations")?;
+    }
     Ok(stored_order)
 }
 
@@ -167,13 +178,32 @@ pub async fn has_pending_content(
     .context("read pending clipboard content")
 }
 
-/// Returns the earliest due content operation whose key has no earlier pending content operation.
+/// Identifies which content outbox scheduling lane to poll or inspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxContentLane {
+    Text,
+    Image,
+    Files,
+}
+
+impl OutboxContentLane {
+    fn as_filter_code(self) -> i64 {
+        match self {
+            Self::Text => 0,
+            Self::Image => 1,
+            Self::Files => 2,
+        }
+    }
+}
+
+/// Returns the earliest due content operation in the requested lane whose key has no earlier pending content operation.
 pub async fn next_ready_content(
     pool: &SqlitePool,
     sync_sensitive: bool,
-    files: Option<bool>,
+    lane: Option<OutboxContentLane>,
 ) -> Result<Option<ContentOutboxOperation>> {
     let now = Utc::now();
+    let lane_code = lane.map(OutboxContentLane::as_filter_code);
     sqlx::query_as::<_, ContentOutboxOperation>(
         r#"
         SELECT current.operation_order, current.item_id, current.sync_key,
@@ -207,15 +237,34 @@ pub async fn next_ready_content(
                 AND state.dirty_mask <> 0
                 AND state.pending_order < current.operation_order
           )
-          AND (? IS NULL OR COALESCE(item.kind = 'files', 0) = ?)
-        ORDER BY operation_order ASC
+          AND (
+              ? IS NULL
+              OR CASE
+                  WHEN item.kind = 'image' THEN 1
+                  WHEN item.kind = 'files' THEN 2
+                  ELSE 0
+              END = ?
+          )
+        ORDER BY
+          current.history_backfill ASC,
+          CASE
+            WHEN item.kind = 'image' THEN 1
+            WHEN item.kind = 'files' THEN 2
+            ELSE 0
+          END ASC,
+          CASE
+            WHEN current.history_backfill = 1 AND item.kind IN ('image', 'files')
+              THEN item.updated_at
+            ELSE NULL
+          END DESC,
+          current.operation_order ASC
         LIMIT 1
         "#,
     )
     .bind(now)
     .bind(sync_sensitive)
-    .bind(files)
-    .bind(files)
+    .bind(lane_code)
+    .bind(lane_code)
     .fetch_optional(pool)
     .await
     .context("load next clipboard content sync operation")
@@ -264,11 +313,13 @@ pub async fn fail_content(
     Ok(delay)
 }
 
+/// Returns the earliest scheduled retry timestamp for the given content lane.
 pub async fn next_content_retry_at(
     pool: &SqlitePool,
     sync_sensitive: bool,
-    files: bool,
+    lane: OutboxContentLane,
 ) -> Result<Option<chrono::DateTime<Utc>>> {
+    let lane_code = lane.as_filter_code();
     sqlx::query_scalar(
         r#"
         SELECT MIN(current.next_attempt_at)
@@ -276,7 +327,11 @@ pub async fn next_content_retry_at(
         LEFT JOIN clipboard_items item ON item.id = current.item_id
         WHERE current.next_attempt_at IS NOT NULL
           AND current.next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-          AND COALESCE(item.kind = 'files', 0) = ?
+          AND CASE
+              WHEN item.kind = 'image' THEN 1
+              WHEN item.kind = 'files' THEN 2
+              ELSE 0
+          END = ?
           AND (
               ? OR item.is_sensitive = 0 OR item.id IS NULL
               OR EXISTS (
@@ -287,7 +342,7 @@ pub async fn next_content_retry_at(
           )
         "#,
     )
-    .bind(files)
+    .bind(lane_code)
     .bind(sync_sensitive)
     .fetch_one(pool)
     .await
@@ -381,10 +436,12 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(next_content_retry_at(&reopened, false, false)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            next_content_retry_at(&reopened, false, OutboxContentLane::Text)
+                .await
+                .unwrap()
+                .is_some()
+        );
         sqlx::query("UPDATE sync_content_outbox SET next_attempt_at = ?")
             .bind(Utc::now() - Duration::seconds(1))
             .execute(&reopened)

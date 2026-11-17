@@ -64,7 +64,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore},
+    sync::{
+        mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore,
+    },
 };
 use uuid::Uuid;
 
@@ -205,11 +207,15 @@ fn sync_transport_config(cloud: bool) -> QuicTransportConfig {
     builder.build()
 }
 
-fn remove_unreferenced_sync_staging(root: &Path, live_blob_ids: &HashSet<String>) -> Result<u64> {
+fn remove_unreferenced_sync_staging(
+    root: &Path,
+    live_blob_ids: &HashSet<String>,
+) -> Result<(u64, u64)> {
     if !root.exists() {
-        return Ok(0);
+        return Ok((0, 0));
     }
-    let mut removed = 0_u64;
+    let mut removed_files = 0_u64;
+    let mut removed_bytes = 0_u64;
     for entry in walkdir::WalkDir::new(root)
         .min_depth(2)
         .max_depth(2)
@@ -233,8 +239,12 @@ fn remove_unreferenced_sync_staging(root: &Path, live_blob_ids: &HashSet<String>
         {
             continue;
         }
+        let file_bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         match fs::remove_file(entry.path()) {
-            Ok(()) => removed = removed.saturating_add(1),
+            Ok(()) => {
+                removed_files = removed_files.saturating_add(1);
+                removed_bytes = removed_bytes.saturating_add(file_bytes);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
                 "remove unreferenced local sync blob {} failed: {error}",
@@ -242,7 +252,7 @@ fn remove_unreferenced_sync_staging(root: &Path, live_blob_ids: &HashSet<String>
             ),
         }
     }
-    Ok(removed)
+    Ok((removed_files, removed_bytes))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -646,9 +656,44 @@ fn notify_cleanup_ready(runtime: &RuntimeCoordinator) {
     }
 }
 
+struct SyncQuiescenceLocks<'a> {
+    _cloud_guard: tokio::sync::MutexGuard<'a, ()>,
+    _lan_guard: tokio::sync::RwLockWriteGuard<'a, ()>,
+    _maintenance_guard: tokio::sync::MutexGuard<'a, ()>,
+    _enqueue_guard: (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::MutexGuard<'a, ()>,
+    ),
+    _apply_guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+/// Suspends active synchronization workers while database or cache storage changes.
+pub(crate) struct SyncStorageSuspension<'a> {
+    manager: &'a SyncManager,
+    suspended_runtime: bool,
+    locks: Option<SyncQuiescenceLocks<'a>>,
+}
+
+impl Drop for SyncStorageSuspension<'_> {
+    fn drop(&mut self) {
+        drop(self.locks.take());
+        if self.suspended_runtime {
+            self.manager
+                .runtime_state
+                .storage_suspended
+                .send_replace(false);
+        }
+        notify_cleanup_ready(&self.manager.runtime_state);
+        if self.suspended_runtime {
+            self.manager.wake();
+        }
+    }
+}
+
 struct MaterializationRun {
     processed: usize,
-    deferred_content: bool,
+    hit_limit: bool,
     staging: TaskStagingCleanup,
 }
 
@@ -656,13 +701,11 @@ struct ContentMaterializationContext<'a> {
     settings: &'a SyncSettings,
     device_id: &'a str,
     group: &'a GroupSecrets,
-    allow_content: bool,
     preparation_target: Option<&'a PreparationTarget>,
 }
 
 enum ContentMaterialization {
     Completed,
-    Deferred,
     Stored {
         staging: TaskStagingCleanup,
         has_attachments: bool,
@@ -998,6 +1041,79 @@ impl SyncManager {
         self.runtime_state.watch_wake.notify_one();
         self.runtime_state.source_asset_wake.notify_one();
         self.notify_local_outbox();
+    }
+
+    pub(super) fn is_storage_suspended(&self) -> bool {
+        *self.runtime_state.storage_suspended.borrow()
+    }
+
+    pub(super) fn storage_epoch(&self) -> u64 {
+        self.runtime_state.storage_epoch.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn wait_while_storage_suspended(&self) {
+        let mut rx = self.runtime_state.storage_suspended.subscribe();
+        let _ = rx.wait_for(|suspended| !*suspended).await;
+    }
+
+    async fn acquire_quiescence(
+        &self,
+        stop_connections: bool,
+    ) -> Result<SyncStorageSuspension<'_>> {
+        let mut suspension = SyncStorageSuspension {
+            manager: self,
+            suspended_runtime: false,
+            locks: None,
+        };
+        let cloud_guard = self.runtime_state.cloud_cycle_lock.lock().await;
+        let lan_guard = self.runtime_state.lan_cycle_lock.write().await;
+        if stop_connections {
+            self.runtime_state.storage_suspended.send_replace(true);
+            self.runtime_state
+                .storage_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            suspension.suspended_runtime = true;
+            if self.pairing_sessions.load(Ordering::Acquire) > 0 {
+                bail!("设备配对进行中，请先完成或取消配对后再继续");
+            }
+            self.runtime_state.watch_wake.notify_one();
+            self.stop_runtime().await?;
+        }
+        let maintenance_guard = self.maintenance_lock.lock().await;
+        let enqueue_guard = self.delivery.lock_enqueue().await;
+        let apply_guard = self.apply_lock.lock().await;
+        suspension.locks = Some(SyncQuiescenceLocks {
+            _cloud_guard: cloud_guard,
+            _lan_guard: lan_guard,
+            _maintenance_guard: maintenance_guard,
+            _enqueue_guard: enqueue_guard,
+            _apply_guard: apply_guard,
+        });
+        Ok(suspension)
+    }
+
+    /// Pauses active transfers and local sync runtime while replacing database/storage roots.
+    pub(crate) async fn suspend_for_storage_replacement(
+        &self,
+    ) -> Result<SyncStorageSuspension<'_>> {
+        self.acquire_quiescence(true).await
+    }
+
+    /// Serializes active sync workers without closing QUIC sockets while pruning disk caches.
+    pub(crate) async fn pause_for_resource_cleanup(&self) -> SyncStorageSuspension<'_> {
+        self.acquire_quiescence(false)
+            .await
+            .expect("quiescence without runtime stop is infallible")
+    }
+
+    /// Reloads identity config from the current data directory and clears pending captures.
+    pub(crate) fn reconcile_after_storage_replacement(&self, app: &AppHandle) -> Result<()> {
+        self.pending_observations
+            .lock()
+            .expect("pending clipboard observations poisoned")
+            .clear();
+        self.identity.rebase(app)?;
+        Ok(())
     }
 
     /// Reconnects LAN peers after an endpoint address or mDNS presence change.
@@ -1703,10 +1819,12 @@ impl SyncManager {
         if target == SyncTarget::Lan && !repository::has_online_peer(&pool).await? {
             bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
-        let _enqueue_guard = self
-            .delivery
-            .lock_materialization(item.kind == ClipboardKind::Files)
-            .await;
+        let lane = match item.kind {
+            ClipboardKind::Text => crate::db::sync_queue::OutboxContentLane::Text,
+            ClipboardKind::Image => crate::db::sync_queue::OutboxContentLane::Image,
+            ClipboardKind::Files => crate::db::sync_queue::OutboxContentLane::Files,
+        };
+        let _enqueue_guard = self.delivery.lock_materialization(Some(lane)).await;
         let content_pending =
             db::sync_queue::has_pending_content(&pool, &item.id, &item.source_revision).await?;
         let external_local_event_exists =
@@ -2765,7 +2883,7 @@ mod tests {
         let removed =
             remove_unreferenced_sync_staging(directory.path(), &HashSet::from([live_id])).unwrap();
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed.0, 1);
         assert!(live_path.is_file());
         assert!(!stale_path.exists());
         assert!(directory.path().join("unmanaged").is_file());

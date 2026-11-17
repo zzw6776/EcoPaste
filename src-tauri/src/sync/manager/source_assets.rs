@@ -66,24 +66,7 @@ impl SyncManager {
         let store = self.app.state::<AppIconStore>();
         let mut pending_count = 0;
         for asset in db::apps::source_app_assets(&pool, &group.group_id).await? {
-            let icon = SourceIconRef {
-                icon_hash: asset.icon_hash.clone(),
-                blob_id: asset.blob_id.clone(),
-                original_size: asset.original_size,
-                encrypted_size: asset.encrypted_size,
-            };
-            let encrypted_available =
-                self.source_icon_blob_record(&icon)
-                    .ok()
-                    .is_some_and(|encrypted| {
-                        Path::new(&encrypted.encrypted_path)
-                            .metadata()
-                            .is_ok_and(|metadata| metadata.len() == encrypted.size)
-                    });
-            if encrypted_available
-                && asset.is_attached
-                && store.icon_file_for_hash(&asset.icon_hash).is_some()
-            {
+            if asset.is_attached && store.icon_file_for_hash(&asset.icon_hash).is_some() {
                 continue;
             }
             pending_count += 1;

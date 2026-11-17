@@ -2,6 +2,103 @@ use ecopaste_sync_protocol::CloudAvailabilityUpdate;
 
 use super::*;
 
+pub(super) fn extract_event_metadata(
+    events: &[EncryptedEvent],
+    key: &[u8; 32],
+) -> HashMap<String, (String, String, i64)> {
+    let mut metadata = HashMap::with_capacity(events.len());
+    for event in events {
+        let entry = match crypto::decrypt_sync_event(key, event) {
+            Ok(DecryptedSyncEvent::Clipboard(envelope)) => (
+                envelope.item.kind,
+                envelope.item.sync_key,
+                envelope
+                    .item
+                    .updated_at_ms
+                    .unwrap_or(envelope.item.created_at_ms),
+            ),
+            Ok(DecryptedSyncEvent::ItemState(patch)) => {
+                ("state".to_owned(), patch.sync_key, event.created_at_ms)
+            }
+            Err(_) => continue,
+        };
+        metadata.insert(event.event_id.clone(), entry);
+    }
+    metadata
+}
+
+/// Enforces cumulative receiver-side 70% historical attachment admission lazily per batch.
+pub(super) struct AttachmentQuotaInspector {
+    app: AppHandle,
+    target_bytes: u64,
+    latest_local_updated_at: Option<chrono::DateTime<Utc>>,
+    measured_base_bytes: Option<u64>,
+    reserved_bytes: u64,
+}
+
+impl AttachmentQuotaInspector {
+    pub(super) async fn for_history(
+        app: &AppHandle,
+        pool: &SqlitePool,
+        history: &crate::settings::History,
+    ) -> Result<Self> {
+        let target_bytes = crate::clipboard::cleanup::history_target_bytes(history);
+        let latest_local_updated_at = if target_bytes > 0 {
+            repository::latest_clipboard_item_updated_at(pool).await?
+        } else {
+            None
+        };
+        Ok(Self {
+            app: app.clone(),
+            target_bytes,
+            latest_local_updated_at,
+            measured_base_bytes: None,
+            reserved_bytes: 0,
+        })
+    }
+
+    pub(super) fn observe_timestamp(&mut self, ts: chrono::DateTime<Utc>) {
+        if self.target_bytes == 0 {
+            return;
+        }
+        self.latest_local_updated_at =
+            Some(self.latest_local_updated_at.map_or(ts, |cur| cur.max(ts)));
+    }
+
+    pub(super) async fn admit_or_reject_historical(
+        &mut self,
+        item_updated_at: chrono::DateTime<Utc>,
+        attachment_bytes: u64,
+    ) -> bool {
+        if self.target_bytes == 0
+            || !self
+                .latest_local_updated_at
+                .is_some_and(|latest| item_updated_at < latest)
+        {
+            return true;
+        }
+        let base = match self.measured_base_bytes {
+            Some(base) => base,
+            None => {
+                let measured = crate::clipboard::cleanup::storage_bytes(&self.app)
+                    .await
+                    .unwrap_or(0);
+                self.measured_base_bytes = Some(measured);
+                measured
+            }
+        };
+        if base
+            .saturating_add(self.reserved_bytes)
+            .saturating_add(attachment_bytes)
+            > self.target_bytes
+        {
+            return false;
+        }
+        self.reserved_bytes = self.reserved_bytes.saturating_add(attachment_bytes);
+        true
+    }
+}
+
 impl SyncManager {
     /// Applies the Hub's independent, resumable blob-availability stream.
     pub(super) async fn sync_cloud_availability(
@@ -53,10 +150,15 @@ impl SyncManager {
             }
             if !has_more {
                 if changed {
+                    self.wake_attachments();
                     self.emit_updated();
                 }
                 return Ok(false);
             }
+        }
+        if changed {
+            self.wake_attachments();
+            self.emit_updated();
         }
         Ok(true)
     }
@@ -114,20 +216,16 @@ impl SyncManager {
         Ok(changed)
     }
 
-    /// Stores one authenticated remote batch and applies all currently eligible events.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn accept_remote_events(
+    /// Stores one authenticated remote batch and updates its continuation cursor atomically.
+    pub(super) async fn store_remote_events(
         &self,
-        connection: &Connection,
         pool: &SqlitePool,
-        sync_settings: &SyncSettings,
         device_id: &str,
         events: Vec<ReceivedSyncEvent>,
         group: &GroupSecrets,
         source: &SyncConnectionTarget,
         latest_cursor: u64,
-        allow_content: bool,
-    ) -> Result<bool> {
+    ) -> Result<(bool, repository::StoreRemoteBatchResult)> {
         let _sync_activity = SyncActivityGuard::acquire();
         let removed_peers = repository::removed_peer_ids(pool).await?;
         let events = events
@@ -152,6 +250,7 @@ impl SyncManager {
             .map(|received| received.event)
             .collect::<Vec<_>>();
         let metadata_only_event_ids = metadata_only_content_event_ids(&encrypted_events, &key);
+        let event_metadata = extract_event_metadata(&encrypted_events, &key);
         let stored = repository::store_remote_batch_with_content_policy(
             pool,
             source.remote_batch_source(),
@@ -160,14 +259,30 @@ impl SyncManager {
             device_id,
             &cloud_availability,
             &metadata_only_event_ids,
+            &event_metadata,
         )
         .await?;
-        for (event_id, origin_device_id) in stored.conflicts {
+        for (event_id, origin_device_id) in &stored.conflicts {
             log::warn!(
                 "ignore sync event {event_id} with a reused origin sequence from {origin_device_id}"
             );
         }
+        Ok((received_content, stored))
+    }
 
+    /// Applies pending events after storing a batch and wakes downstream attachment/LAN queues.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn apply_stored_remote_events(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        sync_settings: &SyncSettings,
+        source: &SyncConnectionTarget,
+        received_content: bool,
+        stored: &repository::StoreRemoteBatchResult,
+        group: &GroupSecrets,
+        allow_content: bool,
+    ) -> Result<bool> {
         let content_has_more = self
             .apply_pending_events(
                 connection,
@@ -257,62 +372,64 @@ impl SyncManager {
         #[cfg(target_os = "android")]
         let mut applied_any = false;
 
-        while !attachments {
-            let pending_states = repository::unapplied_events_by_kind(
-                pool,
-                SyncEventKind::ItemState,
-                MAX_EVENTS_PER_BATCH,
-            )
-            .await?;
-            if pending_states.is_empty() {
-                break;
-            }
-            for stored in pending_states {
-                let event = stored.event;
-                let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
-                    validate_decrypted_sync_event(&event)?;
-                    Ok(event)
-                });
-                match decrypted {
-                    Ok(DecryptedSyncEvent::ItemState(patch)) => {
-                        match self.apply_item_state_event(pool, &event, patch).await {
-                            Ok(()) => {
-                                #[cfg(target_os = "android")]
-                                {
-                                    applied_any = true;
+        if !attachments {
+            loop {
+                let pending_states = repository::unapplied_events_by_kind(
+                    pool,
+                    SyncEventKind::ItemState,
+                    MAX_EVENTS_PER_BATCH,
+                )
+                .await?;
+                if pending_states.is_empty() {
+                    break;
+                }
+                for stored in pending_states {
+                    let event = stored.event;
+                    let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
+                        validate_decrypted_sync_event(&event)?;
+                        Ok(event)
+                    });
+                    match decrypted {
+                        Ok(DecryptedSyncEvent::ItemState(patch)) => {
+                            match self.apply_item_state_event(pool, &event, patch).await {
+                                Ok(()) => {
+                                    #[cfg(target_os = "android")]
+                                    {
+                                        applied_any = true;
+                                    }
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "defer synchronized state event {}: {error:#}",
+                                        event.event_id
+                                    );
+                                    let delay = repository::mark_apply_failed(
+                                        pool,
+                                        &event.event_id,
+                                        &error.to_string(),
+                                    )
+                                    .await?;
+                                    self.schedule_transfer_wake(delay);
                                 }
                             }
-                            Err(error) => {
-                                log::warn!(
-                                    "defer synchronized state event {}: {error:#}",
-                                    event.event_id
-                                );
-                                let delay = repository::mark_apply_failed(
-                                    pool,
-                                    &event.event_id,
-                                    &error.to_string(),
-                                )
-                                .await?;
-                                self.schedule_transfer_wake(delay);
-                            }
                         }
-                    }
-                    Ok(DecryptedSyncEvent::Clipboard(_)) => {
-                        log::warn!(
-                            "discard synchronized state event {} with content payload",
-                            event.event_id
-                        );
-                        repository::mark_rejected(
-                            pool,
-                            &event.event_id,
-                            "状态事件包含剪贴板内容载荷",
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                        repository::mark_rejected(pool, &event.event_id, &error.to_string())
+                        Ok(DecryptedSyncEvent::Clipboard(_)) => {
+                            log::warn!(
+                                "discard synchronized state event {} with content payload",
+                                event.event_id
+                            );
+                            repository::mark_rejected(
+                                pool,
+                                &event.event_id,
+                                "状态事件包含剪贴板内容载荷",
+                            )
                             .await?;
+                        }
+                        Err(error) => {
+                            log::warn!("discard invalid sync event {}: {error}", event.event_id);
+                            repository::mark_rejected(pool, &event.event_id, &error.to_string())
+                                .await?;
+                        }
                     }
                 }
             }
@@ -333,6 +450,7 @@ impl SyncManager {
             pool,
             source.delivery_target(),
             MAX_EVENTS_PER_BATCH,
+            attachments,
             Some(files),
         )
         .await?;
@@ -372,20 +490,92 @@ impl SyncManager {
             }
         }
 
+        // Filter lane eligibility in memory first so unchosen or attachment-only items do not
+        // trigger redundant SQLite write transactions before a download slot actually claims them.
+        let mut eligible_content = Vec::with_capacity(pending_content.len());
+        let mut woke_attachments = false;
+        for (event, envelope) in pending_content {
+            if envelope.item.kind != "files"
+                && !envelope.blobs.is_empty()
+                && !complete_content_source_event_ids.contains(&event.event_id)
+            {
+                continue;
+            }
+            if !attachments && envelope.item.kind != "files" && !envelope.blobs.is_empty() {
+                woke_attachments = true;
+                continue;
+            }
+            if attachments && envelope.blobs.is_empty() {
+                continue;
+            }
+            eligible_content.push((event, envelope));
+        }
+        if woke_attachments {
+            self.wake_attachments();
+        }
+
+        let mut body_claim = None;
+        if attachments {
+            let mut attachment_groups: Vec<ClipboardEnvelope> = Vec::new();
+            eligible_content.retain(|(_, envelope)| {
+                if !matches!(envelope.item.kind.as_str(), "files" | "image") {
+                    return true;
+                }
+                if attachment_groups
+                    .iter()
+                    .any(|other| same_attachment_content(envelope, other))
+                {
+                    return false;
+                }
+                attachment_groups.push(envelope.clone());
+                true
+            });
+            let mut selected = Vec::new();
+            for (event, envelope) in eligible_content {
+                let claim_key = format!("apply:{}", envelope.item.sync_key);
+                let Some(claim) = self.delivery.claim_remote_download(&claim_key) else {
+                    continue;
+                };
+                if !repository::content_event_pending(pool, &event.event_id).await? {
+                    continue;
+                }
+                if matches!(envelope.item.kind.as_str(), "files" | "image") {
+                    let (ids, retry) = self
+                        .equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
+                        .await?;
+                    if let Some((deadline, representative)) = retry {
+                        repository::copy_apply_retry(pool, &ids, &representative).await?;
+                        self.schedule_transfer_wake(deadline - Utc::now());
+                        continue;
+                    }
+                }
+                body_claim = Some(claim);
+                selected.push((event, envelope));
+                break;
+            }
+            eligible_content = selected;
+        }
+        let _body_claim = body_claim;
+
         // SQLite 写入按游标顺序串行完成，避免并发事务互相触发 SQLITE_BUSY；
         // 只有不持有数据库事务的 Blob 网络与文件 I/O 才并发执行。
         let mut ready_content = Vec::new();
         let mut metadata_only_content = Vec::new();
         let mut deduplicated_content = Vec::new();
         let resources = crate::core::paths::resources_dir(&self.app)?;
-        let local_storage_limit_bytes = self
+        let history = self
             .app
             .state::<SettingsStore>()
             .snapshot()
             .clipboard
-            .history
-            .max_storage_bytes;
-        for (event, envelope) in pending_content {
+            .history;
+        let local_storage_limit_bytes = history.max_storage_bytes;
+        let mut quota = AttachmentQuotaInspector::for_history(&self.app, pool, &history).await?;
+        for (event, envelope) in &eligible_content {
+            let (_, item_updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
+            quota.observe_timestamp(item_updated_at);
+        }
+        for (event, envelope) in eligible_content {
             let event_id = event.event_id.clone();
             let preparation: Result<()> = async {
                 let presence = SyncedItemStatePatch {
@@ -438,6 +628,43 @@ impl SyncManager {
                         );
                     }
                     repository::mark_applied(pool, &event.event_id).await?;
+                    if matches!(envelope.item.kind.as_str(), "files" | "image") {
+                        let (aliases, _) = self
+                            .equivalent_pending_files(
+                                pool,
+                                &event.event_id,
+                                &envelope,
+                                &key,
+                                source,
+                            )
+                            .await?;
+                        for alias in aliases {
+                            repository::mark_applied(pool, &alias).await?;
+                        }
+                    }
+                    made_content_progress = true;
+                    return Ok(());
+                }
+
+                let (_, item_updated_at) =
+                    synced_item_timestamps(&envelope.item, event.created_at_ms);
+                let attachment_bytes = envelope
+                    .blobs
+                    .iter()
+                    .fold(0_u64, |total, blob| total.saturating_add(blob.original_size));
+                if envelope.item.kind == "image"
+                    && attachments
+                    && !quota
+                        .admit_or_reject_historical(item_updated_at, attachment_bytes)
+                        .await
+                {
+                    repository::mark_applied(pool, &event.event_id).await?;
+                    let (aliases, _) = self
+                        .equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
+                        .await?;
+                    for alias in aliases {
+                        repository::mark_applied(pool, &alias).await?;
+                    }
                     made_content_progress = true;
                     return Ok(());
                 }
@@ -447,17 +674,6 @@ impl SyncManager {
                     .source_revision
                     .as_deref()
                     .unwrap_or(&event.event_id);
-                if envelope.item.kind != "files"
-                    && !envelope.blobs.is_empty()
-                    && !complete_content_source_event_ids.contains(&event.event_id)
-                {
-                    return Ok(());
-                }
-                if !attachments && envelope.item.kind != "files" && !envelope.blobs.is_empty() {
-                    self.wake_attachments();
-                    return Ok(());
-                }
-                if attachments && envelope.blobs.is_empty() { return Ok(()); }
                 let local_file_available = envelope.item.kind == "files"
                     && available_materialized_file_item(
                         pool,
@@ -472,19 +688,29 @@ impl SyncManager {
                     deduplicated_content.push((event, envelope));
                 } else if envelope.item.kind == "files" && !files {
                     let download_pending = complete_content_source_event_ids.contains(&event.event_id)
-                        && !should_defer_remote_file_download(&envelope, sync_settings.auto_download_max_mb, local_storage_limit_bytes);
-                    metadata_only_content.push((event, envelope, download_pending));
-                } else if envelope.item.kind == "files"
-                    && (!complete_content_source_event_ids.contains(&event.event_id)
-                        || should_defer_remote_file_download(
+                        && !should_defer_remote_file_download(
                             &envelope,
                             sync_settings.auto_download_max_mb,
                             local_storage_limit_bytes,
-                        ))
-                {
-                    metadata_only_content.push((event, envelope, false));
-                } else {
-                    let item_id = if envelope.item.kind == "files" {
+                        )
+                        && quota
+                            .admit_or_reject_historical(item_updated_at, attachment_bytes)
+                            .await;
+                    metadata_only_content.push((event, envelope, download_pending));
+                } else if envelope.item.kind == "files" {
+                    let deferred_or_rejected =
+                        !complete_content_source_event_ids.contains(&event.event_id)
+                            || should_defer_remote_file_download(
+                                &envelope,
+                                sync_settings.auto_download_max_mb,
+                                local_storage_limit_bytes,
+                            )
+                            || !quota
+                                .admit_or_reject_historical(item_updated_at, attachment_bytes)
+                                .await;
+                    if deferred_or_rejected {
+                        metadata_only_content.push((event, envelope, false));
+                    } else {
                         let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
                         let (item_id, _, _) = self
                             .materialize_remote_file_metadata_card(
@@ -495,11 +721,10 @@ impl SyncManager {
                             )
                             .await?;
                         source_assets_pending |= source_icon.is_some();
-                        Some(item_id)
-                    } else {
-                        None
-                    };
-                    ready_content.push((event, envelope, item_id));
+                        ready_content.push((event, envelope, Some(item_id)));
+                    }
+                } else {
+                    ready_content.push((event, envelope, None));
                 }
                 Ok(())
             }
@@ -512,6 +737,13 @@ impl SyncManager {
 
         for (event, envelope, download_pending) in metadata_only_content {
             let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
+            let aliases = if !download_pending {
+                self.equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
+                    .await?
+                    .0
+            } else {
+                Vec::new()
+            };
             let applied: Result<()> = async {
                 self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
                     .await?;
@@ -526,6 +758,16 @@ impl SyncManager {
                     self.wake_attachments();
                 } else {
                     repository::mark_applied(pool, &event.event_id).await?;
+                    for alias in &aliases {
+                        repository::record_inbound_outcome(
+                            pool,
+                            source.remote_batch_source(),
+                            alias,
+                            repository::InboundContentOutcome::Deduplicated,
+                        )
+                        .await?;
+                        repository::mark_applied(pool, alias).await?;
+                    }
                 }
                 Ok(())
             }
@@ -578,54 +820,9 @@ impl SyncManager {
             }
         }
 
-        let mut file_groups: Vec<ClipboardEnvelope> = Vec::new();
-        ready_content.retain(|(_, envelope, _)| {
-            if envelope.item.kind != "files" {
-                return true;
-            }
-            if file_groups
-                .iter()
-                .any(|other| same_file_content(envelope, other))
-            {
-                return false;
-            }
-            file_groups.push(envelope.clone());
-            true
-        });
-        let mut waiting_files = HashSet::new();
-        for (event, envelope, _) in &ready_content {
-            if envelope.item.kind != "files" {
-                continue;
-            }
-            let (ids, retry) = self
-                .equivalent_pending_files(pool, &event.event_id, envelope, &key, source)
-                .await?;
-            if let Some((deadline, representative)) = retry {
-                repository::copy_apply_retry(pool, &ids, &representative).await?;
-                self.schedule_transfer_wake(deadline - Utc::now());
-                waiting_files.insert(event.event_id.clone());
-            }
-        }
-        ready_content.retain(|(event, _, _)| !waiting_files.contains(&event.event_id));
-        let mut body_claim = None;
         if attachments {
-            let mut selected = Vec::new();
-            for entry in ready_content {
-                let claim_key = format!("apply:{}", entry.1.item.sync_key);
-                let Some(claim) = self.delivery.claim_remote_download(&claim_key) else {
-                    continue;
-                };
-                if !repository::content_event_pending(pool, &entry.0.event_id).await? {
-                    continue;
-                }
-                body_claim = Some(claim);
-                selected.push(entry);
-                break;
-            }
-            ready_content = selected;
             drop(apply_guard.take());
         }
-        let _body_claim = body_claim;
         let download_route = if source.is_cloud() {
             super::super::progress::TransferRoute::Cloud
         } else {
@@ -753,7 +950,7 @@ impl SyncManager {
                 continue;
             };
             let (event, envelope, stored_blobs, blob_error, download, canceled) = prepared;
-            let aliases = if envelope.item.kind == "files" {
+            let aliases = if matches!(envelope.item.kind.as_str(), "files" | "image") {
                 self.equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
                     .await?
                     .0
@@ -828,16 +1025,16 @@ impl SyncManager {
             .await;
             match applied {
                 Ok((item_id, item, fingerprint, deduplicated)) => {
-                    if !item_id.is_empty() {
-                        if latest_clipboard_item.as_ref().is_none_or(
+                    if !item_id.is_empty()
+                        && latest_clipboard_item.as_ref().is_none_or(
                             |(latest, _, _): &(
                                 ClipboardItem,
                                 Option<ClipboardFingerprint>,
                                 bool,
                             )| item.updated_at >= latest.updated_at,
-                        ) {
-                            latest_clipboard_item = Some((item, fingerprint, deduplicated));
-                        }
+                        )
+                    {
+                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
                     }
                     if let Some((handle, total_bytes, _)) = &download {
                         handle.completed(*total_bytes);
@@ -916,8 +1113,13 @@ impl SyncManager {
             self.wake_lan_transfer();
         }
         Ok(made_content_progress
-            && repository::has_unapplied_content_for_target(pool, source.delivery_target(), files)
-                .await?)
+            && repository::has_unapplied_content_for_target(
+                pool,
+                source.delivery_target(),
+                attachments,
+                files,
+            )
+            .await?)
     }
 
     /// Includes copies received during an active download and preserves their shared backoff.
@@ -935,10 +1137,13 @@ impl SyncManager {
             repository::pending_file_events_for_item(pool, event_id, source.delivery_target())
                 .await?
         {
+            if alias.event.event_id == event_id {
+                continue;
+            }
             if let Ok(DecryptedSyncEvent::Clipboard(other)) =
                 crypto::decrypt_sync_event(key, &alias.event)
             {
-                if same_file_content(envelope, &other) {
+                if same_attachment_content(envelope, &other) {
                     if let Some(deadline) = retry_at.filter(|deadline| *deadline > Utc::now()) {
                         if retry
                             .as_ref()
@@ -1725,4 +1930,15 @@ fn same_file_content(left: &ClipboardEnvelope, right: &ClipboardEnvelope) -> boo
             .zip(right.content_identity.as_ref())
             .is_some_and(|(left, right)| left == right)
             || file_transfer_key(left) == file_transfer_key(right))
+}
+
+fn same_attachment_content(left: &ClipboardEnvelope, right: &ClipboardEnvelope) -> bool {
+    if left.item.kind != right.item.kind {
+        return false;
+    }
+    match left.item.kind.as_str() {
+        "files" => same_file_content(left, right),
+        "image" => !left.item.sync_key.is_empty() && left.item.sync_key == right.item.sync_key,
+        _ => false,
+    }
 }

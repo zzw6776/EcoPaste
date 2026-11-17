@@ -68,17 +68,23 @@ pub async fn get_storage_location(app: AppHandle) -> Result<StorageLocation> {
 /// 统计当前 `env_dir()` 数据目录的递归总占用，并拆分常见分项供侧栏展示。
 #[tauri::command]
 pub async fn get_storage_usage(app: AppHandle) -> Result<StorageUsage> {
-    let total_bytes = dir_size(&crate::core::paths::app_data_dir(&app)?)?;
-    let database_bytes = database_bytes(&app)?;
-    let resources_bytes = dir_size(&crate::core::paths::resources_dir(&app)?)?;
-    let settings_bytes = settings_bytes(&app)?;
+    let usage = tauri::async_runtime::spawn_blocking(move || -> Result<StorageUsage> {
+        let total_bytes = dir_size(&crate::core::paths::app_data_dir(&app)?)?;
+        let database_bytes = database_bytes(&app)?;
+        let resources_bytes = dir_size(&crate::core::paths::resources_dir(&app)?)?;
+        let settings_bytes = settings_bytes(&app)?;
 
-    Ok(StorageUsage {
-        total_bytes,
-        database_bytes,
-        resources_bytes,
-        settings_bytes,
+        Ok(StorageUsage {
+            total_bytes,
+            database_bytes,
+            resources_bytes,
+            settings_bytes,
+        })
     })
+    .await
+    .context("measure storage usage task failed")??;
+
+    Ok(usage)
 }
 
 /// 将数据目录迁移到用户选择的父目录下，并热切换当前运行时状态。
@@ -108,6 +114,11 @@ pub async fn clean_resource_cache(
     app: AppHandle,
     db: tauri::State<'_, DatabaseState>,
 ) -> Result<CleanCacheResult> {
+    let sync = app.try_state::<Arc<crate::sync::SyncManager>>();
+    let _sync_guard = match sync.as_ref() {
+        Some(manager) => Some(manager.pause_for_resource_cleanup().await),
+        None => None,
+    };
     let _files_guard = shared_files::lock().await;
     let pool = db.pool().await;
     let resources_dir = crate::core::paths::resources_dir(&app)?;
@@ -118,16 +129,28 @@ pub async fn clean_resource_cache(
     let images = reclaim_unreferenced_images(&pool, &resources_dir).await?;
     removed.files += images.files;
     removed.bytes += images.bytes;
-    clean_unreferenced_files(
-        &resources_dir.join("app-icons"),
-        &app_icon_files,
-        &mut removed,
-    )?;
-    clean_unreferenced_files(
-        &resources_dir.join("file-icons"),
-        &file_icon_files,
-        &mut removed,
-    )?;
+    let app_icons_dir = resources_dir.join("app-icons");
+    let file_icons_dir = resources_dir.join("file-icons");
+    let icon_cleanup =
+        tauri::async_runtime::spawn_blocking(move || -> Result<shared_files::CleanupStats> {
+            let mut stats = shared_files::CleanupStats::default();
+            clean_unreferenced_files(&app_icons_dir, &app_icon_files, &mut stats)?;
+            clean_unreferenced_files(&file_icons_dir, &file_icon_files, &mut stats)?;
+            Ok(stats)
+        })
+        .await
+        .context("clean unreferenced icon files task failed")??;
+    removed.files += icon_cleanup.files;
+    removed.bytes += icon_cleanup.bytes;
+    if let Some(manager) = sync.as_ref() {
+        let sync_removed = manager
+            .reclaim_released_sync_content_with_stats(&pool)
+            .await?;
+        removed.files += sync_removed.files;
+        removed.bytes += sync_removed.bytes;
+    }
+    drop(_files_guard);
+    drop(_sync_guard);
 
     Ok(CleanCacheResult {
         removed_files: removed.files,
@@ -167,7 +190,6 @@ async fn switch_storage_location(
     db: &DatabaseState,
     target: PathBuf,
 ) -> Result<ChangeStorageLocationResult> {
-    let _shared_files_guard = crate::clipboard::shared_files::lock().await;
     let current = crate::core::paths::app_data_dir(&app)?;
     if current == target {
         return Ok(ChangeStorageLocationResult {
@@ -181,23 +203,39 @@ async fn switch_storage_location(
         crate::core::paths::validate_storage_target(&target)?;
     }
 
+    let sync = app.try_state::<Arc<crate::sync::SyncManager>>();
+    let _sync_suspension = match sync.as_ref() {
+        Some(manager) => Some(manager.suspend_for_storage_replacement().await?),
+        None => None,
+    };
+    let _shared_files_guard = crate::clipboard::shared_files::lock().await;
+
     let _pause_guard = pause_watcher(&app);
     let switch_error = Arc::new(Mutex::new(None::<String>));
     let switch_error_for_task = switch_error.clone();
     let app_for_db = app.clone();
     let current_for_db = current.clone();
     let target_for_db = target.clone();
+    let old_resources = current.join("resources");
+    let new_resources = target.join("resources");
     let reference_migration = crate::clipboard::shared_files::ReferenceMigration::storage_move(
-        &current.join("resources"),
-        target.join("resources"),
+        &old_resources,
+        new_resources.clone(),
     );
 
     db.close_and_replace(|| async move {
-        let switch_result = (|| -> Result<()> {
-            copy_storage_data(&current_for_db, &target_for_db)?;
-            crate::core::paths::set_app_data_dir(&app_for_db, target_for_db.clone())?;
-            Ok(())
-        })();
+        let current_copy = current_for_db.clone();
+        let target_copy = target_for_db.clone();
+        let copy_result = tauri::async_runtime::spawn_blocking(move || {
+            copy_storage_data(&current_copy, &target_copy)
+        })
+        .await
+        .context("copy storage data task failed");
+        let switch_result = match copy_result {
+            Ok(Ok(())) => crate::core::paths::set_app_data_dir(&app_for_db, target_for_db.clone()),
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(err.into()),
+        };
 
         if let Err(err) = switch_result {
             *switch_error_for_task
@@ -210,6 +248,12 @@ async fn switch_storage_location(
         let initialized = async {
             let pool = crate::db::init(&app_for_db).await?;
             reference_migration.apply(&pool).await?;
+            crate::sync::repository::rebase_sync_resource_paths(
+                &pool,
+                &old_resources,
+                &new_resources,
+            )
+            .await?;
             Ok::<_, crate::core::AppError>(pool)
         }
         .await;
@@ -235,7 +279,19 @@ async fn switch_storage_location(
     }
 
     let settings = rebase_storage_states(&app).await?;
-    remove_old_storage_data(&app, &current)?;
+    if let Some(manager) = sync.as_ref() {
+        manager.reconcile_after_storage_replacement(&app)?;
+    }
+    let app_for_remove = app.clone();
+    let current_for_remove = current.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        remove_old_storage_data(&app_for_remove, &current_for_remove)
+    })
+    .await
+    .context("remove old storage data task failed")??;
+    drop(_pause_guard);
+    drop(_shared_files_guard);
+    drop(_sync_suspension);
     emit_settings_updated(&app, &settings);
     emit_clipboard_imported(&app);
 

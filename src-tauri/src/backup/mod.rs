@@ -303,9 +303,9 @@ pub async fn import_history_backup(
     .await
     .context("backup import preparation task failed")??;
 
-    let _shared_files_guard = crate::clipboard::shared_files::lock().await;
     match options.strategy {
         BackupImportStrategy::Merge => {
+            let _shared_files_guard = crate::clipboard::shared_files::lock().await;
             let pool = db.pool().await;
             merge_import(app, &pool, temp.path(), &options).await
         }
@@ -1089,6 +1089,12 @@ async fn overwrite_import(
     root: &Path,
     _options: &ImportHistoryBackupOptions,
 ) -> Result<ImportHistoryBackupResult> {
+    let sync = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>();
+    let _sync_suspension = match sync.as_ref() {
+        Some(manager) => Some(manager.suspend_for_storage_replacement().await?),
+        None => None,
+    };
+    let _shared_files_guard = crate::clipboard::shared_files::lock().await;
     let _pause_guard = pause_watcher(app);
     let migration = managed_resource_migration(app, root)?;
     let current_pool = db.pool().await;
@@ -1124,16 +1130,18 @@ async fn overwrite_import(
     .await?;
 
     refresh_apps_registry(app).await;
-    emit_clipboard_imported(app);
-
     let settings_path = root.join(CONFIG_ARCHIVE_DIR).join(SETTINGS_FILENAME);
     let next = app
         .state::<crate::settings::SettingsStore>()
         .replace_from_file(&settings_path)?;
-    emit_settings_updated(app, &next);
-    if let Some(manager) = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>() {
-        manager.wake();
+    if let Some(manager) = sync.as_ref() {
+        manager.reconcile_after_storage_replacement(app)?;
     }
+    drop(_pause_guard);
+    drop(_shared_files_guard);
+    drop(_sync_suspension);
+    emit_clipboard_imported(app);
+    emit_settings_updated(app, &next);
 
     Ok(ImportHistoryBackupResult {
         strategy: BackupImportStrategy::Overwrite,
