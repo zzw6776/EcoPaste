@@ -235,6 +235,7 @@ pub fn run() {
             commands::get_update_status,
             commands::check_for_updates,
             commands::download_update,
+            commands::cancel_update_download,
             commands::install_update,
             commands::skip_update_version,
             commands::get_android_permissions_status,

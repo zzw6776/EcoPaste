@@ -9,9 +9,9 @@ pub mod state;
 pub mod sync_item_state;
 pub mod sync_queue;
 
-pub use init::init;
+pub use init::{init, init_at};
 pub use path::db_path;
-pub use state::DatabaseState;
+pub use state::{DatabaseState, PoolReplacement};
 
 #[cfg(test)]
 pub(crate) mod test_support {

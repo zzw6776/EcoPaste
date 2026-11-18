@@ -14,6 +14,7 @@
     "addApp": "Add app",
     "cancelFavorite": "Unfavorite",
     "cancelSyncTransfer": "Cancel transfer",
+    "cancelUpdateDownload": "Cancel update download",
     "changeStorageLocation": "Change data directory",
     "checkForUpdates": "Check for updates",
     "cleanCache": "Clean cache",

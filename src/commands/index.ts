@@ -974,13 +974,23 @@ export const checkForUpdates = () => {
 };
 
 /**
- * 下载并校验当前更新包，进度通过 `update://progress` 推送。
+ * 下载并校验当前更新包，进度通过 `update://progress` 推送；Android 取消下载时返回 `null`。
  */
 export const downloadUpdate = (version: string) => {
-  return call<UpdateMetadata>(
+  return call<UpdateMetadata | null>(
     TAURI_COMMAND.DOWNLOAD_UPDATE,
     "commands:labels.downloadUpdate",
     { version },
+  );
+};
+
+/**
+ * 中止当前正在进行的 Android 更新包下载；桌面端为空操作。
+ */
+export const cancelUpdateDownload = () => {
+  return call<void>(
+    TAURI_COMMAND.CANCEL_UPDATE_DOWNLOAD,
+    "commands:labels.cancelUpdateDownload",
   );
 };
 

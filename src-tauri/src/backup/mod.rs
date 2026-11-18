@@ -1089,6 +1089,9 @@ async fn overwrite_import(
     root: &Path,
     _options: &ImportHistoryBackupOptions,
 ) -> Result<ImportHistoryBackupResult> {
+    let settings_path = root.join(CONFIG_ARCHIVE_DIR).join(SETTINGS_FILENAME);
+    crate::settings::SettingsStore::validate_file(&settings_path)?;
+
     let sync = app.try_state::<std::sync::Arc<crate::sync::SyncManager>>();
     let _sync_suspension = match sync.as_ref() {
         Some(manager) => Some(manager.suspend_for_storage_replacement().await?),
@@ -1098,39 +1101,34 @@ async fn overwrite_import(
     let _pause_guard = pause_watcher(app);
     let migration = managed_resource_migration(app, root)?;
     let current_pool = db.pool().await;
+    checkpoint_database(&current_pool).await?;
     let current_origin_sequence =
         crate::sync::repository::current_origin_sequence(&current_pool).await?;
     drop(current_pool);
 
     let db_src = root.join(DB_ARCHIVE_DIR).join(DB_FILENAME);
     let resources_src = root.join(RESOURCES_ARCHIVE_DIR);
-    let app_for_db = app.clone();
-    db.close_and_replace(|| {
-        let app = app_for_db.clone();
-        let db_src = db_src.clone();
-        async move {
-            replace_live_database(&app, &db_src)?;
-            if resources_src.exists() {
-                replace_dir(&resources_src, &crate::core::paths::resources_dir(&app)?)?;
-            }
-            let pool = crate::db::init(&app).await?;
-            migration.apply(&pool).await?;
-            let removed_remote_items =
-                crate::sync::repository::clear_imported_group_state(&pool, current_origin_sequence)
-                    .await?;
-            remove_imported_sync_staging(&app)?;
-            if removed_remote_items > 0 {
-                log::info!(
-                    "backup overwrite skipped {removed_remote_items} remote file metadata card(s)"
-                );
-            }
-            Ok(pool)
-        }
+    let removed_remote_items =
+        prepare_staged_overwrite_db(&db_src, &migration, current_origin_sequence).await?;
+    if removed_remote_items > 0 {
+        log::info!("backup overwrite skipped {removed_remote_items} remote file metadata card(s)");
+    }
+
+    let live_db = crate::db::db_path(app)?;
+    let live_resources = crate::core::paths::resources_dir(app)?;
+    db.replace_with_rollback(|| async {
+        execute_overwrite_storage_swap(
+            &live_db,
+            &live_resources,
+            &db_src,
+            &resources_src,
+            || async move { Ok(()) },
+        )
+        .await
     })
     .await?;
 
     refresh_apps_registry(app).await;
-    let settings_path = root.join(CONFIG_ARCHIVE_DIR).join(SETTINGS_FILENAME);
     let next = app
         .state::<crate::settings::SettingsStore>()
         .replace_from_file(&settings_path)?;
@@ -1153,9 +1151,224 @@ async fn overwrite_import(
     })
 }
 
-/// Removes transport-only ciphertext restored inside the resources directory.
-fn remove_imported_sync_staging(app: &AppHandle) -> Result<()> {
-    let resources = crate::core::paths::resources_dir(app)?;
+/// Validates and migrates the unpacked backup database in temp storage before touching live data.
+async fn prepare_staged_overwrite_db(
+    staged_db: &Path,
+    migration: &crate::clipboard::shared_files::ReferenceMigration,
+    current_origin_sequence: Option<u64>,
+) -> Result<u64> {
+    let pool = crate::db::init_at(staged_db).await?;
+    let result = async {
+        migration.apply(&pool).await?;
+        let removed_remote_items =
+            crate::sync::repository::clear_imported_group_state(&pool, current_origin_sequence)
+                .await?;
+        checkpoint_database(&pool).await?;
+        Ok::<_, AppError>(removed_remote_items)
+    }
+    .await;
+    pool.close().await;
+    remove_sqlite_sidecars(staged_db)?;
+    result
+}
+
+/// Removes WAL/SHM sidecar files for a closed SQLite database path.
+fn remove_sqlite_sidecars(db_path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(db_path, suffix);
+        if sidecar.exists() {
+            fs::remove_file(&sidecar)
+                .with_context(|| format!("failed to remove sqlite sidecar {sidecar:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", db_path.display()))
+}
+
+struct StorageRollbackSnapshot {
+    db_moved: Vec<(PathBuf, PathBuf)>,
+    resources_moved: Option<(PathBuf, PathBuf)>,
+}
+
+impl StorageRollbackSnapshot {
+    /// Moves existing database files and resource directories to sibling rollback locations.
+    fn capture(live_db: &Path, live_resources: &Path) -> Result<Self> {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let mut db_moved = Vec::new();
+        for source in [
+            live_db.to_path_buf(),
+            sqlite_sidecar_path(live_db, "-wal"),
+            sqlite_sidecar_path(live_db, "-shm"),
+        ] {
+            if !source.exists() {
+                continue;
+            }
+            let backup = PathBuf::from(format!("{}.rollback-{token}", source.display()));
+            if let Err(error) = fs::rename(&source, &backup) {
+                let partial = Self {
+                    db_moved,
+                    resources_moved: None,
+                };
+                if let Err(restore_error) = partial.restore_sync(live_db, live_resources) {
+                    log::warn!(
+                        "rollback after partial database snapshot failed: {restore_error:#}"
+                    );
+                }
+                return Err(anyhow::Error::from(error)
+                    .context(format!("failed to snapshot {source:?} before overwrite"))
+                    .into());
+            }
+            db_moved.push((source, backup));
+        }
+
+        let resources_moved = if live_resources.exists() {
+            let backup = PathBuf::from(format!("{}.rollback-{token}", live_resources.display()));
+            if let Err(error) = fs::rename(live_resources, &backup) {
+                let partial = Self {
+                    db_moved,
+                    resources_moved: None,
+                };
+                if let Err(restore_error) = partial.restore_sync(live_db, live_resources) {
+                    log::warn!(
+                        "rollback after resource snapshot failure failed: {restore_error:#}"
+                    );
+                }
+                return Err(anyhow::Error::from(error)
+                    .context(format!(
+                        "failed to snapshot {live_resources:?} before overwrite"
+                    ))
+                    .into());
+            }
+            Some((live_resources.to_path_buf(), backup))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            db_moved,
+            resources_moved,
+        })
+    }
+
+    fn has_database_snapshot(&self) -> bool {
+        !self.db_moved.is_empty()
+    }
+
+    /// Removes partial new targets and restores the captured live database and resources.
+    fn restore_sync(self, live_db: &Path, live_resources: &Path) -> Result<()> {
+        for target in [
+            live_db.to_path_buf(),
+            sqlite_sidecar_path(live_db, "-wal"),
+            sqlite_sidecar_path(live_db, "-shm"),
+        ] {
+            if target.exists() {
+                fs::remove_file(&target)
+                    .with_context(|| format!("failed to clean partial database {target:?}"))?;
+            }
+        }
+        if live_resources.exists() {
+            fs::remove_dir_all(live_resources)
+                .with_context(|| format!("failed to clean partial resources {live_resources:?}"))?;
+        }
+        for (original, backup) in self.db_moved {
+            if backup.exists() {
+                fs::rename(&backup, &original)
+                    .with_context(|| format!("failed to restore database {original:?}"))?;
+            }
+        }
+        if let Some((original, backup)) = self.resources_moved {
+            if backup.exists() {
+                fs::rename(&backup, &original)
+                    .with_context(|| format!("failed to restore resources {original:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort cleanup once the replacement database pool is active.
+    fn discard(self) {
+        for (_, backup) in self.db_moved {
+            if backup.exists() {
+                if let Err(error) = fs::remove_file(&backup) {
+                    log::warn!("remove overwrite rollback file {backup:?} failed: {error}");
+                }
+            }
+        }
+        if let Some((_, backup)) = self.resources_moved {
+            if backup.exists() {
+                if let Err(error) = fs::remove_dir_all(&backup) {
+                    log::warn!("remove overwrite rollback directory {backup:?} failed: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// Atomically swaps live database and resources with staged data, rolling back on any failure.
+async fn execute_overwrite_storage_swap<F, Fut>(
+    live_db: &Path,
+    live_resources: &Path,
+    staged_db: &Path,
+    staged_resources: &Path,
+    after_copy: F,
+) -> crate::db::PoolReplacement
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let snapshot = match StorageRollbackSnapshot::capture(live_db, live_resources) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let pool = crate::db::init_at(live_db).await.ok();
+            return crate::db::PoolReplacement::RolledBack { pool, error };
+        }
+    };
+    let had_live_db = snapshot.has_database_snapshot();
+
+    let install = async {
+        copy_file_to(staged_db, live_db)?;
+        if staged_resources.exists() {
+            copy_dir_all(staged_resources, live_resources)?;
+        }
+        remove_sync_staging_at(live_resources)?;
+        after_copy().await?;
+        crate::db::init_at(live_db).await
+    }
+    .await;
+
+    match install {
+        Ok(pool) => {
+            snapshot.discard();
+            crate::db::PoolReplacement::Replaced(pool)
+        }
+        Err(error) => {
+            if let Err(restore_error) = snapshot.restore_sync(live_db, live_resources) {
+                log::error!("restore backup overwrite snapshot failed: {restore_error:#}");
+                return crate::db::PoolReplacement::RolledBack { pool: None, error };
+            }
+            let pool = if had_live_db {
+                match crate::db::init_at(live_db).await {
+                    Ok(pool) => Some(pool),
+                    Err(reopen_error) => {
+                        log::error!(
+                            "reopen restored database after failed overwrite failed: {reopen_error:#}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            crate::db::PoolReplacement::RolledBack { pool, error }
+        }
+    }
+}
+
+/// Removes transport-only ciphertext directories inside a resources directory.
+fn remove_sync_staging_at(resources: &Path) -> Result<()> {
     for directory in [
         crate::sync::SYNC_STAGING_DIR,
         crate::sync::LEGACY_SYNC_BLOB_DIR,
@@ -1500,21 +1713,6 @@ fn pause_watcher(app: &AppHandle) -> WatcherPauseRestore {
     }
 }
 
-/// 用备份数据库替换当前主数据库，并移除旧 WAL / SHM sidecar。
-fn replace_live_database(app: &AppHandle, src: &Path) -> Result<()> {
-    let dst = crate::db::db_path(app)?;
-    copy_file_to(src, &dst)?;
-
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = PathBuf::from(format!("{}{suffix}", dst.display()));
-        if sidecar.exists() {
-            fs::remove_file(&sidecar).with_context(|| format!("failed to remove {sidecar:?}"))?;
-        }
-    }
-
-    Ok(())
-}
-
 /// 覆盖导入后从新数据库重建来源应用内存缓存。
 async fn refresh_apps_registry(app: &AppHandle) {
     let Some(registry) = app.try_state::<crate::clipboard::AppsRegistry>() else {
@@ -1550,8 +1748,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<u64> {
     for entry in WalkDir::new(src)
         .into_iter()
         .filter_entry(|entry| !is_transport_only_resource_path(src, entry.path()))
-        .filter_map(std::result::Result::ok)
     {
+        let entry = entry.with_context(|| format!("failed to traverse {src:?}"))?;
         let path = entry.path();
         let relative = path
             .strip_prefix(src)
@@ -1583,8 +1781,8 @@ fn copy_dir_missing(src: &Path, dst: &Path) -> Result<u64> {
     for entry in WalkDir::new(src)
         .into_iter()
         .filter_entry(|entry| !is_transport_only_resource_path(src, entry.path()))
-        .filter_map(std::result::Result::ok)
     {
+        let entry = entry.with_context(|| format!("failed to traverse {src:?}"))?;
         let path = entry.path();
         if !entry.file_type().is_file() {
             continue;
@@ -1603,15 +1801,6 @@ fn copy_dir_missing(src: &Path, dst: &Path) -> Result<u64> {
     }
 
     Ok(copied)
-}
-
-fn replace_dir(src: &Path, dst: &Path) -> Result<()> {
-    if dst.exists() {
-        fs::remove_dir_all(dst).with_context(|| format!("failed to remove {dst:?}"))?;
-    }
-    copy_dir_all(src, dst)?;
-
-    Ok(())
 }
 
 fn emit_clipboard_imported(app: &AppHandle) {
@@ -2183,5 +2372,132 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(imported_sync_key, item.sync_key);
+    }
+
+    #[tokio::test]
+    async fn overwrite_staging_rejects_corrupt_database_before_pool_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged_db = temp.path().join("staged/clipboard.db");
+        fs::create_dir_all(staged_db.parent().unwrap()).unwrap();
+        fs::write(&staged_db, b"not-a-sqlite-database").unwrap();
+
+        let migration = crate::clipboard::shared_files::ReferenceMigration::current(
+            temp.path().join("resources"),
+        );
+
+        assert!(prepare_staged_overwrite_db(&staged_db, &migration, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn overwrite_swap_rolls_back_storage_and_restores_database_pool_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let live_root = temp.path().join("live");
+        let staged_root = temp.path().join("staged");
+        let live_db = live_root.join("db/clipboard.db");
+        let live_resources = live_root.join("resources");
+        let staged_db = staged_root.join("db/clipboard.db");
+        let staged_resources = staged_root.join("resources");
+
+        let pool = crate::db::init_at(&live_db).await.unwrap();
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let existing_item = crate::db::models::ClipboardItem {
+            id: "keep-item-1".to_owned(),
+            kind: crate::db::models::ClipboardKind::Text,
+            sub_kind: None,
+            group_id: None,
+            source_app_id: None,
+            source_revision: uuid::Uuid::new_v4().simple().to_string(),
+            source_device_id: None,
+            source_device_name: None,
+            source_updated_at: None,
+            source_device_is_local: true,
+            content_hash: crate::db::items::content_hash(
+                crate::db::models::ClipboardKind::Text,
+                "original-content",
+            ),
+            sync_key: "e".repeat(64),
+            content: "original-content".to_owned(),
+            search_text: None,
+            summary: None,
+            text_char_count: None,
+            file_types: None,
+            size: None,
+            width: None,
+            height: None,
+            use_count: 1,
+            is_favorite: false,
+            is_pinned: false,
+            is_sensitive: false,
+            platform: crate::db::models::Platform::Macos,
+            note: None,
+            created_at: now,
+            updated_at: now,
+            source_app_name: None,
+            source_app_icon_file: None,
+            source_app_icon_path: None,
+            source_app_accent_start: None,
+            source_app_accent_end: None,
+            image_thumbnail_path: None,
+            file_entries: None,
+            files_preview_kind: None,
+            remote_file_state: None,
+            available_actions: Vec::new(),
+            color_preview: None,
+            display_created_at: String::new(),
+        };
+        crate::db::items::insert_item(&pool, &existing_item)
+            .await
+            .unwrap();
+
+        fs::create_dir_all(live_resources.join("clipboard-images/origin")).unwrap();
+        fs::write(
+            live_resources.join("clipboard-images/origin/keep.png"),
+            b"live-image",
+        )
+        .unwrap();
+
+        let staged_pool = crate::db::init_at(&staged_db).await.unwrap();
+        staged_pool.close().await;
+        remove_sqlite_sidecars(&staged_db).unwrap();
+        fs::create_dir_all(staged_resources.join("clipboard-images/origin")).unwrap();
+        fs::write(
+            staged_resources.join("clipboard-images/origin/new.png"),
+            b"staged-image",
+        )
+        .unwrap();
+
+        let db_state = crate::db::DatabaseState::new(pool);
+        let result = db_state
+            .replace_with_rollback(|| async {
+                execute_overwrite_storage_swap(
+                    &live_db,
+                    &live_resources,
+                    &staged_db,
+                    &staged_resources,
+                    || async { Err(anyhow!("simulated resource install failure").into()) },
+                )
+                .await
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(live_resources.join("clipboard-images/origin/keep.png")).unwrap(),
+            b"live-image"
+        );
+        assert!(!live_resources
+            .join("clipboard-images/origin/new.png")
+            .exists());
+
+        let active_pool = db_state.pool().await;
+        assert!(!active_pool.is_closed());
+        let restored = crate::db::items::find_item_by_id(&active_pool, "keep-item-1")
+            .await
+            .unwrap()
+            .expect("original clipboard item must survive failed overwrite");
+        assert_eq!(restored.content, "original-content");
+        active_pool.close().await;
     }
 }

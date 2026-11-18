@@ -15,8 +15,13 @@ pub async fn check_for_updates(app: AppHandle) -> Result<AppUpdateStatus> {
 }
 
 #[tauri::command]
-pub async fn download_update(app: AppHandle, version: String) -> Result<UpdateMetadata> {
+pub async fn download_update(app: AppHandle, version: String) -> Result<Option<UpdateMetadata>> {
     update::download(&app, version).await
+}
+
+#[tauri::command]
+pub fn cancel_update_download(app: AppHandle) {
+    update::cancel_download(&app);
 }
 
 #[tauri::command]

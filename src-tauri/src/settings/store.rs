@@ -105,14 +105,20 @@ impl SettingsStore {
         Ok(next)
     }
 
-    /// 用完整设置文件替换当前设置；覆盖导入专用。
-    pub fn replace_from_file(&self, path: &Path) -> Result<Settings> {
+    /// Reads and validates a settings file without modifying current state on disk or in memory.
+    pub fn validate_file(path: &Path) -> Result<Settings> {
         let content =
             fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let next: Settings = serde_json::from_str(&content)
             .map_err(|err| AppError::Other(anyhow::anyhow!("invalid settings file: {err}")))?;
 
         validate_settings(&next)?;
+        Ok(next)
+    }
+
+    /// 用完整设置文件替换当前设置；覆盖导入专用。
+    pub fn replace_from_file(&self, path: &Path) -> Result<Settings> {
+        let next = Self::validate_file(path)?;
 
         let path = self.path();
         write_atomic(&path, &next)?;
