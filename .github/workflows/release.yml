@@ -215,13 +215,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: macOS Apple Silicon
+          - bundle_arch: aarch64
+            label: macOS Apple Silicon
             os: macos-latest
-            publish_release: true
             target: aarch64-apple-darwin
-          - label: macOS Intel
+          - bundle_arch: x64
+            label: macOS Intel
             os: macos-26-intel
-            publish_release: true
             target: x86_64-apple-darwin
     steps:
       - name: Checkout release
@@ -285,11 +285,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
-          prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           releaseDraft: true
-          releaseId: ${{ matrix.publish_release && needs.release-metadata.outputs.release_id || '' }}
           retryAttempts: 3
-          tagName: ${{ matrix.publish_release && needs.release-metadata.outputs.tag_name || '' }}
           uploadUpdaterJson: false
 
       - name: Verify macOS app signatures and DMG contents before publishing
@@ -297,6 +294,40 @@ jobs:
         env:
           TAURI_TARGET: ${{ matrix.target }}
         run: bash scripts/verifyMacosBundle.sh "src-tauri/target/${TAURI_TARGET}/release/bundle"
+
+      - name: Upload verified macOS release assets
+        shell: bash
+        env:
+          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          TAG_NAME: ${{ needs.release-metadata.outputs.tag_name }}
+          TAURI_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bundle_dir="src-tauri/target/${TAURI_TARGET}/release/bundle"
+          dmg_asset="${bundle_dir}/dmg/EcoPaste_${RELEASE_VERSION}_${BUNDLE_ARCH}.dmg"
+          tar_asset="${bundle_dir}/macos/EcoPaste.app.tar.gz"
+          sig_asset="${bundle_dir}/macos/EcoPaste.app.tar.gz.sig"
+
+          for asset in "${dmg_asset}" "${tar_asset}" "${sig_asset}"; do
+            if [[ ! -f "${asset}" ]]; then
+              echo "::error::Missing verified macOS release asset: ${asset}"
+              exit 1
+            fi
+          done
+
+          release_assets="${RUNNER_TEMP}/macos-${BUNDLE_ARCH}-release"
+          mkdir -p "${release_assets}"
+          cp "${tar_asset}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_${BUNDLE_ARCH}.app.tar.gz"
+          cp "${sig_asset}" "${release_assets}/EcoPaste_${RELEASE_VERSION}_${BUNDLE_ARCH}.app.tar.gz.sig"
+          gh release upload "${TAG_NAME}" \
+            "${dmg_asset}" \
+            "${release_assets}/EcoPaste_${RELEASE_VERSION}_${BUNDLE_ARCH}.app.tar.gz" \
+            "${release_assets}/EcoPaste_${RELEASE_VERSION}_${BUNDLE_ARCH}.app.tar.gz.sig" \
+            --clobber
 
   build-android:
     name: Build Android ${{ matrix.label }}

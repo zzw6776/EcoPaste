@@ -1,11 +1,12 @@
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useMount } from "ahooks";
+import { useMount, useUnmount } from "ahooks";
 import { Button, Progress } from "antd";
 import type { FC } from "react";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   type AppUpdateStatus,
+  cancelUpdateDownload,
   checkForUpdates,
   downloadUpdate,
   getUpdateStatus,
@@ -58,6 +59,9 @@ const Update: FC = () => {
     total: null,
   });
   const operationRef = useRef(false);
+  const downloadCancelledRef = useRef(false);
+  const stateRef = useRef<UpdateViewState>(state);
+  stateRef.current = state;
   const [errorPhase, setErrorPhase] = useState<UpdateErrorPhase>("checking");
   const [errorMessage, setErrorMessage] = useState("");
   const statusText = resolveStatusText(t, state, errorPhase);
@@ -136,6 +140,7 @@ const Update: FC = () => {
     if (!update || operationRef.current) return;
 
     operationRef.current = true;
+    downloadCancelledRef.current = false;
     setUpdateState("downloading");
     setErrorPhase("updating");
     setErrorMessage("");
@@ -143,6 +148,11 @@ const Update: FC = () => {
 
     try {
       const nextUpdate = await downloadUpdate(update.version);
+      if (!nextUpdate || downloadCancelledRef.current) {
+        setUpdateState("available");
+        return;
+      }
+
       setUpdate(nextUpdate);
       setUpdateState("downloaded");
       setProgress({
@@ -150,7 +160,14 @@ const Update: FC = () => {
         progress: 1,
         total: progress.total,
       });
+
+      if (isAndroid) {
+        await installUpdate(nextUpdate.version);
+      }
     } catch (error) {
+      if (downloadCancelledRef.current) {
+        return;
+      }
       log.warn("download update failed", error);
       setErrorPhase("updating");
       setUpdateState("error");
@@ -203,6 +220,22 @@ const Update: FC = () => {
     await hideWindow(getCurrentWebviewWindow().label);
   };
 
+  /**
+   * 取消当前检查或下载操作；Android 下载中会同步中止后台 APK 拉取。
+   */
+  const cancelUpdateProcess = async () => {
+    if (isAndroid && stateRef.current === "downloading") {
+      downloadCancelledRef.current = true;
+      try {
+        await cancelUpdateDownload();
+      } catch (error) {
+        log.warn("cancel Android update download failed", error);
+      }
+    }
+
+    await closeWindow();
+  };
+
   const openReleaseNotes = async () => {
     if (!update) return;
 
@@ -234,11 +267,22 @@ const Update: FC = () => {
       return;
     }
 
-    setUpdateState(isAndroid ? "downloading" : "available");
+    setUpdateState("available");
   };
 
   useMount(async () => {
     await restoreUpdateStatus();
+  });
+
+  useUnmount(() => {
+    if (
+      isAndroid &&
+      stateRef.current === "downloading" &&
+      !downloadCancelledRef.current
+    ) {
+      downloadCancelledRef.current = true;
+      void cancelUpdateDownload();
+    }
   });
 
   useTauriListen<WindowVisibilityPayload>(
@@ -333,7 +377,7 @@ const Update: FC = () => {
         </div>
 
         <footer className="mt-auto flex shrink-0 items-center gap-3 pt-4">
-          {state === "available" ? (
+          {state === "available" || (isAndroid && state === "downloaded") ? (
             <Button onClick={skipCurrentVersion} shape="round">
               {t("update:actions.skip")}
             </Button>
@@ -341,14 +385,14 @@ const Update: FC = () => {
 
           <span className="mr-auto" />
 
-          {state === "available" ? (
+          {state === "available" || (isAndroid && state === "downloaded") ? (
             <Button onClick={closeWindow} shape="round">
               {t("update:actions.later")}
             </Button>
           ) : null}
 
           {state === "checking" || state === "downloading" ? (
-            <Button onClick={closeWindow} shape="round">
+            <Button onClick={cancelUpdateProcess} shape="round">
               {t("update:actions.cancel")}
             </Button>
           ) : null}

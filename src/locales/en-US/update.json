@@ -6,7 +6,7 @@
     "install": "Install and Relaunch",
     "later": "Remind Me Later",
     "ok": "OK",
-    "openInstaller": "Open Installer Again",
+    "openInstaller": "Open Installer",
     "releaseNotes": "View Release Notes",
     "skip": "Skip This Version"
   },
@@ -15,7 +15,7 @@
     "checkError": "EcoPaste could not check for updates. Please try again later.",
     "checking": "Connecting to the update server. Please wait.",
     "downloaded": "The update has been downloaded and is ready to install.",
-    "downloadedAndroid": "The update has downloaded and the Android package installer has opened. Confirm the installation there.",
+    "downloadedAndroid": "The update has downloaded. Confirm the installation in the Android installer, or open it below if it did not appear.",
     "downloading": "Downloading EcoPaste {{version}}. Please wait.",
     "error": "Something went wrong while checking or installing the update.",
     "idle": "Check whether a new EcoPaste version is available.",

@@ -18,8 +18,6 @@ use crate::settings::{SettingsStore, Update as UpdateSettings, UpdateFrequency};
 const UPDATE_PROGRESS_EVENT: &str = "update://progress";
 #[cfg(target_os = "android")]
 const UPDATE_STATUS_EVENT: &str = "update://status";
-#[cfg(target_os = "android")]
-const UPDATE_ERROR_EVENT: &str = "update://error";
 const STABLE_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_ENDPOINT";
 const DEFAULT_STABLE_ENDPOINT: &str =
     "https://github.com/zzw6776/EcoPaste/releases/latest/download/latest.json";
@@ -52,6 +50,7 @@ struct PendingUpdate {
     apk_path: Option<PathBuf>,
     downloading: bool,
     sha256: String,
+    cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -108,7 +107,10 @@ impl UpdateState {
         });
     }
 
-    fn begin_download(&self, version: &str) -> Result<(String, String)> {
+    fn begin_download(
+        &self,
+        version: &str,
+    ) -> Result<(String, String, tokio::sync::watch::Receiver<bool>)> {
         self.with_current(|current| {
             let pending = current
                 .as_mut()
@@ -123,12 +125,29 @@ impl UpdateState {
                     "the selected update is already downloading"
                 )));
             }
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             pending.downloading = true;
+            pending.cancel_tx = Some(cancel_tx);
             Ok((
                 pending.metadata.download_url.clone(),
                 pending.sha256.clone(),
+                cancel_rx,
             ))
         })
+    }
+
+    fn cancel_download(&self, version: Option<&str>) {
+        self.with_current(|current| {
+            let Some(pending) = current.as_mut() else {
+                return;
+            };
+            if version.is_some_and(|target| pending.metadata.version != target) {
+                return;
+            }
+            if let Some(cancel_tx) = pending.cancel_tx.take() {
+                let _ = cancel_tx.send(true);
+            }
+        });
     }
 
     fn mark_downloaded(&self, version: &str, apk_path: PathBuf) -> Result<UpdateMetadata> {
@@ -143,6 +162,7 @@ impl UpdateState {
             }
             pending.apk_path = Some(apk_path);
             pending.downloading = false;
+            pending.cancel_tx = None;
             pending.metadata.downloaded = true;
             Ok(pending.metadata.clone())
         })
@@ -153,6 +173,7 @@ impl UpdateState {
             if let Some(pending) = current.as_mut() {
                 if pending.metadata.version == version {
                     pending.downloading = false;
+                    pending.cancel_tx = None;
                 }
             }
         });
@@ -259,32 +280,30 @@ pub async fn check(app: &AppHandle, mode: CheckMode) -> Result<AppUpdateStatus> 
             apk_path,
             downloading: false,
             sha256,
+            cancel_tx: None,
         }));
     } else {
         state.set_update(None);
     }
 
     persist_last_checked_at(app);
-    let next = status(app).await;
-    if let Some(update) = next.update.as_ref() {
-        start_android_update(app, update.version.clone());
-    }
-    Ok(next)
+    Ok(status(app).await)
 }
 
 #[cfg(target_os = "android")]
-pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata> {
+pub async fn download(app: &AppHandle, version: String) -> Result<Option<UpdateMetadata>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     if app.state::<UpdateState>().downloaded_path(&version).is_ok() {
-        return Ok(status(app).await.update.context("no update is ready")?);
+        return Ok(status(app).await.update);
     }
 
     let cache_dir = app
         .path()
         .app_cache_dir()
         .context("failed to resolve Android update cache directory")?;
-    let (download_url, expected_sha256) = app.state::<UpdateState>().begin_download(&version)?;
+    let (download_url, expected_sha256, mut cancel_rx) =
+        app.state::<UpdateState>().begin_download(&version)?;
     let apk_path = cache_dir.join(format!("{ANDROID_UPDATE_FILE_PREFIX}{version}.apk"));
     let temporary_path = apk_path.with_extension("apk.download");
     let result = async {
@@ -297,26 +316,42 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
             .context("failed to create Android update client")?;
-        let mut response = client
+        if *cancel_rx.borrow() {
+            return Ok(None);
+        }
+        let request = client
             .get(&download_url)
             .header(reqwest::header::USER_AGENT, "EcoPaste Android updater")
             .header(reqwest::header::ACCEPT, "application/octet-stream")
-            .send()
-            .await
-            .context("failed to download Android update")?
-            .error_for_status()
-            .context("Android update download was rejected")?;
+            .send();
+        let response = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => return Ok(None),
+            response = request => response,
+        }
+        .context("failed to download Android update")?
+        .error_for_status()
+        .context("Android update download was rejected")?;
+        let mut response = response;
         let total = response.content_length();
         let mut downloaded = 0_u64;
         let mut sha256 = Sha256::new();
         let mut file = tokio::fs::File::create(&temporary_path)
             .await
             .context("failed to create Android update file")?;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("failed while reading Android update")?
-        {
+        loop {
+            if *cancel_rx.borrow() {
+                return Ok(None);
+            }
+            let chunk = tokio::select! {
+                biased;
+                _ = cancel_rx.changed() => return Ok(None),
+                chunk = response.chunk() => chunk,
+            }
+            .context("failed while reading Android update")?;
+            let Some(chunk) = chunk else {
+                break;
+            };
             file.write_all(&chunk)
                 .await
                 .context("failed to write Android update")?;
@@ -355,17 +390,23 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
             .await
             .context("failed to finalize Android update")?;
         cleanup_old_android_updates(&cache_dir, &apk_path).await;
-        Ok::<_, anyhow::Error>(
+        Ok::<_, anyhow::Error>(Some(
             app.state::<UpdateState>()
                 .mark_downloaded(&version, apk_path)?,
-        )
+        ))
     }
     .await;
 
     match result {
-        Ok(metadata) => {
+        Ok(Some(metadata)) => {
             emit_status(app).await;
-            Ok(metadata)
+            Ok(Some(metadata))
+        }
+        Ok(None) => {
+            app.state::<UpdateState>().mark_download_failed(&version);
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            emit_status(app).await;
+            Ok(None)
         }
         Err(error) => {
             app.state::<UpdateState>().mark_download_failed(&version);
@@ -373,6 +414,12 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
             Err(error.into())
         }
     }
+}
+
+/// Aborts an in-flight Android APK download without emitting an error.
+#[cfg(target_os = "android")]
+pub fn cancel_download(app: &AppHandle) {
+    app.state::<UpdateState>().cancel_download(None);
 }
 
 #[cfg(target_os = "android")]
@@ -383,6 +430,7 @@ pub fn install(app: &AppHandle, version: String) -> Result<()> {
 
 #[cfg(target_os = "android")]
 pub fn skip(app: &AppHandle, version: String) -> Result<AppUpdateStatus> {
+    app.state::<UpdateState>().cancel_download(Some(&version));
     let patch = serde_json::json!({
         "update": {
             "skippedVersion": version,
@@ -391,6 +439,17 @@ pub fn skip(app: &AppHandle, version: String) -> Result<AppUpdateStatus> {
     let next = app.state::<SettingsStore>().update(patch)?;
     crate::commands::emit_settings_updated(app, &next);
     app.state::<UpdateState>().set_update(None);
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        let cached_apk = cache_dir.join(format!("{ANDROID_UPDATE_FILE_PREFIX}{version}.apk"));
+        if cached_apk.is_file() {
+            if let Err(error) = std::fs::remove_file(&cached_apk) {
+                log::warn!(
+                    "remove skipped Android update {} failed: {error}",
+                    cached_apk.display()
+                );
+            }
+        }
+    }
 
     Ok(app
         .state::<UpdateState>()
@@ -582,7 +641,7 @@ pub async fn check(app: &AppHandle, mode: CheckMode) -> Result<AppUpdateStatus> 
 }
 
 #[cfg(not(target_os = "android"))]
-pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata> {
+pub async fn download(app: &AppHandle, version: String) -> Result<Option<UpdateMetadata>> {
     let update = {
         let state = app.state::<UpdateState>();
         state.with_current(|current| {
@@ -613,8 +672,14 @@ pub async fn download(app: &AppHandle, version: String) -> Result<UpdateMetadata
         .await
         .context("failed to download update")?;
 
-    app.state::<UpdateState>().mark_downloaded(&version, bytes)
+    Ok(Some(
+        app.state::<UpdateState>()
+            .mark_downloaded(&version, bytes)?,
+    ))
 }
+
+#[cfg(not(target_os = "android"))]
+pub fn cancel_download(_app: &AppHandle) {}
 
 #[cfg(not(target_os = "android"))]
 pub fn install(app: &AppHandle, version: String) -> Result<()> {
@@ -677,6 +742,9 @@ pub fn schedule_auto_check(app: &AppHandle) {
 async fn run_auto_check(app: &AppHandle) {
     match check(app, CheckMode::Auto).await {
         Ok(status) if status.update.is_some() => {
+            #[cfg(target_os = "android")]
+            emit_status(app).await;
+
             #[cfg(not(target_os = "android"))]
             {
                 if let Err(err) =
@@ -807,29 +875,6 @@ fn android_update_target() -> &'static str {
     return "android-x86_64";
     #[allow(unreachable_code)]
     "android-unsupported"
-}
-
-#[cfg(target_os = "android")]
-fn start_android_update(app: &AppHandle, version: String) {
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        match download(&handle, version.clone()).await {
-            Ok(_) => {
-                if let Err(error) = install(&handle, version.clone()) {
-                    log::warn!("open Android package installer for {version} failed: {error}");
-                    if let Err(emit_error) = handle.emit(UPDATE_ERROR_EVENT, error.to_string()) {
-                        log::warn!("emit Android update error failed: {emit_error}");
-                    }
-                }
-            }
-            Err(error) => {
-                log::warn!("automatic Android update download {version} failed: {error}");
-                if let Err(emit_error) = handle.emit(UPDATE_ERROR_EVENT, error.to_string()) {
-                    log::warn!("emit Android update error failed: {emit_error}");
-                }
-            }
-        }
-    });
 }
 
 #[cfg(target_os = "android")]

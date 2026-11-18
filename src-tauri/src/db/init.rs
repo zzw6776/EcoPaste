@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result as AnyResult};
@@ -85,12 +86,25 @@ const MIGRATION_LINE_ENDING_CHECKSUMS: &[(i64, &str, &str)] = &[
     ),
 ];
 
+/// Opens and migrates the database at the configured application path.
 pub async fn init(app: &AppHandle) -> Result<SqlitePool> {
-    let started_at = std::time::Instant::now();
     let path = db_path(app)?;
+    init_at(&path).await
+}
+
+/// Opens a SQLite database at `path`, normalizes known migration metadata, and runs migrations.
+pub async fn init_at(path: &Path) -> Result<SqlitePool> {
+    let started_at = std::time::Instant::now();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create db dir at {parent:?}"))?;
+    }
 
     let options = SqliteConnectOptions::new()
-        .filename(&path)
+        .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
