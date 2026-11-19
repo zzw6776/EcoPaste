@@ -6,26 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    CloudAvailabilityUpdate, CloudDevice, CloudEvent, DeferredRetentionEvents, DeviceAnnouncement,
-    EncryptedEvent, MAX_EVENTS_PER_BATCH, PeerAnnouncement, RemovedDevice, RetentionMapping,
-    SyncEventKind,
+    AcceptedItem, CloudDevice, DeviceAnnouncement, MAX_ITEMS_PER_BATCH, PeerAnnouncement,
+    RemovedDevice, SyncItemRecord, SyncItemWrite,
 };
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use subtle::ConstantTimeEq;
-
-#[derive(Debug)]
-pub struct HistoryGap;
-
-impl std::fmt::Display for HistoryGap {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("同步游标早于 Hub 当前保留范围")
-    }
-}
-
-impl std::error::Error for HistoryGap {}
 
 #[derive(Debug)]
 pub struct QuotaExceeded;
@@ -41,16 +29,15 @@ impl std::error::Error for QuotaExceeded {}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HubUsage {
     pub used_bytes: u64,
-    pub event_count: u64,
+    pub item_count: u64,
     pub blob_count: u64,
-    pub oldest_event_received_at_ms: Option<i64>,
+    pub oldest_item_received_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupPolicy {
     pub retention_cutoff_ms: Option<i64>,
-    pub legacy_blob_cutoff_ms: Option<i64>,
-    pub max_events: Option<u64>,
+    pub max_items: Option<u64>,
     pub target_bytes: Option<u64>,
     pub orphan_cutoff_ms: i64,
     pub batch_size: u32,
@@ -58,9 +45,25 @@ pub struct CleanupPolicy {
 
 #[derive(Debug, Default)]
 pub struct CleanupResult {
-    pub deleted_events: u64,
+    pub deleted_items: u64,
     pub deleted_blob_ids: Vec<String>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct UpsertItemsResult {
+    pub accepted: Vec<AcceptedItem>,
+    pub conflicts: Vec<SyncItemRecord>,
+    pub pre_write_latest_seq: u64,
+    pub latest_seq: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct ItemsWindow {
+    pub items: Vec<SyncItemRecord>,
+    pub latest_seq: u64,
+    pub pruned_through_seq: u64,
+    pub had_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +229,42 @@ impl Repository {
             .collect()
     }
 
+    /// Returns recently seen group members without exposing LAN transport routes.
+    pub async fn list_peers(
+        &self,
+        group_id: &str,
+        excluding_device_id: &str,
+    ) -> Result<Vec<PeerAnnouncement>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT device_id, device_name, platform, endpoint_id, last_seen_ms
+            FROM devices
+            WHERE group_id = ? AND device_id != ?
+            ORDER BY last_seen_ms DESC
+            LIMIT 64
+            "#,
+        )
+        .bind(group_id)
+        .bind(excluding_device_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list sync peers")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(PeerAnnouncement {
+                    device_id: row.try_get("device_id")?,
+                    device_name: row.try_get("device_name")?,
+                    platform: row.try_get("platform")?,
+                    endpoint_id: row.try_get("endpoint_id")?,
+                    direct_addresses: Vec::new(),
+                    relay_urls: Vec::new(),
+                    last_seen_ms: row.try_get("last_seen_ms")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn is_removed_endpoint(&self, group_id: &str, endpoint_id: &str) -> Result<bool> {
         let removed: i64 = sqlx::query_scalar(
             r#"
@@ -321,9 +360,9 @@ impl Repository {
             changed |= stored.rows_affected() > 0;
             let (stored_removed_at_ms, stored_restored_at_ms): (i64, Option<i64>) = sqlx::query_as(
                 r#"
-                    SELECT removed_at_ms, restored_at_ms FROM removed_devices
-                    WHERE group_id = ? AND device_id = ?
-                    "#,
+                SELECT removed_at_ms, restored_at_ms FROM removed_devices
+                WHERE group_id = ? AND device_id = ?
+                "#,
             )
             .bind(group_id)
             .bind(&device.device_id)
@@ -376,516 +415,388 @@ impl Repository {
             .collect()
     }
 
-    #[cfg(test)]
-    pub async fn latest_removed_at_ms(&self, group_id: &str) -> Result<i64> {
-        Ok(self.group_watermarks(group_id).await?.1)
-    }
-
-    pub async fn insert_events(
+    /// Upserts encrypted item snapshots with per-item optimistic CAS on `hub_rev`.
+    ///
+    /// Writes whose `expected_hub_rev` lags behind the stored revision are not rejected with an
+    /// error; their current Hub snapshot is returned in `conflicts` so the caller can CRDT-merge.
+    pub async fn upsert_items(
         &self,
         group_id: &str,
-        events: &[EncryptedEvent],
+        writes: &[SyncItemWrite],
         max_available_bytes: Option<u64>,
-    ) -> Result<Vec<String>> {
-        let mut transaction = self.pool.begin().await.context("begin event transaction")?;
-        let referenced_blob_ids = events
-            .iter()
-            .flat_map(|event| {
-                event
-                    .blob_ids
-                    .iter()
-                    .filter(|blob_id| !event.optional_blob_ids.contains(blob_id))
-            })
-            .collect::<HashSet<_>>();
-        if !referenced_blob_ids.is_empty() {
-            let mut query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM blobs WHERE group_id = ");
-            query.push_bind(group_id).push(" AND blob_id IN (");
-            let mut separated = query.separated(", ");
-            for blob_id in &referenced_blob_ids {
-                validate_blob_id(blob_id)?;
-                separated.push_bind(blob_id.as_str());
+    ) -> Result<UpsertItemsResult> {
+        let mut transaction = self.pool.begin().await.context("begin item upsert")?;
+        let (pre_write_latest_seq_raw, used_bytes_raw): (i64, i64) = sqlx::query_as(
+            "SELECT latest_seq, event_bytes + blob_bytes FROM sync_groups WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read sync group sequence before upserting items")?;
+        let pre_write_latest_seq =
+            u64::try_from(pre_write_latest_seq_raw).context("negative group latest_seq")?;
+        let mut next_seq = pre_write_latest_seq;
+        let mut used_bytes = u64::try_from(used_bytes_raw).context("negative sync group usage")?;
+        let mut byte_delta = 0_i64;
+        let mut count_delta = 0_i64;
+        let mut accepted = Vec::with_capacity(writes.len());
+        let mut conflict_keys = Vec::new();
+        let mut seen_conflict_keys = HashSet::new();
+
+        for write in writes {
+            validate_blob_id(&write.item_key)?;
+            validate_identifier("origin_device_id", &write.origin_device_id)?;
+            if write.nonce.len() != 24 || write.ciphertext.is_empty() {
+                bail!("invalid encrypted item snapshot");
             }
-            query.push(")");
-            let stored_count: i64 = query
-                .build_query_scalar()
-                .fetch_one(&mut *transaction)
-                .await
-                .context("validate encrypted event blob references")?;
-            if usize::try_from(stored_count).unwrap_or_default() != referenced_blob_ids.len() {
-                bail!("event references a missing blob");
+            let mut content_blobs = if write.deleted {
+                Vec::new()
+            } else {
+                write.blob_ids.clone()
+            };
+            content_blobs.sort_unstable();
+            content_blobs.dedup();
+            let mut optional_blobs = if write.deleted {
+                Vec::new()
+            } else {
+                write.optional_blob_ids.clone()
+            };
+            optional_blobs.sort_unstable();
+            optional_blobs.dedup();
+            optional_blobs.retain(|blob_id| !content_blobs.contains(blob_id));
+            if content_blobs.len().saturating_add(optional_blobs.len()) > 256 {
+                bail!("too many item blob references");
             }
-        }
-        let mut used_bytes = if max_available_bytes.is_some() {
-            let value: i64 = sqlx::query_scalar(
-                "SELECT event_bytes + blob_bytes FROM sync_groups WHERE group_id = ?",
-            )
-            .bind(group_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .context("read sync group usage before inserting events")?;
-            u64::try_from(value).context("negative sync group usage")?
-        } else {
-            0
-        };
-        let mut inserted_bytes = 0_u64;
-        let mut inserted_count = 0_u64;
-        let mut accepted = Vec::with_capacity(events.len());
-        for event in events {
-            validate_identifier("event_id", &event.event_id)?;
-            validate_identifier("origin_device_id", &event.origin_device_id)?;
-            if let Some(key) = &event.retention_key {
-                validate_blob_id(key)?;
-            }
-            if event.nonce.len() != 24 || event.ciphertext.is_empty() {
-                bail!("invalid encrypted event");
-            }
-            let mut blob_ids = event.blob_ids.clone();
-            blob_ids.sort_unstable();
-            blob_ids.dedup();
-            if blob_ids.len() > 256 {
-                bail!("too many event blob references");
-            }
-            for blob_id in &blob_ids {
+            for blob_id in content_blobs.iter().chain(optional_blobs.iter()) {
                 validate_blob_id(blob_id)?;
             }
-            if event
-                .optional_blob_ids
-                .iter()
-                .any(|blob_id| !blob_ids.contains(blob_id))
-            {
-                bail!("optional blob reference is not listed in event blob references");
-            }
-            let result = sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO events (
-                    group_id, event_id, origin_device_id, origin_sequence,
-                    created_at_ms, received_at_ms, nonce, ciphertext, event_kind, retention_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
+
+            let existing: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT hub_rev, length(nonce) + length(ciphertext) \
+                 FROM items WHERE group_id = ? AND item_key = ?",
             )
             .bind(group_id)
-            .bind(&event.event_id)
-            .bind(&event.origin_device_id)
-            .bind(i64::try_from(event.origin_sequence).context("origin sequence is too large")?)
-            .bind(event.created_at_ms)
-            .bind(now_ms())
-            .bind(&event.nonce)
-            .bind(&event.ciphertext)
-            .bind(event.kind.as_i64())
-            .bind(&event.retention_key)
-            .execute(&mut *transaction)
+            .bind(&write.item_key)
+            .fetch_optional(&mut *transaction)
             .await
-            .context("insert encrypted event")?;
-            if result.rows_affected() == 1 {
-                let event_bytes = u64::try_from(event.nonce.len() + event.ciphertext.len())
-                    .context("encrypted event is too large")?;
-                if max_available_bytes
-                    .is_some_and(|maximum| used_bytes.saturating_add(event_bytes) > maximum)
-                {
-                    return Err(QuotaExceeded.into());
-                }
-                used_bytes = used_bytes.saturating_add(event_bytes);
-                inserted_bytes = inserted_bytes.saturating_add(event_bytes);
-                inserted_count = inserted_count.saturating_add(1);
-                for blob_id in blob_ids {
+            .context("read existing hub item revision")?;
+
+            let new_bytes = i64::try_from(write.nonce.len() + write.ciphertext.len())
+                .context("encrypted item snapshot is too large")?;
+            let now = now_ms();
+
+            match existing {
+                Some((existing_hub_rev_raw, existing_bytes)) => {
+                    let existing_hub_rev =
+                        u64::try_from(existing_hub_rev_raw).context("negative hub_rev")?;
+                    if existing_hub_rev != write.expected_hub_rev {
+                        if seen_conflict_keys.insert(write.item_key.clone()) {
+                            conflict_keys.push(write.item_key.clone());
+                        }
+                        continue;
+                    }
+                    let delta = new_bytes - existing_bytes;
+                    if delta > 0
+                        && max_available_bytes.is_some_and(|maximum| {
+                            used_bytes.saturating_add(delta as u64) > maximum
+                        })
+                    {
+                        return Err(QuotaExceeded.into());
+                    }
+                    next_seq = next_seq.checked_add(1).context("group seq overflow")?;
+                    let new_hub_rev = existing_hub_rev
+                        .checked_add(1)
+                        .context("item hub_rev overflow")?;
                     sqlx::query(
                         r#"
-                        INSERT INTO event_blob_refs (
-                            group_id, event_id, blob_id, created_at_ms
-                        ) VALUES (?, ?, ?, ?)
+                        UPDATE items
+                        SET seq = ?, hub_rev = ?, origin_device_id = ?, updated_at_ms = ?,
+                            received_at_ms = ?, deleted = ?, protected = ?, nonce = ?, ciphertext = ?
+                        WHERE group_id = ? AND item_key = ?
+                        "#,
+                    )
+                    .bind(i64::try_from(next_seq).context("group seq exceeds i64")?)
+                    .bind(i64::try_from(new_hub_rev).context("item hub_rev exceeds i64")?)
+                    .bind(&write.origin_device_id)
+                    .bind(write.updated_at_ms)
+                    .bind(now)
+                    .bind(i64::from(write.deleted))
+                    .bind(i64::from(write.protected && !write.deleted))
+                    .bind(&write.nonce)
+                    .bind(&write.ciphertext)
+                    .bind(group_id)
+                    .bind(&write.item_key)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("update encrypted hub item")?;
+
+                    replace_item_blob_refs(
+                        &mut transaction,
+                        group_id,
+                        &write.item_key,
+                        &content_blobs,
+                        &optional_blobs,
+                        now,
+                    )
+                    .await?;
+
+                    used_bytes = apply_signed_delta(used_bytes, delta);
+                    byte_delta = byte_delta
+                        .checked_add(delta)
+                        .context("item byte delta overflow")?;
+                    accepted.push(AcceptedItem {
+                        item_key: write.item_key.clone(),
+                        hub_rev: new_hub_rev,
+                        seq: next_seq,
+                    });
+                }
+                None => {
+                    if max_available_bytes.is_some_and(|maximum| {
+                        used_bytes.saturating_add(new_bytes as u64) > maximum
+                    }) {
+                        return Err(QuotaExceeded.into());
+                    }
+                    next_seq = next_seq.checked_add(1).context("group seq overflow")?;
+                    // If the row was previously evicted by Hub cleanup, allow the client to
+                    // recreate it cleanly with a strictly monotonic revision.
+                    let new_hub_rev = write.expected_hub_rev.saturating_add(1).max(1);
+                    sqlx::query(
+                        r#"
+                        INSERT INTO items (
+                            group_id, item_key, seq, hub_rev, origin_device_id,
+                            updated_at_ms, received_at_ms, deleted, protected, nonce, ciphertext
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         "#,
                     )
                     .bind(group_id)
-                    .bind(&event.event_id)
-                    .bind(blob_id)
-                    .bind(now_ms())
+                    .bind(&write.item_key)
+                    .bind(i64::try_from(next_seq).context("group seq exceeds i64")?)
+                    .bind(i64::try_from(new_hub_rev).context("item hub_rev exceeds i64")?)
+                    .bind(&write.origin_device_id)
+                    .bind(write.updated_at_ms)
+                    .bind(now)
+                    .bind(i64::from(write.deleted))
+                    .bind(i64::from(write.protected && !write.deleted))
+                    .bind(&write.nonce)
+                    .bind(&write.ciphertext)
                     .execute(&mut *transaction)
                     .await
-                    .context("insert encrypted event blob reference")?;
+                    .context("insert encrypted hub item")?;
+
+                    replace_item_blob_refs(
+                        &mut transaction,
+                        group_id,
+                        &write.item_key,
+                        &content_blobs,
+                        &optional_blobs,
+                        now,
+                    )
+                    .await?;
+
+                    used_bytes = used_bytes.saturating_add(new_bytes as u64);
+                    byte_delta = byte_delta
+                        .checked_add(new_bytes)
+                        .context("item byte delta overflow")?;
+                    count_delta = count_delta
+                        .checked_add(1)
+                        .context("item count delta overflow")?;
+                    accepted.push(AcceptedItem {
+                        item_key: write.item_key.clone(),
+                        hub_rev: new_hub_rev,
+                        seq: next_seq,
+                    });
                 }
-                accepted.push(event.event_id.clone());
             }
         }
-        if inserted_count > 0 {
+
+        if !accepted.is_empty() {
             sqlx::query(
                 r#"
                 UPDATE sync_groups
-                SET event_bytes = event_bytes + ?, event_count = event_count + ?
+                SET latest_seq = ?,
+                    event_bytes = MAX(0, event_bytes + ?),
+                    event_count = MAX(0, event_count + ?)
                 WHERE group_id = ?
                 "#,
             )
-            .bind(i64::try_from(inserted_bytes).context("event byte usage is too large")?)
-            .bind(i64::try_from(inserted_count).context("event count is too large")?)
+            .bind(i64::try_from(next_seq).context("group seq exceeds i64")?)
+            .bind(byte_delta)
+            .bind(count_delta)
             .bind(group_id)
             .execute(&mut *transaction)
             .await
-            .context("update sync group event usage")?;
+            .context("update sync group item stats")?;
         }
-        transaction
-            .commit()
-            .await
-            .context("commit encrypted events")?;
-        Ok(accepted)
+
+        let conflicts = if conflict_keys.is_empty() {
+            Vec::new()
+        } else {
+            load_items_by_keys(&mut transaction, group_id, &conflict_keys).await?
+        };
+
+        transaction.commit().await.context("commit item upsert")?;
+        Ok(UpsertItemsResult {
+            accepted,
+            conflicts,
+            pre_write_latest_seq,
+            latest_seq: next_seq,
+        })
     }
 
-    /// Invalidates cached protection snapshots when a Hub group is recreated.
-    pub async fn retention_epoch(&self, group_id: &str) -> Result<String> {
-        sqlx::query(
-            "UPDATE sync_groups SET retention_epoch = lower(hex(randomblob(16))) \
-             WHERE group_id = ? AND retention_epoch = ''",
-        )
-        .bind(group_id)
-        .execute(&self.pool)
-        .await
-        .context("initialize retention epoch")?;
-        sqlx::query_scalar("SELECT retention_epoch FROM sync_groups WHERE group_id = ?")
-            .bind(group_id)
-            .fetch_one(&self.pool)
-            .await
-            .context("read retention epoch")
-    }
-
-    /// Resumes pending registration, excluding only this endpoint's acknowledged decoder failures.
-    /// Unknown identities remain protected even after every current decoder has deferred them.
-    pub async fn retention_candidates(
+    /// Reads one newest-first window of item snapshots above `after_seq` and below `before_seq`.
+    ///
+    /// When `max_seq_inclusive` is set (e.g., to the pre-write `latest_seq`), snapshots just
+    /// written by the caller in the same RPC are omitted without creating gaps in `latest_seq`.
+    pub async fn list_items_window(
         &self,
         group_id: &str,
-        endpoint_id: &str,
-        decoder_revision: Option<u32>,
-    ) -> Result<Vec<CloudEvent>> {
-        if decoder_revision == Some(0) {
-            bail!("invalid retention decoder revision");
-        }
-        let rows = sqlx::query(
-            r#"
-            SELECT e.cursor, e.event_id, e.origin_device_id, e.origin_sequence,
-                   e.created_at_ms, e.nonce, e.ciphertext, e.event_kind, e.retention_key
-            FROM events e WHERE e.group_id = ? AND e.retention_key IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM retention_deferred_events d
-                  JOIN devices device ON device.group_id = d.group_id AND device.device_id = d.device_id
-                  WHERE d.group_id = e.group_id AND d.event_id = e.event_id
-                    AND device.endpoint_id = ? AND d.decoder_revision = ?
-              )
-            ORDER BY e.cursor ASC LIMIT ?
-            "#,
-        )
-        .bind(group_id)
-        .bind(endpoint_id)
-        .bind(decoder_revision.map(i64::from))
-        .bind(i64::from(MAX_EVENTS_PER_BATCH))
-        .fetch_all(&self.pool)
-        .await
-        .context("list legacy retention candidates")?;
-        rows.into_iter().map(cloud_event_from_row).collect()
-    }
-
-    /// Atomically updates one device's protection snapshot and maps existing encrypted history.
-    /// The union of active-device snapshots protects offline copies until their flags converge.
-    pub async fn set_retention(
-        &self,
-        group_id: &str,
-        device_id: &str,
-        generation: u64,
-        protected_keys: Option<&[String]>,
-        mappings: &[RetentionMapping],
-        deferred: Option<&DeferredRetentionEvents>,
-    ) -> Result<()> {
-        let deferred_count = deferred.map_or(0, |value| value.event_ids.len());
-        if mappings.len().saturating_add(deferred_count) > usize::from(MAX_EVENTS_PER_BATCH) {
-            bail!("too many retention registration results");
-        }
-        if deferred.is_some_and(|value| value.decoder_revision == 0) {
-            bail!("invalid retention decoder revision");
-        }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .context("begin retention registration")?;
-        let now = now_ms().to_string();
-        if let Some(keys) = protected_keys {
-            for key in keys {
-                validate_blob_id(key)?;
-            }
-            let accepted = sqlx::query(
-                "INSERT INTO retention_devices(group_id,device_id,generation,created_at,updated_at) VALUES (?,?,?,?,?) \
-                 ON CONFLICT(group_id,device_id) DO UPDATE SET generation=excluded.generation,updated_at=excluded.updated_at \
-                 WHERE retention_devices.generation < excluded.generation",
-            ).bind(group_id).bind(device_id).bind(i64::try_from(generation).context("invalid retention generation")?)
-                .bind(&now).bind(&now).execute(&mut *transaction).await?.rows_affected() > 0;
-            if accepted {
-                sqlx::query(
-                    "DELETE FROM retention_protections WHERE group_id = ? AND device_id = ?",
-                )
-                .bind(group_id)
-                .bind(device_id)
-                .execute(&mut *transaction)
-                .await?;
-                for key in keys {
-                    sqlx::query("INSERT OR IGNORE INTO retention_protections(group_id,device_id,item_key,created_at,updated_at) VALUES (?,?,?,?,?)")
-                        .bind(group_id).bind(device_id).bind(key).bind(&now).bind(&now).execute(&mut *transaction).await?;
-                }
-            }
-        }
-        for mapping in mappings {
-            validate_identifier("event_id", &mapping.event_id)?;
-            validate_blob_id(&mapping.item_key)?;
-            if mapping.blob_ids.len() > 256 {
-                bail!("too many event blob references");
-            }
-            let existing: Option<Option<String>> = sqlx::query_scalar(
-                "SELECT retention_key FROM events WHERE group_id = ? AND event_id = ?",
-            )
-            .bind(group_id)
-            .bind(&mapping.event_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            let Some(existing) = existing else {
-                continue;
-            };
-            if existing
-                .as_ref()
-                .is_some_and(|key| key != &mapping.item_key)
-            {
-                bail!("retention identity mismatch");
-            }
-            sqlx::query("UPDATE events SET retention_key = ? WHERE group_id = ? AND event_id = ?")
-                .bind(&mapping.item_key)
-                .bind(group_id)
-                .bind(&mapping.event_id)
-                .execute(&mut *transaction)
-                .await?;
-            for blob_id in &mapping.blob_ids {
-                validate_blob_id(blob_id)?;
-                sqlx::query("INSERT OR IGNORE INTO event_blob_refs(group_id,event_id,blob_id,created_at_ms) VALUES (?,?,?,?)")
-                    .bind(group_id).bind(&mapping.event_id).bind(blob_id).bind(now_ms())
-                    .execute(&mut *transaction).await?;
-            }
-        }
-        if let Some(deferred) = deferred {
-            for event_id in &deferred.event_ids {
-                validate_identifier("event_id", event_id)?;
-                sqlx::query(
-                    "INSERT INTO retention_deferred_events(group_id,event_id,device_id,decoder_revision,created_at,updated_at) \
-                     SELECT group_id,event_id,?,?,?,? FROM events WHERE group_id = ? AND event_id = ? AND retention_key IS NULL \
-                     ON CONFLICT(group_id,event_id,device_id) DO UPDATE SET \
-                         decoder_revision = excluded.decoder_revision, updated_at = excluded.updated_at \
-                     WHERE retention_deferred_events.decoder_revision <> excluded.decoder_revision",
-                )
-                .bind(device_id)
-                .bind(i64::from(deferred.decoder_revision))
-                .bind(&now)
-                .bind(&now)
-                .bind(group_id)
-                .bind(event_id)
-                .execute(&mut *transaction)
-                .await
-                .context("defer unsupported retention event")?;
-            }
-        }
-        // A legacy blob can be shared with an event whose references are not registered yet.
-        sqlx::query("UPDATE blobs SET gc_protected = 0 WHERE group_id = ? AND gc_protected = 1 \
-                     AND NOT EXISTS(SELECT 1 FROM events WHERE group_id = ? AND retention_key IS NULL)")
-            .bind(group_id).bind(group_id).execute(&mut *transaction).await?;
-        transaction
-            .commit()
-            .await
-            .context("commit retention registration")?;
-        Ok(())
-    }
-
-    /// Reads encrypted cloud events after the caller's delivery cursor.
-    pub async fn list_events(
-        &self,
-        group_id: &str,
-        after_cursor: u64,
+        after_seq: u64,
+        before_seq: Option<u64>,
+        max_seq_inclusive: Option<u64>,
         limit: u16,
-    ) -> Result<Vec<CloudEvent>> {
+    ) -> Result<ItemsWindow> {
+        let limit = limit.clamp(1, MAX_ITEMS_PER_BATCH);
+        let mut transaction = self.pool.begin().await.context("begin item window read")?;
+        let (latest_seq_raw, pruned_through_seq_raw): (i64, i64) = sqlx::query_as(
+            "SELECT latest_seq, pruned_through_seq FROM sync_groups WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read sync group watermarks")?;
+        let latest_seq = u64::try_from(latest_seq_raw).context("negative group latest_seq")?;
+        let pruned_through_seq =
+            u64::try_from(pruned_through_seq_raw).context("negative group pruned_through_seq")?;
+
+        let upper_bound = match (before_seq, max_seq_inclusive) {
+            (Some(before), Some(max_inc)) => Some(before.min(max_inc.saturating_add(1))),
+            (Some(before), None) => Some(before),
+            (None, Some(max_inc)) => Some(max_inc.saturating_add(1)),
+            (None, None) => None,
+        };
+
+        let fetch_limit = i64::from(limit) + 1;
         let rows = sqlx::query(
             r#"
-            SELECT cursor, event_id, origin_device_id, origin_sequence,
-                   created_at_ms, nonce, ciphertext, event_kind, retention_key
-            FROM events
-            WHERE group_id = ? AND cursor > ?
-            ORDER BY cursor ASC
+            SELECT seq, hub_rev, item_key, origin_device_id, updated_at_ms,
+                   deleted, protected, nonce, ciphertext
+            FROM items
+            WHERE group_id = ?
+              AND seq > ?
+              AND (? IS NULL OR seq < ?)
+            ORDER BY seq DESC
             LIMIT ?
             "#,
         )
         .bind(group_id)
-        .bind(i64::try_from(after_cursor).unwrap_or(i64::MAX))
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
+        .bind(i64::try_from(after_seq).unwrap_or(i64::MAX))
+        .bind(upper_bound.map(|value| i64::try_from(value).unwrap_or(i64::MAX)))
+        .bind(upper_bound.map(|value| i64::try_from(value).unwrap_or(i64::MAX)))
+        .bind(fetch_limit)
+        .fetch_all(&mut *transaction)
         .await
-        .context("list encrypted events")?;
+        .context("list encrypted item window")?;
 
-        let mut events = rows
+        let had_more = rows.len() > usize::from(limit);
+        let mut items = rows
             .into_iter()
-            .map(cloud_event_from_row)
+            .take(usize::from(limit))
+            .map(sync_item_record_from_row)
             .collect::<Result<Vec<_>>>()?;
-        self.attach_blob_ids(group_id, &mut events).await?;
-        Ok(events)
+        attach_item_blobs(&mut transaction, group_id, &mut items).await?;
+        transaction
+            .commit()
+            .await
+            .context("commit item window read")?;
+
+        Ok(ItemsWindow {
+            items,
+            latest_seq,
+            pruned_through_seq,
+            had_more,
+        })
     }
 
-    pub async fn latest_cursor(&self, group_id: &str) -> Result<u64> {
-        let cursor: i64 = sqlx::query_scalar(
+    /// Reads one newest-first page of non-deleted items for the cloud history drawer.
+    pub async fn list_active_items_page(
+        &self,
+        group_id: &str,
+        before_seq: Option<u64>,
+        limit: u16,
+    ) -> Result<(Vec<SyncItemRecord>, Option<u64>, u64)> {
+        let limit = limit.clamp(1, 100);
+        let fetch_limit = i64::from(limit) + 1;
+        let mut transaction = self.pool.begin().await.context("begin active items page")?;
+        let rows = sqlx::query(
             r#"
-            SELECT MAX(
-                pruned_through_cursor,
-                COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0)
-            )
-            FROM sync_groups
+            SELECT seq, hub_rev, item_key, origin_device_id, updated_at_ms,
+                   deleted, protected, nonce, ciphertext
+            FROM items
             WHERE group_id = ?
+              AND deleted = 0
+              AND (? IS NULL OR seq < ?)
+            ORDER BY seq DESC
+            LIMIT ?
             "#,
         )
         .bind(group_id)
-        .bind(group_id)
-        .fetch_one(&self.pool)
+        .bind(before_seq.map(|value| i64::try_from(value).unwrap_or(i64::MAX)))
+        .bind(before_seq.map(|value| i64::try_from(value).unwrap_or(i64::MAX)))
+        .bind(fetch_limit)
+        .fetch_all(&mut *transaction)
         .await
-        .context("read latest encrypted event cursor")?;
-        u64::try_from(cursor).context("negative event cursor")
+        .context("list active cloud items")?;
+
+        let total_raw: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE group_id = ? AND deleted = 0")
+                .bind(group_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .context("count active cloud items")?;
+        let total = u64::try_from(total_raw).context("negative active item count")?;
+
+        let has_more = rows.len() > usize::from(limit);
+        let mut items = rows
+            .into_iter()
+            .take(usize::from(limit))
+            .map(sync_item_record_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let next_before_seq = has_more.then(|| {
+            items
+                .last()
+                .expect("non-empty page when another item exists")
+                .seq
+        });
+        attach_item_blobs(&mut transaction, group_id, &mut items).await?;
+        transaction
+            .commit()
+            .await
+            .context("commit active items page")?;
+        Ok((items, next_before_seq, total))
     }
 
-    /// Reads all durable group change watermarks from one database snapshot.
-    pub async fn group_watermarks(&self, group_id: &str) -> Result<(u64, i64, u64)> {
-        let (cursor, removed, availability): (i64, i64, i64) = sqlx::query_as(
-            "SELECT MAX(pruned_through_cursor, \
-                     COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0)), \
-             COALESCE((SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0))) \
-             FROM removed_devices WHERE group_id = ?), 0), \
-             availability_cursor \
+    /// Reads the durable group watermarks `(latest_seq, latest_removed_at_ms)` from one snapshot.
+    pub async fn group_watermarks(&self, group_id: &str) -> Result<(u64, i64)> {
+        let (latest_seq, removed): (i64, i64) = sqlx::query_as(
+            "SELECT latest_seq, \
+                    COALESCE((SELECT MAX(MAX(removed_at_ms, COALESCE(restored_at_ms, 0))) \
+                    FROM removed_devices WHERE group_id = ?), 0) \
              FROM sync_groups WHERE group_id = ?",
         )
-        .bind(group_id)
         .bind(group_id)
         .bind(group_id)
         .fetch_one(&self.pool)
         .await
         .context("read sync group watermarks")?;
         Ok((
-            u64::try_from(cursor).context("negative event cursor")?,
+            u64::try_from(latest_seq).context("negative group latest_seq")?,
             removed,
-            u64::try_from(availability).context("negative availability cursor")?,
         ))
     }
 
-    /// Reads one newest-first page without changing any device delivery cursor.
-    pub async fn list_events_before(
-        &self,
-        group_id: &str,
-        before_cursor: Option<u64>,
-        limit: u16,
-        include_states: bool,
-    ) -> Result<(Vec<CloudEvent>, Option<u64>)> {
-        let fetch_limit = i64::from(limit) + 1;
-        let rows = if let Some(before_cursor) = before_cursor {
-            sqlx::query(
-                r#"
-                SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext, event_kind, retention_key
-                FROM events
-                WHERE group_id = ? AND (? OR event_kind = ?) AND cursor < ?
-                ORDER BY cursor DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(group_id)
-            .bind(include_states)
-            .bind(SyncEventKind::Content.as_i64())
-            .bind(i64::try_from(before_cursor).unwrap_or(i64::MAX))
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query(
-                r#"
-                SELECT cursor, event_id, origin_device_id, origin_sequence,
-                       created_at_ms, nonce, ciphertext, event_kind, retention_key
-                FROM events
-                WHERE group_id = ? AND (? OR event_kind = ?)
-                ORDER BY cursor DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(group_id)
-            .bind(include_states)
-            .bind(SyncEventKind::Content.as_i64())
-            .bind(fetch_limit)
-            .fetch_all(&self.pool)
-            .await
-        }
-        .context("list encrypted event page")?;
-
-        let mut events = rows
-            .into_iter()
-            .map(cloud_event_from_row)
-            .collect::<Result<Vec<_>>>()?;
-        let has_more = events.len() > usize::from(limit);
-        events.truncate(usize::from(limit));
-        let next_before_cursor = has_more.then(|| {
-            events
-                .last()
-                .expect("non-empty page when another event exists")
-                .cursor
-        });
-        self.attach_blob_ids(group_id, &mut events).await?;
-        Ok((events, next_before_cursor))
-    }
-
-    pub async fn event_count(&self, group_id: &str) -> Result<u64> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE group_id = ? AND event_kind = ?")
-                .bind(group_id)
-                .bind(SyncEventKind::Content.as_i64())
-                .fetch_one(&self.pool)
-                .await
-                .context("count encrypted events")?;
-        u64::try_from(count).context("negative event count")
-    }
-
-    /// Returns recently seen group members without exposing LAN transport routes.
-    pub async fn list_peers(
-        &self,
-        group_id: &str,
-        excluding_device_id: &str,
-    ) -> Result<Vec<PeerAnnouncement>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT device_id, device_name, platform, endpoint_id, last_seen_ms
-            FROM devices
-            WHERE group_id = ? AND device_id != ?
-            ORDER BY last_seen_ms DESC
-            LIMIT 64
-            "#,
-        )
-        .bind(group_id)
-        .bind(excluding_device_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("list sync peers")?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(PeerAnnouncement {
-                    device_id: row.try_get("device_id")?,
-                    device_name: row.try_get("device_name")?,
-                    platform: row.try_get("platform")?,
-                    endpoint_id: row.try_get("endpoint_id")?,
-                    direct_addresses: Vec::new(),
-                    relay_urls: Vec::new(),
-                    last_seen_ms: row.try_get("last_seen_ms")?,
-                })
-            })
-            .collect()
-    }
-
-    pub async fn record_blob(
-        &self,
-        group_id: &str,
-        blob_id: &str,
-        size: u64,
-        managed: bool,
-    ) -> Result<()> {
+    /// Records a stored blob and bumps `seq` (without changing `hub_rev`) on every referencing item
+    /// so watchers pull the newly available blob identifier.
+    pub async fn record_blob(&self, group_id: &str, blob_id: &str, size: u64) -> Result<bool> {
         let mut transaction = self.pool.begin().await.context("begin recording blob")?;
         let existing_size: Option<i64> =
             sqlx::query_scalar("SELECT size FROM blobs WHERE group_id = ? AND blob_id = ?")
@@ -897,20 +808,18 @@ impl Repository {
         let size = i64::try_from(size).context("blob is too large")?;
         sqlx::query(
             r#"
-            INSERT INTO blobs (
-                group_id, blob_id, size, created_at_ms, gc_protected
-            ) VALUES (?, ?, ?, ?, ?)
+            INSERT INTO blobs (group_id, blob_id, size, created_at_ms, gc_protected)
+            VALUES (?, ?, ?, ?, 0)
             ON CONFLICT(group_id, blob_id) DO UPDATE SET
                 size = excluded.size,
                 created_at_ms = excluded.created_at_ms,
-                gc_protected = blobs.gc_protected
+                gc_protected = 0
             "#,
         )
         .bind(group_id)
         .bind(blob_id)
         .bind(size)
         .bind(now_ms())
-        .bind(i64::from(!managed))
         .execute(&mut *transaction)
         .await
         .context("record encrypted blob")?;
@@ -925,7 +834,8 @@ impl Repository {
         sqlx::query(
             r#"
             UPDATE sync_groups
-            SET blob_bytes = blob_bytes + ?, blob_count = blob_count + ?
+            SET blob_bytes = MAX(0, blob_bytes + ?),
+                blob_count = MAX(0, blob_count + ?)
             WHERE group_id = ?
             "#,
         )
@@ -936,200 +846,46 @@ impl Repository {
         .await
         .context("update sync group blob usage")?;
 
-        let event_ids = sqlx::query_scalar::<_, String>(
-            "SELECT event_id FROM event_blob_refs \
-             WHERE group_id = ? AND blob_id = ? ORDER BY event_id",
+        let item_keys = sqlx::query_scalar::<_, String>(
+            "SELECT item_key FROM item_blob_refs \
+             WHERE group_id = ? AND blob_id = ? ORDER BY item_key",
         )
         .bind(group_id)
         .bind(blob_id)
         .fetch_all(&mut *transaction)
         .await
-        .context("list events affected by blob availability")?;
-        if !event_ids.is_empty() {
-            let cursor_count = i64::try_from(event_ids.len())
-                .context("too many events affected by blob availability")?;
-            let last_cursor: i64 = sqlx::query_scalar(
-                "UPDATE sync_groups SET availability_cursor = availability_cursor + ? \
-                 WHERE group_id = ? RETURNING availability_cursor",
+        .context("list items affected by blob availability")?;
+        let items_bumped = !item_keys.is_empty();
+        if items_bumped {
+            let bump_count = i64::try_from(item_keys.len())
+                .context("too many items affected by blob availability")?;
+            let last_seq: i64 = sqlx::query_scalar(
+                "UPDATE sync_groups SET latest_seq = latest_seq + ? \
+                 WHERE group_id = ? RETURNING latest_seq",
             )
-            .bind(cursor_count)
+            .bind(bump_count)
             .bind(group_id)
             .fetch_one(&mut *transaction)
             .await
-            .context("advance cloud availability cursor")?;
-            let first_cursor = last_cursor
-                .checked_sub(cursor_count - 1)
-                .context("cloud availability cursor overflow")?;
-            for (offset, event_id) in event_ids.into_iter().enumerate() {
-                let offset = i64::try_from(offset)
-                    .context("too many events affected by blob availability")?;
-                let cursor = first_cursor
-                    .checked_add(offset)
-                    .context("cloud availability cursor overflow")?;
-                sqlx::query(
-                    "UPDATE events SET availability_cursor = ? \
-                     WHERE group_id = ? AND event_id = ?",
-                )
-                .bind(cursor)
-                .bind(group_id)
-                .bind(event_id)
-                .execute(&mut *transaction)
-                .await
-                .context("publish event blob availability")?;
+            .context("advance group latest_seq for blob availability")?;
+            let first_seq = last_seq
+                .checked_sub(bump_count - 1)
+                .context("group seq overflow")?;
+            for (offset, item_key) in item_keys.into_iter().enumerate() {
+                let seq = first_seq
+                    .checked_add(i64::try_from(offset).context("item offset overflow")?)
+                    .context("group seq overflow")?;
+                sqlx::query("UPDATE items SET seq = ? WHERE group_id = ? AND item_key = ?")
+                    .bind(seq)
+                    .bind(group_id)
+                    .bind(item_key)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("publish item blob availability")?;
             }
         }
         transaction.commit().await.context("commit recorded blob")?;
-        Ok(())
-    }
-
-    /// Reads the latest durable availability revision for each changed event.
-    pub async fn cloud_availability_updates(
-        &self,
-        group_id: &str,
-        after_cursor: u64,
-        limit: u16,
-    ) -> Result<(Vec<CloudAvailabilityUpdate>, u64, bool, u64)> {
-        let limit = limit.clamp(1, MAX_EVENTS_PER_BATCH);
-        let mut transaction = self.pool.begin().await?;
-        let rows = sqlx::query(
-            r#"
-            SELECT availability_cursor, event_id
-            FROM events
-            WHERE group_id = ? AND availability_cursor > ?
-            ORDER BY availability_cursor ASC
-            LIMIT ?
-            "#,
-        )
-        .bind(group_id)
-        .bind(i64::try_from(after_cursor).unwrap_or(i64::MAX))
-        .bind(i64::from(limit) + 1)
-        .fetch_all(&mut *transaction)
-        .await
-        .context("list cloud availability updates")?;
-        let has_more = rows.len() > usize::from(limit);
-        let mut updates = rows
-            .into_iter()
-            .take(usize::from(limit))
-            .map(|row| {
-                Ok(CloudAvailabilityUpdate {
-                    cursor: u64::try_from(row.try_get::<i64, _>("availability_cursor")?)
-                        .context("negative cloud availability cursor")?,
-                    event_id: row.try_get("event_id")?,
-                    available_blob_ids: Vec::new(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !updates.is_empty() {
-            let mut query = sqlx::QueryBuilder::new(
-                "SELECT refs.event_id, refs.blob_id FROM event_blob_refs refs \
-                 JOIN blobs ON blobs.group_id = refs.group_id AND blobs.blob_id = refs.blob_id \
-                 WHERE refs.group_id = ",
-            );
-            query.push_bind(group_id).push(" AND refs.event_id IN (");
-            let mut separated = query.separated(", ");
-            for update in &updates {
-                separated.push_bind(&update.event_id);
-            }
-            query.push(") ORDER BY refs.event_id, refs.blob_id");
-            let rows = query
-                .build()
-                .fetch_all(&mut *transaction)
-                .await
-                .context("list available blobs for cloud availability updates")?;
-            let mut available_by_event: HashMap<String, Vec<String>> = HashMap::new();
-            for row in rows {
-                available_by_event
-                    .entry(row.try_get("event_id")?)
-                    .or_default()
-                    .push(row.try_get("blob_id")?);
-            }
-            for update in &mut updates {
-                update.available_blob_ids = available_by_event
-                    .remove(&update.event_id)
-                    .unwrap_or_default();
-            }
-        }
-        let (availability_cursor, pruned_availability_cursor): (i64, i64) = sqlx::query_as(
-            "SELECT availability_cursor, pruned_availability_cursor FROM sync_groups WHERE group_id = ?",
-        )
-        .bind(group_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .context("read cloud availability watermarks")?;
-        let latest_cursor = if has_more {
-            updates
-                .last()
-                .map(|update| update.cursor)
-                .unwrap_or(after_cursor)
-        } else {
-            u64::try_from(availability_cursor)
-                .context("negative latest cloud availability cursor")?
-        };
-        transaction
-            .commit()
-            .await
-            .context("commit cloud availability snapshot")?;
-        Ok((
-            updates,
-            latest_cursor,
-            has_more,
-            u64::try_from(pruned_availability_cursor).context("negative cloud pruning revision")?,
-        ))
-    }
-
-    /// Rechecks only the caller's known records, including history removed by retention.
-    pub async fn check_cloud_availability(
-        &self,
-        group_id: &str,
-        event_ids: &[String],
-    ) -> Result<(Vec<CloudAvailabilityUpdate>, Vec<String>)> {
-        if event_ids.len() > usize::from(MAX_EVENTS_PER_BATCH) {
-            bail!("too many cloud availability checks");
-        }
-        if event_ids.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let mut query = sqlx::QueryBuilder::new(
-            "SELECT e.event_id, e.availability_cursor, b.blob_id FROM events e \
-             LEFT JOIN event_blob_refs refs ON refs.group_id = e.group_id AND refs.event_id = e.event_id \
-             LEFT JOIN blobs b ON b.group_id = refs.group_id AND b.blob_id = refs.blob_id \
-             WHERE e.group_id = ",
-        );
-        query.push_bind(group_id).push(" AND e.event_id IN (");
-        let mut separated = query.separated(", ");
-        for event_id in event_ids {
-            validate_identifier("event_id", event_id)?;
-            separated.push_bind(event_id);
-        }
-        query.push(")");
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .context("check retained cloud availability")?;
-        let mut updates: HashMap<String, CloudAvailabilityUpdate> = HashMap::new();
-        for row in rows {
-            let event_id: String = row.try_get("event_id")?;
-            let cursor = u64::try_from(row.try_get::<i64, _>("availability_cursor")?)
-                .context("negative cloud availability cursor")?;
-            let update =
-                updates
-                    .entry(event_id.clone())
-                    .or_insert_with(|| CloudAvailabilityUpdate {
-                        cursor,
-                        event_id,
-                        available_blob_ids: Vec::new(),
-                    });
-            if let Some(blob_id) = row.try_get::<Option<String>, _>("blob_id")? {
-                update.available_blob_ids.push(blob_id);
-            }
-        }
-        let missing_event_ids = event_ids
-            .iter()
-            .filter(|event_id| !updates.contains_key(*event_id))
-            .cloned()
-            .collect();
-        Ok((updates.into_values().collect(), missing_event_ids))
+        Ok(items_bumped)
     }
 
     pub async fn blob_size(&self, group_id: &str, blob_id: &str) -> Result<Option<u64>> {
@@ -1152,7 +908,7 @@ impl Repository {
             .bind(blob_id)
             .execute(&self.pool)
             .await
-            .context("refresh legacy Hub blob protection")?;
+            .context("refresh Hub blob orphan grace period")?;
         Ok(())
     }
 
@@ -1162,27 +918,28 @@ impl Repository {
             r#"
             SELECT
                 event_bytes + blob_bytes AS used_bytes,
-                event_count,
+                (SELECT COUNT(*) FROM items WHERE group_id = ? AND deleted = 0) AS active_count,
                 blob_count,
-                (SELECT MIN(received_at_ms) FROM events WHERE group_id = ?)
-                    AS oldest_event_received_at_ms
+                (SELECT MIN(received_at_ms) FROM items WHERE group_id = ? AND deleted = 0)
+                    AS oldest_item_received_at_ms
             FROM sync_groups
             WHERE group_id = ?
             "#,
         )
         .bind(group_id)
         .bind(group_id)
+        .bind(group_id)
         .fetch_one(&self.pool)
         .await
         .context("read sync group usage")?;
         let used_bytes: i64 = row.try_get("used_bytes")?;
-        let event_count: i64 = row.try_get("event_count")?;
+        let item_count: i64 = row.try_get("active_count")?;
         let blob_count: i64 = row.try_get("blob_count")?;
         Ok(HubUsage {
             used_bytes: u64::try_from(used_bytes).context("negative sync group byte usage")?,
-            event_count: u64::try_from(event_count).context("negative sync group event count")?,
+            item_count: u64::try_from(item_count).context("negative sync group item count")?,
             blob_count: u64::try_from(blob_count).context("negative sync group blob count")?,
-            oldest_event_received_at_ms: row.try_get("oldest_event_received_at_ms")?,
+            oldest_item_received_at_ms: row.try_get("oldest_item_received_at_ms")?,
         })
     }
 
@@ -1214,50 +971,7 @@ impl Repository {
         Ok(ids.into_iter().collect())
     }
 
-    pub async fn ensure_cursor_available(&self, group_id: &str, cursor: u64) -> Result<()> {
-        if cursor == 0 {
-            return Ok(());
-        }
-        let (pruned, retained): (i64, bool) =
-            sqlx::query_as("SELECT pruned_through_cursor, EXISTS(SELECT 1 FROM events WHERE group_id = ? AND cursor = ?) FROM sync_groups WHERE group_id = ?")
-                .bind(group_id)
-                .bind(i64::try_from(cursor).unwrap_or(i64::MAX))
-                .bind(group_id)
-                .fetch_one(&self.pool)
-                .await
-                .context("read retained sync cursor floor")?;
-        if !retained && cursor < u64::try_from(pruned).context("negative retained cursor floor")? {
-            return Err(HistoryGap.into());
-        }
-        Ok(())
-    }
-
-    /// Returns the complete cursor range still retained by the Hub.
-    pub async fn bootstrap_cursor_bounds(&self, group_id: &str) -> Result<(u64, u64)> {
-        let (pruned, latest): (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT CASE WHEN EXISTS(
-                       SELECT 1 FROM events WHERE group_id = ? AND cursor <= pruned_through_cursor
-                   ) THEN 0 ELSE pruned_through_cursor END,
-                   MAX(pruned_through_cursor,
-                       COALESCE((SELECT MAX(cursor) FROM events WHERE group_id = ?), 0))
-            FROM sync_groups
-            WHERE group_id = ?
-            "#,
-        )
-        .bind(group_id)
-        .bind(group_id)
-        .bind(group_id)
-        .fetch_one(&self.pool)
-        .await
-        .context("read bootstrap cursor bounds")?;
-        Ok((
-            u64::try_from(pruned).context("negative retained cursor floor")?,
-            u64::try_from(latest).context("negative latest bootstrap cursor")?,
-        ))
-    }
-
-    /// Deletes one bounded oldest-first batch and returns blob files that became unreferenced.
+    /// Evicts oldest unprotected items and reclaims unreferenced blobs in one bounded batch.
     pub async fn cleanup_group(
         &self,
         group_id: &str,
@@ -1265,29 +979,14 @@ impl Repository {
     ) -> Result<CleanupResult> {
         let batch_size = policy.batch_size.max(1);
         let mut transaction = self.pool.begin().await.context("begin Hub cleanup")?;
-        // Protection patches can occur after their content. Until every legacy event has been
-        // inspected, a new device cannot prove that an earlier mapped item is unprotected.
-        let registration_pending: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE group_id = ? AND retention_key IS NULL)",
-        )
-        .bind(group_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .context("read legacy retention registration state")?;
-        if registration_pending {
-            transaction.commit().await?;
-            return Ok(CleanupResult::default());
-        }
+
         let stale_blob_rows = sqlx::query(
             r#"
             SELECT blob_id, size FROM blobs b
             WHERE group_id = ?
-              AND (
-                  (gc_protected = 0 AND created_at_ms < ?)
-                  OR (gc_protected = 1 AND ? IS NOT NULL AND created_at_ms < ?)
-              )
+              AND created_at_ms < ?
               AND NOT EXISTS (
-                  SELECT 1 FROM event_blob_refs r
+                  SELECT 1 FROM item_blob_refs r
                   WHERE r.group_id = b.group_id AND r.blob_id = b.blob_id
               )
             ORDER BY created_at_ms ASC
@@ -1296,8 +995,6 @@ impl Repository {
         )
         .bind(group_id)
         .bind(policy.orphan_cutoff_ms)
-        .bind(policy.legacy_blob_cutoff_ms)
-        .bind(policy.legacy_blob_cutoff_ms)
         .bind(i64::from(batch_size))
         .fetch_all(&mut *transaction)
         .await
@@ -1335,39 +1032,31 @@ impl Repository {
             .context("update stale Hub blob usage")?;
         }
 
-        let usage_row = sqlx::query(
-            r#"
-            SELECT event_bytes + blob_bytes AS used_bytes
-            FROM sync_groups
-            WHERE group_id = ?
-            "#,
+        let used_bytes_raw: i64 = sqlx::query_scalar(
+            "SELECT event_bytes + blob_bytes FROM sync_groups WHERE group_id = ?",
         )
         .bind(group_id)
         .fetch_one(&mut *transaction)
         .await
         .context("read Hub cleanup usage")?;
-        let used_bytes = u64::try_from(usage_row.try_get::<i64, _>("used_bytes")?)
-            .context("negative Hub cleanup usage")?;
+        let used_bytes = u64::try_from(used_bytes_raw).context("negative Hub cleanup usage")?;
+
         struct CleanupCandidate {
-            cursor: i64,
-            event_id: String,
+            seq: i64,
+            item_key: String,
             received_at_ms: i64,
-            event_bytes: u64,
+            item_bytes: u64,
         }
 
         let rows = sqlx::query(
             r#"
-            SELECT cursor, event_id, received_at_ms, length(nonce) + length(ciphertext) AS event_bytes
-            FROM events e
-            WHERE group_id = ? AND retention_key IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM retention_protections p
-                  WHERE p.group_id = e.group_id AND p.item_key = e.retention_key
-              )
+            SELECT seq, item_key, received_at_ms, length(nonce) + length(ciphertext) AS item_bytes
+            FROM items
+            WHERE group_id = ? AND protected = 0
             ORDER BY
                 CASE WHEN ? IS NOT NULL AND received_at_ms < ? THEN 0 ELSE 1 END ASC,
-                created_at_ms ASC,
-                cursor ASC
+                updated_at_ms ASC,
+                seq ASC
             LIMIT ?
             "#,
         )
@@ -1393,28 +1082,29 @@ impl Repository {
             .into_iter()
             .map(|row| {
                 Ok(CleanupCandidate {
-                    cursor: row.try_get("cursor")?,
-                    event_id: row.try_get("event_id")?,
+                    seq: row.try_get("seq")?,
+                    item_key: row.try_get("item_key")?,
                     received_at_ms: row.try_get("received_at_ms")?,
-                    event_bytes: u64::try_from(row.try_get::<i64, _>("event_bytes")?)
+                    item_bytes: u64::try_from(row.try_get::<i64, _>("item_bytes")?)
                         .unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let count_excess =
-            if let Some(maximum) = policy.max_events {
-                let eligible: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM events e WHERE group_id = ? AND retention_key IS NOT NULL \
-                 AND NOT EXISTS(SELECT 1 FROM retention_protections p \
-                     WHERE p.group_id = e.group_id AND p.item_key = e.retention_key)",
-            ).bind(group_id).fetch_one(&mut *transaction).await?;
-                u64::try_from(eligible)
-                    .context("negative Hub cleanup event count")?
-                    .saturating_sub(maximum)
-            } else {
-                0
-            };
+        let count_excess = if let Some(maximum) = policy.max_items {
+            let eligible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM items WHERE group_id = ? AND protected = 0",
+            )
+            .bind(group_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("count eligible cleanup items")?;
+            u64::try_from(eligible)
+                .context("negative Hub cleanup item count")?
+                .saturating_sub(maximum)
+        } else {
+            0
+        };
         let time_excess = policy.retention_cutoff_ms.map_or(0, |cutoff| {
             candidates
                 .iter()
@@ -1428,22 +1118,24 @@ impl Repository {
 
         let mut candidate_rank = HashMap::with_capacity(candidates.len());
         for (index, candidate) in candidates.iter().enumerate() {
-            candidate_rank.insert(candidate.event_id.clone(), index);
+            candidate_rank.insert(candidate.item_key.clone(), index);
         }
         let mut ref_query = sqlx::QueryBuilder::new(
-            "SELECT r.blob_id, b.size, r.event_id \
-             FROM event_blob_refs r \
+            "SELECT r.blob_id, b.size, r.item_key \
+             FROM item_blob_refs r \
              JOIN blobs b ON b.group_id = r.group_id AND b.blob_id = r.blob_id \
              WHERE r.group_id = ",
         );
         ref_query
             .push_bind(group_id)
-            .push(" AND b.gc_protected = 0 AND r.blob_id IN (SELECT DISTINCT blob_id FROM event_blob_refs WHERE group_id = ")
+            .push(
+                " AND r.blob_id IN (SELECT DISTINCT blob_id FROM item_blob_refs WHERE group_id = ",
+            )
             .push_bind(group_id)
-            .push(" AND event_id IN (");
+            .push(" AND item_key IN (");
         let mut separated = ref_query.separated(", ");
         for candidate in &candidates {
-            separated.push_bind(&candidate.event_id);
+            separated.push_bind(&candidate.item_key);
         }
         ref_query.push("))");
         let blob_ref_rows = ref_query
@@ -1457,9 +1149,9 @@ impl Repository {
             let blob_id: String = row.try_get("blob_id")?;
             let size =
                 u64::try_from(row.try_get::<i64, _>("size")?).context("negative Hub blob size")?;
-            let event_id: String = row.try_get("event_id")?;
+            let item_key: String = row.try_get("item_key")?;
             let entry = blob_refs.entry(blob_id).or_insert((size, true, 0));
-            if let Some(&rank) = candidate_rank.get(&event_id) {
+            if let Some(&rank) = candidate_rank.get(&item_key) {
                 entry.2 = entry.2.max(rank);
             } else {
                 entry.1 = false;
@@ -1479,7 +1171,7 @@ impl Repository {
             let mut released = 0_u64;
             let mut quota_delete_count = candidates.len();
             for (index, candidate) in candidates.iter().enumerate() {
-                released = released.saturating_add(candidate.event_bytes);
+                released = released.saturating_add(candidate.item_bytes);
                 if let Some((bytes, _)) = released_by_rank.get(&index) {
                     released = released.saturating_add(*bytes);
                 }
@@ -1506,12 +1198,12 @@ impl Repository {
         let selected = &candidates[..delete_count];
         let deleted_through = selected
             .iter()
-            .map(|candidate| candidate.cursor)
+            .map(|candidate| candidate.seq)
             .max()
             .unwrap_or(0);
-        let deleted_event_bytes = selected
+        let deleted_item_bytes = selected
             .iter()
-            .map(|candidate| candidate.event_bytes)
+            .map(|candidate| candidate.item_bytes)
             .sum::<u64>();
         let mut released_blob_candidates = HashMap::new();
         for (rank, (_, blobs)) in released_by_rank {
@@ -1523,18 +1215,18 @@ impl Repository {
             }
         }
 
-        let mut delete_events = sqlx::QueryBuilder::new("DELETE FROM events WHERE group_id = ");
-        delete_events.push_bind(group_id).push(" AND event_id IN (");
-        let mut separated = delete_events.separated(", ");
+        let mut delete_items = sqlx::QueryBuilder::new("DELETE FROM items WHERE group_id = ");
+        delete_items.push_bind(group_id).push(" AND item_key IN (");
+        let mut separated = delete_items.separated(", ");
         for candidate in selected {
-            separated.push_bind(&candidate.event_id);
+            separated.push_bind(&candidate.item_key);
         }
-        delete_events.push(")");
-        delete_events
+        delete_items.push(")");
+        delete_items
             .build()
             .execute(&mut *transaction)
             .await
-            .context("delete retained Hub events")?;
+            .context("delete evicted Hub items")?;
 
         deleted_blob_ids.sort_unstable();
         deleted_blob_ids.dedup();
@@ -1544,9 +1236,9 @@ impl Repository {
             let deleted = sqlx::query(
                 r#"
                 DELETE FROM blobs
-                WHERE group_id = ? AND blob_id = ? AND gc_protected = 0
+                WHERE group_id = ? AND blob_id = ?
                   AND NOT EXISTS (
-                      SELECT 1 FROM event_blob_refs r
+                      SELECT 1 FROM item_blob_refs r
                       WHERE r.group_id = blobs.group_id AND r.blob_id = blobs.blob_id
                   )
                 "#,
@@ -1566,96 +1258,191 @@ impl Repository {
                 released_blob_count = released_blob_count.saturating_add(1);
             }
         }
-        if released_blob_count > 0 {
-            sqlx::query(
-                "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?), \
-                 availability_cursor = availability_cursor + 1, \
-                 pruned_availability_cursor = availability_cursor + 1 WHERE group_id = ?",
-            )
-            .bind(deleted_through)
-            .bind(group_id)
-            .execute(&mut *transaction)
-            .await
-            .context("advance retained Hub cursor floor and availability watermark")?;
-        } else {
-            sqlx::query(
-                "UPDATE sync_groups SET pruned_through_cursor = MAX(pruned_through_cursor, ?) \
-                 WHERE group_id = ?",
-            )
-            .bind(deleted_through)
-            .bind(group_id)
-            .execute(&mut *transaction)
-            .await
-            .context("advance retained Hub cursor floor")?;
-        }
+
         sqlx::query(
             r#"
             UPDATE sync_groups
-            SET event_bytes = MAX(0, event_bytes - ?),
+            SET pruned_through_seq = MAX(pruned_through_seq, ?),
+                event_bytes = MAX(0, event_bytes - ?),
                 event_count = MAX(0, event_count - ?),
                 blob_bytes = MAX(0, blob_bytes - ?),
                 blob_count = MAX(0, blob_count - ?)
             WHERE group_id = ?
             "#,
         )
-        .bind(i64::try_from(deleted_event_bytes).context("deleted event usage is too large")?)
-        .bind(i64::try_from(delete_count).context("too many deleted Hub events")?)
+        .bind(deleted_through)
+        .bind(i64::try_from(deleted_item_bytes).context("deleted item usage is too large")?)
+        .bind(i64::try_from(delete_count).context("too many deleted Hub items")?)
         .bind(i64::try_from(released_blob_bytes).context("released blob usage is too large")?)
         .bind(i64::try_from(released_blob_count).context("too many released Hub blobs")?)
         .bind(group_id)
         .execute(&mut *transaction)
         .await
         .context("update retained Hub usage")?;
+
         transaction.commit().await.context("commit Hub cleanup")?;
         Ok(CleanupResult {
-            deleted_events: delete_count as u64,
+            deleted_items: delete_count as u64,
             deleted_blob_ids,
             has_more: stale_blob_batch_full
                 || (candidates.len() == batch_size as usize && delete_count == candidates.len()),
         })
     }
+}
 
-    async fn attach_blob_ids(&self, group_id: &str, events: &mut [CloudEvent]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
+async fn replace_item_blob_refs(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_id: &str,
+    item_key: &str,
+    content_blobs: &[String],
+    optional_blobs: &[String],
+    now: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM item_blob_refs WHERE group_id = ? AND item_key = ?")
+        .bind(group_id)
+        .bind(item_key)
+        .execute(&mut **transaction)
+        .await
+        .context("clear item blob references")?;
+    for blob_id in content_blobs {
+        sqlx::query(
+            "INSERT INTO item_blob_refs (group_id, item_key, blob_id, optional, created_at_ms) \
+             VALUES (?, ?, ?, 0, ?)",
+        )
+        .bind(group_id)
+        .bind(item_key)
+        .bind(blob_id)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .context("insert item content blob reference")?;
+    }
+    for blob_id in optional_blobs {
+        sqlx::query(
+            "INSERT INTO item_blob_refs (group_id, item_key, blob_id, optional, created_at_ms) \
+             VALUES (?, ?, ?, 1, ?)",
+        )
+        .bind(group_id)
+        .bind(item_key)
+        .bind(blob_id)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .context("insert item optional blob reference")?;
+    }
+    Ok(())
+}
+
+async fn load_items_by_keys(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_id: &str,
+    item_keys: &[String],
+) -> Result<Vec<SyncItemRecord>> {
+    if item_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT seq, hub_rev, item_key, origin_device_id, updated_at_ms, \
+                deleted, protected, nonce, ciphertext \
+         FROM items WHERE group_id = ",
+    );
+    query.push_bind(group_id).push(" AND item_key IN (");
+    let mut separated = query.separated(", ");
+    for item_key in item_keys {
+        separated.push_bind(item_key);
+    }
+    query.push(") ORDER BY seq DESC");
+    let rows = query
+        .build()
+        .fetch_all(&mut **transaction)
+        .await
+        .context("load conflicting hub items")?;
+    let mut items = rows
+        .into_iter()
+        .map(sync_item_record_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    attach_item_blobs(transaction, group_id, &mut items).await?;
+    Ok(items)
+}
+
+async fn attach_item_blobs(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_id: &str,
+    items: &mut [SyncItemRecord],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut query = sqlx::QueryBuilder::new(
+        "SELECT refs.item_key, refs.blob_id, refs.optional, \
+                blobs.blob_id IS NOT NULL AS available \
+         FROM item_blob_refs refs LEFT JOIN blobs \
+         ON blobs.group_id = refs.group_id AND blobs.blob_id = refs.blob_id \
+         WHERE refs.group_id = ",
+    );
+    query.push_bind(group_id).push(" AND refs.item_key IN (");
+    let mut separated = query.separated(", ");
+    for item in items.iter() {
+        separated.push_bind(&item.item_key);
+    }
+    query.push(") ORDER BY refs.item_key, refs.blob_id");
+    let rows = query
+        .build()
+        .fetch_all(&mut **transaction)
+        .await
+        .context("list item blob references")?;
+
+    let mut content_by_item: HashMap<String, Vec<String>> = HashMap::new();
+    let mut optional_by_item: HashMap<String, Vec<String>> = HashMap::new();
+    let mut available_by_item: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let item_key: String = row.try_get("item_key")?;
+        let blob_id: String = row.try_get("blob_id")?;
+        let optional: i64 = row.try_get("optional")?;
+        if row.try_get::<bool, _>("available")? {
+            available_by_item
+                .entry(item_key.clone())
+                .or_default()
+                .push(blob_id.clone());
         }
-        let mut query = sqlx::QueryBuilder::new(
-            "SELECT refs.event_id, refs.blob_id, blobs.blob_id IS NOT NULL AS available \
-             FROM event_blob_refs refs LEFT JOIN blobs \
-             ON blobs.group_id = refs.group_id AND blobs.blob_id = refs.blob_id \
-             WHERE refs.group_id = ",
-        );
-        query.push_bind(group_id).push(" AND event_id IN (");
-        let mut separated = query.separated(", ");
-        for event in events.iter() {
-            separated.push_bind(&event.event.event_id);
+        if optional != 0 {
+            optional_by_item.entry(item_key).or_default().push(blob_id);
+        } else {
+            content_by_item.entry(item_key).or_default().push(blob_id);
         }
-        query.push(") ORDER BY refs.event_id, refs.blob_id");
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .context("list encrypted event blob references")?;
-        let mut by_event: HashMap<String, Vec<String>> = HashMap::new();
-        let mut available_by_event: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let event_id: String = row.try_get("event_id")?;
-            let blob_id: String = row.try_get("blob_id")?;
-            if row.try_get::<bool, _>("available")? {
-                available_by_event
-                    .entry(event_id.clone())
-                    .or_default()
-                    .push(blob_id.clone());
-            }
-            by_event.entry(event_id).or_default().push(blob_id);
-        }
-        for event in events {
-            event.event.blob_ids = by_event.remove(&event.event.event_id).unwrap_or_default();
-            event.available_blob_ids = available_by_event
-                .remove(&event.event.event_id)
-                .unwrap_or_default();
-        }
-        Ok(())
+    }
+    for item in items {
+        item.blob_ids = content_by_item.remove(&item.item_key).unwrap_or_default();
+        item.optional_blob_ids = optional_by_item.remove(&item.item_key).unwrap_or_default();
+        item.available_blob_ids = available_by_item.remove(&item.item_key).unwrap_or_default();
+    }
+    Ok(())
+}
+
+fn sync_item_record_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SyncItemRecord> {
+    let seq: i64 = row.try_get("seq")?;
+    let hub_rev: i64 = row.try_get("hub_rev")?;
+    Ok(SyncItemRecord {
+        seq: u64::try_from(seq).context("negative item seq")?,
+        hub_rev: u64::try_from(hub_rev).context("negative item hub_rev")?,
+        item_key: row.try_get("item_key")?,
+        origin_device_id: row.try_get("origin_device_id")?,
+        updated_at_ms: row.try_get("updated_at_ms")?,
+        deleted: row.try_get::<i64, _>("deleted")? != 0,
+        protected: row.try_get::<i64, _>("protected")? != 0,
+        nonce: row.try_get("nonce")?,
+        ciphertext: row.try_get("ciphertext")?,
+        blob_ids: Vec::new(),
+        optional_blob_ids: Vec::new(),
+        available_blob_ids: Vec::new(),
+    })
+}
+
+fn apply_signed_delta(base: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        base.saturating_add(delta as u64)
+    } else {
+        base.saturating_sub(delta.unsigned_abs())
     }
 }
 
@@ -1694,99 +1481,32 @@ pub fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-fn cloud_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CloudEvent> {
-    let cursor: i64 = row.try_get("cursor")?;
-    let sequence: i64 = row.try_get("origin_sequence")?;
-    Ok(CloudEvent {
-        cursor: u64::try_from(cursor).context("negative event cursor")?,
-        available_blob_ids: Vec::new(),
-        event: EncryptedEvent {
-            event_id: row.try_get("event_id")?,
-            origin_device_id: row.try_get("origin_device_id")?,
-            origin_sequence: u64::try_from(sequence).context("negative origin sequence")?,
-            created_at_ms: row.try_get("created_at_ms")?,
-            nonce: row.try_get("nonce")?,
-            ciphertext: row.try_get("ciphertext")?,
-            kind: event_kind_from_row(&row)?,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: row.try_get("retention_key")?,
-        },
-    })
-}
-
-fn event_kind_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SyncEventKind> {
-    let value: i64 = row.try_get("event_kind")?;
-    SyncEventKind::from_i64(value).context("invalid synchronized event kind")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn combined_watermarks_preserve_group_isolation_and_restoration() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        for group in ["group_123", "group_456"] {
-            repository.create_group(group, &[7; 32]).await.unwrap();
-        }
-        assert_eq!(
-            repository.group_watermarks("group_123").await.unwrap(),
-            (0, 0, 0)
-        );
-        let event = EncryptedEvent {
-            event_id: "event_123".into(),
-            origin_device_id: "device_123".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
+    fn sample_write(
+        item_key_char: char,
+        expected_hub_rev: u64,
+        updated_at_ms: i64,
+    ) -> SyncItemWrite {
+        SyncItemWrite {
+            item_key: item_key_char.to_string().repeat(64),
+            expected_hub_rev,
+            local_seq: 1,
+            origin_device_id: "device_123456".into(),
+            updated_at_ms,
+            deleted: false,
+            protected: false,
             nonce: vec![1; 24],
-            ciphertext: vec![1],
-            kind: SyncEventKind::Content,
+            ciphertext: vec![2; 64],
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
-            retention_key: None,
-        };
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        let removed = RemovedDevice {
-            device_id: "device_456".into(),
-            endpoint_id: "endpoint_456".into(),
-            removed_at_ms: 100,
-            restored_at_ms: Some(200),
-        };
-        repository
-            .merge_removed_devices("group_123", std::slice::from_ref(&removed))
-            .await
-            .unwrap();
-        repository
-            .merge_removed_devices(
-                "group_456",
-                &[RemovedDevice {
-                    removed_at_ms: 999,
-                    ..removed
-                }],
-            )
-            .await
-            .unwrap();
-        let (cursor, removed, availability) =
-            repository.group_watermarks("group_123").await.unwrap();
-        assert_eq!(cursor, repository.latest_cursor("group_123").await.unwrap());
-        assert!(cursor > 0);
-        assert_eq!(removed, 200);
-        assert_eq!(availability, 0);
-        assert_eq!(
-            repository.group_watermarks("group_456").await.unwrap(),
-            (0, 999, 0)
-        );
+        }
     }
 
     #[tokio::test]
-    async fn later_blob_upload_publishes_resumable_availability() {
+    async fn upsert_cas_accepts_matching_rev_and_returns_conflicts_without_failing_batch() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
@@ -1795,1315 +1515,247 @@ mod tests {
             .create_group("group_123", &[7; 32])
             .await
             .unwrap();
-        let blob_id = "a".repeat(64);
-        let event = EncryptedEvent {
-            event_id: "event_123".into(),
-            origin_device_id: "device_123".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
-            nonce: vec![1; 24],
-            ciphertext: vec![1],
-            kind: SyncEventKind::Content,
-            blob_ids: vec![blob_id.clone()],
-            optional_blob_ids: vec![blob_id.clone()],
-            retention_key: None,
-        };
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        let (before, cursor, has_more, _) = repository
-            .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
-            .await
-            .unwrap();
-        assert!(before.is_empty());
-        assert_eq!(cursor, 0);
-        assert!(!has_more);
 
-        repository
-            .record_blob("group_123", &blob_id, 128, true)
+        let first = repository
+            .upsert_items("group_123", &[sample_write('a', 0, 100)], None)
             .await
             .unwrap();
-        let (updates, cursor, has_more, _) = repository
-            .cloud_availability_updates("group_123", 0, MAX_EVENTS_PER_BATCH)
+        assert_eq!(first.accepted.len(), 1);
+        assert_eq!(first.accepted[0].hub_rev, 1);
+        assert_eq!(first.accepted[0].seq, 1);
+        assert!(first.conflicts.is_empty());
+
+        let stale = sample_write('a', 0, 120);
+        let fresh = sample_write('b', 0, 130);
+        let second = repository
+            .upsert_items("group_123", &[stale, fresh], None)
             .await
             .unwrap();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].event_id, "event_123");
-        assert_eq!(updates[0].available_blob_ids, [blob_id]);
-        assert_eq!(updates[0].cursor, cursor);
-        assert!(!has_more);
+        assert_eq!(second.accepted.len(), 1);
+        assert_eq!(second.accepted[0].item_key, "b".repeat(64));
+        assert_eq!(second.accepted[0].seq, 2);
+        assert_eq!(second.conflicts.len(), 1);
+        assert_eq!(second.conflicts[0].item_key, "a".repeat(64));
+        assert_eq!(second.conflicts[0].hub_rev, 1);
+
+        let updated = sample_write('a', 1, 140);
+        let third = repository
+            .upsert_items("group_123", &[updated], None)
+            .await
+            .unwrap();
+        assert_eq!(third.accepted.len(), 1);
+        assert_eq!(third.accepted[0].hub_rev, 2);
+        assert_eq!(third.accepted[0].seq, 3);
+        assert!(third.conflicts.is_empty());
     }
 
     #[tokio::test]
-    async fn group_authentication_is_idempotent() {
+    async fn record_blob_bumps_item_seq_without_changing_hub_rev() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
             .unwrap();
-        let token = [7_u8; 32];
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
 
-        repository.create_group("group_123", &token).await.unwrap();
-        repository.create_group("group_123", &token).await.unwrap();
+        let blob_id = "1".repeat(64);
+        let icon_id = "2".repeat(64);
+        let mut write = sample_write('a', 0, 100);
+        write.blob_ids = vec![blob_id.clone()];
+        write.optional_blob_ids = vec![icon_id.clone()];
+        let inserted = repository
+            .upsert_items("group_123", &[write], None)
+            .await
+            .unwrap();
+        assert_eq!(inserted.accepted[0].seq, 1);
+        assert_eq!(inserted.accepted[0].hub_rev, 1);
+
+        let before = repository
+            .list_items_window("group_123", 0, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(before.items.len(), 1);
+        assert!(before.items[0].available_blob_ids.is_empty());
 
         assert!(
             repository
-                .authenticate("group_123", &[8_u8; 32])
+                .record_blob("group_123", &blob_id, 2048)
                 .await
-                .is_err()
+                .unwrap()
         );
+        let after = repository
+            .list_items_window("group_123", 1, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(after.latest_seq, 2);
+        assert_eq!(after.items.len(), 1);
+        assert_eq!(after.items[0].seq, 2);
+        assert_eq!(after.items[0].hub_rev, 1);
+        assert_eq!(after.items[0].blob_ids, vec![blob_id.clone()]);
+        assert_eq!(after.items[0].optional_blob_ids, vec![icon_id]);
+        assert_eq!(after.items[0].available_blob_ids, vec![blob_id]);
     }
 
     #[tokio::test]
-    async fn cloud_history_is_newest_first_and_paged() {
+    async fn tombstone_releases_blob_refs_and_protected_items_survive_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
             .unwrap();
         repository
-            .create_group("group_123", &[7_u8; 32])
+            .create_group("group_123", &[7; 32])
             .await
             .unwrap();
-        let events = (1..=3)
-            .map(|sequence| EncryptedEvent {
-                event_id: format!("event_{sequence:03}"),
-                origin_device_id: "device_123".into(),
-                origin_sequence: sequence,
-                created_at_ms: sequence as i64,
-                nonce: vec![sequence as u8; 24],
-                ciphertext: vec![sequence as u8],
-                kind: SyncEventKind::Content,
-                blob_ids: Vec::new(),
-                optional_blob_ids: Vec::new(),
-                retention_key: None,
-            })
-            .collect::<Vec<_>>();
+
+        let blob_a = "1".repeat(64);
+        let blob_b = "2".repeat(64);
+        let mut item_a = sample_write('a', 0, 100);
+        item_a.blob_ids = vec![blob_a.clone()];
+        let mut item_b = sample_write('b', 0, 200);
+        item_b.protected = true;
+        item_b.blob_ids = vec![blob_b.clone()];
         repository
-            .insert_events("group_123", &events, None)
+            .upsert_items("group_123", &[item_a, item_b], None)
             .await
             .unwrap();
         repository
-            .insert_events(
+            .record_blob("group_123", &blob_a, 4096)
+            .await
+            .unwrap();
+        repository
+            .record_blob("group_123", &blob_b, 4096)
+            .await
+            .unwrap();
+
+        let mut tombstone = sample_write('a', 1, 300);
+        tombstone.deleted = true;
+        tombstone.ciphertext = vec![9; 16];
+        repository
+            .upsert_items("group_123", &[tombstone], None)
+            .await
+            .unwrap();
+
+        let (active, next_before, total) = repository
+            .list_active_items_page("group_123", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(next_before, None);
+        assert_eq!(active[0].item_key, "b".repeat(64));
+
+        let cleaned = repository
+            .cleanup_group(
                 "group_123",
-                &[EncryptedEvent {
-                    event_id: "state_004".into(),
-                    origin_device_id: "device_123".into(),
-                    origin_sequence: 4,
-                    created_at_ms: 4,
-                    nonce: vec![4; 24],
-                    ciphertext: vec![4],
-                    kind: SyncEventKind::ItemState,
-                    blob_ids: Vec::new(),
-                    optional_blob_ids: Vec::new(),
-                    retention_key: None,
-                }],
-                None,
-            )
-            .await
-            .unwrap();
-
-        let (first, next) = repository
-            .list_events_before("group_123", None, 2, false)
-            .await
-            .unwrap();
-        assert_eq!(
-            first.iter().map(|item| item.cursor).collect::<Vec<_>>(),
-            vec![3, 2]
-        );
-        assert_eq!(next, Some(2));
-
-        let (second, next) = repository
-            .list_events_before("group_123", next, 2, false)
-            .await
-            .unwrap();
-        assert_eq!(
-            second.iter().map(|item| item.cursor).collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(next, None);
-        assert_eq!(repository.event_count("group_123").await.unwrap(), 3);
-
-        let (first, next) = repository
-            .list_events_before("group_123", None, 2, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            first
-                .iter()
-                .map(|event| event.event.kind)
-                .collect::<Vec<_>>(),
-            [SyncEventKind::ItemState, SyncEventKind::Content]
-        );
-        assert_eq!(
-            first.iter().map(|event| event.cursor).collect::<Vec<_>>(),
-            [4, 3]
-        );
-        let (second, next) = repository
-            .list_events_before("group_123", next, 2, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            second.iter().map(|event| event.cursor).collect::<Vec<_>>(),
-            [2, 1]
-        );
-        assert_eq!(next, None);
-    }
-
-    #[tokio::test]
-    async fn removed_device_is_purged_and_cannot_reannounce() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let device = DeviceAnnouncement {
-            device_id: "device_123".into(),
-            device_name: "Android".into(),
-            platform: "android".into(),
-            endpoint_id: "endpoint_123".into(),
-            direct_addresses: Vec::new(),
-            relay_urls: Vec::new(),
-            app_version: "1.1.154".into(),
-        };
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-
-        let removed = RemovedDevice {
-            device_id: device.device_id.clone(),
-            endpoint_id: device.endpoint_id.clone(),
-            removed_at_ms: 100,
-            restored_at_ms: None,
-        };
-        repository
-            .merge_removed_devices("group_123", std::slice::from_ref(&removed))
-            .await
-            .unwrap();
-
-        assert!(
-            repository
-                .list_peers("group_123", "another_device")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            repository
-                .is_removed_device("group_123", &device.device_id, &device.endpoint_id)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            repository.latest_removed_at_ms("group_123").await.unwrap(),
-            100
-        );
-        assert!(
-            repository
-                .upsert_device("group_123", &device)
-                .await
-                .is_err()
-        );
-
-        let restored = RemovedDevice {
-            restored_at_ms: Some(200),
-            ..removed
-        };
-        repository
-            .merge_removed_devices("group_123", &[restored])
-            .await
-            .unwrap();
-        assert!(
-            !repository
-                .is_removed_device("group_123", &device.device_id, &device.endpoint_id)
-                .await
-                .unwrap()
-        );
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-        assert_eq!(
-            repository.latest_removed_at_ms("group_123").await.unwrap(),
-            200
-        );
-    }
-
-    #[tokio::test]
-    async fn device_directory_does_not_store_or_return_lan_routes() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        repository
-            .upsert_device(
-                "group_123",
-                &DeviceAnnouncement {
-                    device_id: "device_123".into(),
-                    device_name: "Android".into(),
-                    platform: "android".into(),
-                    endpoint_id: "endpoint_123".into(),
-                    direct_addresses: vec!["172.19.0.1:35555".into()],
-                    relay_urls: vec!["https://relay.example".into()],
-                    app_version: "1.1.160".into(),
+                CleanupPolicy {
+                    retention_cutoff_ms: None,
+                    max_items: Some(0),
+                    target_bytes: Some(0),
+                    orphan_cutoff_ms: now_ms() + 10_000,
+                    batch_size: 100,
                 },
             )
             .await
             .unwrap();
+        assert_eq!(cleaned.deleted_items, 1);
+        assert_eq!(cleaned.deleted_blob_ids, vec![blob_a]);
+        let usage = repository.group_usage("group_123").await.unwrap();
+        assert_eq!(usage.item_count, 1);
+        assert_eq!(usage.blob_count, 1);
+    }
 
-        let stored_lengths: (i64, i64) = sqlx::query_as(
-            "SELECT length(direct_addresses), length(relay_urls) FROM devices WHERE group_id = 'group_123' AND device_id = 'device_123'",
+    #[tokio::test]
+    async fn window_pagination_returns_newest_first_without_skipping_older_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
+            .await
+            .unwrap();
+        repository
+            .create_group("group_123", &[7; 32])
+            .await
+            .unwrap();
+
+        let writes = ['a', 'b', 'c', 'd']
+            .into_iter()
+            .enumerate()
+            .map(|(index, ch)| sample_write(ch, 0, (index as i64 + 1) * 100))
+            .collect::<Vec<_>>();
+        repository
+            .upsert_items("group_123", &writes, None)
+            .await
+            .unwrap();
+
+        let page1 = repository
+            .list_items_window("group_123", 1, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.latest_seq, 4);
+        assert!(page1.had_more);
+        assert_eq!(
+            page1.items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+
+        let page2 = repository
+            .list_items_window("group_123", 1, Some(3), None, 2)
+            .await
+            .unwrap();
+        assert!(!page2.had_more);
+        assert_eq!(
+            page2.items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_migration_preserves_groups_and_devices_while_resetting_legacy_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("legacy-hub.sqlite3");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < 12)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+
+        let token = [9_u8; 32];
+        let token_hash = blake3::hash(&token);
+        sqlx::query(
+            "INSERT INTO sync_groups (group_id, access_token_hash, created_at_ms) VALUES (?, ?, 1)",
         )
-        .fetch_one(&repository.pool)
+        .bind("group_legacy")
+        .bind(token_hash.as_bytes().as_slice())
+        .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(stored_lengths, (0, 0));
+        sqlx::query(
+            "INSERT INTO devices (group_id, device_id, device_name, platform, endpoint_id, \
+             direct_addresses, relay_urls, app_version, last_seen_ms) \
+             VALUES ('group_legacy', 'device_legacy', 'Mac', 'macos', 'endpoint_legacy', X'', X'', '1.1.230', 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
 
-        let peer = repository
-            .list_peers("group_123", "another_device")
-            .await
-            .unwrap()
-            .remove(0);
-        assert!(peer.direct_addresses.is_empty());
-        assert!(peer.relay_urls.is_empty());
-    }
-
-    #[tokio::test]
-    async fn bootstrap_uses_complete_retained_hub_range() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let events = (1..=5).map(test_event).collect::<Vec<_>>();
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        repository
-            .cleanup_group(
-                "group_123",
-                CleanupPolicy {
-                    retention_cutoff_ms: None,
-                    legacy_blob_cutoff_ms: None,
-                    max_events: Some(2),
-                    target_bytes: None,
-                    orphan_cutoff_ms: i64::MAX,
-                    batch_size: 10,
-                },
-            )
-            .await
-            .unwrap();
-        let (start, latest) = repository
-            .bootstrap_cursor_bounds("group_123")
-            .await
-            .unwrap();
-
-        assert_eq!(start, 3);
-        assert_eq!(latest, 5);
-    }
-
-    #[tokio::test]
-    async fn cleanup_advances_gap_floor_and_reclaims_referenced_blobs() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let blob_id = "a".repeat(64);
-        repository
-            .record_blob("group_123", &blob_id, 128, true)
-            .await
-            .unwrap();
-        let mut events = (1..=3).map(test_event).collect::<Vec<_>>();
-        events[0].blob_ids.push(blob_id.clone());
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-
-        let result = repository
-            .cleanup_group(
-                "group_123",
-                CleanupPolicy {
-                    retention_cutoff_ms: None,
-                    legacy_blob_cutoff_ms: None,
-                    max_events: Some(1),
-                    target_bytes: None,
-                    orphan_cutoff_ms: i64::MAX,
-                    batch_size: 10,
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.deleted_events, 2);
-        assert_eq!(result.deleted_blob_ids, vec![blob_id]);
-        assert!(
-            repository
-                .ensure_cursor_available("group_123", 0)
-                .await
-                .is_ok()
-        );
-        assert!(
-            repository
-                .ensure_cursor_available("group_123", 1)
-                .await
-                .is_err()
-        );
-        assert!(
-            repository
-                .ensure_cursor_available("group_123", 2)
-                .await
-                .is_ok()
-        );
-        assert_eq!(repository.latest_cursor("group_123").await.unwrap(), 3);
-        let usage = repository.group_usage("group_123").await.unwrap();
-        assert_eq!(usage.blob_count, 0);
-        assert_eq!(usage.event_count, 1);
-        assert_eq!(usage.used_bytes, 40);
-    }
-
-    #[tokio::test]
-    async fn cleanup_reclaims_recent_blob_after_its_last_event_is_pruned() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let blob_id = "b".repeat(64);
-        repository
-            .record_blob("group_123", &blob_id, 128, true)
-            .await
-            .unwrap();
-        let mut event = test_event(1);
-        event.blob_ids.push(blob_id.clone());
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-
-        let result = repository
-            .cleanup_group(
-                "group_123",
-                CleanupPolicy {
-                    retention_cutoff_ms: None,
-                    legacy_blob_cutoff_ms: None,
-                    max_events: Some(0),
-                    target_bytes: None,
-                    orphan_cutoff_ms: now_ms() - 86_400_000,
-                    batch_size: 10,
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.deleted_events, 1);
-        assert_eq!(result.deleted_blob_ids, vec![blob_id]);
-        let usage = repository.group_usage("group_123").await.unwrap();
-        assert_eq!(usage.event_count, 0);
-        assert_eq!(usage.blob_count, 0);
-    }
-
-    #[tokio::test]
-    async fn optional_blob_can_arrive_later_and_is_retained_until_its_event_is_pruned() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let blob_id = "d".repeat(64);
-        let mut event = test_event(1);
-        event.blob_ids.push(blob_id.clone());
-        event.optional_blob_ids.push(blob_id.clone());
-
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        let mut policy = CleanupPolicy {
-            retention_cutoff_ms: None,
-            legacy_blob_cutoff_ms: None,
-            max_events: None,
-            target_bytes: None,
-            orphan_cutoff_ms: i64::MAX,
-            batch_size: 10,
-        };
-        let result = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(result.deleted_events, 0);
-        assert!(result.deleted_blob_ids.is_empty());
+        let upgraded = Repository::open(&db_path).await.unwrap();
+        upgraded.authenticate("group_legacy", &token).await.unwrap();
+        let devices = upgraded.list_devices("group_legacy").await.unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "device_legacy");
         assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .blob_count,
-            0
+            upgraded.group_watermarks("group_legacy").await.unwrap(),
+            (0, 0)
         );
-
-        repository
-            .record_blob("group_123", &blob_id, 128, true)
-            .await
-            .unwrap();
-        let result = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert!(result.deleted_blob_ids.is_empty());
-        let events = repository.list_events("group_123", 0, 10).await.unwrap();
-        assert_eq!(events[0].event.blob_ids, vec![blob_id.clone()]);
-
-        policy.max_events = Some(0);
-        let result = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(result.deleted_events, 1);
-        assert_eq!(result.deleted_blob_ids, vec![blob_id]);
-        let usage = repository.group_usage("group_123").await.unwrap();
-        assert_eq!(usage.blob_count, 0);
-        assert_eq!(usage.used_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn optional_blob_must_be_listed_in_the_event_references() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let mut event = test_event(1);
-        event.optional_blob_ids.push("d".repeat(64));
-
-        assert!(
-            repository
-                .insert_events("group_123", &[event], None)
-                .await
-                .is_err()
-        );
-        assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn optional_blob_does_not_bypass_another_events_required_reference() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let blob_id = "d".repeat(64);
-        let mut optional = test_event(1);
-        optional.blob_ids.push(blob_id.clone());
-        optional.optional_blob_ids.push(blob_id.clone());
-        let mut required = test_event(2);
-        required.blob_ids.push(blob_id);
-
-        assert!(
-            repository
-                .insert_events("group_123", &[optional, required], None)
-                .await
-                .is_err()
-        );
-        assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn required_blob_reference_is_rejected_until_the_blob_is_uploaded() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        let mut event = test_event(1);
-        event.blob_ids.push("c".repeat(64));
-
-        assert!(
-            repository
-                .insert_events("group_123", std::slice::from_ref(&event), None)
-                .await
-                .is_err()
-        );
-        assert_eq!(repository.event_count("group_123").await.unwrap(), 0);
-
-        repository
-            .record_blob("group_123", &event.blob_ids[0], 128, true)
-            .await
-            .unwrap();
-        let accepted = repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(repository.event_count("group_123").await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn event_quota_rejection_rolls_back_the_batch() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-
-        let error = repository
-            .insert_events("group_123", &[test_event(1)], Some(8))
-            .await
-            .unwrap_err();
-
-        assert!(error.downcast_ref::<QuotaExceeded>().is_some());
-        assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .event_count,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn protected_events_and_shared_blobs_survive_quota_cleanup() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let device = retention_test_device("device_123");
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-        let shared_blob = "a".repeat(64);
-        let ordinary_blob = "b".repeat(64);
-        repository
-            .record_blob("group_123", &shared_blob, 1000, true)
-            .await
-            .unwrap();
-        repository
-            .record_blob("group_123", &ordinary_blob, 80, true)
-            .await
-            .unwrap();
-        let mut events = (1..=4).map(test_event).collect::<Vec<_>>();
-        let protected_key = events[0].retention_key.clone().unwrap();
-        events[0].blob_ids.push(shared_blob.clone());
-        events[1].blob_ids.push(shared_blob.clone());
-        events[2].blob_ids.push(ordinary_blob.clone());
-        events[3].kind = SyncEventKind::ItemState;
-        events[3].retention_key = Some(protected_key.clone());
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                1,
-                Some(&[protected_key]),
-                &[],
-                None,
-            )
-            .await
-            .unwrap();
-
-        let mut policy = retention_test_policy();
-        policy.max_events = Some(2);
-        assert_eq!(
-            repository
-                .cleanup_group("group_123", policy)
-                .await
-                .unwrap()
-                .deleted_events,
-            0
-        );
-        policy.max_events = None;
-        policy.target_bytes = Some(1080);
-        let result = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(result.deleted_events, 2);
-        assert_eq!(result.deleted_blob_ids, [ordinary_blob]);
-        assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .used_bytes,
-            1080
-        );
-        let retained = repository.list_events("group_123", 0, 10).await.unwrap();
-        assert_eq!(
-            retained
-                .iter()
-                .map(|stored| stored.cursor)
-                .collect::<Vec<_>>(),
-            [1, 4]
-        );
-        assert_eq!(
-            retained[0].event.blob_ids,
-            std::slice::from_ref(&shared_blob)
-        );
-
-        policy.target_bytes = Some(0);
-        policy.retention_cutoff_ms = Some(i64::MAX);
-        policy.max_events = Some(0);
-        let idle = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(idle.deleted_events, 0);
-        assert!(idle.deleted_blob_ids.is_empty());
-        assert!(!idle.has_more);
-
-        repository
-            .set_retention("group_123", &device.device_id, 2, Some(&[]), &[], None)
-            .await
-            .unwrap();
-        let released = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(released.deleted_events, 2);
-        assert_eq!(released.deleted_blob_ids, [shared_blob]);
-        assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .used_bytes,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn protection_snapshots_ignore_stale_generations_and_removed_devices() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let event = test_event(1);
-        let keys = [event.retention_key.clone().unwrap()];
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        for id in ["device_123", "device_456"] {
-            repository
-                .upsert_device("group_123", &retention_test_device(id))
-                .await
-                .unwrap();
-            repository
-                .set_retention("group_123", id, 10, Some(&keys), &[], None)
-                .await
-                .unwrap();
-        }
-        repository
-            .set_retention("group_123", "device_123", 11, Some(&[]), &[], None)
-            .await
-            .unwrap();
-        repository
-            .set_retention("group_123", "device_123", 10, Some(&keys), &[], None)
-            .await
-            .unwrap();
-        let mut policy = retention_test_policy();
-        policy.target_bytes = Some(0);
-        assert_eq!(
-            repository
-                .cleanup_group("group_123", policy)
-                .await
-                .unwrap()
-                .deleted_events,
-            0
-        );
-
-        repository
-            .merge_removed_devices(
-                "group_123",
-                &[RemovedDevice {
-                    device_id: "device_456".into(),
-                    endpoint_id: "endpoint_device_456".into(),
-                    removed_at_ms: 100,
-                    restored_at_ms: None,
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            repository
-                .cleanup_group("group_123", policy)
-                .await
-                .unwrap()
-                .deleted_events,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_identities_and_shared_blob_references_are_registered_before_reclamation() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let device = retention_test_device("device_123");
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-        let blob = "c".repeat(64);
-        repository
-            .record_blob("group_123", &blob, 200, false)
-            .await
-            .unwrap();
-        let mut events = (1..=2).map(test_event).collect::<Vec<_>>();
-        for event in &mut events {
-            event.retention_key = None;
-        }
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        let mut policy = retention_test_policy();
-        policy.target_bytes = Some(0);
-        policy.retention_cutoff_ms = Some(i64::MAX);
-        policy.legacy_blob_cutoff_ms = Some(i64::MAX);
-        let unchanged = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(unchanged.deleted_events, 0);
-        assert!(unchanged.deleted_blob_ids.is_empty());
-        assert!(!unchanged.has_more);
-        let epoch = repository.retention_epoch("group_123").await.unwrap();
-        assert!(!epoch.is_empty());
-        assert_eq!(
-            repository.retention_epoch("group_123").await.unwrap(),
-            epoch
-        );
-        assert_eq!(
-            repository
-                .retention_candidates("group_123", "endpoint_123", None)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-
-        let first = RetentionMapping {
-            event_id: events[0].event_id.clone(),
-            item_key: "1".repeat(64),
-            blob_ids: vec![blob.clone()],
-        };
-        repository
-            .set_retention("group_123", &device.device_id, 1, Some(&[]), &[first], None)
-            .await
-            .unwrap();
-        let partially_registered = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(partially_registered.deleted_events, 0);
-        assert!(partially_registered.deleted_blob_ids.is_empty());
-        assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .blob_count,
-            1
-        );
-
-        let second = RetentionMapping {
-            event_id: events[1].event_id.clone(),
-            item_key: "2".repeat(64),
-            blob_ids: vec![blob.clone()],
-        };
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                2,
-                Some(std::slice::from_ref(&second.item_key)),
-                std::slice::from_ref(&second),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            repository
-                .retention_candidates("group_123", "endpoint_123", None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            repository
-                .cleanup_group("group_123", policy)
-                .await
-                .unwrap()
-                .deleted_events,
-            1
-        );
-        repository
-            .set_retention("group_123", &device.device_id, 3, Some(&[]), &[], None)
-            .await
-            .unwrap();
-        let released = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(released.deleted_events, 1);
-        assert_eq!(released.deleted_blob_ids, [blob]);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_pages_include_protected_history_below_the_pruned_watermark() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let device = retention_test_device("device_123");
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-        let protected = "a".repeat(64);
-        let events = (1..=260)
-            .map(|sequence| {
-                let mut event = test_event(sequence);
-                if sequence != 259 {
-                    event.retention_key = Some(protected.clone());
-                }
-                event
-            })
-            .collect::<Vec<_>>();
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                1,
-                Some(&[protected]),
-                &[],
-                None,
-            )
-            .await
-            .unwrap();
-        let mut policy = retention_test_policy();
-        policy.target_bytes = Some(0);
-        assert_eq!(
-            repository
-                .cleanup_group("group_123", policy)
-                .await
-                .unwrap()
-                .deleted_events,
-            1
-        );
-        assert_eq!(
-            repository
-                .bootstrap_cursor_bounds("group_123")
-                .await
-                .unwrap(),
-            (0, 260)
-        );
-        let first = repository
-            .list_events("group_123", 0, MAX_EVENTS_PER_BATCH)
-            .await
-            .unwrap();
-        assert_eq!(first.len(), 256);
-        let cursor = first.last().unwrap().cursor;
-        repository
-            .ensure_cursor_available("group_123", cursor)
-            .await
-            .unwrap();
-        let rest = repository
-            .list_events("group_123", cursor, MAX_EVENTS_PER_BATCH)
-            .await
-            .unwrap();
-        assert_eq!(
-            rest.iter().map(|stored| stored.cursor).collect::<Vec<_>>(),
-            [257, 258, 260]
-        );
-    }
-
-    #[tokio::test]
-    async fn deferred_retention_resumes_after_restart_and_is_scoped_to_device_and_decoder() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hub.sqlite3");
-        let repository = Repository::open(&path).await.unwrap();
-        let device = retention_test_device("device_123");
-        let other_device = retention_test_device("device_456");
-        for group in ["group_123", "group_456"] {
-            repository.create_group(group, &[7; 32]).await.unwrap();
-            repository.upsert_device(group, &device).await.unwrap();
-        }
-        repository
-            .upsert_device("group_123", &other_device)
-            .await
-            .unwrap();
-        let mut events = (1..=u64::from(MAX_EVENTS_PER_BATCH) + 2)
-            .map(test_event)
-            .collect::<Vec<_>>();
-        for event in &mut events {
-            event.retention_key = None;
-        }
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        repository
-            .insert_events("group_456", &events[..1], None)
-            .await
-            .unwrap();
-        let blob = "c".repeat(64);
-        repository
-            .record_blob("group_123", &blob, 200, false)
-            .await
-            .unwrap();
-        let first_page = repository
-            .retention_candidates("group_123", &device.endpoint_id, Some(1))
-            .await
-            .unwrap();
-        assert_eq!(first_page.len(), usize::from(MAX_EVENTS_PER_BATCH));
-        let deferred = DeferredRetentionEvents {
-            decoder_revision: 1,
-            event_ids: first_page
-                .iter()
-                .map(|stored| stored.event.event_id.clone())
-                .collect(),
-        };
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                1,
-                Some(&[]),
-                &[],
-                Some(&deferred),
-            )
-            .await
-            .unwrap();
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                1,
-                None,
-                &[],
-                Some(&deferred),
-            )
-            .await
-            .unwrap();
-        repository.pool.close().await;
-
-        let repository = Repository::open(&path).await.unwrap();
-        let next_page = repository
-            .retention_candidates("group_123", &device.endpoint_id, Some(1))
-            .await
-            .unwrap();
-        assert_eq!(next_page.len(), 2);
-        assert_eq!(
-            next_page[0].event,
-            events[usize::from(MAX_EVENTS_PER_BATCH)]
-        );
-        for (group, endpoint, revision, expected) in [
-            (
-                "group_123",
-                device.endpoint_id.as_str(),
-                Some(2),
-                usize::from(MAX_EVENTS_PER_BATCH),
-            ),
-            (
-                "group_123",
-                other_device.endpoint_id.as_str(),
-                Some(1),
-                usize::from(MAX_EVENTS_PER_BATCH),
-            ),
-            (
-                "group_123",
-                device.endpoint_id.as_str(),
-                None,
-                usize::from(MAX_EVENTS_PER_BATCH),
-            ),
-            ("group_456", device.endpoint_id.as_str(), Some(1), 1),
-        ] {
-            assert_eq!(
-                repository
-                    .retention_candidates(group, endpoint, revision)
-                    .await
-                    .unwrap()
-                    .len(),
-                expected
-            );
-        }
-        let mapping = RetentionMapping {
-            event_id: next_page[0].event.event_id.clone(),
-            item_key: "a".repeat(64),
-            blob_ids: Vec::new(),
-        };
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                0,
-                None,
-                &[mapping],
-                Some(&DeferredRetentionEvents {
-                    decoder_revision: 1,
-                    event_ids: vec![next_page[1].event.event_id.clone()],
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            repository
-                .retention_candidates("group_123", &device.endpoint_id, Some(1))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let mut policy = retention_test_policy();
-        policy.target_bytes = Some(0);
-        policy.retention_cutoff_ms = Some(i64::MAX);
-        policy.legacy_blob_cutoff_ms = Some(i64::MAX);
-        let cleanup = repository.cleanup_group("group_123", policy).await.unwrap();
-        assert_eq!(cleanup.deleted_events, 0);
-        assert!(cleanup.deleted_blob_ids.is_empty());
-        assert_eq!(
-            repository
-                .group_usage("group_123")
-                .await
-                .unwrap()
-                .blob_count,
-            1
-        );
-        let original = repository.list_events("group_123", 0, 1).await.unwrap();
-        assert_eq!(original[0].event, events[0]);
-
-        let mut new_event = test_event(999);
-        new_event.retention_key = None;
-        repository
-            .insert_events("group_123", std::slice::from_ref(&new_event), None)
-            .await
-            .unwrap();
-        let next_page = repository
-            .retention_candidates("group_123", &device.endpoint_id, Some(1))
-            .await
-            .unwrap();
-        assert_eq!(next_page.len(), 1);
-        assert_eq!(next_page[0].event, new_event);
-
-        // New decoder results replace the previous revision's deferral instead of accumulating rows.
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                0,
-                None,
-                &[],
-                Some(&DeferredRetentionEvents {
-                    decoder_revision: 2,
-                    event_ids: vec![events[0].event_id.clone()],
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
-                .fetch_one(&repository.pool)
-                .await
-                .unwrap(),
-            i64::from(MAX_EVENTS_PER_BATCH) + 1
-        );
-
-        repository
-            .merge_removed_devices(
-                "group_123",
-                &[RemovedDevice {
-                    device_id: device.device_id.clone(),
-                    endpoint_id: device.endpoint_id.clone(),
-                    removed_at_ms: 100,
-                    restored_at_ms: None,
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
-                .fetch_one(&repository.pool)
-                .await
-                .unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_retention_progress_rolls_back_mappings_and_protection_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let device = retention_test_device("device_123");
-        repository
-            .upsert_device("group_123", &device)
-            .await
-            .unwrap();
-        let mut event = test_event(1);
-        event.retention_key = None;
-        repository
-            .insert_events("group_123", &[event], None)
-            .await
-            .unwrap();
-        let old_key = "a".repeat(64);
-        repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                1,
-                Some(std::slice::from_ref(&old_key)),
-                &[],
-                None,
-            )
-            .await
-            .unwrap();
-        let result = repository
-            .set_retention(
-                "group_123",
-                &device.device_id,
-                2,
-                Some(&["b".repeat(64)]),
-                &[RetentionMapping {
-                    event_id: "event_001".into(),
-                    item_key: "c".repeat(64),
-                    blob_ids: Vec::new(),
-                }],
-                Some(&DeferredRetentionEvents {
-                    decoder_revision: 1,
-                    event_ids: vec!["../invalid".into()],
-                }),
-            )
-            .await;
-        assert!(result.is_err());
-        assert_eq!(
-            repository
-                .retention_candidates("group_123", &device.endpoint_id, Some(1))
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT item_key FROM retention_protections")
-                .fetch_one(&repository.pool)
-                .await
-                .unwrap(),
-            old_key
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT generation FROM retention_devices")
-                .fetch_one(&repository.pool)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retention_deferred_events")
-                .fetch_one(&repository.pool)
-                .await
-                .unwrap(),
-            0
-        );
-
-        for deferred in [
-            DeferredRetentionEvents {
-                decoder_revision: 0,
-                event_ids: vec!["event_001".into()],
-            },
-            DeferredRetentionEvents {
-                decoder_revision: 1,
-                event_ids: vec!["event_001".into(); usize::from(MAX_EVENTS_PER_BATCH) + 1],
-            },
-        ] {
-            assert!(
-                repository
-                    .set_retention(
-                        "group_123",
-                        &device.device_id,
-                        0,
-                        None,
-                        &[],
-                        Some(&deferred)
-                    )
-                    .await
-                    .is_err()
-            );
-        }
-    }
-
-    fn retention_test_device(id: &str) -> DeviceAnnouncement {
-        DeviceAnnouncement {
-            device_id: id.into(),
-            device_name: id.into(),
-            platform: "macos".into(),
-            endpoint_id: format!("endpoint_{id}"),
-            direct_addresses: Vec::new(),
-            relay_urls: Vec::new(),
-            app_version: "1.1.167".into(),
-        }
-    }
-
-    fn retention_test_policy() -> CleanupPolicy {
-        CleanupPolicy {
-            retention_cutoff_ms: None,
-            legacy_blob_cutoff_ms: None,
-            max_events: None,
-            target_bytes: None,
-            orphan_cutoff_ms: i64::MAX,
-            batch_size: 500,
-        }
-    }
-
-    fn test_event(sequence: u64) -> EncryptedEvent {
-        EncryptedEvent {
-            event_id: format!("event_{sequence:03}"),
-            origin_device_id: "device_123".into(),
-            origin_sequence: sequence,
-            created_at_ms: sequence as i64,
-            nonce: vec![sequence as u8; 24],
-            ciphertext: vec![sequence as u8; 16],
-            kind: SyncEventKind::Content,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: Some(format!("{sequence:064x}")),
-        }
     }
 }

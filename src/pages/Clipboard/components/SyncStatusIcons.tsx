@@ -2,7 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useMount, useUnmount } from "ahooks";
 import { Button } from "antd";
 import type { FC, MouseEventHandler, ReactElement } from "react";
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   getSyncStatus,
@@ -16,29 +16,30 @@ import Popover from "@/components/Popover";
 import ScrollArea from "@/components/ScrollArea";
 import Tooltip from "@/components/Tooltip";
 import { TAURI_EVENT } from "@/constants/events";
-import { WINDOW_LABEL } from "@/constants/windows";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
-import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
+import {
+  isCurrentWindowDormant,
+  isCurrentWindowVisible,
+} from "@/stores/windowLifecycle";
 import { cn } from "@/utils/cn";
-import { isAndroid, isTauri } from "@/utils/is";
+import { isAndroid } from "@/utils/is";
 import { log } from "@/utils/log";
 import CloudDevicesDrawer from "./CloudDevicesDrawer";
 import CloudRecordsDrawer from "./CloudRecordsDrawer";
 import HeaderActionPopoverPanel from "./HeaderActionPopoverPanel";
 import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
 
+const HIDDEN_WARM_REFRESH_DEBOUNCE_MS = 120;
+
 interface SyncStatusIconsProps {
   compact?: boolean;
-}
-
-interface WindowVisibilityPayload {
-  label: string;
-  visible: boolean;
 }
 
 const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const { compact = false } = props;
   const { t } = useTranslation("clipboard");
+  const lifecycle = useWindowLifecycle();
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [recordsOpen, setRecordsOpen] = useState(false);
@@ -46,25 +47,35 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     null,
   );
   const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
-  const deferredRefreshFrameRef = useRef<number | null>(null);
-  const deferredRefreshTimerRef = useRef<number | null>(null);
-  const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
+  const warmRefreshTimerRef = useRef<number | null>(null);
+  const dirtyWhileDormantRef = useRef(false);
+  const hasLoadedStatusRef = useRef(false);
   const mountedRef = useRef(false);
   const unlistenRef = useRef<null | (() => void)>(null);
   const refreshRef = useRef<null | (() => Promise<void> | undefined)>(null);
   if (!refreshRef.current) {
     refreshRef.current = createSyncStatusRefresh({
       isActive: () => {
-        return mountedRef.current && clipboardWindowVisibleRef.current;
+        return mountedRef.current && !isCurrentWindowDormant();
       },
       onError: (error) => {
         log.error("load clipboard sync status failed", error);
       },
       read: getSyncStatus,
-      write: setStatus,
+      write: (nextStatus) => {
+        hasLoadedStatusRef.current = true;
+        setStatus(nextStatus);
+      },
     });
   }
   const refresh = refreshRef.current;
+
+  const clearWarmRefreshTimer = useCallback(() => {
+    if (warmRefreshTimerRef.current === null) return;
+
+    window.clearTimeout(warmRefreshTimerRef.current);
+    warmRefreshTimerRef.current = null;
+  }, []);
 
   async function initialize() {
     try {
@@ -77,7 +88,11 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
         return;
       }
       unlistenRef.current = unlisten;
-      if (clipboardWindowVisibleRef.current) void refresh();
+      if (isCurrentWindowDormant()) {
+        dirtyWhileDormantRef.current = true;
+        return;
+      }
+      void refresh();
     } catch (error) {
       log.error("initialize clipboard sync status failed", error);
     }
@@ -90,64 +105,60 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 
   useUnmount(() => {
     mountedRef.current = false;
-    clipboardWindowVisibleRef.current = false;
-    cancelDeferredRefresh();
+    clearWarmRefreshTimer();
     unlistenRef.current?.();
   });
 
-  function cancelDeferredRefresh() {
-    if (deferredRefreshFrameRef.current !== null) {
-      window.cancelAnimationFrame(deferredRefreshFrameRef.current);
-      deferredRefreshFrameRef.current = null;
-    }
-    if (deferredRefreshTimerRef.current !== null) {
-      window.clearTimeout(deferredRefreshTimerRef.current);
-      deferredRefreshTimerRef.current = null;
-    }
-  }
-
-  /** 主窗口连续两帧恢复后再查询状态，避免 Tauri IPC 与 WebKit 首次图层提交竞争。 */
-  function scheduleRefreshAfterClipboardPaint() {
-    cancelDeferredRefresh();
-    deferredRefreshFrameRef.current = window.requestAnimationFrame(() => {
-      deferredRefreshFrameRef.current = window.requestAnimationFrame(() => {
-        deferredRefreshFrameRef.current = null;
-        deferredRefreshTimerRef.current = window.setTimeout(() => {
-          deferredRefreshTimerRef.current = null;
-          if (!mountedRef.current) return;
-
-          void refresh();
-        }, 0);
-      });
-    });
-  }
-
   function handleSyncUpdated() {
-    if (!clipboardWindowVisibleRef.current) return;
-
-    cancelDeferredRefresh();
-    void refresh();
-  }
-
-  function handleWindowVisibility(event: { payload: WindowVisibilityPayload }) {
-    if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
-
-    clipboardWindowVisibleRef.current = event.payload.visible;
-    if (event.payload.visible) {
-      scheduleRefreshAfterClipboardPaint();
+    if (!mountedRef.current) return;
+    if (isCurrentWindowDormant()) {
+      dirtyWhileDormantRef.current = true;
+      clearWarmRefreshTimer();
+      return;
+    }
+    if (isCurrentWindowVisible()) {
+      dirtyWhileDormantRef.current = false;
+      clearWarmRefreshTimer();
+      void refresh();
       return;
     }
 
-    cancelDeferredRefresh();
-    setDetailsTarget(null);
-    setDevicesOpen(false);
-    setRecordsOpen(false);
+    clearWarmRefreshTimer();
+    warmRefreshTimerRef.current = window.setTimeout(() => {
+      warmRefreshTimerRef.current = null;
+      if (!mountedRef.current || isCurrentWindowDormant()) {
+        dirtyWhileDormantRef.current = true;
+        return;
+      }
+      void refresh();
+    }, HIDDEN_WARM_REFRESH_DEBOUNCE_MS);
   }
 
-  useTauriListen<WindowVisibilityPayload>(
-    TAURI_EVENT.WINDOW_VISIBILITY,
-    handleWindowVisibility,
-  );
+  useEffect(() => {
+    if (!lifecycle.initialized) return;
+
+    if (!lifecycle.visible) {
+      setDetailsTarget(null);
+      setDevicesOpen(false);
+      setRecordsOpen(false);
+      if (lifecycle.phase === "dormant") {
+        clearWarmRefreshTimer();
+      }
+      return;
+    }
+
+    clearWarmRefreshTimer();
+    if (dirtyWhileDormantRef.current || !hasLoadedStatusRef.current) {
+      dirtyWhileDormantRef.current = false;
+      void refresh();
+    }
+  }, [
+    clearWarmRefreshTimer,
+    lifecycle.initialized,
+    lifecycle.phase,
+    lifecycle.visible,
+    refresh,
+  ]);
 
   async function handleReconnect(deviceId?: string) {
     setReconnectingKey(deviceId ?? "all");

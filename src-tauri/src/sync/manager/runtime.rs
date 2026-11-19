@@ -1,3 +1,5 @@
+use ecopaste_sync_protocol::MAX_ITEMS_PER_BATCH;
+
 use super::*;
 
 impl SyncManager {
@@ -21,6 +23,33 @@ impl SyncManager {
         self.run_cycle_locked(SyncTarget::Lan, Some(device_id), connect_timeout)
             .await?
             .context("LAN peer cycle produced no outcome")
+    }
+
+    fn spawn_history_backfill_if_needed(self: &Arc<Self>, group: GroupSecrets) {
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let Ok(_maintenance_guard) = manager.maintenance_lock.try_lock() else {
+                return;
+            };
+            let _activity = manager.sync_activity_guard().await;
+            if manager.is_storage_suspended() {
+                return;
+            }
+            let pool = manager.pool().await;
+            match repository::history_backfill_completed(&pool, &group.group_id).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    log::debug!("check history backfill status failed: {error:#}");
+                    return;
+                }
+            }
+            if let Err(error) = manager.backfill_local_history(&pool, &group).await {
+                log::warn!("background local history backfill deferred: {error:#}");
+                return;
+            }
+            manager.wake_transfer();
+        });
     }
 
     pub(super) async fn run_cycle_locked(
@@ -70,13 +99,10 @@ impl SyncManager {
             endpoint: endpoint.clone(),
             pool: pool.clone(),
         };
-        {
-            let _maintenance_guard = self.maintenance_lock.lock().await;
-            repository::ensure_event_lanes_indexed(&pool, &group).await?;
-            self.backfill_local_history(&pool, &group).await?;
-            let _ = self.materialize_dirty_states(Some(&cycle)).await?;
-            self.repair_history_timestamps(&pool, &group).await?;
-        }
+
+        // Kick off one-time local history backfill in background without blocking realtime sync.
+        self.spawn_history_backfill_if_needed(group.clone());
+
         let mut lan_succeeded = false;
         let mut lan_transfer_error = None;
         let mut lan_connection_error = None;
@@ -162,31 +188,7 @@ impl SyncManager {
                             self.ensure_cloud_group(&connection, &group).await?;
                         let group_elapsed = group_started_at.elapsed();
                         let transfer_started_at = Instant::now();
-                        let (cursor, bootstrap_target) = self
-                            .prepare_cloud_cursor(&connection, &group, &pool, false)
-                            .await?;
-                        let latest = self
-                            .sync_connection(
-                                &connection,
-                                &SyncConnectionTarget::Cloud,
-                                cursor,
-                                &cycle,
-                            )
-                            .await?;
-                        let bootstrap_reached = if let Some(target) = bootstrap_target {
-                            repository::cloud_cursor(&pool).await? >= target
-                        } else {
-                            false
-                        };
-                        if bootstrap_reached {
-                            let local_cleanup_succeeded = self
-                                .run_local_retention_cleanup(CleanupTrigger::CloudBootstrap)
-                                .await;
-                            if local_cleanup_succeeded {
-                                repository::mark_cloud_bootstrap_completed(&pool, &group.group_id)
-                                    .await?;
-                            }
-                        }
+                        let latest = self.sync_cloud_control(&connection, &cycle).await?;
                         if latest.has_more {
                             self.wake_cloud_transfer();
                         }
@@ -228,22 +230,29 @@ impl SyncManager {
                             true,
                         );
                     } else {
-                        let pending = repository::pending_cloud_events_for_target(
+                        let pending = repository::pending_outbound_writes(
                             &pool,
                             CLOUD_TARGET,
-                            &identity.device_id,
-                            MAX_EVENTS_PER_BATCH,
-                            None,
+                            MAX_ITEMS_PER_BATCH,
                         )
                         .await?;
-                        let event_ids = pending
-                            .into_iter()
-                            .map(|stored| stored.event.event_id)
-                            .collect::<Vec<_>>();
                         if let Some(error) = cloud_error.as_deref() {
-                            self.delivery
-                                .failed(&pool, CLOUD_TARGET, &event_ids, error)
-                                .await?;
+                            let mut sync_keys = Vec::with_capacity(pending.len());
+                            for write in pending {
+                                if let Some(meta) = repository::load_sync_item_meta_by_item_key(
+                                    &pool,
+                                    &write.item_key,
+                                )
+                                .await?
+                                {
+                                    sync_keys.push(meta.sync_key);
+                                }
+                            }
+                            if !sync_keys.is_empty() {
+                                self.delivery
+                                    .failed(&pool, CLOUD_TARGET, &sync_keys, error)
+                                    .await?;
+                            }
                         }
                         self.set_channel_status(
                             SyncTarget::Cloud,
@@ -362,10 +371,7 @@ impl SyncManager {
                 }
             }
         };
-        match self
-            .sync_connection(&connection, &target, peer.pull_cursor, &cycle)
-            .await
-        {
+        match self.sync_lan_control(&connection, &target, &cycle).await {
             Ok(latest) => {
                 let (connected_address, transport) = connection_path(&connection);
                 repository::mark_peer_online(
@@ -539,6 +545,15 @@ impl SyncManager {
             .is_some_and(|connection| connection.stable_id() == stable_id)
         {
             connections.remove(device_id);
+            if let Some(data_conn) = self
+                .runtime_state
+                .lan_data_connections
+                .write()
+                .expect("LAN data connection cache poisoned")
+                .remove(device_id)
+            {
+                data_conn.close(0_u32.into(), b"LAN control connection invalidated");
+            }
             return true;
         }
         false
@@ -550,6 +565,15 @@ impl SyncManager {
             .write()
             .expect("LAN connection cache poisoned")
             .remove(device_id);
+        if let Some(data_conn) = self
+            .runtime_state
+            .lan_data_connections
+            .write()
+            .expect("LAN data connection cache poisoned")
+            .remove(device_id)
+        {
+            data_conn.close(0_u32.into(), b"LAN peer removed");
+        }
     }
 
     pub(super) fn stop_lan_peer_actors(&self) {
@@ -568,6 +592,11 @@ impl SyncManager {
             .lan_connections
             .write()
             .expect("LAN connection cache poisoned")
+            .clear();
+        self.runtime_state
+            .lan_data_connections
+            .write()
+            .expect("LAN data connection cache poisoned")
             .clear();
     }
 
@@ -685,53 +714,7 @@ impl SyncManager {
             })
     }
 
-    pub(super) async fn prepare_cloud_cursor(
-        &self,
-        connection: &Connection,
-        group: &GroupSecrets,
-        pool: &SqlitePool,
-        force: bool,
-    ) -> Result<(u64, Option<u64>)> {
-        let current = repository::cloud_cursor(pool).await?;
-        if !force && repository::cloud_bootstrap_completed(pool, &group.group_id).await? {
-            return Ok((current, None));
-        }
-        if !force && repository::cloud_bootstrap_pending(pool, &group.group_id).await? {
-            let target = repository::cloud_bootstrap_target(pool, &group.group_id)
-                .await?
-                .context("missing cloud bootstrap target cursor")?;
-            return Ok((current, Some(target)));
-        }
-        if !force && current > 0 {
-            repository::mark_cloud_bootstrap_completed(pool, &group.group_id).await?;
-            return Ok((current, None));
-        }
-
-        let response = call_cloud(
-            connection,
-            Request::BootstrapPlan {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-            },
-            crate::i18n::current_language(&self.app),
-        )
-        .await?;
-        let Response::BootstrapPlan {
-            start_cursor,
-            latest_cursor,
-        } = response
-        else {
-            if let Response::Error { message, .. } = response {
-                bail!(message);
-            }
-            bail!("云端返回了无效的初始同步范围");
-        };
-        repository::start_cloud_bootstrap(pool, &group.group_id, start_cursor, latest_cursor)
-            .await?;
-        Ok((start_cursor, Some(latest_cursor)))
-    }
-
-    /// Exchanges removal tombstones with one LAN peer before its normal event batch.
+    /// Exchanges removal tombstones with one LAN peer before its normal item batch.
     pub(super) async fn sync_lan_removed_devices(
         &self,
         connection: &Connection,
@@ -768,17 +751,18 @@ impl SyncManager {
         group: &GroupSecrets,
         device: &DeviceAnnouncement,
     ) -> Result<()> {
+        let window = repository::cloud_window_cursor(pool).await?;
         let response = call_cloud(
             connection,
-            Request::CloudSync {
+            Request::CloudSyncItems {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 device: self.cloud_device_announcement_for(device),
-                after_cursor: repository::cloud_cursor(pool).await?,
-                events: Vec::new(),
+                after_seq: window.synced_seq,
+                before_seq: None,
+                items: Vec::new(),
                 removed_devices: repository::removed_devices(pool).await?,
                 limit: 1,
-                bounded_hub: false,
             },
             crate::i18n::current_language(&self.app),
         )
@@ -816,7 +800,6 @@ impl SyncManager {
                 device.is_removed()
                     && (device.device_id == own_device_id || device.endpoint_id == own_endpoint_id)
             });
-        // Membership history is not evidence that a LAN route is currently reachable.
         if changed {
             self.emit_updated();
         }

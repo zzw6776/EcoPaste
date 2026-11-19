@@ -14,7 +14,6 @@ use chacha20poly1305::{
     },
     XChaCha20Poly1305, XNonce,
 };
-use ecopaste_sync_protocol::{EncryptedEvent, RetentionMapping, SyncEventKind};
 use rand::RngCore;
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt as TokioAsyncReadExt, AsyncWrite as TokioAsyncWrite,
@@ -23,17 +22,15 @@ use tokio::io::{
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-use super::model::{ClipboardEnvelope, DecryptedSyncEvent, StoredBlob, SyncedItemStatePatch};
+use super::model::{StoredBlob, SyncedItemSnapshot};
 
 const BLOB_MAGIC: &[u8; 8] = b"ECOSBL01";
 const STREAM_NONCE_LEN: usize = 19;
 const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
-pub(crate) const EVENT_AAD_MAGIC: &[u8; 8] = b"ECOEVA02";
+const SNAPSHOT_AAD_MAGIC: &[u8; 8] = b"ECOSNP01";
 const STREAM_BLOB_ID_DOMAIN: &[u8] = b"ecopaste/stream-blob-id/v1\0";
-
-/// Advance only when the event decoder gains support for previously deferred formats.
-pub const RETENTION_DECODER_REVISION: u32 = 1;
+const ITEM_KEY_DOMAIN: &[u8] = b"ecopaste/item-key/v1\0";
 
 struct TemporaryFileCleanup {
     armed: bool,
@@ -208,203 +205,84 @@ impl Drop for TemporaryFileCleanup {
     }
 }
 
-fn encrypt_raw_event(
-    key: &[u8; 32],
-    event_id: String,
-    origin_device_id: String,
-    origin_sequence: u64,
-    created_at_ms: i64,
-    kind: SyncEventKind,
-    plaintext: &[u8],
-) -> Result<EncryptedEvent> {
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
-    let mut nonce = [0_u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let aad = event_aad(
-        &event_id,
-        &origin_device_id,
-        origin_sequence,
-        created_at_ms,
-        kind,
-    );
-    let encrypted = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("failed to encrypt sync event"))?;
-    let mut ciphertext = Vec::with_capacity(EVENT_AAD_MAGIC.len() + encrypted.len());
-    ciphertext.extend_from_slice(EVENT_AAD_MAGIC);
-    ciphertext.extend_from_slice(&encrypted);
-    Ok(EncryptedEvent {
-        event_id,
-        origin_device_id,
-        origin_sequence,
-        created_at_ms,
-        nonce: nonce.to_vec(),
-        ciphertext,
-        kind,
-        blob_ids: Vec::new(),
-        optional_blob_ids: Vec::new(),
-        retention_key: None,
-    })
-}
-
-pub fn encrypt_event(
-    key: &[u8; 32],
-    event_id: String,
-    origin_device_id: String,
-    origin_sequence: u64,
-    created_at_ms: i64,
-    envelope: &ClipboardEnvelope,
-) -> Result<EncryptedEvent> {
-    let plaintext = minicbor::to_vec(envelope).context("failed to encode sync event")?;
-    let mut event = encrypt_raw_event(
-        key,
-        event_id,
-        origin_device_id,
-        origin_sequence,
-        created_at_ms,
-        SyncEventKind::Content,
-        &plaintext,
-    )?;
-    event.retention_key = Some(retention_key(key, &envelope.item.sync_key));
-    Ok(event)
-}
-
-pub fn encrypt_item_state(
-    key: &[u8; 32],
-    event_id: String,
-    origin_device_id: String,
-    origin_sequence: u64,
-    created_at_ms: i64,
-    patch: &SyncedItemStatePatch,
-) -> Result<EncryptedEvent> {
-    let plaintext = minicbor::to_vec(patch).context("failed to encode synchronized item state")?;
-    let mut event = encrypt_raw_event(
-        key,
-        event_id,
-        origin_device_id,
-        origin_sequence,
-        created_at_ms,
-        SyncEventKind::ItemState,
-        &plaintext,
-    )?;
-    event.retention_key = Some(retention_key(key, &patch.sync_key));
-    Ok(event)
-}
-
-fn decrypt_event_plaintext(key: &[u8; 32], event: &EncryptedEvent) -> Result<Vec<u8>> {
-    if event.nonce.len() != 24 {
-        bail!("invalid sync event nonce");
-    }
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
-    let ciphertext = event
-        .ciphertext
-        .strip_prefix(EVENT_AAD_MAGIC)
-        .context("invalid synchronized event format")?;
-    let aad = event_aad(
-        &event.event_id,
-        &event.origin_device_id,
-        event.origin_sequence,
-        event.created_at_ms,
-        event.kind,
-    );
-    let plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&event.nonce),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("sync event authentication failed"))?;
-    Ok(plaintext)
-}
-
-pub fn decrypt_sync_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<DecryptedSyncEvent> {
-    let plaintext = decrypt_event_plaintext(key, event)?;
-    let decoded = match event.kind {
-        SyncEventKind::Content => {
-            let envelope = minicbor::decode(&plaintext).context("failed to decode sync event")?;
-            DecryptedSyncEvent::Clipboard(Box::new(envelope))
-        }
-        SyncEventKind::ItemState => {
-            let patch =
-                minicbor::decode(&plaintext).context("failed to decode synchronized item state")?;
-            DecryptedSyncEvent::ItemState(patch)
-        }
-    };
-    if event
-        .retention_key
-        .as_ref()
-        .is_some_and(|value| value != &retention_key(key, decoded.sync_key()))
-    {
-        bail!("sync event retention identity mismatch");
-    }
-    Ok(decoded)
-}
-
-/// Derives a space-specific opaque identity without exposing content hashes or the content key.
-pub fn retention_key(key: &[u8; 32], sync_key: &str) -> String {
+/// Derives a space-specific opaque 64-hex item identifier without exposing content hashes.
+pub fn derive_item_key(key: &[u8; 32], sync_key: &str) -> String {
     let mut hash = blake3::Hasher::new_keyed(key);
-    hash.update(b"ecopaste/retention/1\0");
+    hash.update(ITEM_KEY_DOMAIN);
     hash.update(sync_key.as_bytes());
     hash.finalize().to_hex().to_string()
 }
 
-/// Reconstructs legacy attachment references from authenticated ciphertext without fetching files.
-pub fn retention_mapping(key: &[u8; 32], event: &EncryptedEvent) -> Result<RetentionMapping> {
-    let decoded = decrypt_sync_event(key, event)?;
-    let mut blob_ids = Vec::new();
-    if let DecryptedSyncEvent::Clipboard(envelope) = &decoded {
-        blob_ids.extend(envelope.blobs.iter().map(|blob| blob.blob_id.clone()));
-        if let Some(icon) = envelope
-            .source_app
-            .as_ref()
-            .and_then(|source| source.icon.as_ref())
-        {
-            blob_ids.push(icon.blob_id.clone());
-        }
-    }
-    blob_ids.sort_unstable();
-    blob_ids.dedup();
-    Ok(RetentionMapping {
-        event_id: event.event_id.clone(),
-        item_key: retention_key(key, decoded.sync_key()),
-        blob_ids,
-    })
+/// Encrypts one per-item CRDT snapshot with AAD binding its wire `item_key`, `deleted`, and `protected` flags.
+pub fn encrypt_item_snapshot(
+    key: &[u8; 32],
+    item_key: &str,
+    deleted: bool,
+    protected: bool,
+    snapshot: &SyncedItemSnapshot,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let plaintext = minicbor::to_vec(snapshot).context("failed to encode sync item snapshot")?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
+    let mut nonce = [0_u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let aad = snapshot_aad(item_key, deleted, protected);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("failed to encrypt sync item snapshot"))?;
+    let mut ciphertext = Vec::with_capacity(SNAPSHOT_AAD_MAGIC.len() + encrypted.len());
+    ciphertext.extend_from_slice(SNAPSHOT_AAD_MAGIC);
+    ciphertext.extend_from_slice(&encrypted);
+    Ok((nonce.to_vec(), ciphertext))
 }
 
-pub fn decrypt_event(key: &[u8; 32], event: &EncryptedEvent) -> Result<ClipboardEnvelope> {
-    match decrypt_sync_event(key, event)? {
-        DecryptedSyncEvent::Clipboard(envelope) => Ok(*envelope),
-        DecryptedSyncEvent::ItemState(_) => {
-            bail!("expected clipboard envelope, got synchronized item state")
-        }
+/// Decrypts and authenticates one per-item CRDT snapshot and verifies its derived `item_key`.
+pub fn decrypt_item_snapshot(
+    key: &[u8; 32],
+    item_key: &str,
+    deleted: bool,
+    protected: bool,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<SyncedItemSnapshot> {
+    if nonce.len() != 24 {
+        bail!("invalid sync item snapshot nonce");
     }
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).context("failed to initialize sync cipher")?;
+    let body = ciphertext
+        .strip_prefix(SNAPSHOT_AAD_MAGIC)
+        .context("invalid synchronized item snapshot format")?;
+    let aad = snapshot_aad(item_key, deleted, protected);
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: body,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("sync item snapshot authentication failed"))?;
+    let snapshot: SyncedItemSnapshot =
+        minicbor::decode(&plaintext).context("failed to decode sync item snapshot")?;
+    if derive_item_key(key, &snapshot.sync_key) != item_key {
+        bail!("sync item identity mismatch");
+    }
+    Ok(snapshot)
 }
 
-fn event_aad(
-    event_id: &str,
-    origin_device_id: &str,
-    origin_sequence: u64,
-    created_at_ms: i64,
-    kind: SyncEventKind,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(event_id.len() + origin_device_id.len() + 25);
-    aad.extend_from_slice(&(event_id.len() as u32).to_be_bytes());
-    aad.extend_from_slice(event_id.as_bytes());
-    aad.extend_from_slice(&(origin_device_id.len() as u32).to_be_bytes());
-    aad.extend_from_slice(origin_device_id.as_bytes());
-    aad.extend_from_slice(&origin_sequence.to_be_bytes());
-    aad.extend_from_slice(&created_at_ms.to_be_bytes());
-    aad.push(kind.as_i64() as u8);
+fn snapshot_aad(item_key: &str, deleted: bool, protected: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(item_key.len() + 6);
+    aad.extend_from_slice(&(item_key.len() as u32).to_be_bytes());
+    aad.extend_from_slice(item_key.as_bytes());
+    aad.push(u8::from(deleted));
+    aad.push(u8::from(protected));
     aad
 }
 
@@ -1393,11 +1271,23 @@ mod tests {
     }
 
     #[test]
-    fn event_metadata_is_authenticated() {
+    fn item_snapshot_metadata_and_identity_are_authenticated() {
+        use super::super::model::{FieldVersion, SyncedClipboardItem, SNAPSHOT_VERSION};
+
         let key = [9_u8; 32];
-        let envelope = ClipboardEnvelope {
-            version: 1,
-            item: super::super::model::SyncedClipboardItem {
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: "hash".into(),
+            content_version: FieldVersion::new(1, "device-123"),
+            presence_version: FieldVersion::new(1, "device-123"),
+            favorite_version: FieldVersion::new(2, "device-123"),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: true,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
                 kind: "text".into(),
                 sub_kind: None,
                 content: "test".into(),
@@ -1416,138 +1306,27 @@ mod tests {
                 source_device_id: None,
                 source_device_name: None,
                 source_updated_at_ms: None,
-            },
+            }),
             blobs: Vec::new(),
             source_app: None,
             content_identity: Some("a".repeat(64)),
         };
-        let event = encrypt_event(
-            &key,
-            "event-123".into(),
-            "device-123".into(),
-            1,
-            2,
-            &envelope,
-        )
-        .unwrap();
-        assert_eq!(decrypt_event(&key, &event).unwrap(), envelope);
-        let anonymous = retention_key(&key, "hash");
-        assert_eq!(event.retention_key.as_deref(), Some(anonymous.as_str()));
-        assert_ne!(anonymous, retention_key(&[8; 32], "hash"));
-        assert_ne!(anonymous, retention_key(&key, "other-hash"));
-        let mut legacy = event.clone();
-        legacy.retention_key = None;
-        assert_eq!(decrypt_event(&key, &legacy).unwrap(), envelope);
-        let mapping = retention_mapping(&key, &legacy).unwrap();
-        assert_eq!(mapping.item_key, anonymous);
-        let mut incorrect_identity = event.clone();
-        incorrect_identity.retention_key = Some("0".repeat(64));
-        assert!(decrypt_event(&key, &incorrect_identity).is_err());
+        let item_key = derive_item_key(&key, &snapshot.sync_key);
+        assert_ne!(item_key, derive_item_key(&[8; 32], &snapshot.sync_key));
+        assert_ne!(item_key, derive_item_key(&key, "other-hash"));
 
-        let mut tampered = event;
-        tampered.origin_sequence = 2;
-        assert!(decrypt_event(&key, &tampered).is_err());
+        let (nonce, ciphertext) =
+            encrypt_item_snapshot(&key, &item_key, false, true, &snapshot).unwrap();
+        let decoded =
+            decrypt_item_snapshot(&key, &item_key, false, true, &nonce, &ciphertext).unwrap();
+        assert_eq!(decoded, snapshot);
 
-        let mut tampered = encrypt_event(
-            &key,
-            "event-kind".into(),
-            "device-123".into(),
-            2,
-            3,
-            &envelope,
-        )
-        .unwrap();
-        tampered.kind = SyncEventKind::ItemState;
-        assert!(decrypt_sync_event(&key, &tampered).is_err());
-    }
-
-    #[test]
-    fn item_state_round_trips_polymorphically() {
-        let key = [7_u8; 32];
-        let patch = SyncedItemStatePatch {
-            sync_key: "hash-patch".into(),
-            is_favorite: Some(true),
-            is_pinned: Some(false),
-            note: Some("note text".into()),
-            note_changed: true,
-            is_present: Some(false),
-        };
-        let event = encrypt_item_state(
-            &key,
-            "patch-event".into(),
-            "device-patch".into(),
-            1,
-            12345,
-            &patch,
-        )
-        .unwrap();
-        match decrypt_sync_event(&key, &event).unwrap() {
-            DecryptedSyncEvent::ItemState(decoded) => assert_eq!(decoded, patch),
-            _ => panic!("expected synchronized item state"),
-        }
-        assert!(decrypt_event(&key, &event).is_err());
-        let mapping = retention_mapping(&key, &event).unwrap();
-        assert_eq!(mapping.item_key, retention_key(&key, &patch.sync_key));
-        assert!(mapping.blob_ids.is_empty());
-    }
-
-    #[test]
-    fn retention_mapping_recovers_content_and_optional_icon_references() {
-        let key = [6; 32];
-        let envelope = ClipboardEnvelope {
-            version: 1,
-            item: super::super::model::SyncedClipboardItem {
-                kind: "image".into(),
-                sub_kind: None,
-                content: "".into(),
-                search_text: None,
-                summary: None,
-                file_types: None,
-                size: Some(32),
-                width: Some(2),
-                height: Some(2),
-                is_sensitive: false,
-                source_platform: "android".into(),
-                created_at_ms: 1,
-                sync_key: "protected-image".into(),
-                updated_at_ms: None,
-                source_revision: None,
-                source_device_id: None,
-                source_device_name: None,
-                source_updated_at_ms: None,
-            },
-            blobs: vec![super::super::model::BlobManifest {
-                blob_id: "b".repeat(64),
-                name: "image.png".into(),
-                original_size: 32,
-                encrypted_size: 64,
-                role: super::super::model::BlobRole::Image,
-                file_index: None,
-                is_directory_archive: false,
-                stream_commitment: false,
-            }],
-            source_app: Some(super::super::model::SourceAppRef {
-                version: 1,
-                source_key: "app".into(),
-                platform: "android".into(),
-                display_name: "app".into(),
-                icon: Some(super::super::model::SourceIconRef {
-                    icon_hash: "hash".into(),
-                    blob_id: "a".repeat(64),
-                    original_size: 8,
-                    encrypted_size: 40,
-                }),
-                accent_start: None,
-                accent_end: None,
-            }),
-            content_identity: Some("c".repeat(64)),
-        };
-        let mut event =
-            encrypt_event(&key, "image-event".into(), "device".into(), 1, 1, &envelope).unwrap();
-        event.retention_key = None;
-        let mapping = retention_mapping(&key, &event).unwrap();
-        assert_eq!(mapping.event_id, event.event_id);
-        assert_eq!(mapping.blob_ids, ["a".repeat(64), "b".repeat(64)]);
+        // Tampering with AAD flags or item_key must fail authentication.
+        assert!(decrypt_item_snapshot(&key, &item_key, true, true, &nonce, &ciphertext).is_err());
+        assert!(decrypt_item_snapshot(&key, &item_key, false, false, &nonce, &ciphertext).is_err());
+        assert!(
+            decrypt_item_snapshot(&key, &"0".repeat(64), false, true, &nonce, &ciphertext).is_err()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! 模拟系统级粘贴。
 //!
 //! 写回剪贴板由 `clipboard::write` 负责；本模块只负责「按键模拟」这一步——
-//! 配合 watcher 的 `WritebackGuard` 抑制自身写回带来的回环。
+//! 配合 watcher 的 `ClipboardFingerprintState` 抑制自身写回带来的回环。
 //!
 //! - macOS：⌘V（CGEvent）
 //! - Windows：Shift+Insert（SendInput）。比 Ctrl+V 兼容性更好，传统 Win32

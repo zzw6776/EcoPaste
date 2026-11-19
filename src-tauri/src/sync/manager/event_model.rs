@@ -1,21 +1,12 @@
 use super::*;
-
-pub(super) fn event_matches_item_timestamp(
-    event: &EncryptedEvent,
-    key: [u8; 32],
-    item: &ClipboardItem,
-) -> bool {
-    crypto::decrypt_event(&key, event).is_ok_and(|envelope| {
-        envelope.item.updated_at_ms == Some(item.updated_at.timestamp_millis())
-    })
-}
+use ecopaste_sync_protocol::SyncItemRecord;
 
 pub(super) fn synced_item_timestamps(
     item: &SyncedClipboardItem,
-    event_created_at_ms: i64,
+    fallback_ms: i64,
 ) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
     let fallback = Utc
-        .timestamp_millis_opt(event_created_at_ms)
+        .timestamp_millis_opt(fallback_ms)
         .single()
         .unwrap_or_else(Utc::now);
     let created_at = Utc
@@ -31,52 +22,56 @@ pub(super) fn synced_item_timestamps(
     (created_at, updated_at)
 }
 
-pub(super) fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
-    if envelope.version != 1 {
-        bail!("unsupported sync event version");
+pub(super) fn validate_snapshot(snapshot: &SyncedItemSnapshot) -> Result<()> {
+    if snapshot.version != crate::sync::model::SNAPSHOT_VERSION {
+        bail!("unsupported sync snapshot version");
     }
-    if !is_hex_identifier(&envelope.item.sync_key) {
+    if !is_hex_identifier(&snapshot.sync_key) {
         bail!("invalid synchronized item key");
     }
-    if envelope
+    if snapshot
         .content_identity
         .as_deref()
         .is_some_and(|identity| !is_hex_identifier(identity))
     {
         bail!("invalid synchronized content identity");
     }
-    let kind = parse_kind(&envelope.item.kind)?;
-    envelope
-        .item
-        .sub_kind
-        .as_deref()
-        .map(parse_sub_kind)
-        .transpose()?;
-    for manifest in &envelope.blobs {
+    if snapshot.deleted() {
+        return Ok(());
+    }
+    let Some(item) = snapshot.item.as_ref() else {
+        return Ok(());
+    };
+    if item.sync_key != snapshot.sync_key {
+        bail!("synchronized item key mismatch");
+    }
+    let kind = parse_kind(&item.kind)?;
+    item.sub_kind.as_deref().map(parse_sub_kind).transpose()?;
+    for manifest in &snapshot.blobs {
         validate_blob_manifest(manifest)?;
     }
     match kind {
         ClipboardKind::Text => {
-            if !envelope.blobs.is_empty() {
+            if !snapshot.blobs.is_empty() {
                 bail!("sync text contains unexpected blobs");
             }
         }
         ClipboardKind::Image => {
-            if envelope.blobs.len() != 1
-                || envelope.blobs[0].role != BlobRole::Image
-                || envelope.blobs[0].file_index.is_some()
-                || envelope.blobs[0].is_directory_archive
-                || envelope.blobs[0].stream_commitment
+            if snapshot.blobs.len() != 1
+                || snapshot.blobs[0].role != BlobRole::Image
+                || snapshot.blobs[0].file_index.is_some()
+                || snapshot.blobs[0].is_directory_archive
+                || snapshot.blobs[0].stream_commitment
             {
                 bail!("sync image has an invalid blob manifest");
             }
         }
         ClipboardKind::Files => {
-            if envelope.blobs.is_empty() || envelope.blobs.len() > 1024 {
+            if snapshot.blobs.is_empty() || snapshot.blobs.len() > 1024 {
                 bail!("sync files are missing their blobs");
             }
-            let mut indexes = HashSet::with_capacity(envelope.blobs.len());
-            for blob in &envelope.blobs {
+            let mut indexes = HashSet::with_capacity(snapshot.blobs.len());
+            for blob in &snapshot.blobs {
                 let Some(index) = blob.file_index else {
                     bail!("sync file is missing its index");
                 };
@@ -90,25 +85,6 @@ pub(super) fn validate_envelope(envelope: &ClipboardEnvelope) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(super) fn validate_decrypted_sync_event(event: &DecryptedSyncEvent) -> Result<()> {
-    match event {
-        DecryptedSyncEvent::Clipboard(envelope) => validate_envelope(envelope),
-        DecryptedSyncEvent::ItemState(patch) => {
-            if !is_hex_identifier(&patch.sync_key)
-                || (patch.is_favorite.is_none()
-                    && patch.is_pinned.is_none()
-                    && !patch.note_changed
-                    && patch.is_present.is_none())
-                || patch.is_present == Some(true)
-                || (!patch.note_changed && patch.note.is_some())
-            {
-                bail!("invalid synchronized item state");
-            }
-            Ok(())
-        }
-    }
 }
 
 pub(super) fn validate_source_app_ref(source: &SourceAppRef) -> Result<()> {
@@ -190,50 +166,45 @@ pub(super) fn sanitize_source_app_name(value: &str) -> String {
 }
 
 pub(super) fn cloud_record(
-    cursor: u64,
-    event: EncryptedEvent,
-    envelope: ClipboardEnvelope,
+    record: &SyncItemRecord,
+    snapshot: SyncedItemSnapshot,
     device_name: String,
     image_path: Option<String>,
-) -> CloudRecord {
-    let is_sensitive = envelope.item.is_sensitive;
-    let file_count = envelope.blobs.len().try_into().unwrap_or(u32::MAX);
-    let total_size = envelope.blobs.iter().map(|blob| blob.original_size).sum();
-    let preview = match envelope.item.kind.as_str() {
-        "files" => envelope
+) -> Option<CloudRecord> {
+    let item = snapshot.item?;
+    let is_sensitive = item.is_sensitive;
+    let file_count = snapshot.blobs.len().try_into().unwrap_or(u32::MAX);
+    let total_size = snapshot.blobs.iter().map(|blob| blob.original_size).sum();
+    let preview = match item.kind.as_str() {
+        "files" => snapshot
             .blobs
             .iter()
             .map(|blob| blob.name.as_str())
             .collect::<Vec<_>>()
             .join("、"),
-        "image" => envelope
-            .item
-            .summary
-            .clone()
-            .unwrap_or_else(|| "图片".to_owned()),
-        _ => envelope
-            .item
+        "image" => item.summary.clone().unwrap_or_else(|| "图片".to_owned()),
+        _ => item
             .search_text
             .clone()
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| envelope.item.content.clone()),
+            .unwrap_or_else(|| item.content.clone()),
     };
-    CloudRecord {
-        cursor,
-        event_id: event.event_id,
+    Some(CloudRecord {
+        cursor: record.seq,
+        event_id: record.item_key.clone(),
         device_name,
-        kind: envelope.item.kind,
+        kind: item.kind,
         preview,
         image_path,
         file_count,
         total_size,
         created_at: Utc
-            .timestamp_millis_opt(event.created_at_ms)
+            .timestamp_millis_opt(item.updated_at_ms.unwrap_or(item.created_at_ms))
             .single()
             .unwrap_or_else(Utc::now)
             .to_rfc3339(),
         is_sensitive,
-    }
+    })
 }
 
 pub(super) fn short_device_id(device_id: &str) -> String {
@@ -270,6 +241,7 @@ pub(super) fn sanitize_name(value: &str) -> String {
         name.chars().take(180).collect()
     }
 }
+
 pub(super) fn kind_string(value: ClipboardKind) -> &'static str {
     match value {
         ClipboardKind::Text => "text",
@@ -277,6 +249,7 @@ pub(super) fn kind_string(value: ClipboardKind) -> &'static str {
         ClipboardKind::Files => "files",
     }
 }
+
 pub(super) fn parse_kind(value: &str) -> Result<ClipboardKind> {
     match value {
         "text" => Ok(ClipboardKind::Text),
@@ -285,6 +258,7 @@ pub(super) fn parse_kind(value: &str) -> Result<ClipboardKind> {
         _ => bail!("invalid clipboard kind"),
     }
 }
+
 pub(super) fn sub_kind_string(value: ClipboardSubKind) -> &'static str {
     match value {
         ClipboardSubKind::Rtf => "rtf",
@@ -295,6 +269,7 @@ pub(super) fn sub_kind_string(value: ClipboardSubKind) -> &'static str {
         ClipboardSubKind::Path => "path",
     }
 }
+
 pub(super) fn parse_sub_kind(value: &str) -> Result<ClipboardSubKind> {
     match value {
         "rtf" => Ok(ClipboardSubKind::Rtf),
@@ -306,6 +281,7 @@ pub(super) fn parse_sub_kind(value: &str) -> Result<ClipboardSubKind> {
         _ => bail!("invalid clipboard sub kind"),
     }
 }
+
 pub(super) fn platform_string(value: Platform) -> &'static str {
     match value {
         Platform::Macos => "macos",
@@ -313,6 +289,7 @@ pub(super) fn platform_string(value: Platform) -> &'static str {
         Platform::Android => "android",
     }
 }
+
 pub(super) fn parse_platform(value: &str) -> Platform {
     match value {
         "windows" => Platform::Windows,

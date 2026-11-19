@@ -107,7 +107,6 @@ impl SyncManager {
             self.identity.set_group(Some(bootstrap.group.clone()))?;
         }
         let pool = self.pool().await;
-        repository::clear_cloud_retention_snapshot(&pool).await?;
         repository::restore_and_upsert_peer(&pool, &bootstrap.inviter).await?;
         let cloud_enabled = !bootstrap.server_endpoint_id.trim().is_empty();
         let settings = self

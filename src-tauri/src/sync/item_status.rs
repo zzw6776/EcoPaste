@@ -9,7 +9,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum ContentLevel {
+pub(crate) enum ContentLevel {
     None,
     Metadata,
     Complete,

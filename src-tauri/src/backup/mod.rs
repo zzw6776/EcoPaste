@@ -1556,14 +1556,27 @@ async fn merge_items(
     backup: &SqlitePool,
     migration: &crate::clipboard::shared_files::ReferenceMigration,
 ) -> Result<MergeOutcome> {
-    let has_remote_file_metadata: i64 = sqlx::query_scalar(
+    let has_per_item_sync: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'sync_items')",
+    )
+    .fetch_one(backup)
+    .await
+    .context("failed to inspect backup schema")?;
+    let has_legacy_remote_file_metadata: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'sync_remote_file_items')",
     )
     .fetch_one(backup)
     .await
     .context("failed to inspect backup schema")?;
-    let select_items = if has_remote_file_metadata != 0 {
+    let select_items = if has_per_item_sync != 0 {
+        "SELECT item.*, remote.item_id AS remote_item_id \
+         FROM clipboard_items item \
+         LEFT JOIN sync_items remote \
+           ON remote.item_id = item.id AND remote.remote_file_state IS NOT NULL \
+         ORDER BY item.created_at ASC"
+    } else if has_legacy_remote_file_metadata != 0 {
         "SELECT item.*, remote.item_id AS remote_item_id \
          FROM clipboard_items item \
          LEFT JOIN sync_remote_file_items remote ON remote.item_id = item.id \
@@ -2254,9 +2267,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO sync_remote_file_items \
-             (item_id, event_id, origin_device_id, state, created_at, updated_at) \
-             VALUES (?, NULL, ?, 'expired', ?, ?)",
+            "INSERT INTO sync_items \
+             (sync_key, item_id, origin, origin_device_id, kind, local_state, remote_file_state, created_at, updated_at) \
+             VALUES ('remote-sync-key', ?, 'remote', ?, 'files', 'metadata', 'expired', ?, ?)",
         )
         .bind("remote-file")
         .bind("origin-device")
@@ -2337,7 +2350,7 @@ mod tests {
             display_created_at: String::new(),
         };
         insert_item(&backup, &item).await.unwrap();
-        sqlx::query("DROP TABLE sync_remote_file_items")
+        sqlx::query("DROP TABLE sync_items")
             .execute(&backup)
             .await
             .unwrap();

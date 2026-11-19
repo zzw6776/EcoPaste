@@ -17,8 +17,8 @@ use tauri_plugin_dialog::DialogExt;
 use crate::clipboard::{
     add_app_from_path, build_item_with_settings, delete_unreferenced_apps, detect_frontmost,
     materialize_source, persist_and_notify, refresh_running_apps, sanitize_css_color,
-    validate_image_file_name, AppIconStore, AppsRegistry, ClipboardReader, FileIconStore,
-    ImageStore, WritebackGuard,
+    validate_image_file_name, AppIconStore, AppsRegistry, ClipboardFingerprintState,
+    ClipboardReader, FileIconStore, ImageStore,
 };
 use crate::core::{AppError, Result};
 use crate::db::items::{
@@ -26,11 +26,12 @@ use crate::db::items::{
     increment_item_use_count,
 };
 use crate::db::models::{
-    ClipboardAction, ClipboardApp, ClipboardGroup, ClipboardItem, ClipboardItemPage,
-    ClipboardItemQuery, ClipboardKind, ClipboardSubKind, FileEntry, Platform,
+    ClipboardAction, ClipboardApp, ClipboardGroup, ClipboardItem, ClipboardItemQuery,
+    ClipboardKind, ClipboardSubKind, FileEntry, Platform,
 };
 use crate::db::DatabaseState;
 use crate::settings::SettingsStore;
+use crate::sync::{SyncItemStatus, SyncManager};
 use crate::window;
 #[cfg(not(target_os = "android"))]
 use crate::window::CLIPBOARD_WINDOW_LABEL;
@@ -567,12 +568,10 @@ pub async fn write_to_clipboard(
     app: AppHandle,
     db: State<'_, DatabaseState>,
     _store: State<'_, ImageStore>,
-    guard: State<'_, Arc<WritebackGuard>>,
+    fingerprints: State<'_, Arc<ClipboardFingerprintState>>,
     id: String,
     _plain: bool,
 ) -> Result<()> {
-    #[cfg(target_os = "android")]
-    let _ = &guard;
     let pool = db.pool().await;
     let mut item = find_item_by_id(&pool, &id)
         .await?
@@ -588,15 +587,14 @@ pub async fn write_to_clipboard(
     let hide_after_copy = settings.clipboard.content.copy_then_hide_window;
 
     #[cfg(not(target_os = "android"))]
-    crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
-    #[cfg(target_os = "android")]
-    crate::clipboard::write_to_clipboard_app(
-        &app,
-        app.state::<Arc<crate::clipboard::ClipboardFingerprintState>>()
-            .inner()
-            .as_ref(),
+    crate::clipboard::write_to_clipboard(
+        &_store,
+        fingerprints.inner().as_ref(),
         &item,
+        write_plain,
     )?;
+    #[cfg(target_os = "android")]
+    crate::clipboard::write_to_clipboard_app(&app, fingerprints.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
     if hide_after_copy {
@@ -618,12 +616,10 @@ pub async fn paste_clipboard_item(
     app: AppHandle,
     db: State<'_, DatabaseState>,
     _store: State<'_, ImageStore>,
-    guard: State<'_, Arc<WritebackGuard>>,
+    fingerprints: State<'_, Arc<ClipboardFingerprintState>>,
     id: String,
     _plain: bool,
 ) -> Result<()> {
-    #[cfg(target_os = "android")]
-    let _ = &guard;
     #[cfg(target_os = "macos")]
     let paste_target_pid = window::macos::clipboard_paste_target_pid()?;
 
@@ -649,15 +645,14 @@ pub async fn paste_clipboard_item(
     );
 
     #[cfg(not(target_os = "android"))]
-    crate::clipboard::write_to_clipboard(&_store, guard.inner().as_ref(), &item, write_plain)?;
-    #[cfg(target_os = "android")]
-    crate::clipboard::write_to_clipboard_app(
-        &app,
-        app.state::<Arc<crate::clipboard::ClipboardFingerprintState>>()
-            .inner()
-            .as_ref(),
+    crate::clipboard::write_to_clipboard(
+        &_store,
+        fingerprints.inner().as_ref(),
         &item,
+        write_plain,
     )?;
+    #[cfg(target_os = "android")]
+    crate::clipboard::write_to_clipboard_app(&app, fingerprints.inner().as_ref(), &item)?;
     mark_item_reused_if_enabled(&app, &pool, &id, item.kind).await?;
 
     #[cfg(target_os = "android")]
@@ -820,10 +815,52 @@ fn hide_clipboard_window_after_copy(app: &AppHandle) {
     }
 }
 
+/// 列表查询的一页结果：顶页项 + 当前过滤下的总数 + 是否还有下一页 + 初始同步徽标快照。
+/// 一次 IPC 同时返回卡片与首帧同步状态，消除前端先渲染灰态再二次拉取状态的闪烁窗口。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardItemPage {
+    pub list: Vec<ClipboardItem>,
+    pub total: i64,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sync_statuses: Vec<SyncItemStatus>,
+}
+
+/// 单条查询结果：展开 [`ClipboardItem`] 并附带当前同步徽标状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardItemResponse {
+    #[serde(flatten)]
+    pub item: ClipboardItem,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_status: Option<SyncItemStatus>,
+}
+
+async fn load_initial_sync_statuses(
+    app: &AppHandle,
+    sync_enabled: bool,
+    item_ids: &[String],
+) -> Vec<SyncItemStatus> {
+    if !sync_enabled || item_ids.is_empty() {
+        return Vec::new();
+    }
+    let Some(manager) = app.try_state::<Arc<SyncManager>>() else {
+        return Vec::new();
+    };
+    match manager.item_statuses(item_ids).await {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            log::warn!("load initial clipboard item sync statuses failed: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
 /// 列表查询命令（薄封装）：参数缺省时走 Rust 端默认（limit=20, offset=0, updatedAtDesc）；
 /// `keyword` 非空时由 `query_items` 内部自动委派 FTS5。
-/// 返回 [`ClipboardItemPage`]：顶页项 + 同过滤下的总数 + `hasMore`，
-/// 供前端一次 IPC 同时拿到「列表 / Footer 总数 / 是否还有下一页」。
+/// 返回 [`ClipboardItemPage`]：顶页项 + 同过滤下的总数 + `hasMore` + 首帧同步状态，
+/// 供前端一次 IPC 同时拿到「列表 / Footer 总数 / 是否还有下一页 / 同步徽标」。
 /// 顺带把 `source_app_icon_file` 解析为绝对路径写到 `source_app_icon_path`，
 /// 前端无需再拉 `get_clipboard_app_icon_path`。
 #[tauri::command]
@@ -846,7 +883,7 @@ pub async fn list_clipboard_items(
     let file_entry_limit = settings.clipboard.display.file_entry_limit();
     let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
     let local_device_id = app
-        .try_state::<Arc<crate::sync::SyncManager>>()
+        .try_state::<Arc<SyncManager>>()
         .map(|manager| manager.local_source_device().0);
     for item in &mut items {
         item.source_device_is_local = local_device_id
@@ -861,6 +898,8 @@ pub async fn list_clipboard_items(
         redact_sensitive_list_item(item, redact_sensitive);
         item.available_actions = compute_available_actions(item);
     }
+    let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let sync_statuses = load_initial_sync_statuses(&app, settings.sync.enabled, &item_ids).await;
     let has_more = q.offset + (items.len() as i64) < total;
     if !FIRST_PAGE_LOGGED.swap(true, Ordering::Relaxed) {
         let total_ms = started_at.elapsed().as_millis();
@@ -875,6 +914,7 @@ pub async fn list_clipboard_items(
         list: items,
         total,
         has_more,
+        sync_statuses,
     })
 }
 
@@ -902,29 +942,34 @@ pub async fn get_clipboard_item(
     app_icon_store: State<'_, AppIconStore>,
     file_icon_store: State<'_, FileIconStore>,
     id: String,
-) -> Result<Option<ClipboardItem>> {
+) -> Result<Option<ClipboardItemResponse>> {
     let pool = db.pool().await;
-    let mut item = find_item_for_list_by_id(&pool, &id).await?;
-    if let Some(item) = item.as_mut() {
-        let local_device_id = app
-            .try_state::<Arc<crate::sync::SyncManager>>()
-            .map(|manager| manager.local_source_device().0);
-        item.source_device_is_local = local_device_id
-            .as_ref()
-            .is_some_and(|id| item.source_device_id.as_deref() == Some(id.as_str()));
-        resolve_managed_file_content(&app, item)?;
-        let settings = app.state::<SettingsStore>().snapshot();
-        let file_entry_limit = settings.clipboard.display.file_entry_limit();
-        let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
-        attach_source_app_icon_path(&app_icon_store, item);
-        attach_file_entries(&pool, &file_icon_store, item, file_entry_limit).await?;
-        attach_image_thumbnail_path(&image_store, item).await?;
-        attach_color_preview(item);
-        attach_display_created_at(item, &Local::now());
-        redact_sensitive_list_item(item, redact_sensitive);
-        item.available_actions = compute_available_actions(item);
-    }
-    Ok(item)
+    let Some(mut item) = find_item_for_list_by_id(&pool, &id).await? else {
+        return Ok(None);
+    };
+    let local_device_id = app
+        .try_state::<Arc<SyncManager>>()
+        .map(|manager| manager.local_source_device().0);
+    item.source_device_is_local = local_device_id
+        .as_ref()
+        .is_some_and(|device_id| item.source_device_id.as_deref() == Some(device_id.as_str()));
+    resolve_managed_file_content(&app, &mut item)?;
+    let settings = app.state::<SettingsStore>().snapshot();
+    let file_entry_limit = settings.clipboard.display.file_entry_limit();
+    let redact_sensitive = settings.clipboard.sensitive.redact_secrets;
+    attach_source_app_icon_path(&app_icon_store, &mut item);
+    attach_file_entries(&pool, &file_icon_store, &mut item, file_entry_limit).await?;
+    attach_image_thumbnail_path(&image_store, &mut item).await?;
+    attach_color_preview(&mut item);
+    attach_display_created_at(&mut item, &Local::now());
+    redact_sensitive_list_item(&mut item, redact_sensitive);
+    item.available_actions = compute_available_actions(&item);
+    let sync_status =
+        load_initial_sync_statuses(&app, settings.sync.enabled, std::slice::from_ref(&item.id))
+            .await
+            .into_iter()
+            .next();
+    Ok(Some(ClipboardItemResponse { item, sync_status }))
 }
 
 /// 为 image 条目补齐缩略图绝对路径，前端可直接渲染。

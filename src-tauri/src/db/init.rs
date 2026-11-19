@@ -914,7 +914,7 @@ mod tests {
         repair_content_availability_draft(&pool, &migrator)
             .await
             .unwrap();
-        migrator.run(&pool).await.unwrap();
+        migrator.run_to(43, &pool).await.unwrap();
 
         let checksum: String =
             sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 30")
@@ -929,6 +929,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(consolidated_tables, 2);
+        migrator.run(&pool).await.unwrap();
     }
 
     #[tokio::test]
@@ -939,7 +940,7 @@ mod tests {
             .await
             .unwrap();
         let migrator = sqlx::migrate!("./migrations");
-        migrator.run(&pool).await.unwrap();
+        migrator.run_to(43, &pool).await.unwrap();
         for draft in SCHEMA_EQUIVALENT_DRAFTS {
             sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
                 .bind(decode_hex_checksum(draft.legacy_checksum).unwrap())
@@ -952,7 +953,7 @@ mod tests {
         repair_schema_equivalent_drafts(&pool, &migrator)
             .await
             .unwrap();
-        migrator.run(&pool).await.unwrap();
+        migrator.run_to(43, &pool).await.unwrap();
 
         for draft in SCHEMA_EQUIVALENT_DRAFTS {
             let checksum: String =
@@ -966,6 +967,7 @@ mod tests {
         assert!(content_objects_schema_is_current(&pool).await.unwrap());
         assert!(content_identity_schema_is_current(&pool).await.unwrap());
         assert!(unified_delivery_schema_is_current(&pool).await.unwrap());
+        migrator.run(&pool).await.unwrap();
     }
 
     #[tokio::test]

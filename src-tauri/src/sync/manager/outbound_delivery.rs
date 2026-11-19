@@ -1,37 +1,11 @@
+use ecopaste_sync_protocol::{LanItemAck, MAX_ITEMS_PER_BATCH};
+
 use super::*;
-
-/// Selects automatic cloud deliveries whose authenticated file metadata should precede content.
-fn deferred_cloud_file_events(
-    events: &[StoredSyncEvent],
-    key: &[u8; 32],
-    auto_upload_max_mb: u32,
-    forced_event_ids: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    let mut deferred = HashSet::new();
-    for stored in events {
-        let decrypted = crypto::decrypt_sync_event(key, &stored.event)?;
-        let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
-            continue;
-        };
-        if !forced_event_ids.contains(&stored.event.event_id)
-            && should_defer_remote_files(&envelope, auto_upload_max_mb)
-        {
-            deferred.insert(stored.event.event_id.clone());
-        }
-    }
-    Ok(deferred)
-}
-
-struct LanContentPlan {
-    planned_count: usize,
-    metadata_only_event_ids: HashSet<String>,
-    available_event_ids: HashSet<String>,
-}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
-struct OutgoingCardError {
-    event_id: String,
+struct OversizedOutgoingItem {
+    item_key: String,
     source: anyhow::Error,
 }
 
@@ -39,8 +13,8 @@ impl SyncManager {
     pub(super) async fn start_preparation_transfer(
         &self,
         pool: &SqlitePool,
-        operation: &db::sync_queue::ContentOutboxOperation,
-        event_id: &str,
+        operation: &db::sync_items::PendingContentPrep,
+        operation_id: &str,
         item: &ClipboardItem,
         target: &PreparationTarget,
         auto_upload_max_mb: u32,
@@ -81,24 +55,24 @@ impl SyncManager {
             self.delivery
                 .promote_local_import(super::super::progress::LocalImportPromotion {
                     item_id: item.id.clone(),
-                    operation_id: event_id.to_owned(),
+                    operation_id: operation_id.to_owned(),
                     route: target.route,
                     target: target.target.clone(),
                     total_bytes,
-                    operation_order: operation.operation_order,
+                    operation_order: operation.local_seq,
                     source_revision: item.source_revision.clone(),
                 })
         {
             return Ok(Some(handle));
         }
-        let task_key = format!("{event_id}\0prepare");
+        let task_key = format!("{operation_id}\0prepare");
         let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
         Ok(Some(self.delivery.start_preparation(
             super::super::progress::TransferTask {
                 id: task_id,
                 revision: 0,
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
-                operation_id: event_id.to_owned(),
+                operation_id: operation_id.to_owned(),
                 item_id: item.id.clone(),
                 direction: super::super::progress::TransferDirection::Upload,
                 route: target.route,
@@ -113,810 +87,391 @@ impl SyncManager {
                 error: None,
                 cancellable: true,
             },
-            operation.operation_order,
+            operation.local_seq,
             item.source_revision.clone(),
         )))
     }
 
-    /// Lets the LAN receiver apply its download threshold before any attachment bytes are sent.
-    async fn plan_lan_content(
+    /// Sends asynchronous LAN content completion acknowledgements over an active peer connection.
+    pub(super) async fn send_lan_acks(
         &self,
         connection: &Connection,
         group: &GroupSecrets,
-        device_id: &str,
-        events: &[StoredSyncEvent],
-    ) -> Result<LanContentPlan> {
-        let mut request = Request::PlanLanContent {
-            group_id: group.group_id.clone(),
-            access_token: group.access_token_bytes()?,
-            device_id: device_id.to_owned(),
-            events: events.iter().map(|stored| stored.event.clone()).collect(),
-        };
-        let planned_count = match limit_lan_content_plan(&mut request) {
-            Ok(count) => count,
-            Err(error) => {
-                if let Some(stored) = events.first() {
-                    return Err(OutgoingCardError {
-                        event_id: stored.event.event_id.clone(),
-                        source: error.into(),
-                    }
-                    .into());
-                }
-                return Err(error.into());
-            }
-        };
-        let planned_ids = match &request {
-            Request::PlanLanContent { events, .. } => events
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect::<HashSet<_>>(),
-            _ => unreachable!(),
-        };
-        let response = call_lan(connection, request).await?;
-        let Response::LanContentPlan {
-            metadata_only_event_ids,
-            available_event_ids,
-        } = response
-        else {
-            if let Response::Error { code, message } = response {
-                return Err(RemoteSyncError { code, message }.into());
-            }
-            bail!("局域网设备返回了无效的文件接收计划");
-        };
-        if metadata_only_event_ids
-            .iter()
-            .chain(&available_event_ids)
-            .any(|event_id| !planned_ids.contains(event_id))
-        {
-            bail!("局域网设备返回了未知的文件接收计划");
+        acks: Vec<LanItemAck>,
+    ) -> Result<()> {
+        if acks.is_empty() {
+            return Ok(());
         }
-        let metadata_only_event_ids = metadata_only_event_ids.into_iter().collect::<HashSet<_>>();
-        let available_event_ids = available_event_ids.into_iter().collect::<HashSet<_>>();
-        if !metadata_only_event_ids.is_disjoint(&available_event_ids) {
-            bail!("局域网设备返回了冲突的文件接收计划");
-        }
-        Ok(LanContentPlan {
-            planned_count,
-            metadata_only_event_ids,
-            available_event_ids,
-        })
-    }
-
-    /// Flushes durable event receipts independently from sync pagination and transfer state.
-    async fn flush_lan_receipts(
-        &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        device: &DeviceAnnouncement,
-        peer_device_id: &str,
-    ) -> Result<bool> {
-        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
-            let receipts =
-                repository::pending_peer_receipts(pool, peer_device_id, MAX_EVENTS_PER_BATCH)
-                    .await?;
-            if receipts.is_empty() {
-                return Ok(false);
-            }
-            let complete_event_ids = receipts
-                .iter()
-                .filter(|receipt| receipt.content_complete)
-                .map(|receipt| receipt.event_id.clone())
-                .collect::<Vec<_>>();
-            let event_ids = receipts
-                .iter()
-                .map(|receipt| receipt.event_id.clone())
-                .collect::<Vec<_>>();
+        let device = self.receipt_device_announcement()?;
+        for chunk in acks.chunks(usize::from(MAX_ITEMS_PER_BATCH)) {
             let response = call_lan(
                 connection,
-                Request::AcknowledgeLan {
+                Request::AckLanItems {
                     group_id: group.group_id.clone(),
                     access_token: group.access_token_bytes()?,
                     device: device.clone(),
-                    event_ids: event_ids.clone(),
-                    complete_event_ids,
+                    acks: chunk.to_vec(),
                 },
             )
             .await?;
             match response {
-                Response::LanAcknowledged => {
-                    repository::complete_peer_receipts(pool, peer_device_id, &receipts).await?;
-                }
+                Response::LanAcknowledged => {}
                 Response::Error { code, message } => {
                     return Err(RemoteSyncError { code, message }.into());
                 }
                 _ => bail!("局域网设备返回了无效的投递回执响应"),
             }
         }
-
-        Ok(!repository::pending_peer_receipts(pool, peer_device_id, 1)
-            .await?
-            .is_empty())
+        Ok(())
     }
 
-    /// Uploads attachments in bounded parallel streams and confirms unrelated records independently.
-    pub(super) async fn sync_connection(
-        self: &Arc<Self>,
-        connection: &Connection,
-        target: &SyncConnectionTarget,
-        after_cursor: u64,
+    async fn prepare_realtime_outbound_lanes(
+        &self,
+        target: &PreparationTarget,
         cycle: &SyncCycleContext,
-    ) -> Result<SyncConnectionOutcome> {
-        self.sync_connection_lane(connection, target, after_cursor, cycle, None)
-            .await
+    ) -> Result<bool> {
+        self.runtime_state
+            .realtime_pending
+            .store(false, Ordering::Release);
+        let _ = self.materialize_dirty_states(Some(cycle)).await?;
+        let text_run = self
+            .materialize_content_lane(
+                db::sync_items::OutboxContentLane::Text,
+                usize::from(MAX_ITEMS_PER_BATCH),
+                Some(target),
+                Some(cycle),
+            )
+            .await?;
+        let mut local_has_more = text_run.hit_limit;
+        text_run.staging.retain_for_delivery();
+
+        let image_run = self
+            .materialize_content_lane(
+                db::sync_items::OutboxContentLane::Image,
+                4,
+                Some(target),
+                Some(cycle),
+            )
+            .await?;
+        local_has_more |= image_run.hit_limit;
+        image_run.staging.retain_for_delivery();
+        Ok(local_has_more)
     }
 
-    /// Reuses the existing delivery pipeline with a disjoint file-body queue.
-    pub(super) async fn sync_connection_lane(
+    async fn block_oversized_item_key(
+        &self,
+        pool: &SqlitePool,
+        target_id: &str,
+        item_key: &str,
+        error: &str,
+    ) -> Result<()> {
+        if let Some(meta) = repository::load_sync_item_meta_by_item_key(pool, item_key).await? {
+            self.delivery
+                .blocked(pool, target_id, &meta.sync_key, error)
+                .await?;
+            self.emit_updated();
+        }
+        Ok(())
+    }
+
+    async fn mark_delivery_error_by_item_keys(
+        &self,
+        pool: &SqlitePool,
+        target_id: &str,
+        item_keys: &[String],
+        error: &str,
+    ) -> Result<()> {
+        let mut sync_keys = Vec::with_capacity(item_keys.len());
+        for item_key in item_keys {
+            if let Some(meta) = repository::load_sync_item_meta_by_item_key(pool, item_key).await? {
+                sync_keys.push(meta.sync_key);
+            }
+        }
+        if !sync_keys.is_empty() {
+            self.delivery
+                .failed(pool, target_id, &sync_keys, error)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Runs the Cloud Hub control-plane sync loop (`CloudSyncItems`) over the dedicated control
+    /// connection, never blocking on attachment bytes.
+    pub(super) async fn sync_cloud_control(
         self: &Arc<Self>,
         connection: &Connection,
-        target: &SyncConnectionTarget,
-        after_cursor: u64,
         cycle: &SyncCycleContext,
-        content: Option<bool>,
     ) -> Result<SyncConnectionOutcome> {
         let _sync_activity = SyncActivityGuard::acquire();
-        let files = content.unwrap_or(false);
-        let attachments = content.is_some();
-        let is_cloud = target.is_cloud();
-        let target_id = target.delivery_target();
         let pool = cycle.pool.clone();
         let group = &cycle.group;
-        let device_id = &cycle.device_id;
-        if !attachments && !is_cloud {
-            match call_lan(connection, Request::Health).await? {
-                Response::Health {
-                    protocol_version, ..
-                } if protocol_version == PROTOCOL_VERSION => {}
-                Response::Health {
-                    protocol_version, ..
-                } => bail!(
-                    "局域网同步协议版本不一致：本机 {PROTOCOL_VERSION}，对端 {protocol_version}，请同时升级两台设备"
-                ),
-                Response::Error { code, message } => {
-                    return Err(RemoteSyncError { code, message }.into());
-                }
-                _ => bail!("局域网设备返回了无效的协议版本响应"),
-            }
-        }
-        let availability_has_more = if !attachments && is_cloud {
-            self.sync_cloud_availability(connection, &pool, group)
-                .await?
-        } else {
-            false
+        let language = crate::i18n::current_language(&self.app);
+        let prep_target = PreparationTarget {
+            route: super::super::progress::TransferRoute::Cloud,
+            target: CLOUD_TARGET.to_owned(),
         };
-        let context = SyncExchange {
-            connection,
-            target,
-            group,
-            pool: &pool,
-            device_id,
-            device: &cycle.device,
-            settings: &cycle.settings,
-        };
-        let mut cursor = after_cursor;
-        let mut follow_up_needed = availability_has_more;
+
+        let mut local_has_more = self
+            .prepare_realtime_outbound_lanes(&prep_target, cycle)
+            .await?;
+        let mut remote_latest_hint: Option<u64> = None;
         let mut has_more = false;
-        let mut remote_pull_needed = !attachments;
-        if let Some(peer_device_id) = target.peer_device_id() {
-            follow_up_needed |= self
-                .flush_lan_receipts(connection, &pool, group, &cycle.device, peer_device_id)
-                .await?;
-        }
-        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
-            let preparation_target = PreparationTarget {
-                route: if is_cloud {
-                    super::super::progress::TransferRoute::Cloud
-                } else {
-                    super::super::progress::TransferRoute::Lan
-                },
-                target: target_id.to_owned(),
-            };
-            let mut local_has_more = if attachments {
-                false
-            } else {
-                let _ = self.materialize_dirty_states(Some(cycle)).await?;
-                let run = self
-                    .materialize_content_lane(
-                        db::sync_queue::OutboxContentLane::Text,
-                        usize::from(MAX_EVENTS_PER_BATCH),
-                        Some(&preparation_target),
-                        Some(cycle),
-                    )
+        let exchange_lock = self
+            .runtime_state
+            .exchange_locks
+            .lock()
+            .await
+            .entry(CLOUD_TARGET.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+
+        for batch_index in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            if batch_index > 0
+                && self
+                    .runtime_state
+                    .realtime_pending
+                    .swap(false, Ordering::AcqRel)
+            {
+                local_has_more |= self
+                    .prepare_realtime_outbound_lanes(&prep_target, cycle)
                     .await?;
-                let hit_limit = run.hit_limit;
-                run.staging.retain_for_delivery();
-                hit_limit
-            };
-            let lane = Some(if attachments {
-                if files {
-                    2
-                } else {
-                    1
-                }
-            } else {
-                0
-            });
-            let mut pending = if is_cloud {
-                repository::pending_cloud_events_for_target(
-                    &pool,
-                    target_id,
-                    device_id,
-                    MAX_EVENTS_PER_BATCH,
-                    lane,
-                )
-                .await?
-            } else {
-                repository::pending_peer_events_for_target(
-                    &pool,
-                    target_id,
-                    target
-                        .peer_device_id()
-                        .context("missing LAN peer device identity")?,
-                    MAX_EVENTS_PER_BATCH,
-                    lane,
-                )
-                .await?
-            };
-            if attachments && pending.is_empty() {
-                let outbox_lane = if files {
-                    db::sync_queue::OutboxContentLane::Files
-                } else {
-                    db::sync_queue::OutboxContentLane::Image
-                };
-                let extra = self
-                    .materialize_content_lane(
-                        outbox_lane,
-                        1,
-                        Some(&preparation_target),
-                        Some(cycle),
-                    )
+            }
+
+            let exchange_guard = exchange_lock.lock().await;
+            let mut window = repository::cloud_window_cursor(&pool).await?;
+            let (after_seq, before_seq) = window.next_pull_params(remote_latest_hint);
+            let writes =
+                repository::pending_outbound_writes(&pool, CLOUD_TARGET, MAX_ITEMS_PER_BATCH)
                     .await?;
-                let extra_processed = extra.processed;
-                if extra.hit_limit {
-                    local_has_more = true;
-                }
-                extra.staging.retain_for_delivery();
-                if extra_processed > 0 {
-                    pending = if is_cloud {
-                        repository::pending_cloud_events_for_target(
+            let available_write_count = writes.len();
+            let remote_ahead = remote_latest_hint.is_some_and(|latest| latest > window.synced_seq);
+            if batch_index > 0
+                && writes.is_empty()
+                && !window.has_catchup_pending()
+                && !remote_ahead
+                && !local_has_more
+            {
+                break;
+            }
+
+            let removed_devices = if batch_index == 0 {
+                repository::removed_devices(&pool).await?
+            } else {
+                Vec::new()
+            };
+            let first_item_key = writes.first().map(|w| w.item_key.clone());
+            let mut request = Request::CloudSyncItems {
+                group_id: group.group_id.clone(),
+                access_token: group.access_token_bytes()?,
+                device: self.cloud_device_announcement_for(&cycle.device),
+                after_seq,
+                before_seq,
+                items: writes,
+                removed_devices,
+                limit: MAX_ITEMS_PER_BATCH,
+            };
+            let submitted_count = match limit_sync_request(&mut request) {
+                Ok(count) => count,
+                Err(error) => {
+                    drop(exchange_guard);
+                    if let Some(item_key) = first_item_key {
+                        let err = OversizedOutgoingItem {
+                            item_key: item_key.clone(),
+                            source: error.into(),
+                        };
+                        self.block_oversized_item_key(
                             &pool,
-                            target_id,
-                            device_id,
-                            MAX_EVENTS_PER_BATCH,
-                            lane,
+                            CLOUD_TARGET,
+                            &err.item_key,
+                            &err.to_string(),
                         )
-                        .await?
-                    } else {
-                        repository::pending_peer_events_for_target(
-                            &pool,
-                            target_id,
-                            target
-                                .peer_device_id()
-                                .context("missing LAN peer device identity")?,
-                            MAX_EVENTS_PER_BATCH,
-                            lane,
-                        )
-                        .await?
-                    };
-                }
-                if pending.is_empty() {
-                    if extra_processed > 0 {
-                        has_more = true;
+                        .await?;
                         continue;
                     }
-                    has_more = false;
-                    break;
+                    return Err(error.into());
                 }
-            }
-            let pending_total = pending.len();
-            let mut attachment_claim = None;
-            if attachments {
-                pending.retain(|event| {
-                    if attachment_claim.is_some() {
-                        return false;
-                    }
-                    attachment_claim = self.delivery.claim_upload(target_id, &event.event.event_id);
-                    attachment_claim.is_some()
-                });
-                if pending.is_empty() {
-                    break;
-                }
-            }
-            let mut more_available = if attachments {
-                pending_total > pending.len()
-            } else {
-                pending.len() == usize::from(MAX_EVENTS_PER_BATCH)
             };
-            let key = group.content_key_bytes()?;
-            let mut validated = Vec::with_capacity(pending.len());
-            for stored in pending {
-                let validation = crypto::decrypt_sync_event(&key, &stored.event)
-                    .and_then(|event| validate_decrypted_sync_event(&event));
-                if let Err(error) = validation {
-                    log::warn!(
-                        "skip invalid outgoing card: eventId={} error={error:#}",
-                        stored.event.event_id
-                    );
-                    self.delivery
-                        .blocked(
+            let outgoing_truncated = submitted_count < available_write_count;
+            let pushed_local_seqs: HashMap<String, u64> = match &request {
+                Request::CloudSyncItems { items, .. } => items
+                    .iter()
+                    .map(|item| (item.item_key.clone(), item.local_seq))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+            let submitted_keys = pushed_local_seqs.keys().cloned().collect::<Vec<_>>();
+
+            let started_at = Instant::now();
+            let response = match call_cloud(connection, request, language).await {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(exchange_guard);
+                    let _ = self
+                        .mark_delivery_error_by_item_keys(
                             &pool,
-                            target_id,
-                            std::slice::from_ref(&stored.event.event_id),
+                            CLOUD_TARGET,
+                            &submitted_keys,
                             &error.to_string(),
                         )
-                        .await?;
-                    self.emit_updated();
-                    continue;
-                }
-                validated.push(stored);
-            }
-            pending = validated;
-            if is_cloud {
-                let key = group.content_key_bytes()?;
-                for stored in &mut pending {
-                    stored.event.retention_key =
-                        Some(crypto::retention_mapping(&key, &stored.event)?.item_key);
-                }
-            }
-            let (mut metadata_only_event_ids, mut available_event_ids) = if is_cloud
-                || pending.is_empty()
-            {
-                if is_cloud {
-                    let forced_event_ids = repository::event_ids_with_requested_content(
-                        &pool, &pending, target_id, "cloud",
-                    )
-                    .await?;
-                    let mut metadata_only_event_ids = deferred_cloud_file_events(
-                        &pending,
-                        &group.content_key_bytes()?,
-                        cycle.settings.auto_upload_max_mb,
-                        &forced_event_ids,
-                    )?;
-                    let routed_away =
-                        repository::event_ids_routed_away_from(&pool, &pending, "cloud").await?;
-                    metadata_only_event_ids
-                        .extend(routed_away.difference(&forced_event_ids).cloned());
-                    (metadata_only_event_ids, HashSet::new())
-                } else {
-                    (HashSet::new(), HashSet::new())
-                }
-            } else {
-                let original_count = pending.len();
-                let mut plan = loop {
-                    match self
-                        .plan_lan_content(connection, group, device_id, &pending)
-                        .await
-                    {
-                        Ok(plan) => break plan,
-                        Err(error) => {
-                            let Some(card) = error.downcast_ref::<OutgoingCardError>() else {
-                                return Err(error);
-                            };
-                            self.delivery
-                                .blocked(
-                                    &pool,
-                                    target_id,
-                                    std::slice::from_ref(&card.event_id),
-                                    &card.to_string(),
-                                )
-                                .await?;
-                            pending.retain(|stored| stored.event.event_id != card.event_id);
-                            self.emit_updated();
-                        }
-                    }
-                };
-                pending.truncate(plan.planned_count);
-                more_available |= plan.planned_count < original_count;
-                let routed_away =
-                    repository::event_ids_routed_away_from(&pool, &pending, "lan").await?;
-                let requested =
-                    repository::event_ids_with_requested_content(&pool, &pending, target_id, "lan")
-                        .await?;
-                plan.metadata_only_event_ids
-                    .extend(routed_away.difference(&requested).cloned());
-                (plan.metadata_only_event_ids, plan.available_event_ids)
-            };
-            repository::attach_event_blob_ids(&pool, &mut pending).await?;
-            mark_metadata_only_blob_refs(
-                &mut pending,
-                &group.content_key_bytes()?,
-                &metadata_only_event_ids,
-            );
-            if is_cloud {
-                mark_optional_source_icon_refs(&mut pending, &group.content_key_bytes()?);
-            }
-            let route = if is_cloud {
-                super::super::progress::TransferRoute::Cloud
-            } else {
-                super::super::progress::TransferRoute::Lan
-            };
-            self.delivery
-                .filter_pending(&pool, target_id, &mut pending, &mut metadata_only_event_ids)
-                .await?;
-            let remaining_event_ids = pending
-                .iter()
-                .map(|stored| stored.event.event_id.as_str())
-                .collect::<HashSet<_>>();
-            available_event_ids.retain(|event_id| remaining_event_ids.contains(event_id.as_str()));
-            let ids = pending
-                .iter()
-                .map(|stored| stored.event.event_id.clone())
-                .collect::<Vec<_>>();
-            self.delivery
-                .queued(&pool, target_id, &ids, &metadata_only_event_ids)
-                .await?;
-            let mut content_event_ids = HashSet::new();
-            let mut file_event_ids = HashSet::new();
-            for stored in &pending {
-                if let DecryptedSyncEvent::Clipboard(envelope) =
-                    crypto::decrypt_sync_event(&key, &stored.event)?
-                {
-                    if envelope.item.kind == "files" {
-                        file_event_ids.insert(stored.event.event_id.clone());
-                    }
-                    if !envelope.blobs.is_empty() {
-                        content_event_ids.insert(stored.event.event_id.clone());
-                    }
-                }
-            }
-            let missing_records =
-                repository::event_ids_without_record(&pool, &pending, target_id).await?;
-            let mut records = pending
-                .iter()
-                .filter(|stored| {
-                    !content_event_ids.contains(&stored.event.event_id)
-                        || ((metadata_only_event_ids.contains(&stored.event.event_id)
-                            || !attachments
-                            || files)
-                            && missing_records.contains(&stored.event.event_id))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            has_more = more_available || local_has_more || remote_pull_needed;
-            let mut records_exchanged = false;
-            while !records.is_empty() {
-                let mut ready = records.clone();
-                mark_metadata_only_blob_refs(&mut ready, &key, &content_event_ids);
-                match self
-                    .exchange_ready_events(&context, cursor, &mut ready, &content_event_ids)
-                    .await
-                {
-                    Ok(outcome) => {
-                        records_exchanged = true;
-                        cursor = outcome.latest_cursor;
-                        if !attachments {
-                            remote_pull_needed = outcome.has_more;
-                        }
-                        has_more |= outcome.has_more;
-                        if outcome.event_ids.is_empty() {
-                            return Ok(SyncConnectionOutcome { has_more: true });
-                        }
-                        records
-                            .retain(|stored| !outcome.event_ids.contains(&stored.event.event_id));
-                    }
-                    Err(error) => {
-                        if let Some(card) = error.downcast_ref::<OutgoingCardError>() {
-                            self.delivery
-                                .blocked(
-                                    &pool,
-                                    target_id,
-                                    std::slice::from_ref(&card.event_id),
-                                    &card.to_string(),
-                                )
-                                .await?;
-                            records.retain(|stored| stored.event.event_id != card.event_id);
-                            pending.retain(|stored| stored.event.event_id != card.event_id);
-                            self.emit_updated();
-                            continue;
-                        }
-                        let submitted = ready
-                            .iter()
-                            .map(|stored| stored.event.event_id.clone())
-                            .collect::<Vec<_>>();
-                        self.delivery
-                            .failed(&pool, target_id, &submitted, &error.to_string())
-                            .await?;
-                        self.emit_updated();
-                        return Err(error);
-                    }
-                }
-            }
-            self.delivery.complete_metadata_only(
-                &metadata_only_event_ids.iter().cloned().collect::<Vec<_>>(),
-                route,
-                target_id,
-            );
-            pending.retain(|stored| {
-                content_event_ids.contains(&stored.event.event_id)
-                    && attachments
-                    && (files == file_event_ids.contains(&stored.event.event_id))
-                    && !metadata_only_event_ids.contains(&stored.event.event_id)
-            });
-            if pending.is_empty() {
-                if !records_exchanged && remote_pull_needed {
-                    let outcome = self
-                        .exchange_ready_events(&context, cursor, &mut Vec::new(), &HashSet::new())
-                        .await?;
-                    cursor = outcome.latest_cursor;
-                    remote_pull_needed = outcome.has_more;
-                    has_more |= outcome.has_more;
-                }
-                if has_more {
-                    continue;
-                }
-                break;
-            }
-            let ids = pending
-                .iter()
-                .map(|stored| stored.event.event_id.clone())
-                .collect::<Vec<_>>();
-            let blobs = repository::blobs_for_events(&pool, &ids).await?;
-            let skip_content_event_ids = metadata_only_event_ids
-                .union(&available_event_ids)
-                .cloned()
-                .collect::<HashSet<_>>();
-            let mut queue = super::super::transfer::TransferQueue::new(
-                pending,
-                blobs,
-                &group.content_key_bytes()?,
-                &skip_content_event_ids,
-            )?;
-            let mut uploads = tokio::task::JoinSet::new();
-            let (upload_started, mut upload_notifications) = mpsc::unbounded_channel();
-            let mut failure = None;
-            let mut blocked_event_ids = HashSet::new();
-            for (id, reason) in queue.take_failures() {
-                log::warn!("skip undeliverable sync event: eventId={id} error={reason}");
-                self.delivery
-                    .blocked(&pool, target_id, std::slice::from_ref(&id), &reason)
-                    .await?;
-                blocked_event_ids.insert(id);
-            }
-            if !blocked_event_ids.is_empty() {
-                queue.cancel_events(&blocked_event_ids);
-                self.emit_updated();
-            }
-            let mut pull_needed = true;
-            while pull_needed || queue.has_pending() {
-                self.delivery
-                    .reconcile_queue(&pool, target_id, &mut queue)
-                    .await?;
-                while uploads.len() < MAX_CONCURRENT_BLOB_TRANSFERS {
-                    let Some(blob) = queue.next_blob() else {
-                        break;
-                    };
-                    let transfer = loop {
-                        let Some((event_id, operation_total_bytes)) = queue
-                            .operation_for_blob(&blob.blob_id)
-                            .map(|(event_id, total_bytes)| (event_id.to_owned(), total_bytes))
-                        else {
-                            break None;
-                        };
-                        match self
-                            .delivery
-                            .start_upload(
-                                &pool,
-                                target_id,
-                                route,
-                                &event_id,
-                                operation_total_bytes,
-                                &blob,
-                            )
-                            .await?
-                        {
-                            UploadTransferStart::Ready(transfer) => break Some(transfer),
-                            UploadTransferStart::Canceled => {
-                                queue.cancel_events(&HashSet::from([event_id]));
-                            }
-                        }
-                    };
-                    let Some(transfer) = transfer else {
-                        continue;
-                    };
-                    let connection = connection.clone();
-                    let group = group.clone();
-                    let manager = self.clone();
-                    let blob_id = blob.blob_id.clone();
-                    let options = BlobUploadOptions {
-                        kind: BlobUploadKind::Content,
-                        file_content: files,
-                        managed_hub_blob: is_cloud,
-                        is_cloud,
-                        language: crate::i18n::current_language(&self.app),
-                        started: Some(upload_started.clone()),
-                        transfer,
-                    };
-                    uploads.spawn(async move {
-                        let transfer = options.transfer.clone();
-                        let result = async {
-                            let (staged, _staging_lease) = if blob.encrypted_path.is_empty() {
-                                (blob.clone(), None)
-                            } else {
-                                let (staged, lease) =
-                                    manager.lease_outgoing_staging(&group, &blob).await?;
-                                (staged, Some(lease))
-                            };
-                            upload_blob(&connection, &group, &staged, options).await
-                        }
                         .await;
-                        if let (Err(error), Some(transfer)) = (&result, &transfer) {
-                            if transfer.canceled() {
-                                transfer.mark_canceled(0);
-                            } else {
-                                transfer.failed(0, error.to_string());
-                            }
-                        }
-                        (blob_id, result)
-                    });
+                    if should_invalidate_cloud_connection(connection, &error) {
+                        self.invalidate_cloud_connection(connection.stable_id());
+                        self.runtime_state.watch_wake.notify_one();
+                    }
+                    return Err(error);
                 }
+            };
+
+            let Response::CloudSynced {
+                accepted,
+                conflicts,
+                items,
+                peers,
+                removed_devices,
+                latest_seq,
+                pruned_through_seq,
+                next_before_seq,
+            } = response
+            else {
+                drop(exchange_guard);
+                if let Response::Error { code, message } = response {
+                    let err = RemoteSyncError { code, message };
+                    let _ = self
+                        .mark_delivery_error_by_item_keys(
+                            &pool,
+                            CLOUD_TARGET,
+                            &submitted_keys,
+                            &err.to_string(),
+                        )
+                        .await;
+                    return Err(err.into());
+                }
+                bail!("云端返回了无效的同步响应");
+            };
+
+            repository::record_cloud_accepted(&pool, &accepted, &pushed_local_seqs).await?;
+            if !removed_devices.is_empty() {
+                self.apply_removed_devices(
+                    &pool,
+                    removed_devices,
+                    &cycle.device_id,
+                    &cycle.device.endpoint_id,
+                )
+                .await?;
+            }
+            for peer in peers {
+                if peer.device_id != cycle.device_id {
+                    repository::upsert_peer_identity(&pool, &peer).await?;
+                }
+            }
+
+            let conflict_summary = self
+                .ingest_remote_records(&pool, group, CLOUD_TARGET, &conflicts, true)
+                .await?;
+            let pull_summary = self
+                .ingest_remote_records(&pool, group, CLOUD_TARGET, &items, true)
+                .await?;
+            window.apply_response(
+                after_seq,
+                before_seq,
+                latest_seq,
+                pruned_through_seq,
+                next_before_seq,
+            );
+            let pull_more = window.has_catchup_pending() || latest_seq > window.synced_seq;
+            repository::update_cloud_window_cursor(&pool, window).await?;
+            remote_latest_hint = Some(latest_seq);
+            drop(exchange_guard);
+
+            let pending_inbound_blobs = self
+                .apply_pending_inline_items(&pool, group, &cycle.settings)
+                .await?;
+            let has_pending_uploads = !repository::pending_cloud_blob_uploads(&pool, false, 1)
+                .await?
+                .is_empty();
+            if pending_inbound_blobs
+                || conflict_summary.needs_blob_pull
+                || pull_summary.needs_blob_pull
+                || has_pending_uploads
+            {
+                self.wake_attachments();
+            }
+            if cycle.settings.lan_enabled && (!items.is_empty() || !conflicts.is_empty()) {
+                self.wake_lan_transfer();
+            }
+            if !submitted_keys.is_empty() || !items.is_empty() || !conflicts.is_empty() {
                 self.emit_updated();
-                let mut ready = self
-                    .delivery
-                    .prepare_ready_events(&pool, target_id, &mut queue)
-                    .await?;
-                if ready.is_empty() && !pull_needed {
-                    let result = tokio::select! {
-                        Some(blob_id) = upload_notifications.recv() => {
-                            self.delivery
-                                .attempted(
-                                    &pool,
-                                    target_id,
-                                    &queue.events_for_blob(&blob_id),
-                                )
-                                .await?;
-                            self.emit_updated();
-                            continue;
-                        }
-                        result = uploads.join_next() => result,
-                    };
-                    let Some(result) = result else {
-                        break;
-                    };
-                    let (blob_id, result) = result.context("attachment upload task failed")?;
-                    match result {
-                        Ok(()) => queue.blob_stored(blob_id),
-                        Err(error) => {
-                            let ids = queue.fail_blob(&blob_id);
-                            log::warn!(
-                                "sync attachment upload failed: blobRef={} error={error:#}",
-                                blob_log_ref(&blob_id)
-                            );
-                            if is_shared_sync_failure(connection, &error) {
-                                let message = error.to_string();
-                                self.delivery
-                                    .failed(&pool, target_id, &ids, &message)
-                                    .await?;
-                                self.delivery
-                                    .failed(&pool, target_id, &queue.active_events(), &message)
-                                    .await?;
-                                failure.get_or_insert(error);
-                                break;
-                            }
-                            self.delivery
-                                .blocked(&pool, target_id, &ids, &error.to_string())
-                                .await?;
-                            queue.cancel_events(&ids.into_iter().collect());
-                            self.emit_updated();
-                        }
-                    }
-                    continue;
-                }
-                pull_needed = false;
-                match self
-                    .exchange_ready_events(&context, cursor, &mut ready, &metadata_only_event_ids)
-                    .await
-                {
-                    Ok(outcome) => {
-                        queue.confirm_events(&outcome.event_ids);
-                        cursor = outcome.latest_cursor;
-                        if !attachments {
-                            remote_pull_needed = outcome.has_more;
-                        }
-                        let outbox_has_more = if attachments && !more_available && !local_has_more {
-                            let outbox_lane = if files {
-                                db::sync_queue::OutboxContentLane::Files
-                            } else {
-                                db::sync_queue::OutboxContentLane::Image
-                            };
-                            db::sync_queue::next_ready_content(
-                                &pool,
-                                cycle.settings.sync_sensitive,
-                                Some(outbox_lane),
-                            )
-                            .await?
-                            .is_some()
-                        } else {
-                            false
-                        };
-                        has_more =
-                            outcome.has_more || local_has_more || more_available || outbox_has_more;
-                    }
-                    Err(error) => {
-                        if let Some(card) = error.downcast_ref::<OutgoingCardError>() {
-                            self.delivery
-                                .blocked(
-                                    &pool,
-                                    target_id,
-                                    std::slice::from_ref(&card.event_id),
-                                    &card.to_string(),
-                                )
-                                .await?;
-                            queue.cancel_events(&HashSet::from([card.event_id.clone()]));
-                            self.emit_updated();
-                            continue;
-                        }
-                        let submitted = ready
-                            .iter()
-                            .map(|stored| stored.event.event_id.clone())
-                            .collect::<Vec<_>>();
-                        queue.fail_events(&submitted);
-                        let message = error.to_string();
-                        self.delivery
-                            .failed(&pool, target_id, &submitted, &message)
-                            .await?;
-                        self.emit_updated();
-                        failure.get_or_insert(error);
-                        if connection.close_reason().is_some() {
-                            self.delivery
-                                .failed(&pool, target_id, &queue.active_events(), &message)
-                                .await?;
-                            break;
-                        }
-                    }
-                }
             }
-            if let Some(error) = failure {
-                return Err(error);
-            }
-            if attachments || !has_more {
+
+            log::info!(
+                "cloud sync batch completed: sent={} accepted={} conflicts={} received={} latestSeq={latest_seq} pullMore={pull_more} elapsedMs={}",
+                submitted_count,
+                accepted.len(),
+                conflicts.len(),
+                items.len(),
+                started_at.elapsed().as_millis(),
+            );
+
+            let needs_repush = conflict_summary.needs_repush || pull_summary.needs_repush;
+            has_more = outgoing_truncated || pull_more || needs_repush || local_has_more;
+            local_has_more = false;
+            if !has_more {
                 break;
             }
         }
-        if !attachments && is_cloud {
-            match self
-                .refresh_cloud_retention(connection, &pool, group, &cycle.device, 1)
-                .await
-            {
-                Ok(retention_has_more) => has_more |= retention_has_more,
-                Err(error) => {
-                    log::warn!("cloud retention sync skipped after exchange: {error:#}");
-                }
-            }
-        }
-        has_more |= follow_up_needed;
+
         self.runtime_state.source_asset_wake.notify_one();
         Ok(SyncConnectionOutcome { has_more })
     }
 
-    /// Publishes records or ready-content confirmations and applies their acknowledgement.
-    async fn exchange_ready_events(
+    /// Runs the LAN peer control-plane sync loop (`SyncItems`) over a peer connection.
+    pub(super) async fn sync_lan_control(
         self: &Arc<Self>,
-        context: &SyncExchange<'_>,
-        after_cursor: u64,
-        pending: &mut Vec<StoredSyncEvent>,
-        metadata_only_event_ids: &HashSet<String>,
-    ) -> Result<SyncReadyOutcome> {
-        let SyncExchange {
-            connection,
-            target,
-            group,
-            pool,
-            device_id,
-            device,
-            settings,
-        } = *context;
-        let is_cloud = target.is_cloud();
+        connection: &Connection,
+        target: &SyncConnectionTarget,
+        cycle: &SyncCycleContext,
+    ) -> Result<SyncConnectionOutcome> {
+        let _sync_activity = SyncActivityGuard::acquire();
+        let pool = cycle.pool.clone();
+        let group = &cycle.group;
+        let peer_device_id = target
+            .peer_device_id()
+            .context("missing LAN peer device identity")?;
         let target_id = target.delivery_target();
-        let pool = pool.clone();
-        let language = crate::i18n::current_language(&self.app);
-        let removed_devices = if is_cloud {
-            repository::removed_devices(&pool).await?
-        } else {
-            self.sync_lan_removed_devices(connection, &pool, group, device_id, &device.endpoint_id)
-                .await?;
-            Vec::new()
+
+        match call_lan(connection, Request::Health).await? {
+            Response::Health {
+                protocol_version, ..
+            } if protocol_version == PROTOCOL_VERSION => {}
+            Response::Health {
+                protocol_version, ..
+            } => bail!(
+                "局域网同步协议版本不一致：本机 {PROTOCOL_VERSION}，对端 {protocol_version}，请同时升级两台设备"
+            ),
+            Response::Error { code, message } => {
+                return Err(RemoteSyncError { code, message }.into());
+            }
+            _ => bail!("局域网设备返回了无效的协议版本响应"),
+        }
+
+        self.sync_lan_removed_devices(
+            connection,
+            &pool,
+            group,
+            &cycle.device_id,
+            &cycle.device.endpoint_id,
+        )
+        .await?;
+
+        let prep_target = PreparationTarget {
+            route: super::super::progress::TransferRoute::Lan,
+            target: target_id.to_owned(),
         };
+        let mut local_has_more = self
+            .prepare_realtime_outbound_lanes(&prep_target, cycle)
+            .await?;
+        let mut remote_latest_hint: Option<u64> = None;
+        let mut has_more = false;
         let exchange_lock = self
             .runtime_state
             .exchange_locks
@@ -925,262 +480,294 @@ impl SyncManager {
             .entry(target_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let exchange_guard = exchange_lock.lock().await;
-        let current_cursor = if is_cloud {
-            repository::cloud_cursor(&pool).await?
-        } else {
-            repository::list_peers(&pool)
-                .await?
-                .into_iter()
-                .find(|peer| Some(peer.announcement.device_id.as_str()) == target.peer_device_id())
-                .map(|peer| peer.pull_cursor)
-                .unwrap_or(0)
-        };
-        let after_cursor = after_cursor.max(current_cursor);
-        let batch_started_at = Instant::now();
-        let available_count = pending.len();
-        let outgoing_events = pending.iter().map(|item| item.event.clone()).collect();
-        // Reserve the final continuation value before selecting the fitting event prefix.
-        let mut request = if is_cloud {
-            Request::CloudSync {
+
+        for batch_index in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            if batch_index > 0
+                && self
+                    .runtime_state
+                    .realtime_pending
+                    .swap(false, Ordering::AcqRel)
+            {
+                local_has_more |= self
+                    .prepare_realtime_outbound_lanes(&prep_target, cycle)
+                    .await?;
+            }
+
+            let exchange_guard = exchange_lock.lock().await;
+            let mut window = repository::peer_window_cursor(&pool, peer_device_id).await?;
+            let (after_seq, before_seq) = window.next_pull_params(remote_latest_hint);
+            let writes =
+                repository::pending_outbound_writes(&pool, target_id, MAX_ITEMS_PER_BATCH).await?;
+            let available_write_count = writes.len();
+            let remote_ahead = remote_latest_hint.is_some_and(|latest| latest > window.synced_seq);
+            if batch_index > 0
+                && writes.is_empty()
+                && !window.has_catchup_pending()
+                && !remote_ahead
+                && !local_has_more
+            {
+                break;
+            }
+
+            let first_item_key = writes.first().map(|w| w.item_key.clone());
+            let mut request = Request::SyncItems {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
-                device: self.cloud_device_announcement_for(device),
-                after_cursor,
-                events: outgoing_events,
-                removed_devices: removed_devices.clone(),
-                limit: MAX_EVENTS_PER_BATCH,
-                bounded_hub: true,
-            }
-        } else {
-            Request::Sync {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                device: device.clone(),
-                after_cursor,
-                events: outgoing_events,
-                limit: MAX_EVENTS_PER_BATCH,
-                events_complete: false,
-            }
-        };
-        let pending_count = match limit_sync_request(&mut request) {
-            Ok(count) => count,
-            Err(error) => {
-                pending.truncate(1);
-                if let Some(stored) = pending.first() {
-                    return Err(OutgoingCardError {
-                        event_id: stored.event.event_id.clone(),
-                        source: error.into(),
-                    }
-                    .into());
-                }
-                return Err(error.into());
-            }
-        };
-        let outgoing_has_more = pending_count < available_count;
-        if let Request::Sync {
-            events_complete, ..
-        } = &mut request
-        {
-            *events_complete = !outgoing_has_more;
-        }
-        pending.truncate(pending_count);
-        let event_ids = pending
-            .iter()
-            .map(|item| item.event.event_id.clone())
-            .collect::<Vec<_>>();
-        let source_icon_blob_ids = source_icon_blob_ids(pending, &group.content_key_bytes()?);
-        let blob_started_at = Instant::now();
-        let blobs = repository::blobs_for_events(&pool, &event_ids).await?;
-        let (required_blobs, source_icon_blobs) =
-            split_source_icon_blobs(blobs, &source_icon_blob_ids);
-        let required_blob_count = required_blobs.len();
-        let source_icon_blob_count = source_icon_blobs.len();
-        let blob_elapsed = blob_started_at.elapsed();
-        let mut deferred_source_icon_blobs = source_icon_blobs;
-        let mut queued_source_icon_count = 0;
-        let request_started_at = Instant::now();
-        let result = async {
-            let protocol = if is_cloud { "cloud" } else { "lan" };
-            let response = if is_cloud {
-                call_cloud(connection, request, language).await?
-            } else {
-                call_lan(connection, request).await?
+                device: cycle.device.clone(),
+                after_seq,
+                before_seq,
+                items: writes,
+                limit: MAX_ITEMS_PER_BATCH,
             };
-            let response = match response {
-                Response::Synced {
-                    events,
-                    peers,
-                    latest_cursor,
-                    has_more,
-                    ..
-                } => SyncBatchResponse {
-                    events: events.into_iter().map(ReceivedSyncEvent::from).collect(),
-                    peers,
-                    latest_cursor,
-                    removed_devices: Vec::new(),
-                    has_more,
-                },
-                Response::CloudSynced {
-                    events,
-                    peers,
-                    latest_cursor,
-                    removed_devices,
-                    has_more,
-                    ..
-                } => SyncBatchResponse {
-                    events: events.into_iter().map(ReceivedSyncEvent::from).collect(),
-                    peers,
-                    latest_cursor,
-                    removed_devices,
-                    has_more,
-                },
-                Response::Error {
-                    code: ErrorCode::HistoryGap,
-                    ..
-                } if is_cloud => return Err(anyhow::Error::new(CloudHistoryGap)),
-                Response::Error { code, message } => {
-                    return Err(RemoteSyncError { code, message }.into());
-                }
-                _ => bail!("同步端返回了无效响应"),
-            };
-            Ok::<_, anyhow::Error>((response, protocol))
-        }
-        .await;
-        let (response, protocol) = match result {
-            Ok(response) => response,
-            Err(error) => {
-                if is_cloud && error.downcast_ref::<CloudHistoryGap>().is_some() {
-                    let (reset_cursor, _) = self
-                        .prepare_cloud_cursor(connection, group, &pool, true)
+            let submitted_count = match limit_sync_request(&mut request) {
+                Ok(count) => count,
+                Err(error) => {
+                    drop(exchange_guard);
+                    if let Some(item_key) = first_item_key {
+                        self.block_oversized_item_key(
+                            &pool,
+                            target_id,
+                            &item_key,
+                            &error.to_string(),
+                        )
                         .await?;
-                    log::info!("cloud history gap recovered: bootstrapCursor={reset_cursor}");
-                    return Ok(SyncReadyOutcome {
-                        latest_cursor: reset_cursor,
-                        has_more: true,
-                        event_ids: Vec::new(),
-                    });
+                        continue;
+                    }
+                    return Err(error.into());
                 }
-                if is_cloud && should_invalidate_cloud_connection(connection, &error) {
-                    self.invalidate_cloud_connection(connection.stable_id());
-                    self.runtime_state.watch_wake.notify_one();
+            };
+            let outgoing_truncated = submitted_count < available_write_count;
+            let submitted_keys = match &request {
+                Request::SyncItems { items, .. } => {
+                    items.iter().map(|w| w.item_key.clone()).collect::<Vec<_>>()
                 }
-                return Err(error);
+                _ => Vec::new(),
+            };
+
+            let response = match call_lan(connection, request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(exchange_guard);
+                    let _ = self
+                        .mark_delivery_error_by_item_keys(
+                            &pool,
+                            target_id,
+                            &submitted_keys,
+                            &error.to_string(),
+                        )
+                        .await;
+                    return Err(error);
+                }
+            };
+
+            let Response::LanSynced {
+                acks,
+                items,
+                latest_seq,
+                next_before_seq,
+            } = response
+            else {
+                drop(exchange_guard);
+                if let Response::Error { code, message } = response {
+                    let err = RemoteSyncError { code, message };
+                    let _ = self
+                        .mark_delivery_error_by_item_keys(
+                            &pool,
+                            target_id,
+                            &submitted_keys,
+                            &err.to_string(),
+                        )
+                        .await;
+                    return Err(err.into());
+                }
+                bail!("局域网设备返回了无效的同步响应");
+            };
+
+            repository::record_lan_acks(&pool, target_id, &acks).await?;
+            let pull_summary = self
+                .ingest_remote_records(&pool, group, target_id, &items, false)
+                .await?;
+            window.apply_response(after_seq, before_seq, latest_seq, 0, next_before_seq);
+            let pull_more = window.has_catchup_pending() || latest_seq > window.synced_seq;
+            repository::update_peer_window_cursor(&pool, peer_device_id, window).await?;
+            remote_latest_hint = Some(latest_seq);
+            drop(exchange_guard);
+
+            let pending_inbound_blobs = self
+                .apply_pending_inline_items(&pool, group, &cycle.settings)
+                .await?;
+            if pending_inbound_blobs || pull_summary.needs_blob_pull {
+                self.wake_attachments();
             }
+            if !submitted_keys.is_empty() || !items.is_empty() || !acks.is_empty() {
+                self.emit_updated();
+            }
+
+            has_more =
+                outgoing_truncated || pull_more || pull_summary.needs_repush || local_has_more;
+            local_has_more = false;
+            if !has_more {
+                break;
+            }
+        }
+
+        self.runtime_state.source_asset_wake.notify_one();
+        Ok(SyncConnectionOutcome { has_more })
+    }
+
+    /// Uploads the single highest-priority pending local attachment item to Cloud Hub over
+    /// `data_connection`. Returns `Ok(true)` when an item was processed so the worker re-queries
+    /// fresh priority order, or `Ok(false)` when no eligible unclaimed item remains so the worker
+    /// sleeps cleanly without busy-looping.
+    pub(super) async fn upload_one_cloud_blob_item(
+        self: &Arc<Self>,
+        data_connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        realtime_only: bool,
+    ) -> Result<bool> {
+        let prep_target = PreparationTarget {
+            route: super::super::progress::TransferRoute::Cloud,
+            target: CLOUD_TARGET.to_owned(),
         };
-        if !is_cloud && !deferred_source_icon_blobs.is_empty() {
-            let manager = self.clone();
-            let connection = connection.clone();
-            let group = group.clone();
-            let icons = std::mem::take(&mut deferred_source_icon_blobs);
-            tauri::async_runtime::spawn(async move {
-                let _guard = manager.sync_activity_guard().await;
-                if let Err(error) = upload_blobs(
-                    manager.clone(),
-                    &connection,
-                    &group,
-                    icons,
-                    BlobUploadOptions {
-                        kind: BlobUploadKind::SourceIcon,
-                        file_content: false,
-                        managed_hub_blob: false,
-                        is_cloud: false,
-                        language,
-                        started: None,
-                        transfer: None,
+        let mut uploads = repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
+        if uploads.is_empty() && !realtime_only {
+            let image_run = self
+                .materialize_content_lane(
+                    db::sync_items::OutboxContentLane::Image,
+                    2,
+                    Some(&prep_target),
+                    None,
+                )
+                .await?;
+            let prepared_any = image_run.processed > 0;
+            image_run.staging.retain_for_delivery();
+            if prepared_any {
+                self.runtime_state.cloud_transfer_wake.notify_one();
+                uploads = repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
+            }
+        }
+        if uploads.is_empty() {
+            return Ok(false);
+        }
+
+        let Some((upload, _claim)) = uploads.into_iter().find_map(|candidate| {
+            self.delivery
+                .claim_upload(CLOUD_TARGET, &candidate.sync_key)
+                .map(|claim| (candidate, claim))
+        }) else {
+            return Ok(false);
+        };
+
+        let language = crate::i18n::current_language(&self.app);
+        let is_files = upload.kind == "files";
+        let total_bytes = upload
+            .blobs
+            .iter()
+            .fold(0_u64, |acc, b| acc.saturating_add(b.size));
+
+        let mut item_failed = false;
+        for blob_row in &upload.blobs {
+            let stored_blob = blob_row.to_stored_blob();
+            let transfer = match self
+                .delivery
+                .start_upload(
+                    pool,
+                    super::super::delivery::UploadStartRequest {
+                        target: CLOUD_TARGET,
+                        route: super::super::progress::TransferRoute::Cloud,
+                        sync_key: &upload.sync_key,
+                        item_id: upload.item_id.as_deref(),
+                        operation_total_bytes: total_bytes,
+                        blob: &stored_blob,
                     },
                 )
-                .await
-                {
-                    log::debug!("optional LAN source icons deferred: {error:#}");
+                .await?
+            {
+                UploadTransferStart::Ready(transfer) => transfer,
+                UploadTransferStart::Canceled => {
+                    item_failed = true;
+                    break;
                 }
-            });
-        }
-        let request_elapsed = request_started_at.elapsed();
-        let received_count = response.events.len();
-        let incoming_has_more = response.has_more;
-        let mut has_more = outgoing_has_more || incoming_has_more;
-        let removed_count = response.removed_devices.len();
-        if !response.removed_devices.is_empty() {
-            self.apply_removed_devices(
-                &pool,
-                response.removed_devices,
-                device_id,
-                &device.endpoint_id,
-            )
-            .await?;
-        }
-        if is_cloud && !deferred_source_icon_blobs.is_empty() {
-            repository::enqueue_source_icon_uploads(
-                &pool,
-                &group.group_id,
-                &deferred_source_icon_blobs,
-            )
-            .await?;
-        }
-        self.delivery
-            .completed(&pool, target_id, &event_ids, metadata_only_event_ids)
-            .await?;
-        self.release_staging_for_events(&pool, &event_ids).await?;
-        for peer in response.peers {
-            if peer.device_id != device_id {
-                repository::upsert_peer_identity(&pool, &peer).await?;
+            };
+            let options = BlobUploadOptions {
+                kind: BlobUploadKind::Content,
+                file_content: is_files,
+                is_cloud: true,
+                language,
+                started: None,
+                transfer: transfer.clone(),
+            };
+            let result = async {
+                let (staged, _lease) = if stored_blob.encrypted_path.is_empty() {
+                    (stored_blob.clone(), None)
+                } else {
+                    let (staged, lease) = self.lease_outgoing_staging(group, &stored_blob).await?;
+                    (staged, Some(lease))
+                };
+                upload_blob(data_connection, group, &staged, options).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    let completed = repository::mark_blob_cloud_available(
+                        pool,
+                        &upload.sync_key,
+                        &blob_row.blob_id,
+                    )
+                    .await?;
+                    if !blob_row.encrypted_path.is_empty()
+                        && blob_row.source_path.is_some()
+                        && blob_row.stream_nonce.is_some()
+                    {
+                        self.delivery.request_staging_release(
+                            &blob_row.blob_id,
+                            PathBuf::from(&blob_row.encrypted_path),
+                        );
+                    }
+                    if completed {
+                        self.emit_updated();
+                    }
+                }
+                Err(error) => {
+                    if let Some(handle) = &transfer {
+                        if handle.canceled() {
+                            handle.mark_canceled(0);
+                        } else {
+                            handle.failed(0, error.to_string());
+                        }
+                    }
+                    if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
+                        self.delivery
+                            .blocked(pool, CLOUD_TARGET, &upload.sync_key, &error.to_string())
+                            .await?;
+                    } else {
+                        self.delivery
+                            .failed(
+                                pool,
+                                CLOUD_TARGET,
+                                std::slice::from_ref(&upload.sync_key),
+                                &error.to_string(),
+                            )
+                            .await?;
+                        if should_invalidate_cloud_connection(data_connection, &error) {
+                            self.invalidate_cloud_data_connection(data_connection.stable_id());
+                        }
+                        return Err(error);
+                    }
+                    self.emit_updated();
+                    item_failed = true;
+                    break;
+                }
             }
         }
-        let apply_started_at = Instant::now();
-        let (received_content, stored_batch) = self
-            .store_remote_events(
-                &pool,
-                device_id,
-                response.events,
-                group,
-                target,
-                response.latest_cursor,
-            )
-            .await?;
-        drop(exchange_guard);
-        let content_has_more = self
-            .apply_stored_remote_events(
-                connection,
-                &pool,
-                settings,
-                target,
-                received_content,
-                &stored_batch,
-                group,
-                true,
-            )
-            .await?;
-        has_more |= content_has_more;
-        if let Some(peer_device_id) = target.peer_device_id() {
-            has_more |= self
-                .flush_lan_receipts(connection, &pool, group, device, peer_device_id)
-                .await?;
+
+        if !item_failed {
+            // Ensure CloudSyncItems also runs if this item's metadata hasn't been pushed yet.
+            self.runtime_state.cloud_transfer_wake.notify_one();
         }
-        if !event_ids.is_empty() || received_count > 0 {
-            self.emit_updated();
-            self.wake_attachments();
-        }
-        let apply_elapsed = apply_started_at.elapsed();
-        if is_cloud {
-            queued_source_icon_count = deferred_source_icon_blobs.len();
-            if queued_source_icon_count > 0 {
-                self.runtime_state.source_asset_wake.notify_one();
-            }
-        }
-        if is_cloud {
-            log::info!(
-                "cloud sync batch completed: protocol={protocol} sentEvents={pending_count} receivedEvents={received_count} removals={removed_count} requiredBlobs={required_blob_count} sourceIconBlobs={source_icon_blob_count} queuedSourceIcons={queued_source_icon_count} blobMs={} requestMs={} applyMs={} totalMs={}",
-                blob_elapsed.as_millis(),
-                request_elapsed.as_millis(),
-                apply_elapsed.as_millis(),
-                batch_started_at.elapsed().as_millis()
-            );
-        }
-        Ok(SyncReadyOutcome {
-            latest_cursor: response.latest_cursor,
-            has_more,
-            event_ids,
-        })
+
+        Ok(true)
     }
 }

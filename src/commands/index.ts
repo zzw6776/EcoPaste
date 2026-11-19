@@ -11,6 +11,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { TAURI_COMMAND } from "@/constants/commands";
 import i18n from "@/i18n";
+import {
+  updateClipboardItemSyncStatus,
+  updateClipboardItemSyncStatuses,
+} from "@/stores/clipboardItemActivity";
 import { settingsState } from "@/stores/settings";
 import type {
   ClipboardAction,
@@ -1299,15 +1303,33 @@ export const deleteUnreferencedClipboardApps = (ids: string[]) => {
   );
 };
 
+interface ClipboardItemPageWire extends ClipboardItemPage {
+  syncStatuses?: SyncItemStatus[];
+}
+
+interface ClipboardItemWire extends ClipboardItem {
+  syncStatus?: SyncItemStatus;
+}
+
 /**
- * 列表查询；返回顶页项 + 总数 + `hasMore`，供列表分页与 Footer 共用。
+ * 列表查询；返回顶页项 + 总数 + `hasMore`，并在提交给组件前同步注水首帧同步徽标状态。
  */
-export const listClipboardItems = (query: ClipboardItemQuery) => {
-  return call<ClipboardItemPage>(
+export const listClipboardItems = async (
+  query: ClipboardItemQuery,
+): Promise<ClipboardItemPage> => {
+  const page = await call<ClipboardItemPageWire>(
     TAURI_COMMAND.LIST_CLIPBOARD_ITEMS,
     "commands:labels.loadClipboardList",
     { query },
   );
+  if (page.syncStatuses && page.syncStatuses.length > 0) {
+    updateClipboardItemSyncStatuses(page.syncStatuses);
+  }
+  return {
+    hasMore: page.hasMore,
+    list: page.list,
+    total: page.total,
+  };
 };
 
 export interface FileIconResult {
@@ -1324,13 +1346,22 @@ export const getFileIconPath = (path: string, isDirectory: boolean) => {
   );
 };
 
-/** 按 id 拉取一条列表视图记录，供剪贴板事件做增量更新。 */
-export const getClipboardItem = (id: string) => {
-  return call<ClipboardItem | null>(
+/** 按 id 拉取一条列表视图记录，供剪贴板事件做增量更新，并同步注水首帧同步徽标状态。 */
+export const getClipboardItem = async (
+  id: string,
+): Promise<ClipboardItem | null> => {
+  const item = await call<ClipboardItemWire | null>(
     TAURI_COMMAND.GET_CLIPBOARD_ITEM,
     "commands:labels.loadClipboardList",
     { id },
   );
+  if (!item) return null;
+
+  const { syncStatus, ...rest } = item;
+  if (syncStatus) {
+    updateClipboardItemSyncStatus(syncStatus);
+  }
+  return rest;
 };
 
 /** 查询记录在指定筛选与排序下的零基索引，供虚拟列表定位。 */

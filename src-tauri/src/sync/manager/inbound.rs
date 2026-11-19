@@ -1,30 +1,17 @@
-use ecopaste_sync_protocol::CloudAvailabilityUpdate;
+use ecopaste_sync_protocol::{LanContentLevel, LanItemAck, SyncItemRecord, SyncItemWrite};
+use sqlx::Row;
 
 use super::*;
 
-pub(super) fn extract_event_metadata(
-    events: &[EncryptedEvent],
-    key: &[u8; 32],
-) -> HashMap<String, (String, String, i64)> {
-    let mut metadata = HashMap::with_capacity(events.len());
-    for event in events {
-        let entry = match crypto::decrypt_sync_event(key, event) {
-            Ok(DecryptedSyncEvent::Clipboard(envelope)) => (
-                envelope.item.kind,
-                envelope.item.sync_key,
-                envelope
-                    .item
-                    .updated_at_ms
-                    .unwrap_or(envelope.item.created_at_ms),
-            ),
-            Ok(DecryptedSyncEvent::ItemState(patch)) => {
-                ("state".to_owned(), patch.sync_key, event.created_at_ms)
-            }
-            Err(_) => continue,
-        };
-        metadata.insert(event.event_id.clone(), entry);
-    }
-    metadata
+/// Freshness grace window for the dedicated VIP realtime download worker. Allows modest clock skew
+/// between paired devices while keeping older historical catch-up strictly on the General worker.
+const VIP_REALTIME_RECENCY_MS: i64 = 120_000;
+
+#[derive(Default)]
+pub(super) struct IngestBatchSummary {
+    pub(super) needs_apply: bool,
+    pub(super) needs_blob_pull: bool,
+    pub(super) needs_repush: bool,
 }
 
 /// Enforces cumulative receiver-side 70% historical attachment admission lazily per batch.
@@ -44,7 +31,12 @@ impl AttachmentQuotaInspector {
     ) -> Result<Self> {
         let target_bytes = crate::clipboard::cleanup::history_target_bytes(history);
         let latest_local_updated_at = if target_bytes > 0 {
-            repository::latest_clipboard_item_updated_at(pool).await?
+            sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+                "SELECT MAX(updated_at) FROM clipboard_items",
+            )
+            .fetch_one(pool)
+            .await
+            .context("read latest local clipboard timestamp")?
         } else {
             None
         };
@@ -57,12 +49,9 @@ impl AttachmentQuotaInspector {
         })
     }
 
-    pub(super) fn observe_timestamp(&mut self, ts: chrono::DateTime<Utc>) {
-        if self.target_bytes == 0 {
-            return;
-        }
-        self.latest_local_updated_at =
-            Some(self.latest_local_updated_at.map_or(ts, |cur| cur.max(ts)));
+    pub(super) fn is_historical(&self, item_updated_at: chrono::DateTime<Utc>) -> bool {
+        self.latest_local_updated_at
+            .is_some_and(|latest| item_updated_at < latest)
     }
 
     pub(super) async fn admit_or_reject_historical(
@@ -70,11 +59,7 @@ impl AttachmentQuotaInspector {
         item_updated_at: chrono::DateTime<Utc>,
         attachment_bytes: u64,
     ) -> bool {
-        if self.target_bytes == 0
-            || !self
-                .latest_local_updated_at
-                .is_some_and(|latest| item_updated_at < latest)
-        {
+        if self.target_bytes == 0 || !self.is_historical(item_updated_at) {
             return true;
         }
         let base = match self.measured_base_bytes {
@@ -99,1008 +84,605 @@ impl AttachmentQuotaInspector {
     }
 }
 
+struct RemotePayloadInput<'a> {
+    item_key: &'a str,
+    origin_device_id: &'a str,
+    hub_rev: Option<u64>,
+    remote_seq: u64,
+    deleted: bool,
+    protected: bool,
+    nonce: &'a [u8],
+    ciphertext: &'a [u8],
+    available_blob_ids: &'a [String],
+}
+
 impl SyncManager {
-    /// Applies the Hub's independent, resumable blob-availability stream.
-    pub(super) async fn sync_cloud_availability(
+    fn decrypt_local_or_fallback_snapshot(
         &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-    ) -> Result<bool> {
-        let mut changed = false;
-        for _ in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
-            let after_cursor = repository::cloud_availability_cursor(pool).await?;
-            let response = call_cloud(
-                connection,
-                Request::SyncCloudAvailability {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    after_cursor,
-                    limit: MAX_EVENTS_PER_BATCH,
-                },
-                crate::i18n::current_language(&self.app),
-            )
-            .await?;
-            let Response::CloudAvailabilitySynced {
-                updates,
-                latest_cursor,
-                has_more,
-                pruned_availability_cursor,
-            } = response
-            else {
-                if let Response::Error { message, .. } = response {
-                    bail!(message);
-                }
-                bail!("云端返回了无效的内容可用性响应");
-            };
-            let key = group.content_key_bytes()?;
-            changed |=
-                apply_cloud_availability_updates(pool, &key, &updates, &[], latest_cursor).await?;
-            let reconciled_cursor = repository::cloud_pruned_availability_cursor(pool).await?;
-            if pruned_availability_cursor > reconciled_cursor {
-                changed |= self
-                    .reconcile_pruned_cloud_availability(
-                        connection,
-                        pool,
-                        group,
-                        latest_cursor,
-                        pruned_availability_cursor,
-                    )
-                    .await?;
-            }
-            if !has_more {
-                if changed {
-                    self.wake_attachments();
-                    self.emit_updated();
-                }
-                return Ok(false);
+        meta: &repository::StoredSyncItemMeta,
+        key: &[u8; 32],
+        local_device_id: &str,
+    ) -> SyncedItemSnapshot {
+        if let (Some(item_key), Some(nonce), Some(ciphertext)) = (
+            meta.item_key.as_deref(),
+            meta.nonce.as_deref(),
+            meta.ciphertext.as_deref(),
+        ) {
+            if let Ok(snapshot) = crypto::decrypt_item_snapshot(
+                key,
+                item_key,
+                meta.deleted,
+                meta.protected,
+                nonce,
+                ciphertext,
+            ) {
+                return snapshot;
             }
         }
-        if changed {
-            self.wake_attachments();
-            self.emit_updated();
-        }
-        Ok(true)
+        repository::snapshot_from_meta(meta, local_device_id)
     }
 
-    /// Revalidates retained cloud facts once per Hub cleanup, including equivalent older events.
-    async fn reconcile_pruned_cloud_availability(
+    /// Decrypts, validates, CRDT-merges, and persists one incoming remote snapshot.
+    async fn ingest_single_remote_payload(
         &self,
-        connection: &Connection,
         pool: &SqlitePool,
-        group: &GroupSecrets,
-        availability_cursor: u64,
-        pruned_availability_cursor: u64,
-    ) -> Result<bool> {
-        let key = group.content_key_bytes()?;
-        let mut after_event_id = String::new();
-        let mut changed = false;
-        loop {
-            let event_ids =
-                repository::confirmed_cloud_event_ids(pool, &after_event_id, MAX_EVENTS_PER_BATCH)
-                    .await?;
-            let Some(last_event_id) = event_ids.last() else {
-                break;
-            };
-            after_event_id = last_event_id.clone();
-            let response = call_cloud(
-                connection,
-                Request::CheckCloudAvailability {
-                    group_id: group.group_id.clone(),
-                    access_token: group.access_token_bytes()?,
-                    event_ids,
-                },
-                crate::i18n::current_language(&self.app),
-            )
-            .await?;
-            let Response::CloudAvailabilityChecked {
-                updates,
-                missing_event_ids,
-            } = response
-            else {
-                if let Response::Error { message, .. } = response {
-                    bail!(message);
-                }
-                bail!("云端返回了无效的内容可用性响应");
-            };
-            changed |= apply_cloud_availability_updates(
-                pool,
-                &key,
-                &updates,
-                &missing_event_ids,
-                availability_cursor,
-            )
-            .await?;
+        key: &[u8; 32],
+        local_device_id: &str,
+        source_target_id: &str,
+        removed_peers: &HashSet<String>,
+        input: RemotePayloadInput<'_>,
+    ) -> Result<Option<(SyncedItemSnapshot, bool, bool, bool)>> {
+        if removed_peers.contains(input.origin_device_id) {
+            return Ok(None);
         }
-        repository::mark_cloud_pruning_reconciled(pool, pruned_availability_cursor).await?;
-        Ok(changed)
+        let remote_snapshot = match crypto::decrypt_item_snapshot(
+            key,
+            input.item_key,
+            input.deleted,
+            input.protected,
+            input.nonce,
+            input.ciphertext,
+        )
+        .and_then(|snapshot| {
+            validate_snapshot(&snapshot)?;
+            Ok(snapshot)
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!(
+                    "ignore invalid remote sync item {}: {error:#}",
+                    &input.item_key[..input.item_key.len().min(12)]
+                );
+                return Ok(None);
+            }
+        };
+        let expected_item_key = crypto::derive_item_key(key, &remote_snapshot.sync_key);
+        if expected_item_key != input.item_key {
+            log::warn!(
+                "ignore remote sync item {} with mismatched derived item_key",
+                &input.item_key[..input.item_key.len().min(12)]
+            );
+            return Ok(None);
+        }
+
+        let existing = repository::load_sync_item_meta(pool, &remote_snapshot.sync_key).await?;
+        if let Some(existing_meta) = &existing {
+            // If a newer local content capture is still encrypting in the background, only a
+            // strictly newer remote deletion tombstone may supersede it before prep finishes.
+            let local_preparing_newer_content = existing_meta.nonce.is_none()
+                && !existing_meta.deleted
+                && existing_meta.content_version > remote_snapshot.content_version;
+            let remote_deletes = !remote_snapshot.is_present
+                && remote_snapshot.presence_version > existing_meta.presence_version;
+            if local_preparing_newer_content && !remote_deletes {
+                return Ok(None);
+            }
+        }
+
+        let (
+            final_snapshot,
+            final_nonce,
+            final_ciphertext,
+            needs_apply,
+            needs_blob_wake,
+            re_push_required,
+        ) = if let Some(existing_meta) = &existing {
+            let local_snapshot =
+                self.decrypt_local_or_fallback_snapshot(existing_meta, key, local_device_id);
+            let merged = super::super::model::merge_snapshots(&local_snapshot, &remote_snapshot);
+            let newly_available_blobs = !merged.snapshot.deleted()
+                && !merged.snapshot.blobs.is_empty()
+                && existing_meta.local_state != "managed"
+                && !input.available_blob_ids.is_empty();
+            let needs_apply = merged.local_changed;
+            let needs_blob_wake = !merged.snapshot.deleted()
+                && (existing_meta.needs_blob_pull || newly_available_blobs);
+            if merged.remote_changed {
+                let (nonce, ciphertext) = crypto::encrypt_item_snapshot(
+                    key,
+                    input.item_key,
+                    merged.snapshot.deleted(),
+                    merged.snapshot.protected(),
+                    &merged.snapshot,
+                )?;
+                (
+                    merged.snapshot,
+                    nonce,
+                    ciphertext,
+                    needs_apply,
+                    needs_blob_wake,
+                    true,
+                )
+            } else {
+                (
+                    merged.snapshot,
+                    input.nonce.to_vec(),
+                    input.ciphertext.to_vec(),
+                    needs_apply,
+                    needs_blob_wake,
+                    false,
+                )
+            }
+        } else {
+            let has_blobs = !remote_snapshot.deleted() && !remote_snapshot.blobs.is_empty();
+            (
+                remote_snapshot,
+                input.nonce.to_vec(),
+                input.ciphertext.to_vec(),
+                true,
+                has_blobs,
+                false,
+            )
+        };
+
+        let sync_key = final_snapshot.sync_key.clone();
+        repository::store_merged_remote_item(
+            pool,
+            repository::StoreMergedRemoteItem {
+                sync_key: &sync_key,
+                item_key: input.item_key,
+                origin_device_id: input.origin_device_id,
+                hub_rev: input.hub_rev,
+                remote_seq: input.remote_seq,
+                source_target_id,
+                snapshot: &final_snapshot,
+                nonce: &final_nonce,
+                ciphertext: &final_ciphertext,
+                available_blob_ids: input.available_blob_ids,
+                needs_apply,
+                re_push_required,
+            },
+        )
+        .await?;
+
+        Ok(Some((
+            final_snapshot,
+            needs_apply,
+            needs_blob_wake,
+            re_push_required,
+        )))
     }
 
-    /// Stores one authenticated remote batch and updates its continuation cursor atomically.
-    pub(super) async fn store_remote_events(
+    /// Merges a batch of `SyncItemRecord` rows pulled from Cloud (`items` + `conflicts`) or LAN.
+    pub(super) async fn ingest_remote_records(
         &self,
         pool: &SqlitePool,
-        device_id: &str,
-        events: Vec<ReceivedSyncEvent>,
         group: &GroupSecrets,
-        source: &SyncConnectionTarget,
-        latest_cursor: u64,
-    ) -> Result<(bool, repository::StoreRemoteBatchResult)> {
+        source_target_id: &str,
+        records: &[SyncItemRecord],
+        is_cloud: bool,
+    ) -> Result<IngestBatchSummary> {
+        let mut summary = IngestBatchSummary::default();
+        if records.is_empty() {
+            return Ok(summary);
+        }
         let _sync_activity = SyncActivityGuard::acquire();
         let removed_peers = repository::removed_peer_ids(pool).await?;
-        let events = events
-            .into_iter()
-            .filter(|received| !removed_peers.contains(&received.event.origin_device_id))
-            .collect::<Vec<_>>();
         let key = group.content_key_bytes()?;
-        let cloud_availability = if source.is_cloud() {
-            events
-                .iter()
-                .filter_map(|received| {
-                    cloud_content_availability(received, &key)
-                        .map(|state| (received.event.event_id.clone(), state))
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let received_content = !events.is_empty();
-        let encrypted_events = events
-            .into_iter()
-            .map(|received| received.event)
-            .collect::<Vec<_>>();
-        let metadata_only_event_ids = metadata_only_content_event_ids(&encrypted_events, &key);
-        let event_metadata = extract_event_metadata(&encrypted_events, &key);
-        let stored = repository::store_remote_batch_with_content_policy(
-            pool,
-            source.remote_batch_source(),
-            Some(latest_cursor),
-            &encrypted_events,
-            device_id,
-            &cloud_availability,
-            &metadata_only_event_ids,
-            &event_metadata,
-        )
-        .await?;
-        for (event_id, origin_device_id) in &stored.conflicts {
-            log::warn!(
-                "ignore sync event {event_id} with a reused origin sequence from {origin_device_id}"
-            );
-        }
-        Ok((received_content, stored))
-    }
+        let local_device_id = self.identity.snapshot().device_id;
 
-    /// Applies pending events after storing a batch and wakes downstream attachment/LAN queues.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn apply_stored_remote_events(
-        &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        sync_settings: &SyncSettings,
-        source: &SyncConnectionTarget,
-        received_content: bool,
-        stored: &repository::StoreRemoteBatchResult,
-        group: &GroupSecrets,
-        allow_content: bool,
-    ) -> Result<bool> {
-        let content_has_more = self
-            .apply_pending_events(
-                connection,
-                pool,
-                group,
-                sync_settings,
-                source,
-                allow_content,
-            )
-            .await?;
-        if received_content {
-            self.wake_attachments();
-        }
-        if stored.received_new_events && source.is_cloud() {
-            self.wake_lan_transfer();
-        }
-        Ok(content_has_more)
-    }
-
-    /// Persists one card's retry without treating its application failure as a session failure.
-    async fn defer_card_apply(&self, pool: &SqlitePool, event_id: &str, error: &str) -> Result<()> {
-        log::warn!("defer synchronized card: eventId={event_id} error={error}");
-        let delay = repository::mark_apply_failed(pool, event_id, error).await?;
-        self.schedule_transfer_wake(delay);
-        self.emit_updated();
-        Ok(())
-    }
-
-    /// Replays state before content so a later tombstone suppresses content even across pages.
-    pub(super) async fn apply_pending_events(
-        &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        sync_settings: &SyncSettings,
-        source: &SyncConnectionTarget,
-        allow_content: bool,
-    ) -> Result<bool> {
-        self.apply_pending_events_lane(
-            connection,
-            pool,
-            group,
-            sync_settings,
-            source,
-            allow_content,
-            false,
-            false,
-        )
-        .await
-    }
-
-    pub(super) async fn apply_pending_attachment_events(
-        &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        settings: &SyncSettings,
-        source: &SyncConnectionTarget,
-        files: bool,
-    ) -> Result<bool> {
-        self.apply_pending_events_lane(connection, pool, group, settings, source, true, files, true)
-            .await
-    }
-
-    /// Keeps large downloads off the lock used to apply text, images and card state.
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_pending_events_lane(
-        &self,
-        connection: &Connection,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        sync_settings: &SyncSettings,
-        source: &SyncConnectionTarget,
-        allow_content: bool,
-        files: bool,
-        attachments: bool,
-    ) -> Result<bool> {
-        // 仅串行选取任务与写入元数据；附件认领后释放锁，网络 I/O 不阻塞记录同步。
-        let mut apply_guard = Some(self.apply_lock.lock().await);
-        let clipboard_generation = self
-            .app
-            .state::<Arc<ClipboardFingerprintState>>()
-            .generation();
-        let key = group.content_key_bytes()?;
-        let mut source_assets_pending = false;
-        let mut latest_clipboard_item = None;
-        #[cfg(target_os = "android")]
-        let mut applied_any = false;
-
-        if !attachments {
-            loop {
-                let pending_states = repository::unapplied_events_by_kind(
+        for record in records {
+            let Some((snapshot, needs_apply, needs_blob_wake, re_push)) = self
+                .ingest_single_remote_payload(
                     pool,
-                    SyncEventKind::ItemState,
-                    MAX_EVENTS_PER_BATCH,
+                    &key,
+                    &local_device_id,
+                    source_target_id,
+                    &removed_peers,
+                    RemotePayloadInput {
+                        item_key: &record.item_key,
+                        origin_device_id: &record.origin_device_id,
+                        hub_rev: is_cloud.then_some(record.hub_rev),
+                        remote_seq: if is_cloud { 0 } else { record.seq },
+                        deleted: record.deleted,
+                        protected: record.protected,
+                        nonce: &record.nonce,
+                        ciphertext: &record.ciphertext,
+                        available_blob_ids: &record.available_blob_ids,
+                    },
                 )
-                .await?;
-                if pending_states.is_empty() {
-                    break;
-                }
-                for stored in pending_states {
-                    let event = stored.event;
-                    let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
-                        validate_decrypted_sync_event(&event)?;
-                        Ok(event)
-                    });
-                    match decrypted {
-                        Ok(DecryptedSyncEvent::ItemState(patch)) => {
-                            match self.apply_item_state_event(pool, &event, patch).await {
-                                Ok(()) => {
-                                    #[cfg(target_os = "android")]
-                                    {
-                                        applied_any = true;
-                                    }
-                                }
-                                Err(error) => {
-                                    log::warn!(
-                                        "defer synchronized state event {}: {error:#}",
-                                        event.event_id
-                                    );
-                                    let delay = repository::mark_apply_failed(
-                                        pool,
-                                        &event.event_id,
-                                        &error.to_string(),
-                                    )
-                                    .await?;
-                                    self.schedule_transfer_wake(delay);
-                                }
-                            }
-                        }
-                        Ok(DecryptedSyncEvent::Clipboard(_)) => {
-                            log::warn!(
-                                "discard synchronized state event {} with content payload",
-                                event.event_id
-                            );
-                            repository::mark_rejected(
-                                pool,
-                                &event.event_id,
-                                "状态事件包含剪贴板内容载荷",
-                            )
-                            .await?;
-                        }
-                        Err(error) => {
-                            log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                            repository::mark_rejected(pool, &event.event_id, &error.to_string())
-                                .await?;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !allow_content {
-            drop(apply_guard.take());
-            #[cfg(target_os = "android")]
-            if applied_any {
-                crate::commands::android::notify_overlay_clipboard_changed();
-            }
-            return Ok(false);
-        }
-
-        // Replaying still-unapplied content makes a download/apply interruption recoverable even
-        // when the Hub no longer returns the duplicate event.
-        let pending_apply = repository::unapplied_content_events_for_target(
-            pool,
-            source.delivery_target(),
-            MAX_EVENTS_PER_BATCH,
-            attachments,
-            Some(files),
-        )
-        .await?;
-        let complete_content_source_event_ids = repository::event_ids_with_complete_content_source(
-            pool,
-            &pending_apply,
-            source.delivery_target(),
-            source.is_cloud(),
-        )
-        .await?;
-        let mut pending_content = Vec::new();
-        let mut made_content_progress = false;
-        for stored in pending_apply {
-            let event = stored.event;
-            let decrypted = crypto::decrypt_sync_event(&key, &event).and_then(|event| {
-                validate_decrypted_sync_event(&event)?;
-                Ok(event)
-            });
-            match decrypted {
-                Ok(DecryptedSyncEvent::Clipboard(envelope)) => {
-                    pending_content.push((event, *envelope));
-                }
-                Ok(DecryptedSyncEvent::ItemState(_)) => {
-                    log::warn!(
-                        "discard synchronized content event {} with state payload",
-                        event.event_id
-                    );
-                    repository::mark_rejected(pool, &event.event_id, "内容事件包含状态载荷")
-                        .await?;
-                    made_content_progress = true;
-                }
-                Err(error) => {
-                    log::warn!("discard invalid sync event {}: {error}", event.event_id);
-                    repository::mark_rejected(pool, &event.event_id, &error.to_string()).await?;
-                    made_content_progress = true;
-                }
-            }
-        }
-
-        // Filter lane eligibility in memory first so unchosen or attachment-only items do not
-        // trigger redundant SQLite write transactions before a download slot actually claims them.
-        let mut eligible_content = Vec::with_capacity(pending_content.len());
-        let mut woke_attachments = false;
-        for (event, envelope) in pending_content {
-            if envelope.item.kind != "files"
-                && !envelope.blobs.is_empty()
-                && !complete_content_source_event_ids.contains(&event.event_id)
+                .await?
+            else {
+                continue;
+            };
+            summary.needs_apply |= needs_apply;
+            summary.needs_repush |= re_push;
+            if needs_blob_wake || (needs_apply && !snapshot.deleted() && !snapshot.blobs.is_empty())
             {
-                continue;
+                summary.needs_blob_pull = true;
             }
-            if !attachments && envelope.item.kind != "files" && !envelope.blobs.is_empty() {
-                woke_attachments = true;
-                continue;
-            }
-            if attachments && envelope.blobs.is_empty() {
-                continue;
-            }
-            eligible_content.push((event, envelope));
         }
-        if woke_attachments {
-            self.wake_attachments();
+        Ok(summary)
+    }
+
+    /// Merges incoming LAN `SyncItemWrite` pushes, immediately applies inline items & file cards
+    /// within the same 1-RTT frame, and returns per-item `LanItemAck` receipts.
+    pub(super) async fn ingest_lan_writes(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        sync_settings: &SyncSettings,
+        peer_device_id: &str,
+        writes: &[SyncItemWrite],
+    ) -> Result<(Vec<LanItemAck>, bool, bool)> {
+        if writes.is_empty() {
+            return Ok((Vec::new(), false, false));
+        }
+        let _sync_activity = SyncActivityGuard::acquire();
+        let removed_peers = repository::removed_peer_ids(pool).await?;
+        let key = group.content_key_bytes()?;
+        let local_device_id = self.identity.snapshot().device_id;
+        let source_target_id = format!("peer:{peer_device_id}");
+        let mut staged_acks = Vec::with_capacity(writes.len());
+        let mut any_repush = false;
+
+        for write in writes {
+            let Some((snapshot, _needs_apply, _needs_blob_wake, re_push)) = self
+                .ingest_single_remote_payload(
+                    pool,
+                    &key,
+                    &local_device_id,
+                    &source_target_id,
+                    &removed_peers,
+                    RemotePayloadInput {
+                        item_key: &write.item_key,
+                        origin_device_id: &write.origin_device_id,
+                        hub_rev: None,
+                        remote_seq: write.local_seq,
+                        deleted: write.deleted,
+                        protected: write.protected,
+                        nonce: &write.nonce,
+                        ciphertext: &write.ciphertext,
+                        available_blob_ids: &write.blob_ids,
+                    },
+                )
+                .await?
+            else {
+                continue;
+            };
+            any_repush |= re_push;
+            staged_acks.push((write.item_key.clone(), write.local_seq, snapshot));
         }
 
-        let mut body_claim = None;
-        if attachments {
-            let mut attachment_groups: Vec<ClipboardEnvelope> = Vec::new();
-            eligible_content.retain(|(_, envelope)| {
-                if !matches!(envelope.item.kind.as_str(), "files" | "image") {
-                    return true;
-                }
-                if attachment_groups
-                    .iter()
-                    .any(|other| same_attachment_content(envelope, other))
+        // Apply all inline text, tombstones, metadata patches, and file metadata cards BEFORE
+        // replying so the sender's WiFi badge turns solid green in 1 RTT!
+        let has_pending_blobs = self
+            .apply_pending_inline_items(pool, group, sync_settings)
+            .await?;
+
+        let mut acks = Vec::with_capacity(staged_acks.len());
+        let mut needs_blob_pull = has_pending_blobs;
+        for (item_key, local_seq, snapshot) in staged_acks {
+            let level = if snapshot.deleted() || snapshot.blobs.is_empty() {
+                LanContentLevel::Complete
+            } else {
+                let meta = repository::load_sync_item_meta(pool, &snapshot.sync_key).await?;
+                if meta
+                    .as_ref()
+                    .is_some_and(|row| row.local_state == "managed" && row.item_id.is_some())
                 {
-                    return false;
-                }
-                attachment_groups.push(envelope.clone());
-                true
-            });
-            let mut selected = Vec::new();
-            for (event, envelope) in eligible_content {
-                let claim_key = format!("apply:{}", envelope.item.sync_key);
-                let Some(claim) = self.delivery.claim_remote_download(&claim_key) else {
-                    continue;
-                };
-                if !repository::content_event_pending(pool, &event.event_id).await? {
-                    continue;
-                }
-                if matches!(envelope.item.kind.as_str(), "files" | "image") {
-                    let (ids, retry) = self
-                        .equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
-                        .await?;
-                    if let Some((deadline, representative)) = retry {
-                        repository::copy_apply_retry(pool, &ids, &representative).await?;
-                        self.schedule_transfer_wake(deadline - Utc::now());
-                        continue;
+                    LanContentLevel::Complete
+                } else {
+                    if meta.as_ref().is_some_and(|row| row.needs_blob_pull) {
+                        needs_blob_pull = true;
                     }
+                    LanContentLevel::Metadata
                 }
-                body_claim = Some(claim);
-                selected.push((event, envelope));
-                break;
-            }
-            eligible_content = selected;
+            };
+            acks.push(LanItemAck {
+                item_key,
+                local_seq,
+                level,
+            });
         }
-        let _body_claim = body_claim;
 
-        // SQLite 写入按游标顺序串行完成，避免并发事务互相触发 SQLITE_BUSY；
-        // 只有不持有数据库事务的 Blob 网络与文件 I/O 才并发执行。
-        let mut ready_content = Vec::new();
-        let mut metadata_only_content = Vec::new();
-        let mut deduplicated_content = Vec::new();
-        let resources = crate::core::paths::resources_dir(&self.app)?;
+        Ok((acks, needs_blob_pull, any_repush))
+    }
+
+    /// Sends `AckLanItems` with each peer's recorded `remote_seq` once blob materialization or
+    /// manual download completes, covering both direct LAN pulls and dual-channel Cloud pulls.
+    pub(super) async fn send_lan_acks_for_completed_item(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        sync_key: &str,
+        item_key: &str,
+    ) {
+        let peer_seqs = match repository::lan_remote_seqs_for_item(pool, sync_key).await {
+            Ok(seqs) => seqs,
+            Err(error) => {
+                log::debug!("read LAN remote sequences for ack failed: {error:#}");
+                return;
+            }
+        };
+        for (peer_device_id, remote_seq) in peer_seqs {
+            let Some(control_conn) = self.cached_lan_connection(&peer_device_id) else {
+                continue;
+            };
+            if let Err(error) = self
+                .send_lan_acks(
+                    &control_conn,
+                    group,
+                    vec![LanItemAck {
+                        item_key: item_key.to_owned(),
+                        local_seq: remote_seq,
+                        level: LanContentLevel::Complete,
+                    }],
+                )
+                .await
+            {
+                log::debug!(
+                    "send LAN attachment completion ack to {peer_device_id} failed: {error:#}"
+                );
+            }
+        }
+    }
+
+    /// Applies all pending items that require zero network blob I/O (tombstones, metadata updates,
+    /// inline text, deduplicated local files/images, and deferred remote file metadata cards).
+    /// Returns `true` when at least one remaining item needs Data-Plane blob downloads.
+    pub(super) async fn apply_pending_inline_items(
+        &self,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        sync_settings: &SyncSettings,
+    ) -> Result<bool> {
+        let key = group.content_key_bytes()?;
         let history = self
             .app
             .state::<SettingsStore>()
             .snapshot()
             .clipboard
             .history;
-        let local_storage_limit_bytes = history.max_storage_bytes;
-        let mut quota = AttachmentQuotaInspector::for_history(&self.app, pool, &history).await?;
-        for (event, envelope) in &eligible_content {
-            let (_, item_updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
-            quota.observe_timestamp(item_updated_at);
-        }
-        for (event, envelope) in eligible_content {
-            let event_id = event.event_id.clone();
-            let preparation: Result<()> = async {
-                let presence = SyncedItemStatePatch {
-                    sync_key: envelope.item.sync_key.clone(),
-                    is_favorite: None,
-                    is_pinned: None,
-                    note: None,
-                    note_changed: false,
-                    is_present: Some(true),
-                };
-                let _resource_guard = crate::clipboard::shared_files::lock().await;
-                let outcome = db::sync_item_state::apply_remote_patch(
-                    pool,
-                    &presence,
-                    &db::sync_item_state::SyncEventVersion {
-                        origin_sequence: event.origin_sequence,
-                        origin_device_id: event.origin_device_id.clone(),
-                    },
-                )
-                .await?;
+        let history_target_bytes = crate::clipboard::cleanup::history_target_bytes(&history);
+        let clipboard_generation = self
+            .app
+            .state::<Arc<ClipboardFingerprintState>>()
+            .generation();
+        let mut latest_clipboard_item: Option<(ClipboardItem, Option<ClipboardFingerprint>)> = None;
+        let mut source_assets_pending = false;
+        let mut applied_any = false;
+        let mut has_pending_blobs = false;
 
-                if !outcome.image_files.is_empty() {
-                    let store = self.app.state::<ImageStore>();
-                    if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
-                        pool,
-                        store.inner(),
-                        &outcome.image_files,
-                    )
-                    .await
-                    {
+        let pending = repository::list_items_needing_apply(pool, 64).await?;
+        if pending.is_empty() {
+            return Ok(false);
+        }
+
+        for chunk in pending.chunks(16) {
+            let _apply_guard = self.apply_lock.lock().await;
+            for meta in chunk {
+                let (Some(item_key), Some(nonce), Some(ciphertext)) = (
+                    meta.item_key.as_deref(),
+                    meta.nonce.as_deref(),
+                    meta.ciphertext.as_deref(),
+                ) else {
+                    repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+                    continue;
+                };
+                let snapshot = match crypto::decrypt_item_snapshot(
+                    &key,
+                    item_key,
+                    meta.deleted,
+                    meta.protected,
+                    nonce,
+                    ciphertext,
+                )
+                .and_then(|snapshot| {
+                    validate_snapshot(&snapshot)?;
+                    Ok(snapshot)
+                }) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
                         log::warn!(
-                            "reclaim deleted synchronized images after content presence failed: {error:#}"
+                            "discard invalid pending sync item {}: {error:#}",
+                            meta.sync_key
                         );
+                        repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+                        continue;
                     }
+                };
+
+                if !snapshot.is_present {
+                    self.apply_tombstone_snapshot(pool, &snapshot.sync_key)
+                        .await?;
+                    repository::mark_item_applied(pool, &meta.sync_key, None, "managed", None)
+                        .await?;
+                    applied_any = true;
+                    continue;
                 }
-                if outcome.canonical_presence == Some(false) {
-                    if outcome.deleted {
-                        self.emit_clipboard_reconciled();
-                        #[cfg(target_os = "android")]
-                        crate::commands::android::notify_overlay_clipboard_changed();
-                    }
-                    if let Err(error) = crate::clipboard::shared_files::cleanup_resources_locked(
+
+                let Some(synced_item) = snapshot.item.as_ref() else {
+                    let existing_id = self.apply_metadata_only_snapshot(pool, &snapshot).await?;
+                    repository::mark_item_applied(
                         pool,
-                        resources.clone(),
+                        &meta.sync_key,
+                        existing_id.as_deref(),
+                        "managed",
+                        None,
                     )
-                    .await
-                    {
-                        log::warn!(
-                            "reclaim deleted synchronized files after content presence failed: {error:#}"
-                        );
-                    }
-                    repository::mark_applied(pool, &event.event_id).await?;
-                    if matches!(envelope.item.kind.as_str(), "files" | "image") {
-                        let (aliases, _) = self
-                            .equivalent_pending_files(
-                                pool,
-                                &event.event_id,
-                                &envelope,
-                                &key,
-                                source,
-                            )
+                    .await?;
+                    applied_any |= existing_id.is_some();
+                    continue;
+                };
+
+                source_assets_pending |= snapshot
+                    .source_app
+                    .as_ref()
+                    .and_then(valid_source_icon)
+                    .is_some();
+
+                let kind = parse_kind(&synced_item.kind)?;
+                match kind {
+                    ClipboardKind::Text => {
+                        let (item_id, item, fingerprint, deduplicated) = self
+                            .apply_materialized_snapshot(pool, &snapshot, group, false)
                             .await?;
-                        for alias in aliases {
-                            repository::mark_applied(pool, &alias).await?;
+                        repository::mark_item_applied(
+                            pool,
+                            &meta.sync_key,
+                            (!item_id.is_empty()).then_some(item_id.as_str()),
+                            "managed",
+                            None,
+                        )
+                        .await?;
+                        if !item_id.is_empty() {
+                            self.emit_clipboard_item_updated(&item, deduplicated);
+                            if latest_clipboard_item
+                                .as_ref()
+                                .is_none_or(|(latest, _)| item.updated_at >= latest.updated_at)
+                            {
+                                latest_clipboard_item = Some((item, fingerprint));
+                            }
+                            applied_any = true;
                         }
                     }
-                    made_content_progress = true;
-                    return Ok(());
-                }
-
-                let (_, item_updated_at) =
-                    synced_item_timestamps(&envelope.item, event.created_at_ms);
-                let attachment_bytes = envelope
-                    .blobs
-                    .iter()
-                    .fold(0_u64, |total, blob| total.saturating_add(blob.original_size));
-                if envelope.item.kind == "image"
-                    && attachments
-                    && !quota
-                        .admit_or_reject_historical(item_updated_at, attachment_bytes)
-                        .await
-                {
-                    repository::mark_applied(pool, &event.event_id).await?;
-                    let (aliases, _) = self
-                        .equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
-                        .await?;
-                    for alias in aliases {
-                        repository::mark_applied(pool, &alias).await?;
-                    }
-                    made_content_progress = true;
-                    return Ok(());
-                }
-
-                let source_revision = envelope
-                    .item
-                    .source_revision
-                    .as_deref()
-                    .unwrap_or(&event.event_id);
-                let local_file_available = envelope.item.kind == "files"
-                    && available_materialized_file_item(
-                        pool,
-                        &resources,
-                        &envelope.item.sync_key,
-                        source_revision,
-                        envelope.content_identity.as_deref(),
-                    )
-                    .await?
-                    .is_some();
-                if local_file_available {
-                    deduplicated_content.push((event, envelope));
-                } else if envelope.item.kind == "files" && !files {
-                    let download_pending = complete_content_source_event_ids.contains(&event.event_id)
-                        && !should_defer_remote_file_download(
-                            &envelope,
-                            sync_settings.auto_download_max_mb,
-                            local_storage_limit_bytes,
-                        )
-                        && quota
-                            .admit_or_reject_historical(item_updated_at, attachment_bytes)
-                            .await;
-                    metadata_only_content.push((event, envelope, download_pending));
-                } else if envelope.item.kind == "files" {
-                    let deferred_or_rejected =
-                        !complete_content_source_event_ids.contains(&event.event_id)
-                            || should_defer_remote_file_download(
-                                &envelope,
-                                sync_settings.auto_download_max_mb,
-                                local_storage_limit_bytes,
-                            )
-                            || !quota
-                                .admit_or_reject_historical(item_updated_at, attachment_bytes)
-                                .await;
-                    if deferred_or_rejected {
-                        metadata_only_content.push((event, envelope, false));
-                    } else {
-                        let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-                        let (item_id, _, _) = self
-                            .materialize_remote_file_metadata_card(
+                    ClipboardKind::Image => {
+                        // Reuse local image immediately if already present on disk (e.g. metadata update).
+                        let already_local = if let Some(existing) =
+                            db::items::find_item_by_sync_key(pool, &snapshot.sync_key).await?
+                        {
+                            existing.kind == ClipboardKind::Image
+                                && self
+                                    .app
+                                    .state::<ImageStore>()
+                                    .origin_path(&existing.content)
+                                    .is_file()
+                        } else {
+                            false
+                        };
+                        if already_local {
+                            let (item_id, item, _, deduplicated) = self
+                                .apply_materialized_snapshot(pool, &snapshot, group, true)
+                                .await?;
+                            repository::mark_item_applied(
                                 pool,
-                                &event,
-                                envelope.clone(),
+                                &meta.sync_key,
+                                (!item_id.is_empty()).then_some(item_id.as_str()),
+                                "managed",
+                                None,
+                            )
+                            .await?;
+                            if !item_id.is_empty() {
+                                self.emit_clipboard_item_updated(&item, deduplicated);
+                                applied_any = true;
+                            }
+                        } else {
+                            repository::mark_item_needs_blob_pull(
+                                pool,
+                                &meta.sync_key,
+                                None,
+                                "metadata",
+                                None,
+                            )
+                            .await?;
+                            has_pending_blobs = true;
+                        }
+                    }
+                    ClipboardKind::Files => {
+                        let resources = crate::core::paths::resources_dir(&self.app)?;
+                        let source_revision = synced_item
+                            .source_revision
+                            .as_deref()
+                            .unwrap_or(&snapshot.sync_key);
+                        if let Some(existing) = available_materialized_file_item(
+                            pool,
+                            &resources,
+                            &snapshot.sync_key,
+                            source_revision,
+                            snapshot.content_identity.as_deref(),
+                        )
+                        .await?
+                        {
+                            let _ = self.apply_metadata_only_snapshot(pool, &snapshot).await?;
+                            repository::mark_item_applied(
+                                pool,
+                                &meta.sync_key,
+                                Some(&existing.id),
+                                "managed",
+                                None,
+                            )
+                            .await?;
+                            self.emit_clipboard_item_updated(&existing, true);
+                            applied_any = true;
+                            continue;
+                        }
+
+                        // Always materialize or refresh the remote file metadata card immediately.
+                        let origin_device_id = meta.origin_device_id.as_deref().unwrap_or("");
+                        let (card_id, card_item, deduplicated) = self
+                            .apply_remote_file_metadata_snapshot(
+                                pool,
+                                &snapshot,
+                                origin_device_id,
                                 group,
                             )
                             .await?;
-                        source_assets_pending |= source_icon.is_some();
-                        ready_content.push((event, envelope, Some(item_id)));
-                    }
-                } else {
-                    ready_content.push((event, envelope, None));
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = preparation {
-                self.defer_card_apply(pool, &event_id, &error.to_string())
-                    .await?;
-            }
-        }
-
-        for (event, envelope, download_pending) in metadata_only_content {
-            let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let aliases = if !download_pending {
-                self.equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
-                    .await?
-                    .0
-            } else {
-                Vec::new()
-            };
-            let applied: Result<()> = async {
-                self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
-                    .await?;
-                repository::record_inbound_outcome(
-                    pool,
-                    source.remote_batch_source(),
-                    &event.event_id,
-                    repository::InboundContentOutcome::Metadata,
-                )
-                .await?;
-                if download_pending {
-                    self.wake_attachments();
-                } else {
-                    repository::mark_applied(pool, &event.event_id).await?;
-                    for alias in &aliases {
-                        repository::record_inbound_outcome(
-                            pool,
-                            source.remote_batch_source(),
-                            alias,
-                            repository::InboundContentOutcome::Deduplicated,
-                        )
-                        .await?;
-                        repository::mark_applied(pool, alias).await?;
-                    }
-                }
-                Ok(())
-            }
-            .await;
-            match applied {
-                Ok(()) => {
-                    made_content_progress = true;
-                    source_assets_pending |= source_icon.is_some();
-                    #[cfg(target_os = "android")]
-                    {
-                        applied_any = true;
-                    }
-                }
-                Err(error) => {
-                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
-                        .await?;
-                }
-            }
-        }
-
-        for (event, envelope) in deduplicated_content {
-            let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let applied: Result<()> = async {
-                self.materialize_remote_file_metadata_card(pool, &event, envelope, group)
-                    .await?;
-                repository::record_inbound_outcome(
-                    pool,
-                    source.remote_batch_source(),
-                    &event.event_id,
-                    repository::InboundContentOutcome::Deduplicated,
-                )
-                .await?;
-                repository::mark_applied(pool, &event.event_id).await?;
-                Ok(())
-            }
-            .await;
-            match applied {
-                Ok(()) => {
-                    made_content_progress = true;
-                    source_assets_pending |= source_icon.is_some();
-                    #[cfg(target_os = "android")]
-                    {
-                        applied_any = true;
-                    }
-                }
-                Err(error) => {
-                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
-                        .await?;
-                }
-            }
-        }
-
-        if attachments {
-            drop(apply_guard.take());
-        }
-        let download_route = if source.is_cloud() {
-            super::super::progress::TransferRoute::Cloud
-        } else {
-            super::super::progress::TransferRoute::Lan
-        };
-        let download_target = source.delivery_target().to_owned();
-        let preparations = n0_future::stream::iter(ready_content)
-            .map(|(event, envelope, download_item)| {
-                let download_target = download_target.clone();
-                async move {
-                    let mut stored_blobs = Vec::new();
-                    let mut blob_error = None;
-                    let transferred = AtomicU64::new(0);
-                    let download = if let Some(item_id) = download_item {
-                        let claim = self.delivery.claim_remote_download(&item_id)?;
-                        let total_bytes = envelope.blobs.iter().fold(0_u64, |total, manifest| {
-                            total.saturating_add(manifest.encrypted_size)
-                        });
-                        let task_key = format!(
-                            "{}\0{}\0{}\0auto-download",
-                            file_transfer_key(&envelope),
-                            download_target,
-                            total_bytes
-                        );
-                        let handle = self.delivery.start(super::super::progress::TransferTask {
-                            id: blake3::hash(task_key.as_bytes()).to_hex().to_string(),
-                            revision: 0,
-                            started_at_ms: chrono::Utc::now().timestamp_millis(),
-                            operation_id: event.event_id.clone(),
-                            item_id,
-                            direction: super::super::progress::TransferDirection::Download,
-                            route: download_route,
-                            target: download_target,
-                            file_name: (envelope.blobs.len() == 1)
-                                .then(|| envelope.blobs[0].name.clone()),
-                            phase: super::super::progress::TransferPhase::Queued,
-                            transferred_bytes: 0,
-                            total_bytes,
-                            speed_bytes_per_second: 0,
-                            elapsed_ms: 0,
-                            eta_seconds: None,
-                            error: None,
-                            cancellable: true,
-                        });
-                        handle.connecting();
-                        Some((handle, total_bytes, claim))
-                    } else {
-                        None
-                    };
-                    let mut completed_bytes = 0_u64;
-                    for manifest in &envelope.blobs {
-                        if download
-                            .as_ref()
-                            .is_some_and(|(handle, _, _)| handle.canceled())
-                        {
-                            blob_error = Some("transfer canceled".to_owned());
-                            break;
+                        if !card_id.is_empty() {
+                            self.emit_clipboard_item_updated(&card_item, deduplicated);
+                            applied_any = true;
                         }
-                        let progress =
-                            download
-                                .as_ref()
-                                .map(|(handle, _, _)| BlobDownloadProgress {
-                                    completed_bytes,
-                                    handle,
-                                    transferred: &transferred,
-                                });
-                        match self
-                            .ensure_blob(connection, group, manifest, progress)
-                            .await
-                        {
-                            Ok(path) => stored_blobs.push(StoredBlob {
-                                blob_id: manifest.blob_id.clone(),
-                                encrypted_path: path.to_string_lossy().into_owned(),
-                                size: manifest.encrypted_size,
-                                source_path: None,
-                                source_is_directory: false,
-                                stream_nonce: None,
-                            }),
-                            Err(error) => {
-                                log::debug!(
-                                    "defer sync event {} until blob {} is available: {error}",
-                                    event.event_id,
-                                    manifest.blob_id
-                                );
-                                blob_error = Some(format!(
-                                    "同步 Blob {} 暂时不可用: {error}",
-                                    manifest.blob_id
-                                ));
-                                break;
-                            }
-                        }
-                        completed_bytes = completed_bytes.saturating_add(manifest.encrypted_size);
-                    }
-                    let mut canceled = download
-                        .as_ref()
-                        .is_some_and(|(handle, _, _)| handle.canceled());
-                    if blob_error.is_none()
-                        && download
-                            .as_ref()
-                            .is_some_and(|(handle, _, _)| !handle.begin_finalizing(completed_bytes))
-                    {
-                        blob_error = Some("transfer canceled".to_owned());
-                        canceled = true;
-                    }
-                    if let (Some(error), Some((handle, _, _))) = (&blob_error, &download) {
-                        if !handle.canceled() {
-                            handle.failed(transferred.load(Ordering::Acquire), error.clone());
+                        if should_defer_remote_file_download(
+                            &snapshot,
+                            sync_settings.auto_download_max_mb,
+                            history_target_bytes,
+                        ) {
+                            repository::mark_item_applied(
+                                pool,
+                                &meta.sync_key,
+                                (!card_id.is_empty()).then_some(card_id.as_str()),
+                                "metadata",
+                                Some("available"),
+                            )
+                            .await?;
+                        } else {
+                            repository::mark_item_needs_blob_pull(
+                                pool,
+                                &meta.sync_key,
+                                (!card_id.is_empty()).then_some(card_id.as_str()),
+                                "metadata",
+                                Some("available"),
+                            )
+                            .await?;
+                            has_pending_blobs = true;
                         }
                     }
-                    Some((
-                        event,
-                        envelope,
-                        stored_blobs,
-                        blob_error,
-                        download,
-                        canceled,
-                    ))
-                }
-            })
-            .buffered_unordered(2);
-        let mut preparations = std::pin::pin!(preparations);
-        let mut consumed_staging = Vec::new();
-        while let Some(prepared) = preparations.next().await {
-            let Some(prepared) = prepared else {
-                continue;
-            };
-            let (event, envelope, stored_blobs, blob_error, download, canceled) = prepared;
-            let aliases = if matches!(envelope.item.kind.as_str(), "files" | "image") {
-                self.equivalent_pending_files(pool, &event.event_id, &envelope, &key, source)
-                    .await?
-                    .0
-            } else {
-                Vec::new()
-            };
-            if let Some(error) = blob_error {
-                if canceled {
-                    repository::mark_applied(pool, &event.event_id).await?;
-                    for alias in &aliases {
-                        repository::mark_applied(pool, alias).await?;
-                    }
-                    consumed_staging.extend(
-                        stored_blobs
-                            .into_iter()
-                            .map(|blob| PathBuf::from(blob.encrypted_path)),
-                    );
-                    made_content_progress = true;
-                    #[cfg(target_os = "android")]
-                    {
-                        applied_any = true;
-                    }
-                    continue;
-                }
-                self.defer_card_apply(pool, &event.event_id, &error).await?;
-                repository::copy_apply_retry(pool, &aliases, &event.event_id).await?;
-                continue;
-            }
-            let source_icon = envelope.source_app.as_ref().and_then(valid_source_icon);
-            let manifests = envelope.blobs.clone();
-            let content_identity = envelope.content_identity.clone();
-            let applied: Result<_> = async {
-                let (item_id, item, fingerprint, deduplicated) =
-                    self.apply_envelope(&event, envelope, group).await?;
-                if !item_id.is_empty() {
-                    let sources = self
-                        .materialized_blob_sources(&item, &manifests, &stored_blobs)
-                        .await?;
-                    repository::register_event_blob_sources(pool, &event.event_id, &sources)
-                        .await?;
-                    repository::link_content_event_to_item(
-                        pool,
-                        &item_id,
-                        &event.event_id,
-                        "remote",
-                        content_identity.as_deref(),
-                    )
-                    .await?;
-                    self.reconcile_item_timestamps(pool, group, &item_id)
-                        .await?;
-                }
-                repository::record_inbound_outcome(
-                    pool,
-                    source.remote_batch_source(),
-                    &event.event_id,
-                    repository::InboundContentOutcome::Received,
-                )
-                .await?;
-                repository::mark_applied(pool, &event.event_id).await?;
-                for alias in &aliases {
-                    repository::record_inbound_outcome(
-                        pool,
-                        source.remote_batch_source(),
-                        alias,
-                        repository::InboundContentOutcome::Deduplicated,
-                    )
-                    .await?;
-                    repository::mark_applied(pool, alias).await?;
-                }
-                Ok((item_id, item, fingerprint, deduplicated))
-            }
-            .await;
-            match applied {
-                Ok((item_id, item, fingerprint, deduplicated)) => {
-                    if !item_id.is_empty()
-                        && latest_clipboard_item.as_ref().is_none_or(
-                            |(latest, _, _): &(
-                                ClipboardItem,
-                                Option<ClipboardFingerprint>,
-                                bool,
-                            )| item.updated_at >= latest.updated_at,
-                        )
-                    {
-                        latest_clipboard_item = Some((item, fingerprint, deduplicated));
-                    }
-                    if let Some((handle, total_bytes, _)) = &download {
-                        handle.completed(*total_bytes);
-                    }
-                    made_content_progress = true;
-                    source_assets_pending |= source_icon.is_some();
-                    consumed_staging.extend(
-                        stored_blobs
-                            .into_iter()
-                            .map(|blob| PathBuf::from(blob.encrypted_path)),
-                    );
-                    #[cfg(target_os = "android")]
-                    {
-                        applied_any = true;
-                    }
-                }
-                Err(error) => {
-                    if let Some((handle, total_bytes, _)) = &download {
-                        handle.failed(*total_bytes, error.to_string());
-                    }
-                    self.defer_card_apply(pool, &event.event_id, &error.to_string())
-                        .await?;
-                    repository::copy_apply_retry(pool, &aliases, &event.event_id).await?;
                 }
             }
+            drop(_apply_guard);
+            tokio::task::yield_now().await;
         }
-        for path in consumed_staging {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    log::debug!(
-                        "defer consumed sync staging cleanup {}: {error}",
-                        path.display()
-                    );
-                }
-            }
+
+        if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
+            let can_write = sync_settings.auto_write_clipboard
+                && self
+                    .app
+                    .state::<Arc<ClipboardFingerprintState>>()
+                    .generation()
+                    == clipboard_generation
+                && repository::is_latest_clipboard_item(pool, &item.id).await?;
+            self.write_latest_synced_item_to_clipboard(item, fingerprint.as_ref(), can_write);
         }
-        if let Some((item, fingerprint, deduplicated)) = latest_clipboard_item.as_ref() {
-            self.write_latest_synced_item_to_clipboard(
-                item,
-                fingerprint.as_ref(),
-                sync_settings.auto_write_clipboard
-                    && self
-                        .app
-                        .state::<Arc<ClipboardFingerprintState>>()
-                        .generation()
-                        == clipboard_generation
-                    && repository::is_latest_clipboard_item(pool, &item.id).await?,
-            );
-            if let Err(error) = self.app.emit(
-                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-                serde_json::json!({
-                    "id": item.id,
-                    "kind": item.kind,
-                    "deduplicated": deduplicated,
-                    "reconciled": true,
-                }),
-            ) {
-                log::warn!(
-                    "emit {} failed: {error}",
-                    crate::clipboard::CLIPBOARD_UPDATED_EVENT
-                );
-            }
-        }
-        drop(apply_guard.take());
         #[cfg(target_os = "android")]
         if applied_any {
             crate::commands::android::notify_overlay_clipboard_changed();
@@ -1108,336 +690,469 @@ impl SyncManager {
         if source_assets_pending {
             self.runtime_state.source_asset_wake.notify_one();
         }
-        // Attachment receipts are created after the record exchange has already finished.
-        if attachments && made_content_progress {
-            self.wake_lan_transfer();
+        if applied_any {
+            self.emit_updated();
         }
-        Ok(made_content_progress
-            && repository::has_unapplied_content_for_target(
-                pool,
-                source.delivery_target(),
-                attachments,
-                files,
-            )
-            .await?)
+        Ok(has_pending_blobs)
     }
 
-    /// Includes copies received during an active download and preserves their shared backoff.
-    async fn equivalent_pending_files(
-        &self,
+    /// Pulls and materializes the single highest-priority remote attachment item available on
+    /// `source` over `data_connection`.
+    ///
+    /// Returns `Ok(true)` when an item was processed/transitioned so the worker re-queries fresh
+    /// priority order, `Ok(false)` when no eligible unclaimed item exists so the worker sleeps
+    /// cleanly, and `Err` on retryable transport failure so the worker applies backoff.
+    pub(super) async fn pull_one_remote_blob_item(
+        self: &Arc<Self>,
+        data_connection: &Connection,
         pool: &SqlitePool,
-        event_id: &str,
-        envelope: &ClipboardEnvelope,
-        key: &[u8; 32],
+        group: &GroupSecrets,
+        sync_settings: &SyncSettings,
         source: &SyncConnectionTarget,
-    ) -> Result<(Vec<String>, Option<(chrono::DateTime<Utc>, String)>)> {
-        let mut ids = Vec::new();
-        let mut retry: Option<(chrono::DateTime<Utc>, String)> = None;
-        for (alias, retry_at) in
-            repository::pending_file_events_for_item(pool, event_id, source.delivery_target())
-                .await?
+        realtime_only: bool,
+    ) -> Result<bool> {
+        let target_id = source.delivery_target();
+        let min_updated_at_ms = realtime_only.then(|| {
+            Utc::now()
+                .timestamp_millis()
+                .saturating_sub(VIP_REALTIME_RECENCY_MS)
+        });
+        let candidates =
+            repository::list_blob_pull_items_for_source(pool, target_id, min_updated_at_ms, 4)
+                .await?;
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let Some((meta, download_claim)) = candidates.into_iter().find_map(|candidate| {
+            let claim_id = candidate.item_id.as_deref().unwrap_or(&candidate.sync_key);
+            self.delivery
+                .claim_remote_download(claim_id)
+                .map(|claim| (candidate, claim))
+        }) else {
+            return Ok(false);
+        };
+
+        let key = group.content_key_bytes()?;
+        let history = self
+            .app
+            .state::<SettingsStore>()
+            .snapshot()
+            .clipboard
+            .history;
+        let history_target_bytes = crate::clipboard::cleanup::history_target_bytes(&history);
+        let mut quota = AttachmentQuotaInspector::for_history(&self.app, pool, &history).await?;
+        let clipboard_generation = self
+            .app
+            .state::<Arc<ClipboardFingerprintState>>()
+            .generation();
+        let route = if source.is_cloud() {
+            super::super::progress::TransferRoute::Cloud
+        } else {
+            super::super::progress::TransferRoute::Lan
+        };
+
+        let (Some(item_key), Some(nonce), Some(ciphertext)) = (
+            meta.item_key.as_deref(),
+            meta.nonce.as_deref(),
+            meta.ciphertext.as_deref(),
+        ) else {
+            repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            return Ok(true);
+        };
+        let Ok(snapshot) = crypto::decrypt_item_snapshot(
+            &key,
+            item_key,
+            meta.deleted,
+            meta.protected,
+            nonce,
+            ciphertext,
+        )
+        .and_then(|s| {
+            validate_snapshot(&s)?;
+            Ok(s)
+        }) else {
+            repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            return Ok(true);
+        };
+        if !snapshot.is_present || snapshot.blobs.is_empty() {
+            repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            return Ok(true);
+        }
+        let Some(synced_item) = snapshot.item.as_ref() else {
+            repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            return Ok(true);
+        };
+        if synced_item.kind == "files"
+            && should_defer_remote_file_download(
+                &snapshot,
+                sync_settings.auto_download_max_mb,
+                history_target_bytes,
+            )
         {
-            if alias.event.event_id == event_id {
-                continue;
+            repository::mark_item_applied(
+                pool,
+                &meta.sync_key,
+                meta.item_id.as_deref(),
+                "metadata",
+                Some("available"),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let (_, updated_at) = synced_item_timestamps(synced_item, meta.payload_updated_at_ms);
+        let total_original = snapshot
+            .blobs
+            .iter()
+            .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+        let total_encrypted = snapshot
+            .blobs
+            .iter()
+            .fold(0_u64, |acc, b| acc.saturating_add(b.encrypted_size));
+        if !quota
+            .admit_or_reject_historical(updated_at, total_original)
+            .await
+        {
+            if synced_item.kind == "files" {
+                repository::mark_item_applied(
+                    pool,
+                    &meta.sync_key,
+                    meta.item_id.as_deref(),
+                    "metadata",
+                    Some("available"),
+                )
+                .await?;
+            } else {
+                repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
             }
-            if let Ok(DecryptedSyncEvent::Clipboard(other)) =
-                crypto::decrypt_sync_event(key, &alias.event)
+            return Ok(true);
+        }
+
+        let is_files = synced_item.kind == "files";
+        let transfer_handle = if is_files {
+            if let Some(item_id) = meta.item_id.as_deref() {
+                let task_id = Uuid::new_v4().simple().to_string();
+                repository::lock_transfer_item(pool, &task_id, item_id).await?;
+                let handle = self.delivery.start(super::super::progress::TransferTask {
+                    id: task_id.clone(),
+                    revision: 0,
+                    started_at_ms: Utc::now().timestamp_millis(),
+                    operation_id: meta.sync_key.clone(),
+                    item_id: item_id.to_owned(),
+                    direction: super::super::progress::TransferDirection::Download,
+                    route,
+                    target: target_id.to_owned(),
+                    file_name: (snapshot.blobs.len() == 1).then(|| snapshot.blobs[0].name.clone()),
+                    phase: super::super::progress::TransferPhase::Transferring,
+                    transferred_bytes: 0,
+                    total_bytes: total_encrypted,
+                    speed_bytes_per_second: 0,
+                    elapsed_ms: 0,
+                    eta_seconds: None,
+                    error: None,
+                    cancellable: true,
+                });
+                Some((task_id, handle))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let transferred = AtomicU64::new(0);
+        let mut completed_bytes = 0_u64;
+        let mut staged_blobs = Vec::with_capacity(snapshot.blobs.len());
+        let mut pull_error: Option<anyhow::Error> = None;
+
+        for manifest in &snapshot.blobs {
+            let progress = transfer_handle
+                .as_ref()
+                .map(|(_, handle)| BlobDownloadProgress {
+                    handle,
+                    transferred: &transferred,
+                    completed_bytes,
+                });
+            match self
+                .ensure_blob(data_connection, group, manifest, progress)
+                .await
             {
-                if same_attachment_content(envelope, &other) {
-                    if let Some(deadline) = retry_at.filter(|deadline| *deadline > Utc::now()) {
-                        if retry
-                            .as_ref()
-                            .is_none_or(|(current, _)| deadline > *current)
-                        {
-                            retry = Some((deadline, alias.event.event_id.clone()));
-                        }
-                    }
-                    ids.push(alias.event.event_id);
+                Ok(path) => {
+                    completed_bytes = completed_bytes.saturating_add(manifest.encrypted_size);
+                    staged_blobs.push(StoredBlob {
+                        blob_id: manifest.blob_id.clone(),
+                        encrypted_path: path.to_string_lossy().into_owned(),
+                        size: manifest.encrypted_size,
+                        source_path: None,
+                        source_is_directory: manifest.is_directory_archive,
+                        stream_nonce: None,
+                    });
+                }
+                Err(error) => {
+                    pull_error = Some(error);
+                    break;
                 }
             }
         }
-        Ok((ids, retry))
+
+        if let Some(error) = pull_error {
+            let canceled = transfer_handle
+                .as_ref()
+                .is_some_and(|(_, handle)| handle.canceled());
+            if let Some((task_id, handle)) = &transfer_handle {
+                let bytes = transferred.load(Ordering::Acquire);
+                if canceled {
+                    handle.mark_canceled(bytes);
+                } else {
+                    handle.failed(bytes, error.to_string());
+                }
+                let _ = repository::unlock_transfer_item(pool, task_id).await;
+            }
+            drop(download_claim);
+            if canceled {
+                repository::mark_item_applied(
+                    pool,
+                    &meta.sync_key,
+                    meta.item_id.as_deref(),
+                    "metadata",
+                    Some("available"),
+                )
+                .await?;
+                for blob in staged_blobs {
+                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+                }
+                return Ok(true);
+            }
+            if source.is_cloud() && should_invalidate_cloud_connection(data_connection, &error) {
+                self.invalidate_cloud_data_connection(data_connection.stable_id());
+            }
+            return Err(error);
+        }
+
+        if let Some((_, handle)) = &transfer_handle {
+            if !handle.begin_finalizing(completed_bytes) {
+                handle.mark_canceled(completed_bytes);
+                if let Some((task_id, _)) = &transfer_handle {
+                    let _ = repository::unlock_transfer_item(pool, task_id).await;
+                }
+                drop(download_claim);
+                repository::mark_item_applied(
+                    pool,
+                    &meta.sync_key,
+                    meta.item_id.as_deref(),
+                    "metadata",
+                    Some("available"),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+
+        let apply_res = self
+            .apply_materialized_snapshot(pool, &snapshot, group, false)
+            .await;
+        match apply_res {
+            Ok((item_id, item, fingerprint, deduplicated)) => {
+                if !item_id.is_empty() {
+                    if let Ok(sources) = self
+                        .materialized_blob_sources(&item, &snapshot.blobs, &staged_blobs)
+                        .await
+                    {
+                        for source_blob in sources {
+                            let _ = repository::update_blob_local_source(
+                                pool,
+                                &meta.sync_key,
+                                &source_blob.blob_id,
+                                "",
+                                source_blob.source_path.as_deref(),
+                                source_blob.source_is_directory,
+                                source_blob.stream_nonce.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                repository::mark_item_applied(
+                    pool,
+                    &meta.sync_key,
+                    (!item_id.is_empty()).then_some(item_id.as_str()),
+                    "managed",
+                    None,
+                )
+                .await?;
+                for blob in staged_blobs {
+                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+                }
+                if let Some((task_id, handle)) = &transfer_handle {
+                    handle.completed(total_encrypted);
+                    let _ = repository::unlock_transfer_item(pool, task_id).await;
+                }
+                drop(download_claim);
+
+                if !item_id.is_empty() {
+                    self.emit_clipboard_item_updated(&item, deduplicated);
+                    let can_write = sync_settings.auto_write_clipboard
+                        && self
+                            .app
+                            .state::<Arc<ClipboardFingerprintState>>()
+                            .generation()
+                            == clipboard_generation
+                        && repository::is_latest_clipboard_item(pool, &item.id).await?;
+                    self.write_latest_synced_item_to_clipboard(
+                        &item,
+                        fingerprint.as_ref(),
+                        can_write,
+                    );
+                }
+                self.send_lan_acks_for_completed_item(pool, group, &meta.sync_key, item_key)
+                    .await;
+                #[cfg(target_os = "android")]
+                crate::commands::android::notify_overlay_clipboard_changed();
+                self.runtime_state.source_asset_wake.notify_one();
+                self.emit_updated();
+                Ok(true)
+            }
+            Err(error) => {
+                if let Some((task_id, handle)) = &transfer_handle {
+                    handle.failed(total_encrypted, error.to_string());
+                    let _ = repository::unlock_transfer_item(pool, task_id).await;
+                }
+                drop(download_claim);
+                Err(error)
+            }
+        }
     }
 
-    /// Maps a materialized item back to its plaintext sources for future task-scoped staging.
-    async fn materialized_blob_sources(
-        &self,
-        item: &ClipboardItem,
-        manifests: &[BlobManifest],
-        staged: &[StoredBlob],
-    ) -> Result<Vec<StoredBlob>> {
-        let resources = crate::core::paths::resources_dir(&self.app)?;
-        let source_paths = match item.kind {
-            ClipboardKind::Text => Vec::new(),
-            ClipboardKind::Image => vec![self.app.state::<ImageStore>().origin_path(&item.content)],
-            ClipboardKind::Files => item
-                .content
-                .lines()
-                .filter(|value| !value.is_empty())
-                .map(|value| crate::clipboard::shared_files::resolve_path(&resources, value))
-                .collect::<Result<Vec<_>>>()?,
-        };
-        let content_manifests = manifests
-            .iter()
-            .filter(|manifest| {
-                manifest.role != BlobRole::Image || item.kind == ClipboardKind::Image
-            })
-            .collect::<Vec<_>>();
-        if content_manifests.len() != source_paths.len() {
-            bail!("materialized sync blob source count mismatch");
+    fn emit_clipboard_item_updated(&self, item: &ClipboardItem, deduplicated: bool) {
+        if let Err(error) = self.app.emit(
+            crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+            serde_json::json!({
+                "id": item.id,
+                "kind": item.kind,
+                "deduplicated": deduplicated,
+                "reconciled": true,
+            }),
+        ) {
+            log::warn!(
+                "emit {} failed: {error}",
+                crate::clipboard::CLIPBOARD_UPDATED_EVENT
+            );
         }
-        let mut sources = Vec::with_capacity(source_paths.len());
-        for (manifest, source_path) in content_manifests.into_iter().zip(source_paths) {
-            let staged = staged
-                .iter()
-                .find(|blob| blob.blob_id == manifest.blob_id)
-                .context("materialized sync blob staging is missing")?;
-            sources.push(StoredBlob {
-                blob_id: staged.blob_id.clone(),
-                encrypted_path: staged.encrypted_path.clone(),
-                size: staged.size,
-                source_path: Some(source_path.to_string_lossy().into_owned()),
-                source_is_directory: manifest.is_directory_archive,
-                stream_nonce: Some(crypto::blob_stream_nonce(Path::new(
-                    &staged.encrypted_path,
-                ))?),
-            });
-        }
-        Ok(sources)
     }
 
-    /// Merges a metadata or presence event even when its clipboard content has not arrived yet.
-    async fn apply_item_state_event(
-        &self,
-        pool: &SqlitePool,
-        event: &EncryptedEvent,
-        patch: SyncedItemStatePatch,
-    ) -> Result<()> {
-        let sync_key = patch.sync_key.clone();
+    async fn apply_tombstone_snapshot(&self, pool: &SqlitePool, sync_key: &str) -> Result<()> {
         let resources = crate::core::paths::resources_dir(&self.app)?;
         let _resource_guard = crate::clipboard::shared_files::lock().await;
-        let outcome = db::sync_item_state::apply_remote_patch(
-            pool,
-            &patch,
-            &db::sync_item_state::SyncEventVersion {
-                origin_sequence: event.origin_sequence,
-                origin_device_id: event.origin_device_id.clone(),
-            },
-        )
-        .await?;
-
-        if let Some(item_id) = outcome.item_id.as_deref() {
-            repository::link_event_to_item(pool, item_id, &event.event_id, "remote").await?;
-            self.app.emit(
-                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-                serde_json::json!({
-                    "id": item_id,
-                    "deduplicated": true,
-                    "reconciled": true,
-                }),
-            )?;
-        } else if outcome.canonical_presence == Some(false) {
-            self.app.emit(
-                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-                serde_json::json!({ "deletedHash": sync_key, "reconciled": true }),
-            )?;
+        let rows = sqlx::query("SELECT kind, content FROM clipboard_items WHERE sync_key = ?")
+            .bind(sync_key)
+            .fetch_all(pool)
+            .await
+            .context("query deleted synchronized clipboard items")?;
+        if rows.is_empty() {
+            return Ok(());
         }
+        let mut deleted_images = Vec::new();
+        for row in rows {
+            let kind: ClipboardKind = row.try_get("kind")?;
+            let content: String = row.try_get("content")?;
+            if kind == ClipboardKind::Image && !content.is_empty() {
+                deleted_images.push(content);
+            }
+        }
+        sqlx::query("DELETE FROM clipboard_items WHERE sync_key = ?")
+            .bind(sync_key)
+            .execute(pool)
+            .await
+            .context("delete synchronized clipboard item")?;
 
-        if !outcome.image_files.is_empty() {
+        if let Err(error) = self.app.emit(
+            crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+            serde_json::json!({ "deletedHash": sync_key, "reconciled": true }),
+        ) {
+            log::warn!("emit synchronized deletion failed: {error}");
+        }
+        if !deleted_images.is_empty() {
             let store = self.app.state::<ImageStore>();
             if let Err(error) = crate::clipboard::cache::reclaim_deleted_images(
                 pool,
                 store.inner(),
-                &outcome.image_files,
+                &deleted_images,
             )
             .await
             {
-                log::warn!(
-                    "reclaim deleted synchronized images after state apply failed: {error:#}"
-                );
+                log::warn!("reclaim deleted synchronized images failed: {error:#}");
             }
         }
-
-        if outcome.canonical_presence == Some(false) {
-            if let Err(error) =
-                crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
-            {
-                log::warn!(
-                    "reclaim deleted synchronized files after state apply failed: {error:#}"
-                );
-            }
+        if let Err(error) =
+            crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
+        {
+            log::warn!("reclaim deleted synchronized files failed: {error:#}");
         }
-        repository::mark_applied(pool, &event.event_id).await?;
         Ok(())
     }
 
-    async fn ensure_blob(
-        &self,
-        connection: &Connection,
-        group: &GroupSecrets,
-        manifest: &BlobManifest,
-        progress: Option<BlobDownloadProgress<'_>>,
-    ) -> Result<PathBuf> {
-        let root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
-        self.ensure_blob_at(connection, group, manifest, &root, progress)
-            .await
-    }
-    /// Downloads one encrypted blob into the caller-owned cache root.
-    pub(super) async fn ensure_blob_at(
-        &self,
-        connection: &Connection,
-        group: &GroupSecrets,
-        manifest: &BlobManifest,
-        root: &Path,
-        progress: Option<BlobDownloadProgress<'_>>,
-    ) -> Result<PathBuf> {
-        validate_blob_manifest(manifest)?;
-        let path = crypto::blob_path(root, &manifest.blob_id)?;
-        let download_lock = {
-            let mut locks = self.blob_download_locks.lock().await;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&path).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(path.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
-        let _download_guard = download_lock.lock().await;
-        if progress.is_some_and(|progress| progress.canceled()) {
-            bail!("transfer canceled");
-        }
-        if path.is_file() && path.metadata()?.len() == manifest.encrypted_size {
-            if let Some(progress) = progress {
-                progress.transferred(manifest.encrypted_size);
-            }
-            return Ok(path);
-        }
-        download_blob(connection, group, manifest, &path, progress).await?;
-        Ok(path)
-    }
-
-    /// Downloads and decrypts a cloud-only image into an ephemeral cache outside durable history.
-    pub(super) async fn cloud_record_image_path(
-        &self,
-        connection: &Connection,
-        group: &GroupSecrets,
-        envelope: &ClipboardEnvelope,
-    ) -> Result<Option<String>> {
-        let Some(manifest) = envelope
-            .blobs
-            .iter()
-            .find(|blob| blob.role == BlobRole::Image)
-        else {
-            return Ok(None);
-        };
-        let group_cache = self
-            .app
-            .path()
-            .app_cache_dir()?
-            .join(CLOUD_RECORD_CACHE_DIR)
-            .join(blake3::hash(group.group_id.as_bytes()).to_hex().as_str());
-        let encrypted = self
-            .ensure_blob_at(
-                connection,
-                group,
-                manifest,
-                &group_cache.join("blobs"),
-                None,
-            )
-            .await?;
-        let destination = group_cache
-            .join("images")
-            .join(format!("{}.png", manifest.blob_id));
-        if !destination.is_file() || destination.metadata()?.len() != manifest.original_size {
-            fs::create_dir_all(
-                destination
-                    .parent()
-                    .context("cloud record image cache has no parent")?,
-            )?;
-            let destination_for_task = destination.clone();
-            let original_size = manifest.original_size;
-            let key = group.content_key_bytes()?;
-            tauri::async_runtime::spawn_blocking(move || {
-                crypto::decrypt_blob(&encrypted, &destination_for_task, original_size, &key)
-            })
-            .await
-            .context("cloud image decryption task failed")??;
-        }
-
-        Ok(Some(destination.to_string_lossy().into_owned()))
-    }
-
-    /// Creates or refreshes the remote card before an optional managed download starts.
-    async fn materialize_remote_file_metadata_card(
+    async fn apply_metadata_only_snapshot(
         &self,
         pool: &SqlitePool,
-        event: &EncryptedEvent,
-        envelope: ClipboardEnvelope,
-        group: &GroupSecrets,
-    ) -> Result<(String, ClipboardItem, bool)> {
-        let content_identity = envelope.content_identity.clone();
-        let (item_id, item, deduplicated) = self
-            .apply_remote_file_metadata(event, envelope, group)
-            .await?;
-        if !item_id.is_empty() {
-            repository::link_content_event_to_item(
-                pool,
-                &item_id,
-                &event.event_id,
-                "remote",
-                content_identity.as_deref(),
-            )
-            .await?;
-            self.reconcile_item_timestamps(pool, group, &item_id)
-                .await?;
-            if let Err(error) = self.app.emit(
-                crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-                serde_json::json!({
-                    "id": item.id,
-                    "kind": item.kind,
-                    "deduplicated": deduplicated,
-                    "reconciled": true,
-                }),
-            ) {
-                log::warn!("emit remote file metadata update failed: {error}");
-            }
-        }
-        Ok((item_id, item, deduplicated))
+        snapshot: &SyncedItemSnapshot,
+    ) -> Result<Option<String>> {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM clipboard_items WHERE sync_key = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&snapshot.sync_key)
+        .fetch_optional(pool)
+        .await
+        .context("find clipboard item for metadata snapshot")?;
+        let Some(item_id) = existing else {
+            return Ok(None);
+        };
+        sqlx::query(
+            r#"
+            UPDATE clipboard_items
+            SET is_favorite = CASE WHEN ? > 0 THEN ? ELSE is_favorite END,
+                is_pinned = CASE WHEN ? > 0 THEN ? ELSE is_pinned END,
+                note = CASE WHEN ? > 0 THEN ? ELSE note END
+            WHERE id = ?
+            "#,
+        )
+        .bind(i64::try_from(snapshot.favorite_version.seq).unwrap_or(i64::MAX))
+        .bind(snapshot.is_favorite)
+        .bind(i64::try_from(snapshot.pinned_version.seq).unwrap_or(i64::MAX))
+        .bind(snapshot.is_pinned)
+        .bind(i64::try_from(snapshot.note_version.seq).unwrap_or(i64::MAX))
+        .bind(snapshot.note.as_deref())
+        .bind(&item_id)
+        .execute(pool)
+        .await
+        .context("apply metadata-only sync snapshot")?;
+
+        let _ = self.app.emit(
+            crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+            serde_json::json!({
+                "id": item_id,
+                "deduplicated": true,
+                "reconciled": true,
+            }),
+        );
+        Ok(Some(item_id))
     }
 
-    /// Materializes a remote file card from its encrypted event without downloading file bytes.
-    async fn apply_remote_file_metadata(
+    async fn apply_remote_file_metadata_snapshot(
         &self,
-        event: &EncryptedEvent,
-        envelope: ClipboardEnvelope,
+        pool: &SqlitePool,
+        snapshot: &SyncedItemSnapshot,
+        origin_device_id: &str,
         group: &GroupSecrets,
     ) -> Result<(String, ClipboardItem, bool)> {
-        if envelope.version != 1 || parse_kind(&envelope.item.kind)? != ClipboardKind::Files {
+        let synced = snapshot
+            .item
+            .as_ref()
+            .context("missing item in remote file snapshot")?;
+        if parse_kind(&synced.kind)? != ClipboardKind::Files {
             bail!("不支持的远端文件元数据");
         }
-        let pool = self.pool().await;
-        let resources = crate::core::paths::resources_dir(&self.app)?;
-        let source_revision = envelope
-            .item
-            .source_revision
-            .as_deref()
-            .unwrap_or(&event.event_id);
-        if let Some(existing) = available_materialized_file_item(
-            &pool,
-            &resources,
-            &envelope.item.sync_key,
-            source_revision,
-            envelope.content_identity.as_deref(),
-        )
-        .await?
-        {
-            return Ok((existing.id.clone(), existing, true));
-        }
-
-        let mut manifests = envelope
+        let mut manifests = snapshot
             .blobs
             .iter()
             .filter(|blob| blob.role == BlobRole::File)
@@ -1452,21 +1167,19 @@ impl SyncManager {
             bail!("远端文件元数据为空");
         }
 
-        let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
-        let source_updated_at = envelope
-            .item
+        let (created_at, updated_at) = synced_item_timestamps(synced, synced.created_at_ms);
+        let source_updated_at = synced
             .source_updated_at_ms
             .and_then(|value| Utc.timestamp_millis_opt(value).single())
             .unwrap_or(updated_at);
-        let source_revision = envelope
-            .item
+        let source_revision = synced
             .source_revision
             .clone()
-            .unwrap_or_else(|| event.event_id.clone());
-        let source_app_id = if let Some(source_app) = envelope.source_app.as_ref() {
+            .unwrap_or_else(|| snapshot.sync_key.clone());
+        let source_app_id = if let Some(source_app) = snapshot.source_app.as_ref() {
             match self
                 .resolve_received_source_app(
-                    &pool,
+                    pool,
                     group,
                     source_app,
                     source_updated_at,
@@ -1483,7 +1196,7 @@ impl SyncManager {
         } else {
             None
         };
-        let sync_key = envelope.item.sync_key.clone();
+        let sync_key = snapshot.sync_key.clone();
         let mut item = ClipboardItem {
             id: Uuid::new_v4().to_string(),
             kind: ClipboardKind::Files,
@@ -1491,26 +1204,26 @@ impl SyncManager {
             group_id: None,
             source_app_id,
             source_revision,
-            source_device_id: envelope.item.source_device_id.clone(),
-            source_device_name: envelope.item.source_device_name.clone(),
+            source_device_id: synced.source_device_id.clone(),
+            source_device_name: synced.source_device_name.clone(),
             source_updated_at: Some(source_updated_at),
             source_device_is_local: false,
             content: content.clone(),
             content_hash: sync_key.clone(),
-            sync_key: sync_key.clone(),
+            sync_key,
             search_text: Some(content),
-            summary: envelope.item.summary,
+            summary: synced.summary.clone(),
             text_char_count: None,
-            file_types: envelope.item.file_types,
-            size: envelope.item.size,
+            file_types: synced.file_types.clone(),
+            size: synced.size,
             width: None,
             height: None,
             use_count: 1,
-            is_favorite: false,
-            is_pinned: false,
-            is_sensitive: envelope.item.is_sensitive,
-            platform: parse_platform(&envelope.item.source_platform),
-            note: None,
+            is_favorite: snapshot.is_favorite,
+            is_pinned: snapshot.is_pinned,
+            is_sensitive: synced.is_sensitive,
+            platform: parse_platform(&synced.source_platform),
+            note: snapshot.note.clone(),
             created_at,
             updated_at,
             source_app_name: None,
@@ -1526,64 +1239,60 @@ impl SyncManager {
             color_preview: None,
             display_created_at: String::new(),
         };
-        let result = db::items::upsert_remote_file_item(
-            &pool,
-            &item,
-            &event.event_id,
-            &event.origin_device_id,
-        )
-        .await?;
+        let result = db::items::upsert_remote_file_item(pool, &item, origin_device_id).await?;
         item.id.clone_from(&result.id);
-        if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
+        if let Some(materialized) = db::items::find_item_by_id(pool, &result.id).await? {
             item = materialized;
         }
         Ok((result.id, item, result.deduplicated))
     }
 
-    async fn apply_envelope(
+    async fn apply_materialized_snapshot(
         &self,
-        event: &EncryptedEvent,
-        envelope: ClipboardEnvelope,
+        pool: &SqlitePool,
+        snapshot: &SyncedItemSnapshot,
         group: &GroupSecrets,
+        skip_existing_image_decrypt: bool,
     ) -> Result<(String, ClipboardItem, Option<ClipboardFingerprint>, bool)> {
         let _sync_activity = SyncActivityGuard::acquire();
-        if envelope.version != 1 {
-            bail!("不支持的同步事件版本");
-        }
-        let kind = parse_kind(&envelope.item.kind)?;
-        // Resource GC uses the same lock. Keep materialized files alive until their database
-        // references commit, while preserving the global apply_lock -> resource lock order.
-        let image_apply_guard = if kind == ClipboardKind::Image {
+        let synced = snapshot
+            .item
+            .as_ref()
+            .context("missing item in materialized snapshot")?;
+        let kind = parse_kind(&synced.kind)?;
+        let image_apply_guard = if kind == ClipboardKind::Image && !skip_existing_image_decrypt {
             Some(self.apply_lock.lock().await)
         } else {
             None
         };
-        let mut resource_guard = if kind != ClipboardKind::Image {
-            None
-        } else {
+        let mut resource_guard = if kind == ClipboardKind::Image {
             Some(crate::clipboard::shared_files::lock().await)
+        } else {
+            None
         };
         let resources = crate::core::paths::resources_dir(&self.app)?;
         let blob_root = resources.join(SYNC_STAGING_DIR);
         let mut file_apply_guard = None;
         let (content, files_fingerprint) = match kind {
-            ClipboardKind::Text => (envelope.item.content.clone(), None),
+            ClipboardKind::Text => (synced.content.clone(), None),
             ClipboardKind::Image => {
-                let manifest = envelope
+                let manifest = snapshot
                     .blobs
                     .iter()
                     .find(|blob| blob.role == BlobRole::Image)
                     .context("同步图片缺少数据")?;
                 let image_name = sanitize_name(&manifest.name);
                 let destination = self.app.state::<ImageStore>().origin_path(&image_name);
-                let encrypted = crypto::blob_path(&blob_root, &manifest.blob_id)?;
-                let key = group.content_key_bytes()?;
-                let original_size = manifest.original_size;
-                tauri::async_runtime::spawn_blocking(move || {
-                    crypto::decrypt_blob(&encrypted, &destination, original_size, &key)
-                })
-                .await
-                .context("image decryption task failed")??;
+                if !(skip_existing_image_decrypt && destination.is_file()) {
+                    let encrypted = crypto::blob_path(&blob_root, &manifest.blob_id)?;
+                    let key = group.content_key_bytes()?;
+                    let original_size = manifest.original_size;
+                    tauri::async_runtime::spawn_blocking(move || {
+                        crypto::decrypt_blob(&encrypted, &destination, original_size, &key)
+                    })
+                    .await
+                    .context("image decryption task failed")??;
+                }
                 (image_name, None)
             }
             ClipboardKind::Files => {
@@ -1596,13 +1305,10 @@ impl SyncManager {
                     .join(Uuid::new_v4().to_string());
                 let mut paths = Vec::new();
                 let mut file_fingerprints = Vec::new();
-                for manifest in &envelope.blobs {
+                for manifest in &snapshot.blobs {
                     if manifest.role != BlobRole::File {
                         continue;
                     }
-                    // 不在逻辑文件名前加序号：系统剪贴板及 RustDesk 会继续
-                    // 传播落盘后的 basename，改名会让同一内容在往返中产生不同指纹。
-                    // 用独立序号目录处理同名根项，同时保留原始 basename。
                     let destination = synced_file_destination(
                         &directory,
                         manifest.file_index.unwrap_or(0),
@@ -1653,8 +1359,10 @@ impl SyncManager {
                     });
                     paths.push(destination.to_string_lossy().into_owned());
                 }
-                file_apply_guard = Some(self.apply_lock.lock().await);
-                resource_guard = Some(crate::clipboard::shared_files::lock().await);
+                if kind == ClipboardKind::Files {
+                    file_apply_guard = Some(self.apply_lock.lock().await);
+                    resource_guard = Some(crate::clipboard::shared_files::lock().await);
+                }
                 tokio::fs::create_dir_all(resources.join("sync-files")).await?;
                 tokio::fs::rename(&directory, &final_directory).await?;
                 let physical_content = paths
@@ -1682,22 +1390,20 @@ impl SyncManager {
                 )
             }
         };
-        let (created_at, updated_at) = synced_item_timestamps(&envelope.item, event.created_at_ms);
-        let source_updated_at = envelope
-            .item
+
+        let (created_at, updated_at) = synced_item_timestamps(synced, synced.created_at_ms);
+        let source_updated_at = synced
             .source_updated_at_ms
             .and_then(|value| Utc.timestamp_millis_opt(value).single())
             .unwrap_or(updated_at);
-        let source_revision = envelope
-            .item
+        let source_revision = synced
             .source_revision
             .clone()
-            .unwrap_or_else(|| event.event_id.clone());
-        let pool = self.pool().await;
-        let source_app_id = if let Some(source_app) = envelope.source_app.as_ref() {
+            .unwrap_or_else(|| snapshot.sync_key.clone());
+        let source_app_id = if let Some(source_app) = snapshot.source_app.as_ref() {
             match self
                 .resolve_received_source_app(
-                    &pool,
+                    pool,
                     group,
                     source_app,
                     source_updated_at,
@@ -1714,22 +1420,16 @@ impl SyncManager {
         } else {
             None
         };
-        let sync_key = envelope.item.sync_key.clone();
-
+        let sync_key = snapshot.sync_key.clone();
         let mut item = ClipboardItem {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: Uuid::new_v4().to_string(),
             kind,
-            sub_kind: envelope
-                .item
-                .sub_kind
-                .as_deref()
-                .map(parse_sub_kind)
-                .transpose()?,
+            sub_kind: synced.sub_kind.as_deref().map(parse_sub_kind).transpose()?,
             group_id: None,
             source_app_id,
             source_revision,
-            source_device_id: envelope.item.source_device_id.clone(),
-            source_device_name: envelope.item.source_device_name.clone(),
+            source_device_id: synced.source_device_id.clone(),
+            source_device_name: synced.source_device_name.clone(),
             source_updated_at: Some(source_updated_at),
             source_device_is_local: false,
             content_hash: if kind == ClipboardKind::Files {
@@ -1737,21 +1437,21 @@ impl SyncManager {
             } else {
                 sync_key.clone()
             },
-            sync_key: sync_key.clone(),
+            sync_key,
             content,
-            search_text: envelope.item.search_text,
-            summary: envelope.item.summary,
+            search_text: synced.search_text.clone(),
+            summary: synced.summary.clone(),
             text_char_count: None,
-            file_types: envelope.item.file_types,
-            size: envelope.item.size,
-            width: envelope.item.width,
-            height: envelope.item.height,
+            file_types: synced.file_types.clone(),
+            size: synced.size,
+            width: synced.width,
+            height: synced.height,
             use_count: 1,
-            is_favorite: false,
-            is_pinned: false,
-            is_sensitive: envelope.item.is_sensitive,
-            platform: parse_platform(&envelope.item.source_platform),
-            note: None,
+            is_favorite: snapshot.is_favorite,
+            is_pinned: snapshot.is_pinned,
+            is_sensitive: synced.is_sensitive,
+            platform: parse_platform(&synced.source_platform),
+            note: snapshot.note.clone(),
             created_at,
             updated_at,
             source_app_name: None,
@@ -1767,7 +1467,7 @@ impl SyncManager {
             color_preview: None,
             display_created_at: String::new(),
         };
-        let result = db::items::upsert_materialized_synced_item(&pool, &item).await?;
+        let result = db::items::upsert_materialized_synced_item(pool, &item).await?;
         drop(resource_guard);
         drop(file_apply_guard);
         drop(image_apply_guard);
@@ -1775,15 +1475,160 @@ impl SyncManager {
             return Ok((String::new(), item, None, result.deduplicated));
         }
         item.id.clone_from(&result.id);
-        if let Some(materialized) = db::items::find_item_by_id(&pool, &result.id).await? {
+        if let Some(materialized) = db::items::find_item_by_id(pool, &result.id).await? {
             item = materialized;
         }
         let fingerprint = files_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
         Ok((result.id, item, fingerprint, result.deduplicated))
     }
 
-    /// A remote batch updates the system clipboard at most once. Clipboard ownership is
-    /// independent from transport health, so a busy OS clipboard must never fail synchronization.
+    /// Maps a materialized item back to its plaintext sources so staging ciphertext can be deleted.
+    async fn materialized_blob_sources(
+        &self,
+        item: &ClipboardItem,
+        manifests: &[BlobManifest],
+        staged: &[StoredBlob],
+    ) -> Result<Vec<StoredBlob>> {
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let source_paths = match item.kind {
+            ClipboardKind::Text => Vec::new(),
+            ClipboardKind::Image => vec![self.app.state::<ImageStore>().origin_path(&item.content)],
+            ClipboardKind::Files => item
+                .content
+                .lines()
+                .filter(|value| !value.is_empty())
+                .map(|value| crate::clipboard::shared_files::resolve_path(&resources, value))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let content_manifests = manifests
+            .iter()
+            .filter(|manifest| {
+                manifest.role != BlobRole::Image || item.kind == ClipboardKind::Image
+            })
+            .collect::<Vec<_>>();
+        if content_manifests.len() != source_paths.len() {
+            bail!("materialized sync blob source count mismatch");
+        }
+        let mut sources = Vec::with_capacity(source_paths.len());
+        for (manifest, source_path) in content_manifests.into_iter().zip(source_paths) {
+            let staged = staged
+                .iter()
+                .find(|blob| blob.blob_id == manifest.blob_id)
+                .context("materialized sync blob staging is missing")?;
+            sources.push(StoredBlob {
+                blob_id: staged.blob_id.clone(),
+                encrypted_path: staged.encrypted_path.clone(),
+                size: staged.size,
+                source_path: Some(source_path.to_string_lossy().into_owned()),
+                source_is_directory: manifest.is_directory_archive,
+                stream_nonce: Some(crypto::blob_stream_nonce(Path::new(
+                    &staged.encrypted_path,
+                ))?),
+            });
+        }
+        Ok(sources)
+    }
+
+    async fn ensure_blob(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        manifest: &BlobManifest,
+        progress: Option<BlobDownloadProgress<'_>>,
+    ) -> Result<PathBuf> {
+        let root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
+        self.ensure_blob_at(connection, group, manifest, &root, progress)
+            .await
+    }
+
+    /// Downloads one encrypted blob into the caller-owned cache root.
+    pub(super) async fn ensure_blob_at(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        manifest: &BlobManifest,
+        root: &Path,
+        progress: Option<BlobDownloadProgress<'_>>,
+    ) -> Result<PathBuf> {
+        validate_blob_manifest(manifest)?;
+        let path = crypto::blob_path(root, &manifest.blob_id)?;
+        let download_lock = {
+            let mut locks = self.blob_download_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&path).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(path.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _download_guard = download_lock.lock().await;
+        if progress.is_some_and(|progress| progress.canceled()) {
+            bail!("transfer canceled");
+        }
+        if path.is_file() && path.metadata()?.len() == manifest.encrypted_size {
+            if let Some(progress) = progress {
+                progress.transferred(manifest.encrypted_size);
+            }
+            return Ok(path);
+        }
+        download_blob(connection, group, manifest, &path, progress).await?;
+        Ok(path)
+    }
+
+    /// Downloads and decrypts a cloud-only image into an ephemeral cache outside durable history.
+    pub(super) async fn cloud_record_image_path(
+        &self,
+        connection: &Connection,
+        group: &GroupSecrets,
+        snapshot: &SyncedItemSnapshot,
+    ) -> Result<Option<String>> {
+        let Some(manifest) = snapshot
+            .blobs
+            .iter()
+            .find(|blob| blob.role == BlobRole::Image)
+        else {
+            return Ok(None);
+        };
+        let group_cache = self
+            .app
+            .path()
+            .app_cache_dir()?
+            .join(CLOUD_RECORD_CACHE_DIR)
+            .join(blake3::hash(group.group_id.as_bytes()).to_hex().as_str());
+        let encrypted = self
+            .ensure_blob_at(
+                connection,
+                group,
+                manifest,
+                &group_cache.join("blobs"),
+                None,
+            )
+            .await?;
+        let destination = group_cache
+            .join("images")
+            .join(format!("{}.png", manifest.blob_id));
+        if !destination.is_file() || destination.metadata()?.len() != manifest.original_size {
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .context("cloud record image cache has no parent")?,
+            )?;
+            let destination_for_task = destination.clone();
+            let original_size = manifest.original_size;
+            let key = group.content_key_bytes()?;
+            tauri::async_runtime::spawn_blocking(move || {
+                crypto::decrypt_blob(&encrypted, &destination_for_task, original_size, &key)
+            })
+            .await
+            .context("cloud image decryption task failed")??;
+        }
+
+        Ok(Some(destination.to_string_lossy().into_owned()))
+    }
+
     fn write_latest_synced_item_to_clipboard(
         &self,
         item: &ClipboardItem,
@@ -1820,11 +1665,8 @@ impl SyncManager {
             Ok(false)
         };
         #[cfg(not(target_os = "android"))]
-        let guard = self.app.state::<Arc<WritebackGuard>>();
-        #[cfg(not(target_os = "android"))]
         let result = crate::clipboard::write_synced_item_to_clipboard(
             &self.app.state::<ImageStore>(),
-            &guard,
             &fingerprints,
             &resolved_item,
             _fingerprint,
@@ -1836,109 +1678,5 @@ impl SyncManager {
                 item.id
             );
         }
-    }
-}
-
-/// Applies authoritative Hub facts without treating removed metadata as complete inline content.
-async fn apply_cloud_availability_updates(
-    pool: &SqlitePool,
-    key: &[u8; 32],
-    updates: &[CloudAvailabilityUpdate],
-    missing_event_ids: &[String],
-    latest_cursor: u64,
-) -> Result<bool> {
-    let event_ids = updates
-        .iter()
-        .map(|update| update.event_id.clone())
-        .collect::<Vec<_>>();
-    let events = repository::events_by_ids(pool, &event_ids)
-        .await?
-        .into_iter()
-        .map(|stored| (stored.event.event_id.clone(), stored.event))
-        .collect::<HashMap<_, _>>();
-    let availability = updates
-        .iter()
-        .filter_map(|update| {
-            events.get(&update.event_id).and_then(|event| {
-                cloud_event_content_availability(event, &update.available_blob_ids, key)
-                    .map(|state| (update.event_id.clone(), state))
-            })
-        })
-        .collect::<Vec<_>>();
-    repository::record_cloud_availability_batch(
-        pool,
-        &availability,
-        missing_event_ids,
-        latest_cursor,
-    )
-    .await?;
-    Ok(!availability.is_empty() || !missing_event_ids.is_empty())
-}
-
-/// Derives Hub content availability from its authoritative stored-blob list.
-fn cloud_content_availability(
-    received: &ReceivedSyncEvent,
-    key: &[u8; 32],
-) -> Option<repository::RouteContentAvailability> {
-    let available_blob_ids = received.cloud_blob_ids.as_ref()?;
-    cloud_event_content_availability(&received.event, available_blob_ids, key)
-}
-
-fn cloud_event_content_availability(
-    event: &EncryptedEvent,
-    available_blob_ids: &[String],
-    key: &[u8; 32],
-) -> Option<repository::RouteContentAvailability> {
-    let DecryptedSyncEvent::Clipboard(envelope) = crypto::decrypt_sync_event(key, event).ok()?
-    else {
-        return None;
-    };
-    let available_blob_ids = available_blob_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let complete = envelope
-        .blobs
-        .iter()
-        .all(|blob| available_blob_ids.contains(blob.blob_id.as_str()));
-    Some(if complete {
-        repository::RouteContentAvailability::Complete
-    } else {
-        repository::RouteContentAvailability::Metadata
-    })
-}
-
-/// Identifies the authenticated file manifest, independent of copy events and retry attempts.
-fn file_transfer_key(envelope: &ClipboardEnvelope) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(envelope.item.sync_key.as_bytes());
-    for blob in &envelope.blobs {
-        hasher.update(blob.blob_id.as_bytes());
-        hasher.update(blob.name.as_bytes());
-        hasher.update(&blob.file_index.unwrap_or(0).to_le_bytes());
-        hasher.update(&blob.original_size.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Uses the existing content fingerprint, with manifest identity for older stored events.
-fn same_file_content(left: &ClipboardEnvelope, right: &ClipboardEnvelope) -> bool {
-    left.item.sync_key == right.item.sync_key
-        && (left
-            .content_identity
-            .as_ref()
-            .zip(right.content_identity.as_ref())
-            .is_some_and(|(left, right)| left == right)
-            || file_transfer_key(left) == file_transfer_key(right))
-}
-
-fn same_attachment_content(left: &ClipboardEnvelope, right: &ClipboardEnvelope) -> bool {
-    if left.item.kind != right.item.kind {
-        return false;
-    }
-    match left.item.kind.as_str() {
-        "files" => same_file_content(left, right),
-        "image" => !left.item.sync_key.is_empty() && left.item.sync_key == right.item.sync_key,
-        _ => false,
     }
 }

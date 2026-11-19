@@ -37,7 +37,31 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
             }
             let activity = manager.sync_activity_guard().await;
             if !files {
-                let prepared = manager.materialize_dirty_states(None).await;
+                let prepared = async {
+                    let mut count = manager.materialize_dirty_states(None).await?;
+                    let text_run = manager
+                        .materialize_content_lane(
+                            db::sync_items::OutboxContentLane::Text,
+                            16,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    count += text_run.processed;
+                    text_run.staging.retain_for_delivery();
+                    let image_run = manager
+                        .materialize_content_lane(
+                            db::sync_items::OutboxContentLane::Image,
+                            2,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    count += image_run.processed;
+                    image_run.staging.retain_for_delivery();
+                    Ok::<usize, anyhow::Error>(count)
+                }
+                .await;
                 drop(activity);
                 match prepared {
                     Ok(processed) if processed > 0 => continue,
@@ -54,7 +78,7 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
             }
             let prepared = manager
                 .materialize_content_lane(
-                    db::sync_queue::OutboxContentLane::Files,
+                    db::sync_items::OutboxContentLane::Files,
                     1,
                     target.as_ref(),
                     None,
@@ -73,10 +97,10 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                             break;
                         }
                         let pool = manager.pool().await;
-                        match db::sync_queue::next_content_retry_at(
+                        match db::sync_items::next_content_retry_at(
                             &pool,
                             settings.sync_sensitive,
-                            db::sync_queue::OutboxContentLane::Files,
+                            db::sync_items::OutboxContentLane::Files,
                         )
                         .await
                         {
@@ -535,8 +559,6 @@ pub(super) fn spawn_endpoint_watchers(
 pub(super) async fn process_mdns_event(manager: &Arc<SyncManager>, event: PendingMdnsEvent) {
     match event {
         PendingMdnsEvent::Expired { endpoint_id } => {
-            // Discovery presence is not connection liveness. Android may filter multicast while
-            // a direct QUIC path remains healthy, so only the connection watcher marks it offline.
             manager
                 .runtime_state
                 .nearby_devices
@@ -648,7 +670,7 @@ pub(super) fn parse_android_lan_multicast_interfaces(value: &str) -> BTreeSet<Ip
         .collect()
 }
 
-/// Publishes and downloads optional source icons without delaying clipboard event delivery.
+/// Publishes and downloads optional source icons without delaying clipboard synchronization.
 pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
     let mut upload_failure_count = 0_usize;
     loop {
@@ -661,7 +683,6 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
             }
         }
         manager.wait_while_storage_suspended().await;
-        // Local retention takes the write side before reclaiming temporary ciphertext.
         let _staging_guard = manager.sync_activity_guard().await;
         if manager.is_storage_suspended() {
             continue;
@@ -676,7 +697,9 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
             continue;
         }
 
-        let connection = manager.cached_cloud_connection();
+        let connection = manager
+            .cached_cloud_data_connection()
+            .or_else(|| manager.cached_cloud_connection());
         if settings.cloud_enabled {
             let publish_started_at = Instant::now();
             match manager
@@ -820,22 +843,21 @@ pub(super) async fn watch_cloud_group(
     watch_epoch: u64,
     watch_ready: &mut bool,
 ) -> Result<()> {
-    let (mut cursor, mut availability_cursor, mut removed_at_ms) = {
+    let (mut seq, mut removed_at_ms) = {
         let _lan_guard = manager.sync_activity_guard().await;
         if manager.is_storage_suspended() || manager.storage_epoch() != watch_epoch {
             return Ok(());
         }
         let pool = manager.pool().await;
         (
-            repository::cloud_cursor(&pool).await?,
-            repository::cloud_availability_cursor(&pool).await?,
+            repository::cloud_window_cursor(&pool).await?.synced_seq,
             repository::latest_removed_at_ms(&pool).await?,
         )
     };
     let request = Request::WatchCloud {
         group_id: group.group_id.clone(),
         access_token: group.access_token_bytes()?,
-        after_cursor: cursor,
+        after_seq: seq,
         after_removed_at_ms: removed_at_ms,
     };
     let (mut recv, initial_response) = tokio::select! {
@@ -848,15 +870,9 @@ pub(super) async fn watch_cloud_group(
             Ok::<_, anyhow::Error>((recv, response))
         }) => result.context("读取云端订阅首帧超时")??,
     };
-    apply_cloud_watch_response(
-        manager,
-        initial_response,
-        &mut cursor,
-        &mut availability_cursor,
-        &mut removed_at_ms,
-    )?;
+    apply_cloud_watch_response(manager, initial_response, &mut seq, &mut removed_at_ms)?;
     mark_cloud_watch_ready(manager, watch_ready);
-    log::info!("cloud watch ready: connectionId={}", connection.stable_id(),);
+    log::info!("cloud watch ready: connectionId={}", connection.stable_id());
 
     loop {
         let response = tokio::select! {
@@ -866,13 +882,7 @@ pub(super) async fn watch_cloud_group(
                 read_frame(&mut recv),
             ) => result.context("等待云端持续订阅心跳超时")??,
         };
-        apply_cloud_watch_response(
-            manager,
-            response,
-            &mut cursor,
-            &mut availability_cursor,
-            &mut removed_at_ms,
-        )?;
+        apply_cloud_watch_response(manager, response, &mut seq, &mut removed_at_ms)?;
     }
 }
 
@@ -888,59 +898,45 @@ pub(super) fn mark_cloud_watch_ready(manager: &SyncManager, watch_ready: &mut bo
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct CloudWatchChanges {
-    pub(super) events_changed: bool,
-    pub(super) availability_changed: bool,
+    pub(super) items_changed: bool,
     pub(super) removals_changed: bool,
 }
 
 /// Advances the local watch watermarks and reports work only when the Hub moved either one.
 pub(super) fn advance_cloud_watch_watermarks(
-    latest_cursor: u64,
-    latest_availability_cursor: u64,
+    latest_seq: u64,
     latest_removed_at_ms: i64,
-    cursor: &mut u64,
-    availability_cursor: &mut u64,
+    seq: &mut u64,
     removed_at_ms: &mut i64,
 ) -> Option<CloudWatchChanges> {
     let changes = CloudWatchChanges {
-        events_changed: latest_cursor > *cursor,
-        availability_changed: latest_availability_cursor > *availability_cursor,
+        items_changed: latest_seq > *seq,
         removals_changed: latest_removed_at_ms > *removed_at_ms,
     };
-    *cursor = (*cursor).max(latest_cursor);
-    *availability_cursor = (*availability_cursor).max(latest_availability_cursor);
+    *seq = (*seq).max(latest_seq);
     *removed_at_ms = (*removed_at_ms).max(latest_removed_at_ms);
 
-    (changes.events_changed || changes.availability_changed || changes.removals_changed)
-        .then_some(changes)
+    (changes.items_changed || changes.removals_changed).then_some(changes)
 }
 
-/// Wakes change-driven workers only for a real event or removal watermark advance.
+/// Wakes change-driven workers only for a real item or removal watermark advance.
 pub(super) fn apply_cloud_watch_watermarks(
     manager: &SyncManager,
-    latest_cursor: u64,
-    latest_availability_cursor: u64,
+    latest_seq: u64,
     latest_removed_at_ms: i64,
-    cursor: &mut u64,
-    availability_cursor: &mut u64,
+    seq: &mut u64,
     removed_at_ms: &mut i64,
 ) {
-    let Some(changes) = advance_cloud_watch_watermarks(
-        latest_cursor,
-        latest_availability_cursor,
-        latest_removed_at_ms,
-        cursor,
-        availability_cursor,
-        removed_at_ms,
-    ) else {
+    let Some(changes) =
+        advance_cloud_watch_watermarks(latest_seq, latest_removed_at_ms, seq, removed_at_ms)
+    else {
         return;
     };
     let received_at_ms = Utc::now().timestamp_millis();
-    let events_changed = changes.events_changed;
-    let availability_changed = changes.availability_changed;
-    let removals_changed = changes.removals_changed;
     log::info!(
-        "cloud watch change received: eventsChanged={events_changed} availabilityChanged={availability_changed} removalsChanged={removals_changed} latestCursor={latest_cursor} latestAvailabilityCursor={latest_availability_cursor} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}"
+        "cloud watch change received: itemsChanged={} removalsChanged={} latestSeq={latest_seq} latestRemovedAtMs={latest_removed_at_ms} receivedAtMs={received_at_ms}",
+        changes.items_changed,
+        changes.removals_changed,
     );
     manager.runtime_state.source_asset_wake.notify_one();
     manager.wake_cloud_transfer();
@@ -949,25 +945,21 @@ pub(super) fn apply_cloud_watch_watermarks(
 pub(super) fn apply_cloud_watch_response(
     manager: &SyncManager,
     response: Response,
-    cursor: &mut u64,
-    availability_cursor: &mut u64,
+    seq: &mut u64,
     removed_at_ms: &mut i64,
 ) -> Result<()> {
     match response {
         Response::CloudChanged {
-            latest_cursor,
+            latest_seq,
             latest_removed_at_ms,
             server_version,
-            latest_availability_cursor,
         } => {
             manager.update_cloud_server_version(Some(server_version));
             apply_cloud_watch_watermarks(
                 manager,
-                latest_cursor,
-                latest_availability_cursor,
+                latest_seq,
                 latest_removed_at_ms,
-                cursor,
-                availability_cursor,
+                seq,
                 removed_at_ms,
             );
             Ok(())
@@ -997,170 +989,151 @@ pub(super) fn next_cloud_watch_failure_count(failure_count: usize, watch_ready: 
     failure_count.saturating_add(1)
 }
 
-struct AttachmentSlotGuard {
-    active: Arc<StdMutex<HashMap<String, usize>>>,
-    target: String,
-}
-
-impl Drop for AttachmentSlotGuard {
-    fn drop(&mut self) {
-        let mut active = self
-            .active
-            .lock()
-            .expect("attachment active slots poisoned");
-        if let Some(count) = active.get_mut(&self.target) {
-            *count = count.saturating_sub(1);
-        }
-    }
-}
-
-/// Keeps each attachment direction/category running independently and refills a freed slot.
-pub(super) async fn attachment_worker(manager: Arc<SyncManager>, files: bool, sending: bool) {
-    let lane = usize::from(files) * 2 + usize::from(sending);
-    let mut jobs = tokio::task::JoinSet::<bool>::new();
-    let active = Arc::new(StdMutex::new(HashMap::<String, usize>::new()));
-    let mut retry_after_completion = false;
+/// Data-plane attachment worker with fixed per-direction `1+1` roles:
+/// - `realtime_only = false` (`General`): processes realtime items first, then at most one
+///   historical backfill item at a time in its direction.
+/// - `realtime_only = true` (`VipRealtime`): processes only freshly copied / manually shared
+///   items, sleeping with zero polling whenever no realtime attachment is queued.
+pub(super) async fn attachment_worker(
+    manager: Arc<SyncManager>,
+    realtime_only: bool,
+    sending: bool,
+) {
+    let lane = usize::from(realtime_only) * 2 + usize::from(sending);
     loop {
+        manager.runtime_state.attachment_wakes[lane]
+            .notified()
+            .await;
         loop {
-            tokio::select! {
-                _ = manager.runtime_state.attachment_wakes[lane].notified() => {
-                    retry_after_completion = false;
+            manager.wait_while_storage_suspended().await;
+            let storage_epoch = manager.storage_epoch();
+            let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+            let Some(group) = manager.identity.snapshot().group else {
+                break;
+            };
+            if !settings.enabled {
+                break;
+            }
+            let pool = {
+                let _guard = manager.sync_activity_guard().await;
+                if manager.is_storage_suspended() || manager.storage_epoch() != storage_epoch {
                     break;
                 }
-                completed = jobs.join_next(), if !jobs.is_empty() => {
-                    let more = matches!(completed, Some(Ok(true)));
-                    if let Some(Err(error)) = completed {
-                        log::warn!("attachment worker task failed: lane={lane} error={error}");
-                    }
-                    if more || std::mem::take(&mut retry_after_completion) {
-                        break;
-                    }
-                }
-            }
-        }
-        manager.wait_while_storage_suspended().await;
-        let storage_epoch = manager.storage_epoch();
-        let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-        let identity = manager.identity.snapshot();
-        let Some(group) = identity.group else {
-            continue;
-        };
-        if !settings.enabled {
-            continue;
-        }
-        let mut routes = Vec::new();
-        if settings.lan_enabled {
-            for (device_id, connection) in manager
-                .runtime_state
-                .lan_connections
-                .read()
-                .expect("LAN connections poisoned")
-                .iter()
-            {
-                if connection.close_reason().is_none() {
-                    routes.push((
-                        SyncConnectionTarget::peer(device_id.clone()),
-                        connection.clone(),
-                    ));
-                }
-            }
-        }
-        if server_is_configured(&settings) {
-            if let Some(connection) = manager.cached_cloud_connection() {
-                routes.push((SyncConnectionTarget::Cloud, connection));
-            }
-        }
-        if routes.is_empty() {
-            continue;
-        }
-        let endpoint = match manager.ensure_endpoint(&settings).await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                log::warn!("prepare attachment endpoint failed: {error:#}");
-                continue;
-            }
-        };
-        let pool = {
-            let _guard = manager.sync_activity_guard().await;
-            if manager.is_storage_suspended() || manager.storage_epoch() != storage_epoch {
-                continue;
-            }
-            manager.pool().await
-        };
-        let cycle = SyncCycleContext {
-            target: SyncTarget::Lan,
-            device: manager.device_announcement_for(
-                &endpoint,
-                &identity.device_id,
-                &identity.device_name,
-            ),
-            device_id: identity.device_id,
-            settings,
-            group,
-            endpoint,
-            pool,
-        };
-        let mut spawned_any = false;
-        let mut any_saturated = false;
-        for (target, connection) in routes {
-            let target_id = target.delivery_target().to_owned();
-            loop {
-                let slot = {
-                    let mut guard = active.lock().expect("attachment active slots poisoned");
-                    let count = guard.entry(target_id.clone()).or_default();
-                    if *count < multipart::ATTACHMENTS_PER_DIRECTION {
-                        *count += 1;
-                        Some(AttachmentSlotGuard {
-                            active: active.clone(),
-                            target: target_id.clone(),
-                        })
-                    } else {
-                        any_saturated = true;
-                        None
-                    }
-                };
-                let Some(slot_guard) = slot else {
-                    break;
-                };
-                spawned_any = true;
-                let manager = manager.clone();
-                let cycle = cycle.clone();
-                let connection = connection.clone();
-                let target = target.clone();
-                let target_id = target_id.clone();
-                jobs.spawn(async move {
-                    let _slot_guard = slot_guard;
-                    let _guard = manager.sync_activity_guard().await;
-                    let result = if sending {
-                        manager
-                            .sync_connection_lane(&connection, &target, 0, &cycle, Some(files))
-                            .await
-                            .map(|outcome| outcome.has_more)
-                    } else {
-                        manager
-                            .apply_pending_attachment_events(
-                                &connection,
-                                &cycle.pool,
-                                &cycle.group,
-                                &cycle.settings,
-                                &target,
-                                files,
-                            )
-                            .await
-                    };
-                    match result {
-                        Ok(more) => more,
+                manager.pool().await
+            };
+
+            let mut handled_item = false;
+            if sending {
+                // LAN attachments are receiver-pulled via `GetBlob`; only Cloud needs sender uploads.
+                if settings.cloud_enabled
+                    && server_is_configured(&settings)
+                    && manager.cached_cloud_connection().is_some()
+                {
+                    match manager.ensure_cloud_data_connection(&settings).await {
+                        Ok(data_conn) => {
+                            let _guard = manager.sync_activity_guard().await;
+                            match manager
+                                .upload_one_cloud_blob_item(
+                                    &data_conn,
+                                    &pool,
+                                    &group,
+                                    realtime_only,
+                                )
+                                .await
+                            {
+                                Ok(handled) => handled_item |= handled,
+                                Err(error) => {
+                                    log::warn!("cloud attachment upload deferred: {error:#}");
+                                    manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                                    break;
+                                }
+                            }
+                        }
                         Err(error) => {
-                            log::warn!("attachment deferred: target={target_id} files={files} sending={sending} error={error:#}");
-                            manager.schedule_transfer_wake(chrono::Duration::seconds(5));
-                            false
+                            log::debug!("cloud data connection unavailable for upload: {error:#}");
                         }
                     }
-                });
+                }
+            } else {
+                // Pull one highest-priority inbound blob item from LAN peers first, then Cloud.
+                if settings.lan_enabled {
+                    let lan_peers = manager
+                        .runtime_state
+                        .lan_connections
+                        .read()
+                        .expect("LAN connections poisoned")
+                        .iter()
+                        .filter(|(_, conn)| conn.close_reason().is_none())
+                        .map(|(id, conn)| (id.clone(), conn.clone()))
+                        .collect::<Vec<_>>();
+                    for (peer_id, control_conn) in lan_peers {
+                        let data_conn = manager
+                            .lan_data_connection_or_fallback(&settings, &peer_id, &control_conn)
+                            .await;
+                        let target = SyncConnectionTarget::peer(peer_id);
+                        let _guard = manager.sync_activity_guard().await;
+                        match manager
+                            .pull_one_remote_blob_item(
+                                &data_conn,
+                                &pool,
+                                &group,
+                                &settings,
+                                &target,
+                                realtime_only,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                handled_item = true;
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                log::warn!("LAN attachment download deferred: {error:#}");
+                                manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                            }
+                        }
+                    }
+                }
+                if !handled_item
+                    && settings.cloud_enabled
+                    && server_is_configured(&settings)
+                    && manager.cached_cloud_connection().is_some()
+                {
+                    match manager.ensure_cloud_data_connection(&settings).await {
+                        Ok(data_conn) => {
+                            let _guard = manager.sync_activity_guard().await;
+                            match manager
+                                .pull_one_remote_blob_item(
+                                    &data_conn,
+                                    &pool,
+                                    &group,
+                                    &settings,
+                                    &SyncConnectionTarget::Cloud,
+                                    realtime_only,
+                                )
+                                .await
+                            {
+                                Ok(handled) => handled_item |= handled,
+                                Err(error) => {
+                                    log::warn!("cloud attachment download deferred: {error:#}");
+                                    manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::debug!(
+                                "cloud data connection unavailable for download: {error:#}"
+                            );
+                        }
+                    }
+                }
             }
-        }
-        if !spawned_any && any_saturated {
-            retry_after_completion = true;
+
+            if !handled_item {
+                break;
+            }
         }
     }
 }

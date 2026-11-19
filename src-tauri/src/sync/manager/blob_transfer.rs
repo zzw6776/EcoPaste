@@ -87,7 +87,6 @@ impl BlobUploadKind {
 pub(super) struct BlobUploadOptions {
     pub(super) kind: BlobUploadKind,
     pub(super) file_content: bool,
-    pub(super) managed_hub_blob: bool,
     pub(super) is_cloud: bool,
     pub(super) language: Language,
     pub(super) started: Option<mpsc::UnboundedSender<String>>,
@@ -204,8 +203,8 @@ pub(super) async fn upload_blob_inner(
         let write_started_at = Instant::now();
         let streaming = blob.encrypted_path.is_empty();
         let transfer_id = rand::random();
-        let request = match (options.kind, options.managed_hub_blob, streaming) {
-            (BlobUploadKind::Content, true, true) => Request::PutManagedStreamBlob {
+        let request = match (options.kind, streaming) {
+            (BlobUploadKind::Content, true) => Request::PutManagedStreamBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
@@ -213,7 +212,7 @@ pub(super) async fn upload_blob_inner(
                 transfer_id,
                 file_content: options.file_content,
             },
-            (BlobUploadKind::Content, false, true) => Request::PutStreamBlob {
+            (BlobUploadKind::SourceIcon, false) => Request::PutManagedSourceIcon {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
@@ -221,7 +220,7 @@ pub(super) async fn upload_blob_inner(
                 transfer_id,
                 file_content: options.file_content,
             },
-            (BlobUploadKind::SourceIcon, true, false) => Request::PutManagedSourceIcon {
+            (BlobUploadKind::Content, false) => Request::PutManagedBlob {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
                 blob_id: blob.blob_id.clone(),
@@ -229,31 +228,7 @@ pub(super) async fn upload_blob_inner(
                 transfer_id,
                 file_content: options.file_content,
             },
-            (BlobUploadKind::SourceIcon, false, false) => Request::PutSourceIcon {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                blob_id: blob.blob_id.clone(),
-                size: blob.size,
-                transfer_id,
-                file_content: options.file_content,
-            },
-            (BlobUploadKind::Content, true, false) => Request::PutManagedBlob {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                blob_id: blob.blob_id.clone(),
-                size: blob.size,
-                transfer_id,
-                file_content: options.file_content,
-            },
-            (BlobUploadKind::Content, false, false) => Request::PutBlob {
-                group_id: group.group_id.clone(),
-                access_token: group.access_token_bytes()?,
-                blob_id: blob.blob_id.clone(),
-                size: blob.size,
-                transfer_id,
-                file_content: options.file_content,
-            },
-            (BlobUploadKind::SourceIcon, _, true) => {
+            (BlobUploadKind::SourceIcon, true) => {
                 bail!("source icons cannot use streaming upload")
             }
         };
@@ -466,99 +441,6 @@ pub(super) fn log_blob_upload_completed(
 
 pub(super) fn blob_log_ref(blob_id: &str) -> &str {
     blob_id.get(..12).unwrap_or(blob_id)
-}
-
-/// Separates best-effort source icons from blobs required to apply clipboard content.
-pub(super) fn split_source_icon_blobs(
-    blobs: Vec<StoredBlob>,
-    source_icon_blob_ids: &HashSet<String>,
-) -> (Vec<StoredBlob>, Vec<StoredBlob>) {
-    blobs
-        .into_iter()
-        .partition(|blob| !source_icon_blob_ids.contains(&blob.blob_id))
-}
-
-pub(super) fn source_icon_blob_ids(events: &[StoredSyncEvent], key: &[u8; 32]) -> HashSet<String> {
-    events
-        .iter()
-        .filter_map(|stored| crypto::decrypt_event(key, &stored.event).ok())
-        .filter_map(|envelope| envelope.source_app.as_ref().and_then(valid_source_icon))
-        .map(|icon| icon.blob_id)
-        .collect()
-}
-
-/// Marks source icons as deferrable so metadata delivery does not wait for decorative assets.
-pub(super) fn mark_optional_source_icon_refs(events: &mut [StoredSyncEvent], key: &[u8; 32]) {
-    for stored in events {
-        let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
-            continue;
-        };
-        let Some(icon) = envelope.source_app.as_ref().and_then(valid_source_icon) else {
-            continue;
-        };
-        if stored.event.blob_ids.contains(&icon.blob_id)
-            && !envelope
-                .blobs
-                .iter()
-                .any(|blob| blob.blob_id == icon.blob_id)
-        {
-            stored.event.optional_blob_ids.push(icon.blob_id);
-        }
-    }
-}
-
-/// Publishes encrypted metadata while its image or file payload is still being transferred.
-pub(super) fn mark_metadata_only_blob_refs(
-    events: &mut [StoredSyncEvent],
-    key: &[u8; 32],
-    deferred_event_ids: &HashSet<String>,
-) {
-    for stored in events {
-        if !deferred_event_ids.contains(&stored.event.event_id) {
-            continue;
-        }
-        let Ok(envelope) = crypto::decrypt_event(key, &stored.event) else {
-            continue;
-        };
-        let content_blob_ids = envelope
-            .blobs
-            .iter()
-            .map(|blob| blob.blob_id.as_str())
-            .collect::<HashSet<_>>();
-        for blob_id in &stored.event.blob_ids {
-            if content_blob_ids.contains(blob_id.as_str())
-                && !stored.event.optional_blob_ids.contains(blob_id)
-            {
-                stored.event.optional_blob_ids.push(blob_id.clone());
-            }
-        }
-    }
-}
-
-/// Reads content availability independently of optional source app assets.
-pub(super) fn metadata_only_content_event_ids(
-    events: &[EncryptedEvent],
-    key: &[u8; 32],
-) -> HashSet<String> {
-    events
-        .iter()
-        .filter_map(|event| {
-            let envelope = crypto::decrypt_event(key, event).ok()?;
-            let content_blob_ids = envelope
-                .blobs
-                .iter()
-                .map(|blob| blob.blob_id.as_str())
-                .collect::<HashSet<_>>();
-            (!content_blob_ids.is_empty()
-                && content_blob_ids.iter().all(|blob_id| {
-                    event
-                        .optional_blob_ids
-                        .iter()
-                        .any(|value| value.as_str() == *blob_id)
-                }))
-            .then(|| event.event_id.clone())
-        })
-        .collect()
 }
 
 /// Uploads independent encrypted blobs over a small number of parallel QUIC streams.

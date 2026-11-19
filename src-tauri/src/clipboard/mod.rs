@@ -8,7 +8,6 @@ mod detect;
 mod file_icon_store;
 mod file_thumbnail;
 mod fingerprint;
-mod guard;
 mod icon;
 mod ingest;
 mod payload;
@@ -30,7 +29,6 @@ pub use file_icon_store::FileIconStore;
 pub use fingerprint::{
     ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation, FileEntryFingerprint,
 };
-pub use guard::WritebackGuard;
 pub use icon::{get_icon_cache_key, icon_png, DIR_CACHE_KEY};
 #[cfg(test)]
 pub use ingest::build_item;

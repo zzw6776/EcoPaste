@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./i18n";
+import "./stores/windowLifecycle";
 import { log } from "./utils/log";
 import { recordStartupTiming } from "./utils/startupTiming";
 

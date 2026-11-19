@@ -334,6 +334,120 @@ impl SyncManager {
             .cloned()
     }
 
+    pub(super) fn cached_cloud_data_connection(&self) -> Option<Connection> {
+        self.runtime_state
+            .cloud_data_connection
+            .read()
+            .expect("cloud data connection cache poisoned")
+            .as_ref()
+            .filter(|connection| connection.close_reason().is_none())
+            .cloned()
+    }
+
+    /// Opens or reuses a dedicated secondary QUIC connection for Cloud blob transfers so large
+    /// uploads/downloads never contend with control-plane `CloudSyncItems` or `WatchCloud` frames.
+    pub(super) async fn ensure_cloud_data_connection(
+        self: &Arc<Self>,
+        settings: &SyncSettings,
+    ) -> Result<Connection> {
+        if let Some(connection) = self.cached_cloud_data_connection() {
+            return Ok(connection);
+        }
+        let _guard = self.runtime_state.cloud_data_connect_lock.lock().await;
+        if let Some(connection) = self.cached_cloud_data_connection() {
+            return Ok(connection);
+        }
+        let endpoint = self.ensure_endpoint(settings).await?;
+        let server = server_endpoint_addr(settings)
+            .await?
+            .context("云端同步未配置")?;
+        let options = ConnectOptions::new().with_transport_config(sync_transport_config(true));
+        let connection = tokio::time::timeout(Duration::from_secs(8), async {
+            let connecting = endpoint.connect_with_opts(server, ALPN, options).await?;
+            Ok::<_, anyhow::Error>(connecting.await?)
+        })
+        .await
+        .context("云端数据通道连接超时")??;
+        *self
+            .runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned") = Some(connection.clone());
+        Ok(connection)
+    }
+
+    pub(super) fn invalidate_cloud_data_connection(&self, stable_id: usize) {
+        let mut connection = self
+            .runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned");
+        if connection
+            .as_ref()
+            .is_some_and(|existing| existing.stable_id() == stable_id)
+        {
+            if let Some(existing) = connection.take() {
+                existing.close(0_u32.into(), b"cloud data connection invalidated");
+            }
+        }
+    }
+
+    /// Opens or reuses a dedicated secondary LAN QUIC connection for `GetBlob` pulls, falling back
+    /// to the active control connection when the peer is only reachable over an inbound link.
+    pub(super) async fn lan_data_connection_or_fallback(
+        self: &Arc<Self>,
+        settings: &SyncSettings,
+        device_id: &str,
+        fallback_control: &Connection,
+    ) -> Connection {
+        if let Some(existing) = self
+            .runtime_state
+            .lan_data_connections
+            .read()
+            .expect("LAN data connections poisoned")
+            .get(device_id)
+            .filter(|connection| connection.close_reason().is_none())
+            .cloned()
+        {
+            return existing;
+        }
+        let pool = self.pool().await;
+        let peer = repository::list_peers(&pool).await.ok().and_then(|peers| {
+            peers
+                .into_iter()
+                .find(|peer| peer.announcement.device_id == device_id)
+        });
+        let Some(peer) = peer else {
+            return fallback_control.clone();
+        };
+        let Ok(addr) = peer_endpoint_addr(&peer.announcement) else {
+            return fallback_control.clone();
+        };
+        let Ok(endpoint) = self.ensure_endpoint(settings).await else {
+            return fallback_control.clone();
+        };
+        let dialed = tokio::time::timeout(LAN_EVENT_CONNECT_TIMEOUT, endpoint.connect(addr, ALPN))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let Some(connection) = dialed else {
+            return fallback_control.clone();
+        };
+        if ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT)
+            .await
+            .is_err()
+        {
+            connection.close(0_u32.into(), b"non-lan data connection rejected");
+            return fallback_control.clone();
+        }
+        self.runtime_state
+            .lan_data_connections
+            .write()
+            .expect("LAN data connections poisoned")
+            .insert(device_id.to_owned(), connection.clone());
+        connection
+    }
+
     pub(super) fn invalidate_cloud_connection(&self, stable_id: usize) {
         let removed = {
             let mut connection = self
@@ -354,6 +468,15 @@ impl SyncManager {
             }
         };
         if removed {
+            if let Some(data) = self
+                .runtime_state
+                .cloud_data_connection
+                .write()
+                .expect("cloud data connection cache poisoned")
+                .take()
+            {
+                data.close(0_u32.into(), b"cloud control connection invalidated");
+            }
             self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
             let mut session = self
                 .runtime_state
@@ -380,6 +503,15 @@ impl SyncManager {
             .take()?;
         let stable_id = connection.stable_id();
         connection.close(0_u32.into(), b"cloud network path changed");
+        if let Some(data) = self
+            .runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned")
+            .take()
+        {
+            data.close(0_u32.into(), b"cloud network path changed");
+        }
         self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
         let mut session = self
             .runtime_state
@@ -413,6 +545,11 @@ impl SyncManager {
             .expect("cloud connection cache poisoned")
             .take();
         self.runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned")
+            .take();
+        self.runtime_state
             .cloud_session
             .write()
             .expect("cloud session state poisoned")
@@ -426,6 +563,11 @@ impl SyncManager {
             .lan_connections
             .write()
             .expect("LAN connection cache poisoned")
+            .clear();
+        self.runtime_state
+            .lan_data_connections
+            .write()
+            .expect("LAN data connection cache poisoned")
             .clear();
     }
 

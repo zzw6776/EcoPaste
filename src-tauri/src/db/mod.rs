@@ -6,8 +6,7 @@ pub mod items;
 pub mod models;
 pub mod path;
 pub mod state;
-pub mod sync_item_state;
-pub mod sync_queue;
+pub mod sync_items;
 
 pub use init::{init, init_at};
 pub use path::db_path;

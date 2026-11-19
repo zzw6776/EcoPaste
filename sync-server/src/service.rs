@@ -11,8 +11,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecopaste_sync_protocol::{
-    ErrorCode, FrameError, HubStatus, MAX_EVENTS_PER_BATCH, QuotaPolicy, Request, Response,
-    limit_events_page, limit_retention_plan, limit_sync_response, read_frame, write_frame,
+    ErrorCode, FrameError, HubStatus, MAX_ITEMS_PER_BATCH, QuotaPolicy, Request, Response,
+    SyncItemWrite, limit_items_page, limit_sync_response, read_frame, write_frame,
 };
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch
 use tracing::{debug, info, warn};
 
 use crate::repository::{
-    CleanupPolicy, HistoryGap, QuotaExceeded, Repository, now_ms, validate_identifier,
+    CleanupPolicy, QuotaExceeded, Repository, UpsertItemsResult, now_ms, validate_identifier,
 };
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -151,8 +151,8 @@ pub struct HubService {
     blob_root: Arc<PathBuf>,
     max_group_bytes: u64,
     quota_policy: QuotaPolicy,
-    event_retention_days: u32,
-    max_events_per_group: u64,
+    item_retention_days: u32,
+    max_items_per_group: u64,
     blob_quota_states: Arc<StdMutex<HashMap<String, BlobQuotaState>>>,
     quota_cleanup_targets: Arc<StdMutex<HashMap<String, u64>>>,
     cleanup_wake: Arc<Notify>,
@@ -170,16 +170,16 @@ impl HubService {
         blob_root: PathBuf,
         max_group_bytes: u64,
         quota_policy: QuotaPolicy,
-        event_retention_days: u32,
-        max_events_per_group: u64,
+        item_retention_days: u32,
+        max_items_per_group: u64,
     ) -> Self {
         Self {
             repository,
             blob_root: Arc::new(blob_root),
             max_group_bytes,
             quota_policy,
-            event_retention_days,
-            max_events_per_group,
+            item_retention_days,
+            max_items_per_group,
             blob_quota_states: Arc::new(StdMutex::new(HashMap::new())),
             quota_cleanup_targets: Arc::new(StdMutex::new(HashMap::new())),
             cleanup_wake: Arc::new(Notify::new()),
@@ -243,7 +243,7 @@ impl HubService {
         );
     }
 
-    /// Serializes membership changes and event insertion within one sync group.
+    /// Serializes membership changes and item writes within one sync group.
     async fn group_sync_lock(&self, group_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.group_sync_locks.lock().await;
         locks
@@ -384,13 +384,13 @@ impl HubService {
         })
     }
 
-    async fn insert_events_with_quota_recovery(
+    async fn upsert_items_with_quota_recovery(
         &self,
         group_id: &str,
-        events: &[ecopaste_sync_protocol::EncryptedEvent],
-    ) -> Result<Vec<String>> {
-        let result = self.repository.insert_events(group_id, events, None).await;
-        if matches!(&result, Ok(accepted_event_ids) if !accepted_event_ids.is_empty()) {
+        writes: &[SyncItemWrite],
+    ) -> Result<UpsertItemsResult> {
+        let result = self.repository.upsert_items(group_id, writes, None).await;
+        if matches!(&result, Ok(upserted) if !upserted.accepted.is_empty()) {
             self.request_policy_cleanup_if_needed(group_id).await;
         }
         result
@@ -432,8 +432,6 @@ impl HubService {
                 .and_then(|directory| known_groups.get(directory))
                 .cloned()
             else {
-                // A group can be created after the directory snapshot. Unknown directories are
-                // left untouched; every valid group's contents are reconciled on the next pass.
                 continue;
             };
             let group_lock = self.group_sync_lock(&group_id).await;
@@ -524,14 +522,11 @@ impl HubService {
             let mut history_pruned = false;
             loop {
                 let now = now_ms();
-                let retention_cutoff_ms = (self.event_retention_days > 0)
-                    .then(|| now.saturating_sub(i64::from(self.event_retention_days) * 86_400_000));
+                let retention_cutoff_ms = (self.item_retention_days > 0)
+                    .then(|| now.saturating_sub(i64::from(self.item_retention_days) * 86_400_000));
                 let result = {
                     let group_lock = self.group_sync_lock(&group_id).await;
                     let _group_guard = group_lock.lock().await;
-                    // An upload writes its final file before recording metadata. Avoid reclaiming
-                    // that path between those two steps, and keep metadata/file deletion atomic
-                    // with respect to the next upload reservation.
                     if self.has_active_blob_upload(&group_id) {
                         blocked_by_upload = true;
                         break;
@@ -542,9 +537,8 @@ impl HubService {
                             &group_id,
                             CleanupPolicy {
                                 retention_cutoff_ms,
-                                legacy_blob_cutoff_ms: retention_cutoff_ms,
-                                max_events: (self.max_events_per_group > 0)
-                                    .then_some(self.max_events_per_group),
+                                max_items: (self.max_items_per_group > 0)
+                                    .then_some(self.max_items_per_group),
                                 target_bytes: cleanup_target,
                                 orphan_cutoff_ms: now.saturating_sub(
                                     i64::try_from(HUB_ORPHAN_GRACE.as_millis()).unwrap_or(i64::MAX),
@@ -569,15 +563,15 @@ impl HubService {
                     }
                     result
                 };
-                if result.deleted_events > 0 || !result.deleted_blob_ids.is_empty() {
+                if result.deleted_items > 0 || !result.deleted_blob_ids.is_empty() {
                     info!(
                         group_ref = %group_log_ref(&group_id),
-                        deleted_events = result.deleted_events,
+                        deleted_items = result.deleted_items,
                         deleted_blobs = result.deleted_blob_ids.len(),
                         "Hub retention batch completed"
                     );
                 }
-                history_pruned |= result.deleted_events > 0;
+                history_pruned |= result.deleted_items > 0;
                 if !result.has_more {
                     break;
                 }
@@ -725,94 +719,33 @@ impl HubService {
                     .await?;
                 write_frame(send, &Response::GroupCreated).await?;
             }
-            Request::RetentionPlan {
-                group_id,
-                access_token,
-                decoder_revision,
-            } => {
-                self.repository
-                    .authenticate(&group_id, &access_token)
-                    .await?;
-                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
-                    .await?;
-                let events = self
-                    .repository
-                    .retention_candidates(&group_id, remote_endpoint_id, decoder_revision)
-                    .await?;
-                let mut response = Response::RetentionPlan {
-                    epoch: self.repository.retention_epoch(&group_id).await?,
-                    has_more: events.len() == usize::from(MAX_EVENTS_PER_BATCH),
-                    events,
-                };
-                limit_retention_plan(&mut response)?;
-                write_frame(send, &response).await?;
-            }
-            Request::SetRetention {
+            Request::CloudSyncItems {
                 group_id,
                 access_token,
                 device,
-                generation,
-                protected_keys,
-                mappings,
-                deferred,
-            } => {
-                self.repository
-                    .authenticate(&group_id, &access_token)
-                    .await?;
-                if device.endpoint_id != remote_endpoint_id {
-                    bail!("device endpoint identity does not match the connection");
-                }
-                let group_lock = self.group_sync_lock(&group_id).await;
-                let guard = group_lock.lock().await;
-                self.repository.upsert_device(&group_id, &device).await?;
-                self.repository
-                    .set_retention(
-                        &group_id,
-                        &device.device_id,
-                        generation,
-                        protected_keys.as_deref(),
-                        &mappings,
-                        deferred.as_ref(),
-                    )
-                    .await?;
-                drop(guard);
-                self.cleanup_wake.notify_one();
-                write_frame(send, &Response::RetentionUpdated).await?;
-            }
-            Request::CloudSync {
-                group_id,
-                access_token,
-                device,
-                after_cursor,
-                events,
+                after_seq,
+                before_seq,
+                items,
                 removed_devices,
                 limit,
-                bounded_hub,
             } => {
                 let started_at = Instant::now();
-                let submitted_event_count = events.len();
+                let submitted_item_count = items.len();
                 let submitted_removal_count = removed_devices.len();
-                let newest_submitted_event_at_ms =
-                    events.iter().map(|event| event.created_at_ms).max();
                 self.repository
                     .authenticate(&group_id, &access_token)
                     .await?;
                 if device.endpoint_id != remote_endpoint_id {
                     bail!("device endpoint identity does not match the connection");
                 }
-                if events.len() > usize::from(MAX_EVENTS_PER_BATCH) {
-                    bail!("too many events");
+                if items.len() > usize::from(MAX_ITEMS_PER_BATCH) {
+                    bail!("too many items");
                 }
                 if removed_devices.len() > 256 {
                     bail!("too many removed devices");
                 }
                 let group_lock = self.group_sync_lock(&group_id).await;
                 let group_guard = group_lock.lock().await;
-                if bounded_hub {
-                    self.repository
-                        .ensure_cursor_available(&group_id, after_cursor)
-                        .await?;
-                }
 
                 let remote_was_removed = self
                     .repository
@@ -839,7 +772,7 @@ impl HubService {
                     }
                     info!(
                         protocol = "cloud",
-                        submitted_events = submitted_event_count,
+                        submitted_items = submitted_item_count,
                         submitted_removals = submitted_removal_count,
                         returned_removals = merged_removals.len(),
                         elapsed_ms = started_at.elapsed().as_millis(),
@@ -848,12 +781,14 @@ impl HubService {
                     write_frame(
                         send,
                         &Response::CloudSynced {
-                            accepted_event_ids: Vec::new(),
-                            events: Vec::new(),
+                            accepted: Vec::new(),
+                            conflicts: Vec::new(),
+                            items: Vec::new(),
                             peers: Vec::new(),
-                            latest_cursor: after_cursor,
                             removed_devices: merged_removals,
-                            has_more: false,
+                            latest_seq: after_seq,
+                            pruned_through_seq: 0,
+                            next_before_seq: None,
                         },
                     )
                     .await?;
@@ -861,49 +796,48 @@ impl HubService {
                 }
 
                 self.repository.upsert_device(&group_id, &device).await?;
-                let accepted_event_ids = self
-                    .insert_events_with_quota_recovery(&group_id, &events)
+                let upserted = self
+                    .upsert_items_with_quota_recovery(&group_id, &items)
                     .await?;
-                let events_changed = !accepted_event_ids.is_empty();
-                let events = self
+                let items_changed = !upserted.accepted.is_empty();
+                let window = self
                     .repository
-                    .list_events(
+                    .list_items_window(
                         &group_id,
-                        after_cursor,
-                        limit.clamp(1, MAX_EVENTS_PER_BATCH),
+                        after_seq,
+                        before_seq,
+                        items_changed.then_some(upserted.pre_write_latest_seq),
+                        limit.clamp(1, MAX_ITEMS_PER_BATCH),
                     )
                     .await?;
-                let latest_cursor = events
-                    .last()
-                    .map(|item| item.cursor)
-                    .unwrap_or(after_cursor.max(self.repository.latest_cursor(&group_id).await?));
-                let group_latest_cursor = if events_changed {
-                    self.repository.latest_cursor(&group_id).await?
-                } else {
-                    latest_cursor
-                };
                 let peers = self
                     .repository
                     .list_peers(&group_id, &device.device_id)
                     .await?;
                 drop(group_guard);
-                if removals_changed || events_changed {
+                if removals_changed || items_changed {
                     self.notify_group_change(&group_id).await;
                 }
+
                 let returned_removal_count = merged_removals.len();
                 let mut response = Response::CloudSynced {
-                    accepted_event_ids,
-                    events,
+                    accepted: upserted.accepted,
+                    conflicts: upserted.conflicts,
+                    items: window.items,
                     peers,
-                    latest_cursor,
                     removed_devices: merged_removals,
-                    has_more: false,
+                    latest_seq: window.latest_seq,
+                    pruned_through_seq: window.pruned_through_seq,
+                    next_before_seq: None,
                 };
-                limit_sync_response(&mut response, after_cursor, limit)?;
+                limit_sync_response(&mut response, window.had_more)?;
                 let Response::CloudSynced {
-                    accepted_event_ids,
-                    events,
-                    latest_cursor,
+                    accepted,
+                    conflicts,
+                    items,
+                    latest_seq,
+                    pruned_through_seq,
+                    next_before_seq,
                     ..
                 } = &response
                 else {
@@ -913,15 +847,15 @@ impl HubService {
                     protocol = "cloud",
                     group_ref = %group_log_ref(&group_id),
                     source_endpoint_id = remote_endpoint_id,
-                    submitted_events = submitted_event_count,
-                    accepted_events = accepted_event_ids.len(),
-                    returned_events = events.len(),
+                    submitted_items = submitted_item_count,
+                    accepted_items = accepted.len(),
+                    conflict_items = conflicts.len(),
+                    returned_items = items.len(),
                     submitted_removals = submitted_removal_count,
                     returned_removals = returned_removal_count,
-                    latest_cursor,
-                    group_latest_cursor,
-                    newest_submitted_event_at_ms = ?newest_submitted_event_at_ms,
-                    accepted_at_ms = now_ms(),
+                    latest_seq,
+                    pruned_through_seq,
+                    next_before_seq = ?next_before_seq,
                     elapsed_ms = started_at.elapsed().as_millis(),
                     "cloud sync request completed"
                 );
@@ -930,7 +864,7 @@ impl HubService {
             request @ (Request::PutManagedBlob { .. }
             | Request::PutManagedSourceIcon { .. }
             | Request::PutManagedStreamBlob { .. }) => {
-                let notify_source_icon = matches!(request, Request::PutManagedSourceIcon { .. });
+                let is_source_icon = matches!(request, Request::PutManagedSourceIcon { .. });
                 let streaming = matches!(request, Request::PutManagedStreamBlob { .. });
                 let (group_id, access_token, blob_id, size, transfer_id) = match request {
                     Request::PutManagedBlob {
@@ -995,7 +929,7 @@ impl HubService {
                         group_ref = %group_log_ref(&group_id),
                         source_endpoint_id = remote_endpoint_id,
                         blob_ref = %blob_log_ref(&blob_id),
-                        kind = if notify_source_icon { "source-icon" } else { "content" },
+                        kind = if is_source_icon { "source-icon" } else { "content" },
                         outcome = "already-stored",
                         blob_bytes = size,
                         uploaded_bytes = 0_u64,
@@ -1028,23 +962,27 @@ impl HubService {
                     })
                     .await?;
                     let receive_elapsed = receive_started_at.elapsed();
-                    {
+                    let items_bumped = {
                         let group_lock = self.group_sync_lock(&group_id).await;
                         let _group_guard = group_lock.lock().await;
-                        self.repository
-                            .record_blob(&group_id, &blob_id, size, true)
+                        let bumped = self
+                            .repository
+                            .record_blob(&group_id, &blob_id, size)
                             .await?;
                         drop(reservation);
-                    }
+                        bumped
+                    };
                     self.request_policy_cleanup_if_needed(&group_id).await;
-                    self.notify_group_change(&group_id).await;
+                    if items_bumped {
+                        self.notify_group_change(&group_id).await;
+                    }
                     let confirmation_started_at = Instant::now();
                     write_frame(send, &Response::BlobStored).await?;
                     info!(
                         group_ref = %group_log_ref(&group_id),
                         source_endpoint_id = remote_endpoint_id,
                         blob_ref = %blob_log_ref(&blob_id),
-                        kind = if notify_source_icon { "source-icon" } else { "content" },
+                        kind = if is_source_icon { "source-icon" } else { "content" },
                         outcome = "uploaded",
                         blob_bytes = size,
                         uploaded_bytes = size,
@@ -1052,7 +990,7 @@ impl HubService {
                         response_write_ms = readiness_elapsed.as_millis(),
                         receive_ms = receive_elapsed.as_millis(),
                         confirmation_write_ms = confirmation_started_at.elapsed().as_millis(),
-                        watchers_notified = true,
+                        watchers_notified = items_bumped,
                         total_ms = started_at.elapsed().as_millis(),
                         "cloud blob request completed"
                     );
@@ -1095,59 +1033,10 @@ impl HubService {
                 .context("send encrypted blob")?;
                 write_frame(send, &Response::BlobStored).await?;
             }
-            Request::SyncCloudAvailability {
-                group_id,
-                access_token,
-                after_cursor,
-                limit,
-            } => {
-                self.repository
-                    .authenticate(&group_id, &access_token)
-                    .await?;
-                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
-                    .await?;
-                let (updates, latest_cursor, has_more, pruned_availability_cursor) = self
-                    .repository
-                    .cloud_availability_updates(&group_id, after_cursor, limit)
-                    .await?;
-                write_frame(
-                    send,
-                    &Response::CloudAvailabilitySynced {
-                        updates,
-                        latest_cursor,
-                        has_more,
-                        pruned_availability_cursor,
-                    },
-                )
-                .await?;
-            }
-            Request::CheckCloudAvailability {
-                group_id,
-                access_token,
-                event_ids,
-            } => {
-                self.repository
-                    .authenticate(&group_id, &access_token)
-                    .await?;
-                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
-                    .await?;
-                let (updates, missing_event_ids) = self
-                    .repository
-                    .check_cloud_availability(&group_id, &event_ids)
-                    .await?;
-                write_frame(
-                    send,
-                    &Response::CloudAvailabilityChecked {
-                        updates,
-                        missing_event_ids,
-                    },
-                )
-                .await?;
-            }
             Request::WatchCloud {
                 group_id,
                 access_token,
-                after_cursor,
+                after_seq,
                 after_removed_at_ms,
             } => {
                 self.repository
@@ -1156,7 +1045,7 @@ impl HubService {
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 let mut changes = self.group_changes(&group_id).await;
-                let (mut latest_cursor, mut latest_removed_at_ms, mut latest_availability_cursor) =
+                let (mut latest_seq, mut latest_removed_at_ms) =
                     self.repository.group_watermarks(&group_id).await?;
                 self.repository
                     .touch_device(&group_id, remote_endpoint_id)
@@ -1169,11 +1058,7 @@ impl HubService {
                         FRAME_WRITE_TIMEOUT,
                         write_frame(
                             send,
-                            &cloud_changed_response(
-                                latest_cursor,
-                                latest_removed_at_ms,
-                                latest_availability_cursor,
-                            ),
+                            &cloud_changed_response(latest_seq, latest_removed_at_ms),
                         ),
                     )
                     .await
@@ -1182,7 +1067,7 @@ impl HubService {
                         group_ref = %group_ref,
                         target_endpoint_id = remote_endpoint_id,
                         watch_generation,
-                        latest_cursor,
+                        latest_seq,
                         latest_removed_at_ms,
                         ready_at_ms = now_ms(),
                         "cloud watch stream ready"
@@ -1197,11 +1082,8 @@ impl HubService {
                             ) => matches!(result, Ok(Ok(()))),
                         };
                         if changed {
-                            (
-                                latest_cursor,
-                                latest_removed_at_ms,
-                                latest_availability_cursor,
-                            ) = self.repository.group_watermarks(&group_id).await?;
+                            (latest_seq, latest_removed_at_ms) =
+                                self.repository.group_watermarks(&group_id).await?;
                         }
                         self.repository
                             .touch_device(&group_id, remote_endpoint_id)
@@ -1212,9 +1094,8 @@ impl HubService {
                             write_frame(
                                 send,
                                 &cloud_changed_response(
-                                    latest_cursor.max(after_cursor),
+                                    latest_seq.max(after_seq),
                                     latest_removed_at_ms.max(after_removed_at_ms),
-                                    latest_availability_cursor,
                                 ),
                             ),
                         )
@@ -1226,7 +1107,7 @@ impl HubService {
                                 target_endpoint_id = remote_endpoint_id,
                                 watch_generation,
                                 notification_version = *changes.borrow(),
-                                latest_cursor,
+                                latest_seq,
                                 latest_removed_at_ms,
                                 sent_at_ms = now_ms(),
                                 write_ms = write_started_at.elapsed().as_millis(),
@@ -1240,12 +1121,11 @@ impl HubService {
                     .await;
                 watch_result?;
             }
-            Request::ListEvents {
+            Request::ListItems {
                 group_id,
                 access_token,
-                before_cursor,
+                before_seq,
                 limit,
-                include_states,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)
@@ -1253,22 +1133,16 @@ impl HubService {
                 self.ensure_endpoint_active(&group_id, remote_endpoint_id)
                     .await?;
                 let limit = limit.clamp(1, 100);
-                let include_states = include_states.unwrap_or(false);
-                let (events, next_before_cursor) = self
+                let (items, next_before_seq, total) = self
                     .repository
-                    .list_events_before(&group_id, before_cursor, limit, include_states)
+                    .list_active_items_page(&group_id, before_seq, limit)
                     .await?;
-                let total = if include_states {
-                    self.repository.group_usage(&group_id).await?.event_count
-                } else {
-                    self.repository.event_count(&group_id).await?
-                };
-                let mut response = Response::EventsPage {
-                    events,
-                    next_before_cursor,
+                let mut response = Response::ItemsPage {
+                    items,
+                    next_before_seq,
                     total,
                 };
-                limit_events_page(&mut response)?;
+                limit_items_page(&mut response)?;
                 write_frame(send, &response).await?;
             }
             Request::ListDevices {
@@ -1299,45 +1173,21 @@ impl HubService {
                         hub_status: Some(HubStatus {
                             used_bytes: usage.used_bytes,
                             max_bytes: self.max_group_bytes,
-                            event_count: usage.event_count,
+                            event_count: usage.item_count,
                             blob_count: usage.blob_count,
-                            oldest_event_received_at_ms: usage.oldest_event_received_at_ms,
-                            retention_days: self.event_retention_days,
-                            max_events: self.max_events_per_group,
+                            oldest_event_received_at_ms: usage.oldest_item_received_at_ms,
+                            retention_days: self.item_retention_days,
+                            max_events: self.max_items_per_group,
                         }),
                     },
                 )
                 .await?;
             }
-            Request::BootstrapPlan {
-                group_id,
-                access_token,
-            } => {
-                self.repository
-                    .authenticate(&group_id, &access_token)
-                    .await?;
-                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
-                    .await?;
-                let (start_cursor, latest_cursor) =
-                    self.repository.bootstrap_cursor_bounds(&group_id).await?;
-                write_frame(
-                    send,
-                    &Response::BootstrapPlan {
-                        start_cursor,
-                        latest_cursor,
-                    },
-                )
-                .await?;
-            }
             Request::Health
-            | Request::Sync { .. }
+            | Request::SyncItems { .. }
             | Request::BlobPart { .. }
-            | Request::PutBlob { .. }
-            | Request::PutSourceIcon { .. }
-            | Request::PutStreamBlob { .. }
             | Request::SyncRemovedDevices { .. }
-            | Request::PlanLanContent { .. }
-            | Request::AcknowledgeLan { .. }
+            | Request::AckLanItems { .. }
             | Request::CommitStreamBlob { .. } => {
                 bail!("request is not part of the current cloud protocol");
             }
@@ -1461,7 +1311,6 @@ async fn receive_blob<R: AsyncRead + Unpin>(
         while remaining > 0 {
             let requested =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            // Multipart owns the network deadline; this pipe waits for an entire ordered part.
             let read = recv.read(&mut buffer[..requested]).await?;
             if read == 0 {
                 bail!("blob ended early");
@@ -1500,9 +1349,7 @@ async fn receive_blob<R: AsyncRead + Unpin>(
 
 fn response_for_error(error: &anyhow::Error) -> Response {
     let message = error.to_string();
-    let code = if error.chain().any(|cause| cause.is::<HistoryGap>()) {
-        ErrorCode::HistoryGap
-    } else if error
+    let code = if error
         .chain()
         .any(|cause| cause.is::<QuotaExceeded>() || cause.is::<InsufficientStorage>())
     {
@@ -1532,16 +1379,11 @@ fn blob_log_ref(blob_id: &str) -> &str {
     blob_id.get(..12).unwrap_or(blob_id)
 }
 
-fn cloud_changed_response(
-    latest_cursor: u64,
-    latest_removed_at_ms: i64,
-    latest_availability_cursor: u64,
-) -> Response {
+fn cloud_changed_response(latest_seq: u64, latest_removed_at_ms: i64) -> Response {
     Response::CloudChanged {
-        latest_cursor,
+        latest_seq,
         latest_removed_at_ms,
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
-        latest_availability_cursor,
     }
 }
 
@@ -1553,9 +1395,23 @@ fn is_frame_io_error(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ecopaste_sync_protocol::{EncryptedEvent, SyncEventKind};
-
     use super::*;
+
+    fn sample_write(item_key_char: char, ciphertext_len: usize) -> SyncItemWrite {
+        SyncItemWrite {
+            item_key: item_key_char.to_string().repeat(64),
+            expected_hub_rev: 0,
+            local_seq: 1,
+            origin_device_id: "device_123456".into(),
+            updated_at_ms: 1,
+            deleted: false,
+            protected: false,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; ciphertext_len],
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+        }
+    }
 
     #[test]
     fn disk_pressure_requests_only_the_missing_capacity() {
@@ -1586,7 +1442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_event_write_requests_the_shared_quota_target() {
+    async fn successful_item_write_requests_the_shared_quota_target() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Repository::open(&directory.path().join("hub.sqlite3"))
             .await
@@ -1603,21 +1459,9 @@ mod tests {
             0,
             0,
         );
-        let event = EncryptedEvent {
-            event_id: "event_123".into(),
-            origin_device_id: "device_123".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 68],
-            kind: SyncEventKind::Content,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: Some("a".repeat(64)),
-        };
 
         service
-            .insert_events_with_quota_recovery("group_123", &[event])
+            .upsert_items_with_quota_recovery("group_123", &[sample_write('a', 68)])
             .await
             .unwrap();
 
@@ -1636,22 +1480,7 @@ mod tests {
             .await
             .unwrap();
         repository
-            .insert_events(
-                "group_123",
-                &[EncryptedEvent {
-                    event_id: "event_123".into(),
-                    origin_device_id: "device_123".into(),
-                    origin_sequence: 1,
-                    created_at_ms: 1,
-                    nonce: vec![1; 24],
-                    ciphertext: vec![2; 16],
-                    kind: SyncEventKind::Content,
-                    blob_ids: Vec::new(),
-                    optional_blob_ids: Vec::new(),
-                    retention_key: Some("a".repeat(64)),
-                }],
-                None,
-            )
+            .upsert_items("group_123", &[sample_write('a', 16)], None)
             .await
             .unwrap();
         let service = HubService::new(
@@ -1669,7 +1498,7 @@ mod tests {
             .unwrap();
         assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(44));
         repository
-            .record_blob("group_123", &"b".repeat(64), 40, true)
+            .record_blob("group_123", &"b".repeat(64), 40)
             .await
             .unwrap();
         drop(reservation);
@@ -1693,7 +1522,7 @@ mod tests {
         let live_blob = "a".repeat(64);
         let orphaned_blob = "b".repeat(64);
         repository
-            .record_blob("group_123", &live_blob, 4, true)
+            .record_blob("group_123", &live_blob, 4)
             .await
             .unwrap();
         let blob_root = directory.path().join("blobs");
@@ -1734,26 +1563,13 @@ mod tests {
             .unwrap();
         let blob_id = "a".repeat(64);
         repository
-            .record_blob("group_123", &blob_id, 48, true)
+            .record_blob("group_123", &blob_id, 48)
             .await
             .unwrap();
+        let mut write = sample_write('a', 16);
+        write.blob_ids = vec![blob_id];
         repository
-            .insert_events(
-                "group_123",
-                &[EncryptedEvent {
-                    event_id: "event_123".into(),
-                    origin_device_id: "device_123".into(),
-                    origin_sequence: 1,
-                    created_at_ms: 1,
-                    nonce: vec![1; 24],
-                    ciphertext: vec![2; 16],
-                    kind: SyncEventKind::Content,
-                    blob_ids: vec![blob_id],
-                    optional_blob_ids: Vec::new(),
-                    retention_key: Some("a".repeat(64)),
-                }],
-                None,
-            )
+            .upsert_items("group_123", &[write], None)
             .await
             .unwrap();
         let service = HubService::new(
@@ -1774,142 +1590,5 @@ mod tests {
 
         assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 0);
         assert_eq!(service.pending_quota_cleanup_target("group_123"), None);
-    }
-
-    #[tokio::test]
-    async fn quota_cleanup_target_remains_until_usage_reaches_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7_u8; 32])
-            .await
-            .unwrap();
-        repository
-            .record_blob("group_123", &"d".repeat(64), 48, false)
-            .await
-            .unwrap();
-        let service = HubService::new(
-            repository.clone(),
-            directory.path().join("blobs"),
-            64,
-            QuotaPolicy::default(),
-            0,
-            0,
-        );
-
-        let reservation = service
-            .reserve_blob_quota_locked("group_123", 32, 32)
-            .await
-            .unwrap();
-        drop(reservation);
-        service.cleanup_all_groups().await.unwrap();
-
-        assert_eq!(repository.group_used_bytes("group_123").await.unwrap(), 48);
-        assert_eq!(service.pending_quota_cleanup_target("group_123"), Some(44));
-    }
-
-    #[tokio::test]
-    async fn full_hub_reclaims_space_after_more_than_one_cycle_of_legacy_registration() {
-        use ecopaste_sync_protocol::{DeviceAnnouncement, RetentionMapping};
-
-        let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(&directory.path().join("hub.sqlite3"))
-            .await
-            .unwrap();
-        repository
-            .create_group("group_123", &[7; 32])
-            .await
-            .unwrap();
-        let events = (1..=u64::from(MAX_EVENTS_PER_BATCH) * 8 + 1)
-            .map(|sequence| EncryptedEvent {
-                event_id: format!("legacy_{sequence}"),
-                origin_device_id: "device_123".into(),
-                origin_sequence: sequence,
-                created_at_ms: 1,
-                nonce: vec![1; 24],
-                ciphertext: vec![2; 16],
-                kind: SyncEventKind::Content,
-                blob_ids: Vec::new(),
-                optional_blob_ids: Vec::new(),
-                retention_key: None,
-            })
-            .collect::<Vec<_>>();
-        repository
-            .insert_events("group_123", &events, None)
-            .await
-            .unwrap();
-        let used = repository.group_used_bytes("group_123").await.unwrap();
-        let service = HubService::new(
-            repository.clone(),
-            directory.path().join("blobs"),
-            used,
-            QuotaPolicy::default(),
-            0,
-            0,
-        );
-        let reservation = service
-            .reserve_blob_quota_locked("group_123", 64, 64)
-            .await
-            .unwrap();
-        drop(reservation);
-        repository
-            .upsert_device(
-                "group_123",
-                &DeviceAnnouncement {
-                    device_id: "device_123".into(),
-                    device_name: "test".into(),
-                    platform: "macos".into(),
-                    endpoint_id: "endpoint_123".into(),
-                    direct_addresses: Vec::new(),
-                    relay_urls: Vec::new(),
-                    app_version: "1.1.168".into(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut pages = 0;
-        loop {
-            let candidates = repository
-                .retention_candidates("group_123", "endpoint_123", None)
-                .await
-                .unwrap();
-            if candidates.is_empty() {
-                break;
-            }
-            let mappings = candidates
-                .iter()
-                .map(|stored| RetentionMapping {
-                    event_id: stored.event.event_id.clone(),
-                    item_key: format!("{:064x}", stored.cursor),
-                    blob_ids: Vec::new(),
-                })
-                .collect::<Vec<_>>();
-            repository
-                .set_retention("group_123", "device_123", 1, Some(&[]), &mappings, None)
-                .await
-                .unwrap();
-            pages += 1;
-            service.cleanup_all_groups().await.unwrap();
-            if pages <= 8 {
-                assert_eq!(
-                    repository.group_used_bytes("group_123").await.unwrap(),
-                    used
-                );
-                assert!(service.pending_quota_cleanup_target("group_123").is_some());
-            }
-        }
-        assert_eq!(pages, 9);
-        assert!(
-            repository.group_used_bytes("group_123").await.unwrap()
-                <= service.quota_policy.target_bytes(service.max_group_bytes)
-        );
-        let reservation = service
-            .reserve_blob_quota_locked("group_123", 64, 64)
-            .await
-            .unwrap();
-        drop(reservation);
     }
 }

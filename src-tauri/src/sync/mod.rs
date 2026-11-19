@@ -9,7 +9,6 @@ mod model;
 mod pairing;
 mod progress;
 pub(crate) mod repository;
-mod transfer;
 mod upload;
 
 #[cfg(target_os = "android")]
@@ -19,7 +18,7 @@ pub use manager::SyncManager;
 pub(crate) use manager::{LEGACY_SYNC_BLOB_DIR, SYNC_STAGING_DIR};
 pub use model::{
     CloudDeviceDirectory, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbySyncSpace,
-    SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget, SyncedItemStatePatch,
+    SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget,
 };
 pub use progress::{TransferRoute, TransferTask};
 

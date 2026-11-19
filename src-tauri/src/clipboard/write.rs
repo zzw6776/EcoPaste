@@ -3,13 +3,11 @@
 //! 时序约束：[`ClipboardContext`] 是 `!Send`，调用方需在不跨 await 的同步段内完成调用
 //! （命令层照 `read_clipboard` 的写法处理）。
 //!
-//! 回环抑制：写回前向 [`WritebackGuard`] 登记将写入内容的 `content_hash`，
-//! OS 监听重新读到同内容时跳过入库，避免「点击粘贴 → 自动新增一条」回环。
-//! 哈希必须与 [`crate::clipboard::ingest::build_item`] 在 watcher 路径上将算出的哈希一致：
-//! - text / html / rtf：watcher 拿到的 plain/html/rtf 经 `draft_from_text` 后 `content` 即我们写入的串，
-//!   `content_hash(Text, written)` 自然匹配；
-//! - files：watcher 把路径列表用 `\n` 连接后哈希，与我们 `item.content` 一致；
-//! - image：使用解码后的像素指纹，避免 Windows 或 clipboard-rs 重编码 PNG 后字节哈希变化。
+//! 回环抑制：写回前统一向 [`ClipboardFingerprintState`] 登记语义抑制令牌并按需发布当前语义指纹，
+//! OS 监听重新读到同语义内容时跳过入库，避免「点击粘贴 / 自动同步写回 → 再次入库」回环：
+//! - text / html / rtf：统一按系统剪贴板纯文本表示生成语义指纹，兼容 Windows `CF_HTML` 包装；
+//! - image：使用解码后的 RGBA 像素指纹，兼容 macOS / Windows 重编码；
+//! - files：使用零文件 I/O 的规范化路径列表令牌，同步写回同时保留跨设备文件语义指纹。
 //!
 //! 纯文本模式（`plain = true`）：忽略 `sub_kind`，写 `search_text`（OS 提供的纯文本表示），
 //! 缺失时退回 `content`。供「纯文本粘贴」快捷路径使用。
@@ -24,11 +22,9 @@ use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 
 use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState};
 #[cfg(not(target_os = "android"))]
-use super::guard::WritebackGuard;
-#[cfg(not(target_os = "android"))]
 use super::storage::ImageStore;
 use crate::core::{AppError, Result};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(test, not(target_os = "android")))]
 use crate::db::items::content_hash;
 use crate::db::models::ClipboardItem;
 #[cfg(not(target_os = "android"))]
@@ -40,18 +36,60 @@ use crate::db::models::ClipboardSubKind;
 #[cfg(not(target_os = "android"))]
 pub fn write_to_clipboard(
     store: &ImageStore,
-    guard: &WritebackGuard,
+    fingerprints: &ClipboardFingerprintState,
     item: &ClipboardItem,
     plain: bool,
 ) -> Result<()> {
     let ctx = ClipboardContext::new().map_err(clip_err)?;
 
     match item.kind {
-        ClipboardKind::Text => write_text(&ctx, guard, item, plain)?,
-        ClipboardKind::Image => write_image(&ctx, store, guard, item)?,
+        ClipboardKind::Text => {
+            let fingerprint = text_write_fingerprint(item, plain);
+            let write = fingerprints.begin_write_with_token(
+                fingerprint.as_str().to_owned(),
+                Some(fingerprint),
+                false,
+            );
+            if let Err(error) = write_text_raw(&ctx, item, plain) {
+                fingerprints.rollback_write(write);
+                return Err(error);
+            }
+        }
+        ClipboardKind::Image => {
+            let bytes = read_image_bytes(store, item)?;
+            let fingerprint = ClipboardFingerprint::from_image_bytes(&bytes);
+            let token = fingerprint
+                .as_ref()
+                .map(|value| value.as_str().to_owned())
+                .unwrap_or_else(|| item.content_hash.clone());
+            let write = fingerprints.begin_write_with_token(token, fingerprint, false);
+            if let Err(error) = write_image_raw(&ctx, &bytes) {
+                fingerprints.rollback_write(write);
+                return Err(error);
+            }
+        }
         // files + plain：把路径列表当文本写回，供「粘贴为路径」使用。
-        ClipboardKind::Files if plain => write_files_as_text(&ctx, guard, item)?,
-        ClipboardKind::Files => write_files(&ctx, guard, item)?,
+        ClipboardKind::Files if plain => {
+            let fingerprint = ClipboardFingerprint::from_text(item.content.trim());
+            let write = fingerprints.begin_write_with_token(
+                fingerprint.as_str().to_owned(),
+                Some(fingerprint),
+                false,
+            );
+            if let Err(error) = write_files_as_text_raw(&ctx, item) {
+                fingerprints.rollback_write(write);
+                return Err(error);
+            }
+        }
+        ClipboardKind::Files => {
+            let paths = parse_file_paths(item)?;
+            let token = ClipboardFingerprint::local_files_suppression_token(&item.content);
+            let write = fingerprints.begin_write_with_token(token, None, false);
+            if let Err(error) = ctx.set_files(paths).map_err(clip_err) {
+                fingerprints.rollback_write(write);
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }
@@ -60,7 +98,6 @@ pub fn write_to_clipboard(
 #[cfg(not(target_os = "android"))]
 pub fn write_synced_item_to_clipboard(
     store: &ImageStore,
-    guard: &WritebackGuard,
     fingerprints: &ClipboardFingerprintState,
     item: &ClipboardItem,
     files_fingerprint: Option<&ClipboardFingerprint>,
@@ -70,38 +107,52 @@ pub fn write_synced_item_to_clipboard(
     } else {
         None
     };
-    let fingerprint = match item.kind {
-        ClipboardKind::Text => ClipboardFingerprint::from_text_item(item),
+    let published = match item.kind {
+        ClipboardKind::Text => Some(text_write_fingerprint(item, false)),
         ClipboardKind::Image => image_bytes
             .as_deref()
             .and_then(ClipboardFingerprint::from_image_bytes),
         ClipboardKind::Files => files_fingerprint.cloned(),
     };
-    if fingerprint
+    if published
         .as_ref()
         .is_some_and(|fingerprint| fingerprints.matches(fingerprint))
     {
         return Ok(false);
     }
 
-    let write = fingerprint.map(|fingerprint| fingerprints.begin_write(fingerprint));
+    let file_paths = if item.kind == ClipboardKind::Files {
+        Some(parse_file_paths(item)?)
+    } else {
+        None
+    };
+    let token = match item.kind {
+        ClipboardKind::Text => published
+            .as_ref()
+            .expect("text fingerprint prepared")
+            .as_str()
+            .to_owned(),
+        ClipboardKind::Image => published
+            .as_ref()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| item.content_hash.clone()),
+        ClipboardKind::Files => ClipboardFingerprint::local_files_suppression_token(&item.content),
+    };
+    let write = fingerprints.begin_write_with_token(token, published, true);
     let result = (|| {
         let ctx = ClipboardContext::new().map_err(clip_err)?;
         match item.kind {
-            ClipboardKind::Text => write_text(&ctx, guard, item, false),
-            ClipboardKind::Image => write_image_bytes(
-                &ctx,
-                guard,
-                item,
-                image_bytes.as_deref().expect("image bytes prepared"),
-            ),
-            ClipboardKind::Files => write_files(&ctx, guard, item),
+            ClipboardKind::Text => write_text_raw(&ctx, item, false),
+            ClipboardKind::Image => {
+                write_image_raw(&ctx, image_bytes.as_deref().expect("image bytes prepared"))
+            }
+            ClipboardKind::Files => ctx
+                .set_files(file_paths.expect("file paths prepared"))
+                .map_err(clip_err),
         }
     })();
     if result.is_err() {
-        if let Some(write) = write {
-            fingerprints.rollback_write(write);
-        }
+        fingerprints.rollback_write(write);
     }
     result.map(|_| true)
 }
@@ -113,7 +164,7 @@ pub fn write_to_clipboard_app(
     item: &ClipboardItem,
 ) -> Result<()> {
     let text = item.search_text.as_deref().unwrap_or(&item.content);
-    write_text_to_clipboard_app(fingerprints, text)
+    write_text_to_clipboard_app(fingerprints, text, false)
 }
 
 /// Android 同步文本仅在纯文本语义变化时写回系统剪贴板。
@@ -123,7 +174,7 @@ pub fn write_synced_item_to_clipboard_app(
     fingerprints: &ClipboardFingerprintState,
     item: &ClipboardItem,
 ) -> Result<bool> {
-    let text = item.search_text.as_deref().unwrap_or(&item.content);
+    let text = item.search_text.as_deref().unwrap_or(&item.content).trim();
     if text.is_empty() {
         return Ok(false);
     }
@@ -132,16 +183,26 @@ pub fn write_synced_item_to_clipboard_app(
         return Ok(false);
     }
 
-    write_text_to_clipboard_app(fingerprints, text).map(|_| true)
+    write_text_to_clipboard_app(fingerprints, text, true).map(|_| true)
 }
 
 #[cfg(target_os = "android")]
-fn write_text_to_clipboard_app(fingerprints: &ClipboardFingerprintState, text: &str) -> Result<()> {
-    if text.is_empty() {
+fn write_text_to_clipboard_app(
+    fingerprints: &ClipboardFingerprintState,
+    text: &str,
+    synced: bool,
+) -> Result<()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return Ok(());
     }
 
-    let write = fingerprints.begin_write(ClipboardFingerprint::from_text(text));
+    let fingerprint = ClipboardFingerprint::from_text(trimmed);
+    let write = fingerprints.begin_write_with_token(
+        fingerprint.as_str().to_owned(),
+        Some(fingerprint),
+        synced,
+    );
     let result = crate::commands::android::write_android_clipboard_text(text)
         .map_err(|error| AppError::Clipboard(error.to_string()));
     if result.is_err() {
@@ -151,12 +212,21 @@ fn write_text_to_clipboard_app(fingerprints: &ClipboardFingerprintState, text: &
 }
 
 #[cfg(not(target_os = "android"))]
-fn write_text(
-    ctx: &ClipboardContext,
-    guard: &WritebackGuard,
-    item: &ClipboardItem,
-    plain: bool,
-) -> Result<()> {
+fn text_write_fingerprint(item: &ClipboardItem, plain: bool) -> ClipboardFingerprint {
+    let text = if plain
+        || matches!(
+            item.sub_kind,
+            Some(ClipboardSubKind::Html | ClipboardSubKind::Rtf)
+        ) {
+        item.search_text.as_deref().unwrap_or(&item.content)
+    } else {
+        &item.content
+    };
+    ClipboardFingerprint::from_text(text.trim())
+}
+
+#[cfg(not(target_os = "android"))]
+fn write_text_raw(ctx: &ClipboardContext, item: &ClipboardItem, plain: bool) -> Result<()> {
     // 纯文本模式下，OS 提供的 plain 表示优先；缺失时退回 content（plain 文本场景下 content 即纯文本）。
     let (content, sub_kind) = if plain {
         let text = item
@@ -168,8 +238,6 @@ fn write_text(
         (item.content.clone(), item.sub_kind)
     };
 
-    guard.suppress(content_hash(ClipboardKind::Text, &content));
-
     match sub_kind {
         // 纯文本模式必须只写 Text flavor，确保清掉剪贴板中可能残留的 HTML/RTF。
         None if plain => ctx
@@ -180,7 +248,6 @@ fn write_text(
         // 走 set(Vec<ClipboardContent>) 一次写多格式（内部不再相互清空）。
         Some(ClipboardSubKind::Html) => {
             let plain = item.search_text.clone().unwrap_or_else(|| content.clone());
-            guard.suppress(content_hash(ClipboardKind::Text, &plain));
             ctx.set(vec![
                 ClipboardContent::Text(plain),
                 ClipboardContent::Html(content),
@@ -189,7 +256,6 @@ fn write_text(
         }
         Some(ClipboardSubKind::Rtf) => {
             let plain = item.search_text.clone().unwrap_or_else(|| content.clone());
-            guard.suppress(content_hash(ClipboardKind::Text, &plain));
             ctx.set(vec![
                 ClipboardContent::Text(plain),
                 ClipboardContent::Rtf(content),
@@ -203,17 +269,6 @@ fn write_text(
 }
 
 #[cfg(not(target_os = "android"))]
-fn write_image(
-    #[cfg_attr(target_os = "macos", allow(unused_variables))] ctx: &ClipboardContext,
-    store: &ImageStore,
-    guard: &WritebackGuard,
-    item: &ClipboardItem,
-) -> Result<()> {
-    let bytes = read_image_bytes(store, item)?;
-    write_image_bytes(ctx, guard, item, &bytes)
-}
-
-#[cfg(not(target_os = "android"))]
 fn read_image_bytes(store: &ImageStore, item: &ClipboardItem) -> Result<Vec<u8>> {
     let path = store.origin_path(&item.content);
     std::fs::read(&path).map_err(|err| {
@@ -223,17 +278,10 @@ fn read_image_bytes(store: &ImageStore, item: &ClipboardItem) -> Result<Vec<u8>>
 }
 
 #[cfg(not(target_os = "android"))]
-fn write_image_bytes(
+fn write_image_raw(
     #[cfg_attr(target_os = "macos", allow(unused_variables))] ctx: &ClipboardContext,
-    guard: &WritebackGuard,
-    item: &ClipboardItem,
     bytes: &[u8],
 ) -> Result<()> {
-    let suppression = ClipboardFingerprint::from_image_bytes(bytes)
-        .map(|fingerprint| fingerprint.as_str().to_owned())
-        .unwrap_or_else(|| item.content_hash.clone());
-    guard.suppress(suppression.clone());
-
     #[cfg(target_os = "macos")]
     {
         use objc2::runtime::ProtocolObject;
@@ -251,7 +299,6 @@ fn write_image_bytes(
             let write_objects =
                 NSArray::from_retained_slice(&[ProtocolObject::from_retained(item_obj)]);
             if !pasteboard.writeObjects(&write_objects) {
-                guard.cancel(&suppression);
                 return Err(AppError::Clipboard("writeObjects failed".to_owned()));
             }
         }
@@ -259,10 +306,7 @@ fn write_image_bytes(
 
     #[cfg(not(target_os = "macos"))]
     {
-        if let Err(error) = set_image_with_retry(ctx, bytes) {
-            guard.cancel(&suppression);
-            return Err(error);
-        }
+        set_image_with_retry(ctx, bytes)?;
     }
 
     Ok(())
@@ -301,7 +345,7 @@ fn set_image_with_retry(ctx: &ClipboardContext, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(target_os = "android"))]
-fn write_files(ctx: &ClipboardContext, guard: &WritebackGuard, item: &ClipboardItem) -> Result<()> {
+fn parse_file_paths(item: &ClipboardItem) -> Result<Vec<String>> {
     let paths: Vec<String> = item
         .content
         .split('\n')
@@ -311,25 +355,13 @@ fn write_files(ctx: &ClipboardContext, guard: &WritebackGuard, item: &ClipboardI
     if paths.is_empty() {
         return Err(AppError::Clipboard("no files to write".to_owned()));
     }
-
-    guard.suppress(content_hash(ClipboardKind::Files, &item.content));
-    ctx.set_files(paths).map_err(clip_err)?;
-    Ok(())
+    Ok(paths)
 }
 
 #[cfg(not(target_os = "android"))]
 /// 把 files 条目的路径列表当文本写回（换行分隔，多文件按行展开）。
-/// 与 `write_files` 共用 `content_hash` 抑制——OS 监听不会拿到与原文本完全一致的回环。
-fn write_files_as_text(
-    ctx: &ClipboardContext,
-    guard: &WritebackGuard,
-    item: &ClipboardItem,
-) -> Result<()> {
-    let text = item.content.clone();
-
-    guard.suppress(content_hash(ClipboardKind::Text, &text));
-    ctx.set_text(text).map_err(clip_err)?;
-    Ok(())
+fn write_files_as_text_raw(ctx: &ClipboardContext, item: &ClipboardItem) -> Result<()> {
+    ctx.set_text(item.content.clone()).map_err(clip_err)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -342,7 +374,7 @@ mod tests {
     use super::super::payload::ImagePayload;
     use super::super::read::ClipboardReader;
     use super::*;
-    use crate::clipboard::{build_item, ImageStore, WritebackGuard};
+    use crate::clipboard::{build_item, ImageStore};
     use crate::db::models::Platform;
     use chrono::Utc;
 
@@ -401,16 +433,16 @@ mod tests {
         (dir, store)
     }
 
-    // 触碰真实剪贴板：写入纯文本 → 读回应为同串，且 guard 已登记本次哈希。
+    // 触碰真实剪贴板：写入纯文本 → 读回应为同串，且语义状态机已登记本次抑制令牌。
     #[test]
     #[ignore = "touches the real system clipboard; run with --ignored on a desktop session"]
-    fn writes_plain_text_and_arms_guard() {
+    fn writes_plain_text_and_arms_fingerprint_state() {
         let _serial = crate::clipboard::test_lock::serial();
         let (_dir, store) = temp_store();
-        let guard = WritebackGuard::new();
+        let fingerprints = ClipboardFingerprintState::new();
 
         let item = text_item("hello write", None, None);
-        write_to_clipboard(&store, &guard, &item, false).unwrap();
+        write_to_clipboard(&store, &fingerprints, &item, false).unwrap();
 
         let reader = ClipboardReader::new().unwrap();
         let payload = reader
@@ -419,7 +451,13 @@ mod tests {
             .expect("should read");
         let read_item = build_item(&store, &payload).unwrap().unwrap();
         assert_eq!(read_item.content, "hello write");
-        assert!(guard.should_skip(&read_item.content_hash));
+        let observed = ClipboardFingerprint::from_text_item(&read_item).unwrap();
+        let observation = fingerprints.begin_observation();
+        assert!(fingerprints.consume_pending_writeback(
+            &observation,
+            observed.as_str(),
+            Some(&observed),
+        ));
     }
 
     // 纯文本模式：强制丢弃 HTML，写 search_text。
@@ -428,14 +466,14 @@ mod tests {
     fn plain_mode_strips_html() {
         let _serial = crate::clipboard::test_lock::serial();
         let (_dir, store) = temp_store();
-        let guard = WritebackGuard::new();
+        let fingerprints = ClipboardFingerprintState::new();
 
         let item = text_item(
             "<b>Hello</b> World",
             Some(ClipboardSubKind::Html),
             Some("Hello World"),
         );
-        write_to_clipboard(&store, &guard, &item, true).unwrap();
+        write_to_clipboard(&store, &fingerprints, &item, true).unwrap();
 
         let reader = ClipboardReader::new().unwrap();
         let payload = reader
@@ -454,7 +492,7 @@ mod tests {
     fn round_trip_image_matches_hash() {
         let _serial = crate::clipboard::test_lock::serial();
         let (_dir, store) = temp_store();
-        let guard = WritebackGuard::new();
+        let fingerprints = ClipboardFingerprintState::new();
 
         // 先落盘一张原图（模拟历史记录里的 image item）。
         let png = sample_png(48, 32);
@@ -508,7 +546,7 @@ mod tests {
             display_created_at: String::new(),
         };
 
-        write_to_clipboard(&store, &guard, &item, false).unwrap();
+        write_to_clipboard(&store, &fingerprints, &item, false).unwrap();
 
         let reader = ClipboardReader::new().unwrap();
         let payload = reader
@@ -523,7 +561,12 @@ mod tests {
         };
         let read_item = build_item(&store, &payload).unwrap().unwrap();
         assert_eq!(read_item.kind, ClipboardKind::Image);
-        assert!(guard.should_skip(fingerprint.as_str()));
+        let observation = fingerprints.begin_observation();
+        assert!(fingerprints.consume_pending_writeback(
+            &observation,
+            fingerprint.as_str(),
+            Some(&fingerprint),
+        ));
     }
 
     fn sample_png(w: u32, h: u32) -> Vec<u8> {

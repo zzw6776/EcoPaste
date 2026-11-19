@@ -18,13 +18,12 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::db;
 
 use super::{
-    model::{StoredBlob, StoredSyncEvent},
+    model::StoredBlob,
     progress::{
         LocalImportPromotion, PreparationClaim, TransferDirection, TransferHandle, TransferPhase,
         TransferRegistry, TransferRoute, TransferTask,
     },
     repository,
-    transfer::TransferQueue,
 };
 
 pub(super) enum DeliveryCancel {
@@ -36,18 +35,18 @@ pub(super) enum DeliveryCancel {
     },
 }
 
+pub(super) struct UploadStartRequest<'a> {
+    pub target: &'a str,
+    pub route: TransferRoute,
+    pub sync_key: &'a str,
+    pub item_id: Option<&'a str>,
+    pub operation_total_bytes: u64,
+    pub blob: &'a StoredBlob,
+}
+
 pub(super) enum UploadTransferStart {
     Ready(Option<TransferHandle>),
     Canceled,
-}
-
-enum DurableDeliveryTransition<'a> {
-    Attempted,
-    Failed(&'a str),
-    Blocked(&'a str),
-    Completed {
-        metadata_only_event_ids: &'a HashSet<String>,
-    },
 }
 
 #[derive(Clone)]
@@ -171,7 +170,7 @@ impl TaskStagingCleanup {
             .push((blob.blob_id.clone(), PathBuf::from(&blob.encrypted_path)));
     }
 
-    /// After committing an outbox event, its delivery/retention cleanup owns staged content.
+    /// After committing an item snapshot, its delivery/retention cleanup owns staged content.
     pub fn retain_for_delivery(mut self) {
         self.entries.clear();
     }
@@ -315,11 +314,9 @@ impl Drop for PreparationCommitGuard {
 /// Keeps durable delivery state authoritative while projecting progress into short-lived UI tasks.
 pub(super) struct DeliveryCoordinator {
     app: AppHandle,
-    /// Serializes local event materialization with group changes and retention cleanup.
     enqueue_lock: Mutex<()>,
     image_enqueue_lock: Mutex<()>,
     file_enqueue_lock: Mutex<()>,
-    /// Closes the cancel/confirm boundary without holding a lock during network I/O.
     transition_lock: Mutex<()>,
     registry: TransferRegistry,
     staging: OutgoingStagingLeases,
@@ -351,16 +348,16 @@ impl DeliveryCoordinator {
     /// Serializes only the matching preparation lane during ordinary synchronization.
     pub async fn lock_materialization(
         &self,
-        lane: Option<crate::db::sync_queue::OutboxContentLane>,
+        lane: Option<crate::db::sync_items::OutboxContentLane>,
     ) -> MutexGuard<'_, ()> {
         match lane {
-            Some(crate::db::sync_queue::OutboxContentLane::Files) => {
+            Some(crate::db::sync_items::OutboxContentLane::Files) => {
                 self.file_enqueue_lock.lock().await
             }
-            Some(crate::db::sync_queue::OutboxContentLane::Image) => {
+            Some(crate::db::sync_items::OutboxContentLane::Image) => {
                 self.image_enqueue_lock.lock().await
             }
-            Some(crate::db::sync_queue::OutboxContentLane::Text) | None => {
+            Some(crate::db::sync_items::OutboxContentLane::Text) | None => {
                 self.enqueue_lock.lock().await
             }
         }
@@ -443,11 +440,10 @@ impl DeliveryCoordinator {
         self.staging.rebuild_lock(blob_id)
     }
 
-    /// Claims one outgoing card for a target while other cards keep filling free slots.
-    pub fn claim_upload(&self, target: &str, event: &str) -> Option<RemoteDownloadClaim> {
+    pub fn claim_upload(&self, target: &str, sync_key: &str) -> Option<RemoteDownloadClaim> {
         claim_remote_download(
             &self.remote_download_claims,
-            &format!("upload:{target}:{event}"),
+            &format!("upload:{target}:{sync_key}"),
         )
     }
 
@@ -467,7 +463,7 @@ impl DeliveryCoordinator {
     pub async fn cancel(&self, pool: &SqlitePool, task_id: &str) -> Result<DeliveryCancel> {
         if let Some(preparation) = self.registry.request_preparation_cancel(task_id) {
             if let Err(error) =
-                db::sync_queue::complete_content(pool, preparation.operation_order).await
+                db::sync_items::cancel_content_prep(pool, preparation.operation_order).await
             {
                 let message = crate::i18n::commands::label(
                     crate::i18n::current_language(&self.app),
@@ -475,7 +471,7 @@ impl DeliveryCoordinator {
                 );
                 self.registry
                     .finish_preparation_cancel(task_id, Some(message.to_owned()));
-                return Err(error);
+                return Err(error.into());
             }
             self.registry.finish_preparation_cancel(task_id, None);
             return Ok(DeliveryCancel::Preparation {
@@ -503,69 +499,30 @@ impl DeliveryCoordinator {
         })
     }
 
-    /// Merges durable cancellation markers with tasks canceled after batch selection.
-    async fn canceled_event_ids(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-    ) -> Result<HashSet<String>> {
-        repository::canceled_delivery_ids(pool, target, event_ids).await
-    }
-
-    pub async fn filter_pending(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        pending: &mut Vec<StoredSyncEvent>,
-        deferred_event_ids: &mut HashSet<String>,
-    ) -> Result<()> {
-        let ids = pending
-            .iter()
-            .map(|stored| stored.event.event_id.clone())
-            .collect::<Vec<_>>();
-        let canceled = self.canceled_event_ids(pool, target, &ids).await?;
-        pending.retain(|stored| !canceled.contains(&stored.event.event_id));
-        deferred_event_ids.retain(|event_id| !canceled.contains(event_id));
-        Ok(())
-    }
-
-    pub async fn reconcile_queue(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        queue: &mut TransferQueue,
-    ) -> Result<()> {
-        let canceled = self
-            .canceled_event_ids(pool, target, &queue.pending_event_ids())
-            .await?;
-        queue.cancel_events(&canceled);
-        Ok(())
-    }
-
     pub async fn start_upload(
         &self,
         pool: &SqlitePool,
-        target: &str,
-        route: TransferRoute,
-        event_id: &str,
-        operation_total_bytes: u64,
-        blob: &StoredBlob,
+        request: UploadStartRequest<'_>,
     ) -> Result<UploadTransferStart> {
-        if !repository::canceled_delivery_ids(pool, target, &[event_id.to_owned()])
-            .await?
-            .is_empty()
-        {
+        let UploadStartRequest {
+            target,
+            route,
+            sync_key,
+            item_id,
+            operation_total_bytes,
+            blob,
+        } = request;
+        if repository::is_delivery_canceled(pool, target, sync_key).await? {
             return Ok(UploadTransferStart::Canceled);
         }
-        let Some(item_id) = repository::transfer_item_id_for_event(pool, event_id).await? else {
+        let Some(item_id) = item_id.map(str::to_owned) else {
             return Ok(UploadTransferStart::Ready(None));
         };
-        let task_key = format!("{event_id}\0{target}\0{}", blob.blob_id);
+        let task_key = format!("{sync_key}\0{target}\0{}", blob.blob_id);
         let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
         match self
             .registry
-            .claim_preparation(event_id, route, target, operation_total_bytes)
+            .claim_preparation(sync_key, route, target, operation_total_bytes)
         {
             PreparationClaim::Claimed(transfer) => {
                 return Ok(UploadTransferStart::Ready(Some(transfer)));
@@ -579,7 +536,7 @@ impl DeliveryCoordinator {
                 id: task_id,
                 revision: 0,
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
-                operation_id: event_id.to_owned(),
+                operation_id: sync_key.to_owned(),
                 item_id,
                 direction: TransferDirection::Upload,
                 route,
@@ -597,241 +554,27 @@ impl DeliveryCoordinator {
         ))))
     }
 
-    pub async fn queued(
+    pub async fn blocked(
         &self,
         pool: &SqlitePool,
         target: &str,
-        event_ids: &[String],
-        metadata_only_event_ids: &HashSet<String>,
+        sync_key: &str,
+        error: &str,
     ) -> Result<()> {
         let _transition_guard = self.transition_lock.lock().await;
-        let canceled = self.canceled_event_ids(pool, target, event_ids).await?;
-        let active = event_ids
-            .iter()
-            .filter(|event_id| !canceled.contains(*event_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        repository::plan_deliveries(pool, target, &active, metadata_only_event_ids).await
-    }
-
-    pub async fn attempted(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-    ) -> Result<()> {
-        self.transition_active(
-            pool,
-            target,
-            event_ids,
-            DurableDeliveryTransition::Attempted,
-        )
-        .await
+        repository::block_delivery(pool, target, sync_key, error).await?;
+        self.registry.fail_upload_operation(sync_key, target, error);
+        Ok(())
     }
 
     pub async fn failed(
         &self,
         pool: &SqlitePool,
         target: &str,
-        event_ids: &[String],
+        sync_keys: &[String],
         error: &str,
     ) -> Result<()> {
-        self.transition_active(
-            pool,
-            target,
-            event_ids,
-            DurableDeliveryTransition::Failed(error),
-        )
-        .await
-    }
-
-    pub async fn blocked(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-        error: &str,
-    ) -> Result<()> {
-        self.transition_active(
-            pool,
-            target,
-            event_ids,
-            DurableDeliveryTransition::Blocked(error),
-        )
-        .await
-    }
-
-    pub async fn completed(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-        metadata_only_event_ids: &HashSet<String>,
-    ) -> Result<()> {
-        self.transition_active(
-            pool,
-            target,
-            event_ids,
-            DurableDeliveryTransition::Completed {
-                metadata_only_event_ids,
-            },
-        )
-        .await
-    }
-
-    /// Serializes durable delivery outcomes with cancellation and ignores canceled operations.
-    async fn transition_active(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        event_ids: &[String],
-        transition: DurableDeliveryTransition<'_>,
-    ) -> Result<()> {
         let _transition_guard = self.transition_lock.lock().await;
-        let canceled = self.canceled_event_ids(pool, target, event_ids).await?;
-        let active = event_ids
-            .iter()
-            .filter(|event_id| !canceled.contains(*event_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            return Ok(());
-        }
-
-        match transition {
-            DurableDeliveryTransition::Attempted => {
-                repository::record_delivery_attempt(pool, target, &active).await
-            }
-            DurableDeliveryTransition::Failed(error) => {
-                repository::mark_delivery_error(pool, target, &active, error).await
-            }
-            DurableDeliveryTransition::Blocked(error) => {
-                for event_id in active {
-                    repository::block_delivery(pool, target, &event_id, error).await?;
-                    self.registry
-                        .fail_upload_operation(&event_id, target, error);
-                }
-                Ok(())
-            }
-            DurableDeliveryTransition::Completed {
-                metadata_only_event_ids,
-            } => {
-                repository::complete_outbound_delivery(
-                    pool,
-                    target,
-                    &active,
-                    metadata_only_event_ids,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Selects attachment-ready confirmations after merging durable cancellation markers.
-    pub async fn prepare_ready_events(
-        &self,
-        pool: &SqlitePool,
-        target: &str,
-        queue: &mut TransferQueue,
-    ) -> Result<Vec<StoredSyncEvent>> {
-        let _transition_guard = self.transition_lock.lock().await;
-        self.reconcile_queue(pool, target, queue).await?;
-        Ok(queue.ready_events())
-    }
-
-    pub fn complete_metadata_only(
-        &self,
-        operations: &[String],
-        route: TransferRoute,
-        target: &str,
-    ) {
-        for event_id in operations {
-            self.registry
-                .complete_metadata_only_preparation(event_id, route, target);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn outgoing_staging_release_waits_for_every_active_lease() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("encrypted");
-        fs::write(&path, b"ciphertext").unwrap();
-        let leases = OutgoingStagingLeases::default();
-        let first = leases.acquire("blob");
-        let second = leases.acquire("blob");
-
-        leases.request_release("blob", path.clone());
-        drop(first);
-        assert!(path.exists());
-
-        drop(second);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn materialized_staging_is_deleted_when_the_task_finishes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("encrypted");
-        fs::write(&path, b"ciphertext").unwrap();
-        let leases = OutgoingStagingLeases::default();
-        let active_transfer = leases.acquire("blob");
-        {
-            let mut cleanup = TaskStagingCleanup::new(leases);
-            cleanup.track(&StoredBlob {
-                blob_id: "blob".into(),
-                encrypted_path: path.to_string_lossy().into_owned(),
-                size: 10,
-                source_path: Some("source".into()),
-                source_is_directory: false,
-                stream_nonce: Some(vec![1; 24]),
-            });
-        }
-
-        assert!(path.exists());
-        drop(active_transfer);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn outgoing_staging_rebuilds_share_one_lock_per_blob() {
-        let leases = OutgoingStagingLeases::default();
-        let _first_lease = leases.acquire("blob");
-        let _second_lease = leases.acquire("blob");
-        let first = leases.rebuild_lock("blob");
-        let second = leases.rebuild_lock("blob");
-
-        assert!(Arc::ptr_eq(&first, &second));
-        let _guard = first.lock().unwrap();
-        assert!(second.try_lock().is_err());
-    }
-
-    #[test]
-    fn reproducible_staging_is_released_when_its_task_finishes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("encrypted");
-        fs::write(&path, b"ciphertext").unwrap();
-        let leases = OutgoingStagingLeases::default();
-        let mut lease = leases.acquire("blob");
-        lease.release_on_drop(path.clone());
-
-        drop(lease);
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn remote_download_claim_blocks_duplicates_until_released() {
-        let claims = Arc::new(StdMutex::new(HashSet::new()));
-        let claim = claim_remote_download(&claims, "item").unwrap();
-        assert!(claim_remote_download(&claims, "item").is_none());
-
-        drop(claim);
-
-        assert!(claim_remote_download(&claims, "item").is_some());
+        repository::mark_delivery_error(pool, target, sync_keys, error).await
     }
 }
