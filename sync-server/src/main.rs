@@ -3,9 +3,16 @@ use std::{path::Path, str::FromStr, time::Duration};
 use anyhow::{Context, Result};
 use clap::Parser;
 use data_encoding::HEXLOWER;
-use ecopaste_sync_protocol::{ALPN, QuotaPolicy};
+use ecopaste_sync_protocol::{
+    ALPN, QuotaPolicy,
+    transfer::{SEND_WINDOW_BYTES, STREAM_RECEIVE_WINDOW_BYTES},
+};
 use ecopaste_sync_server::{config::Config, repository::Repository, service::HubService};
-use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets, protocol::Router};
+use iroh::{
+    Endpoint, RelayMode, SecretKey,
+    endpoint::{QuicTransportConfig, VarInt, presets},
+    protocol::Router,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -39,7 +46,12 @@ async fn main() -> Result<()> {
     );
     service.spawn_cleanup_worker();
 
+    let transport_config = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW_BYTES))
+        .send_window(SEND_WINDOW_BYTES)
+        .build();
     let mut builder = Endpoint::builder(presets::N0)
+        .transport_config(transport_config)
         .secret_key(secret_key)
         .clear_ip_transports()
         .bind_addr(config.bind)

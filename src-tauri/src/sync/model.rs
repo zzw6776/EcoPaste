@@ -101,28 +101,45 @@ pub struct MergedSnapshot {
 
 /// Joins two snapshots for the same `sync_key` field-by-field using Lamport LWW versions.
 pub fn merge_snapshots(local: &SyncedItemSnapshot, remote: &SyncedItemSnapshot) -> MergedSnapshot {
-    let take_remote_presence = remote.presence_version > local.presence_version;
+    let take_remote_presence = match remote.presence_version.cmp(&local.presence_version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Tombstones win deterministically on equal presence versions so merges stay commutative.
+        std::cmp::Ordering::Equal => !remote.is_present && local.is_present,
+    };
     let (presence_version, is_present) = if take_remote_presence {
         (remote.presence_version.clone(), remote.is_present)
     } else {
         (local.presence_version.clone(), local.is_present)
     };
 
-    let take_remote_favorite = remote.favorite_version > local.favorite_version;
+    let take_remote_favorite = match remote.favorite_version.cmp(&local.favorite_version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => remote.is_favorite && !local.is_favorite,
+    };
     let (favorite_version, is_favorite) = if take_remote_favorite {
         (remote.favorite_version.clone(), remote.is_favorite)
     } else {
         (local.favorite_version.clone(), local.is_favorite)
     };
 
-    let take_remote_pinned = remote.pinned_version > local.pinned_version;
+    let take_remote_pinned = match remote.pinned_version.cmp(&local.pinned_version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => remote.is_pinned && !local.is_pinned,
+    };
     let (pinned_version, is_pinned) = if take_remote_pinned {
         (remote.pinned_version.clone(), remote.is_pinned)
     } else {
         (local.pinned_version.clone(), local.is_pinned)
     };
 
-    let take_remote_note = remote.note_version > local.note_version;
+    let take_remote_note = match remote.note_version.cmp(&local.note_version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => remote.note > local.note,
+    };
     let (note_version, note) = if take_remote_note {
         (remote.note_version.clone(), remote.note.clone())
     } else {
@@ -132,7 +149,11 @@ pub fn merge_snapshots(local: &SyncedItemSnapshot, remote: &SyncedItemSnapshot) 
     let take_remote_content = match remote.content_version.cmp(&local.content_version) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => local.item.is_none() && remote.item.is_some(),
+        std::cmp::Ordering::Equal => match (&local.item, &remote.item) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            _ => content_tiebreak_key(remote, local) > content_tiebreak_key(local, remote),
+        },
     };
     let (content_version, mut item, mut blobs, mut source_app, mut content_identity) =
         if take_remote_content {
@@ -203,6 +224,25 @@ pub fn merge_snapshots(local: &SyncedItemSnapshot, remote: &SyncedItemSnapshot) 
         local_changed,
         remote_changed,
     }
+}
+
+/// Produces an order-independent canonical key for equal-version content tie-breaking so two peers
+/// holding divergent metadata (such as `source_app`) never ping-pong forever.
+fn content_tiebreak_key(candidate: &SyncedItemSnapshot, peer: &SyncedItemSnapshot) -> Vec<u8> {
+    let mut normalized_item = candidate.item.clone();
+    if let (Some(item), Some(other)) = (normalized_item.as_mut(), peer.item.as_ref()) {
+        item.created_at_ms = item.created_at_ms.min(other.created_at_ms);
+        let item_updated = item.updated_at_ms.unwrap_or(item.created_at_ms);
+        let other_updated = other.updated_at_ms.unwrap_or(other.created_at_ms);
+        item.updated_at_ms = Some(item_updated.max(other_updated));
+    }
+    minicbor::to_vec((
+        &normalized_item,
+        &candidate.blobs,
+        &candidate.source_app,
+        &candidate.content_identity,
+    ))
+    .unwrap_or_default()
 }
 
 /// Sliding-window pagination cursor for newest-first synchronization without backlog HoL blocking.
@@ -786,6 +826,45 @@ mod tests {
         assert!(merged.snapshot.item.is_none());
         assert!(merged.snapshot.blobs.is_empty());
         assert!(merged.local_changed);
+    }
+
+    #[test]
+    fn merge_snapshots_equal_versions_converge_commutatively() {
+        let mut device_a = sample_snapshot("dev-a");
+        device_a.source_app = Some(SourceAppRef {
+            version: 1,
+            source_key: "app-a".into(),
+            platform: "macos".into(),
+            display_name: "App A".into(),
+            icon: None,
+            accent_start: Some("#111111".into()),
+            accent_end: None,
+        });
+        device_a.note = Some("alpha".into());
+
+        let mut device_b = sample_snapshot("dev-a");
+        device_b.source_app = Some(SourceAppRef {
+            version: 1,
+            source_key: "app-b".into(),
+            platform: "android".into(),
+            display_name: "App B".into(),
+            icon: None,
+            accent_start: Some("#222222".into()),
+            accent_end: None,
+        });
+        device_b.note = Some("beta".into());
+        device_b.is_favorite = true;
+
+        let ab = merge_snapshots(&device_a, &device_b);
+        let ba = merge_snapshots(&device_b, &device_a);
+        assert_eq!(ab.snapshot, ba.snapshot);
+        assert!(ab.snapshot.is_favorite);
+        assert_eq!(ab.snapshot.note.as_deref(), Some("beta"));
+
+        // Merging either side with the winning snapshot reaches a fixed point with no re-push.
+        let converged_a = merge_snapshots(&ab.snapshot, &ba.snapshot);
+        assert!(!converged_a.local_changed);
+        assert!(!converged_a.remote_changed);
     }
 
     #[test]

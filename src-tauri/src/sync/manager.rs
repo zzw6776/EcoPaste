@@ -40,8 +40,9 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer, TransferLimits, Transfers};
 use ecopaste_sync_protocol::{
-    limit_sync_request, read_frame, write_frame, DeviceAnnouncement, ErrorCode, PeerAnnouncement,
-    RemovedDevice, Request, Response, ALPN, MAX_FRAME_BYTES, MAX_ITEMS_PER_BATCH, PROTOCOL_VERSION,
+    limit_sync_request, read_frame, write_frame, DeviceAnnouncement, ErrorCode, FrameError,
+    PeerAnnouncement, RemovedDevice, Request, Response, ALPN, MAX_FRAME_BYTES, MAX_ITEMS_PER_BATCH,
+    PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -93,11 +94,12 @@ use super::{
     },
     model::{
         BlobManifest, BlobRole, CloudDeviceDirectory, CloudDeviceStatus, CloudHubStatus,
-        CloudRecord, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbyJoinState,
-        NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef, StoredBlob,
-        StoredContentObject, SyncChannelState, SyncChannelStatus, SyncContentAvailability,
-        SyncItemAction, SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer,
-        SyncStatus, SyncTarget, SyncedClipboardItem, SyncedItemSnapshot,
+        CloudRecord, CloudRecordPage, FieldVersion, IncomingJoinRequest, NearbyJoinAttempt,
+        NearbyJoinState, NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef,
+        StoredBlob, StoredContentObject, SyncChannelState, SyncChannelStatus,
+        SyncContentAvailability, SyncItemAction, SyncItemStatus, SyncLocalContentState,
+        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
+        SyncedItemSnapshot,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -185,9 +187,13 @@ const LOCAL_SYNC_GC_BATCH_SIZE: u32 = 500;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
-/// Applies cloud keep-alive intervals while the maintained transport handles GSO fallback.
+/// Applies transfer flow-control windows and cloud keep-alive intervals.
 fn sync_transport_config(cloud: bool) -> QuicTransportConfig {
-    let builder = QuicTransportConfig::builder();
+    let builder = QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(
+            multipart::STREAM_RECEIVE_WINDOW_BYTES,
+        ))
+        .send_window(multipart::SEND_WINDOW_BYTES);
     let builder = if cloud {
         builder
             .keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
@@ -1397,7 +1403,7 @@ impl SyncManager {
         let identity = self.identity.snapshot();
         let pool = self.pool().await;
         let (pending_events, pending_manual_items, peer_count) =
-            repository::status_counts(&pool).await?;
+            repository::status_counts(&pool, settings.sync_sensitive).await?;
         let mut peers = repository::list_peer_statuses(&pool).await?;
         let mut lan = self
             .runtime_state
@@ -1804,10 +1810,19 @@ impl SyncManager {
         let meta = repository::load_sync_item_meta(&pool, &item.sync_key).await?;
         let content_pending = meta
             .as_ref()
-            .is_some_and(|row| row.nonce.is_none() && !row.deleted);
-        let external_local_ready = meta
-            .as_ref()
-            .is_some_and(|row| row.origin == "local" && row.nonce.is_some());
+            .is_some_and(|row| row.nonce.is_none() && row.is_present);
+        let external_local_ready = if remote_content_state == Some(SyncLocalContentState::External)
+            && meta.as_ref().is_some_and(|row| row.nonce.is_some())
+        {
+            let blobs = repository::load_item_blobs(&pool, &item.sync_key).await?;
+            let content_blobs = blobs
+                .iter()
+                .filter(|blob| !blob.optional)
+                .collect::<Vec<_>>();
+            !content_blobs.is_empty() && content_blobs.iter().all(|blob| blob.local_available)
+        } else {
+            false
+        };
         let delivery_requested = if content_pending
             || (remote_content_state == Some(SyncLocalContentState::External)
                 && !external_local_ready)
@@ -2588,6 +2603,7 @@ fn cloud_relay_mode(settings: &SyncSettings, token: Option<&str>) -> Result<Rela
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::model::SNAPSHOT_VERSION;
 
     /// Establishes an isolated loopback QUIC session without discovery or external relays.
     async fn upload_test_connection() -> (Endpoint, Endpoint, Connection, Connection) {
@@ -3387,5 +3403,89 @@ mod tests {
         ));
         let mixed = conclude_remote_blob_failure(mixed, false);
         assert!(mixed.downcast_ref::<RemoteBlobTransportFailure>().is_some());
+    }
+
+    #[test]
+    fn decrypt_stored_snapshot_tolerates_flipped_protected_aad_and_overlays_crdt_fields() {
+        let key = [37_u8; 32];
+        let sync_key = "a".repeat(64);
+        let item_key = crypto::derive_item_key(&key, &sync_key);
+        let original = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: sync_key.clone(),
+            content_version: FieldVersion::new(1, "dev-a"),
+            presence_version: FieldVersion::new(1, "dev-a"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: "keep-my-payload".into(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: Some(15),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: 1_700_000_000_000,
+                sync_key: sync_key.clone(),
+                updated_at_ms: Some(1_700_000_000_000),
+                source_revision: Some("rev-1".into()),
+                source_device_id: Some("dev-a".into()),
+                source_device_name: Some("Mac".into()),
+                source_updated_at_ms: Some(1_700_000_000_000),
+            }),
+            blobs: Vec::new(),
+            source_app: None,
+            content_identity: None,
+        };
+        // Encrypted originally with `protected = false`.
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &original).unwrap();
+
+        // Simulate a legacy pre-1.1.232 row whose `protected` column flipped to `true` before
+        // re-encryption, plus a pending favorite & note mutation in `meta`.
+        let mut recovered =
+            decrypt_stored_snapshot(&key, &item_key, false, true, &nonce, &ciphertext).unwrap();
+        let meta = repository::StoredSyncItemMeta {
+            sync_key,
+            item_key: Some(item_key),
+            item_id: Some("item-1".into()),
+            origin_device_id: Some("dev-a".into()),
+            content_identity: None,
+            deleted: false,
+            protected: true,
+            content_version: FieldVersion::new(1, "dev-a"),
+            presence_version: FieldVersion::new(1, "dev-a"),
+            favorite_version: FieldVersion::new(2, ""),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::new(3, ""),
+            is_present: true,
+            is_favorite: true,
+            is_pinned: false,
+            note: Some("pinned note".into()),
+            payload_updated_at_ms: 1_700_000_000_000,
+            nonce: Some(nonce),
+            ciphertext: Some(ciphertext),
+            local_state: "managed".into(),
+            needs_blob_pull: false,
+        };
+        overlay_meta_crdt_fields(&mut recovered, &meta, "dev-a");
+
+        assert_eq!(
+            recovered.item.as_ref().map(|item| item.content.as_str()),
+            Some("keep-my-payload")
+        );
+        assert!(recovered.is_favorite);
+        assert_eq!(recovered.favorite_version, FieldVersion::new(2, "dev-a"));
+        assert_eq!(recovered.note.as_deref(), Some("pinned note"));
+        assert_eq!(recovered.note_version, FieldVersion::new(3, "dev-a"));
     }
 }

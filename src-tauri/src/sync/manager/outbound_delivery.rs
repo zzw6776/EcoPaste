@@ -1,4 +1,4 @@
-use ecopaste_sync_protocol::{LanItemAck, MAX_ITEMS_PER_BATCH};
+use ecopaste_sync_protocol::{LanContentLevel, LanItemAck, MAX_ITEMS_PER_BATCH};
 
 use super::*;
 
@@ -596,6 +596,36 @@ impl SyncManager {
             let pending_inbound_blobs = self
                 .apply_pending_inline_items(&pool, group, &cycle.settings)
                 .await?;
+            // Acknowledge pulled items immediately over the open control link so the peer's WiFi
+            // status converges even when it didn't initiate a reciprocal push.
+            if !items.is_empty() {
+                let mut pulled_acks = Vec::with_capacity(items.len());
+                for record in &items {
+                    let level = if record.deleted || record.blob_ids.is_empty() {
+                        LanContentLevel::Complete
+                    } else {
+                        let meta =
+                            repository::load_sync_item_meta_by_item_key(&pool, &record.item_key)
+                                .await?;
+                        if meta.as_ref().is_some_and(|row| {
+                            matches!(row.local_state.as_str(), "managed" | "external")
+                                && row.item_id.is_some()
+                        }) {
+                            LanContentLevel::Complete
+                        } else {
+                            LanContentLevel::Metadata
+                        }
+                    };
+                    pulled_acks.push(LanItemAck {
+                        item_key: record.item_key.clone(),
+                        local_seq: record.seq,
+                        level,
+                    });
+                }
+                if let Err(error) = self.send_lan_acks(connection, group, pulled_acks).await {
+                    log::debug!("send LAN pull acks to {peer_device_id} failed: {error:#}");
+                }
+            }
             if pending_inbound_blobs || pull_summary.needs_blob_pull {
                 self.wake_attachments();
             }
@@ -661,10 +691,6 @@ impl SyncManager {
 
         let language = crate::i18n::current_language(&self.app);
         let is_files = upload.kind == "files";
-        let total_bytes = upload
-            .blobs
-            .iter()
-            .fold(0_u64, |acc, b| acc.saturating_add(b.size));
 
         let mut item_failed = false;
         for blob_row in &upload.blobs {
@@ -678,7 +704,7 @@ impl SyncManager {
                         route: super::super::progress::TransferRoute::Cloud,
                         sync_key: &upload.sync_key,
                         item_id: upload.item_id.as_deref(),
-                        operation_total_bytes: total_bytes,
+                        operation_total_bytes: blob_row.size,
                         blob: &stored_blob,
                     },
                 )
@@ -698,6 +724,7 @@ impl SyncManager {
                 started: None,
                 transfer: transfer.clone(),
             };
+            let mut upload_started = false;
             let result = async {
                 let (staged, _lease) = if stored_blob.encrypted_path.is_empty() {
                     (stored_blob.clone(), None)
@@ -705,6 +732,7 @@ impl SyncManager {
                     let (staged, lease) = self.lease_outgoing_staging(group, &stored_blob).await?;
                     (staged, Some(lease))
                 };
+                upload_started = true;
                 upload_blob(data_connection, group, &staged, options).await
             }
             .await;
@@ -731,11 +759,13 @@ impl SyncManager {
                     }
                 }
                 Err(error) => {
-                    if let Some(handle) = &transfer {
-                        if handle.canceled() {
-                            handle.mark_canceled(0);
-                        } else {
-                            handle.failed(0, error.to_string());
+                    if !upload_started {
+                        if let Some(handle) = &transfer {
+                            if handle.canceled() {
+                                handle.mark_canceled(0);
+                            } else {
+                                handle.failed(0, error.to_string());
+                            }
                         }
                     }
                     if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {

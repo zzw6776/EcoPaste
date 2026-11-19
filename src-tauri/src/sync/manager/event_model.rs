@@ -1,6 +1,71 @@
 use super::*;
 use ecopaste_sync_protocol::SyncItemRecord;
 
+/// Decrypts a locally persisted item snapshot, tolerating flipped `(deleted, protected)` AAD flags
+/// from pre-1.1.232 rows while relying on 128-bit AEAD authentication to accept only the exact AAD.
+pub(super) fn decrypt_stored_snapshot(
+    key: &[u8; 32],
+    item_key: &str,
+    deleted: bool,
+    protected: bool,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<SyncedItemSnapshot> {
+    let candidates = [
+        (deleted, protected),
+        (deleted, !protected),
+        (!deleted, protected),
+        (!deleted, !protected),
+    ];
+    let mut last_error = None;
+    for (cand_deleted, cand_protected) in candidates {
+        match crypto::decrypt_item_snapshot(
+            key,
+            item_key,
+            cand_deleted,
+            cand_protected,
+            nonce,
+            ciphertext,
+        ) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("non-empty AAD candidates"))
+}
+
+/// Overlays newer live CRDT metadata fields from `sync_items` onto a decrypted snapshot so
+/// uncommitted local favorite/pin/note/delete mutations are never lost during re-encryption or merge.
+pub(super) fn overlay_meta_crdt_fields(
+    snapshot: &mut SyncedItemSnapshot,
+    meta: &repository::StoredSyncItemMeta,
+    local_device_id: &str,
+) {
+    let updated = repository::snapshot_from_meta(meta, local_device_id);
+    if updated.presence_version.seq > 0 && updated.presence_version >= snapshot.presence_version {
+        snapshot.presence_version = updated.presence_version;
+        snapshot.is_present = updated.is_present;
+    }
+    if updated.favorite_version.seq > 0 && updated.favorite_version >= snapshot.favorite_version {
+        snapshot.favorite_version = updated.favorite_version;
+        snapshot.is_favorite = updated.is_favorite;
+    }
+    if updated.pinned_version.seq > 0 && updated.pinned_version >= snapshot.pinned_version {
+        snapshot.pinned_version = updated.pinned_version;
+        snapshot.is_pinned = updated.is_pinned;
+    }
+    if updated.note_version.seq > 0 && updated.note_version >= snapshot.note_version {
+        snapshot.note_version = updated.note_version;
+        snapshot.note = updated.note;
+    }
+    if !snapshot.is_present {
+        snapshot.item = None;
+        snapshot.blobs.clear();
+        snapshot.source_app = None;
+        snapshot.content_identity = None;
+    }
+}
+
 pub(super) fn synced_item_timestamps(
     item: &SyncedClipboardItem,
     fallback_ms: i64,

@@ -46,7 +46,6 @@ pub struct StoredSyncItemMeta {
     pub sync_key: String,
     pub item_key: Option<String>,
     pub item_id: Option<String>,
-    pub origin: String,
     pub origin_device_id: Option<String>,
     pub content_identity: Option<String>,
     pub deleted: bool,
@@ -222,7 +221,6 @@ fn meta_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSyncItemMeta> {
         sync_key: row.try_get("sync_key")?,
         item_key: row.try_get("item_key")?,
         item_id: row.try_get("item_id")?,
-        origin: row.try_get("origin")?,
         origin_device_id: row.try_get("origin_device_id")?,
         content_identity: row.try_get("content_identity")?,
         deleted: row.try_get("deleted")?,
@@ -287,13 +285,17 @@ pub async fn commit_prepared_item(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin committing prepared sync item")?;
-    let current_seq: Option<i64> =
-        sqlx::query_scalar("SELECT local_seq FROM sync_items WHERE sync_key = ?")
+    let current: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT local_seq, delivery_route FROM sync_items WHERE sync_key = ?")
             .bind(commit.sync_key)
             .fetch_optional(&mut *transaction)
             .await
             .context("check sync item local_seq before commit")?;
-    if current_seq != Some(commit.expected_local_seq) {
+    let Some((current_seq, delivery_route)) = current else {
+        transaction.rollback().await.ok();
+        return Ok(false);
+    };
+    if current_seq != commit.expected_local_seq {
         transaction.rollback().await.ok();
         return Ok(false);
     }
@@ -436,77 +438,84 @@ pub async fn commit_prepared_item(
         .context("upsert sync content object")?;
     }
 
-    // Ensure a cloud target row reflects the desired content level and re-queues pending delivery.
-    // Metadata-only updates (`cloud_desired = None`) preserve any deferred `'metadata'` upload policy.
-    if let Some(cloud_desired) = commit.cloud_desired {
-        sqlx::query(
-            r#"
-            INSERT INTO sync_item_targets (
-                sync_key, target_id, desired_content, confirmed_content, status,
-                pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
-            ) VALUES (?, 'cloud', ?, 'none', 'pending', 0, 0, NULL, ?, ?)
-            ON CONFLICT(sync_key, target_id) DO UPDATE SET
-                desired_content = CASE
-                    WHEN excluded.desired_content = 'complete' THEN 'complete'
-                    ELSE sync_item_targets.desired_content
-                END,
-                status = CASE
-                    WHEN sync_item_targets.status IN ('blocked', 'canceled')
-                         AND excluded.desired_content = sync_item_targets.desired_content
-                    THEN sync_item_targets.status
-                    ELSE 'pending'
-                END,
-                last_error = NULL,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(commit.sync_key)
-        .bind(cloud_desired.as_str())
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .context("plan cloud target for prepared sync item")?;
-    } else {
-        sqlx::query(
-            r#"
-            INSERT INTO sync_item_targets (
-                sync_key, target_id, desired_content, confirmed_content, status,
-                pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
-            ) VALUES (?, 'cloud', 'complete', 'none', 'pending', 0, 0, NULL, ?, ?)
-            ON CONFLICT(sync_key, target_id) DO UPDATE SET
-                status = CASE
-                    WHEN sync_item_targets.status IN ('blocked', 'canceled')
-                    THEN sync_item_targets.status
-                    ELSE 'pending'
-                END,
-                last_error = NULL,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(commit.sync_key)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .context("requeue cloud target for metadata-only sync item update")?;
+    // Ensure target rows honor `delivery_route` consistently across Control-Plane, Data-Plane,
+    // and UI status projection. Metadata-only updates (`cloud_desired = None`) preserve any
+    // deferred `'metadata'` upload policy.
+    let cloud_allowed = delivery_route.as_deref() != Some("lan");
+    let lan_allowed = delivery_route.as_deref() != Some("cloud");
+    if cloud_allowed {
+        if let Some(cloud_desired) = commit.cloud_desired {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_item_targets (
+                    sync_key, target_id, desired_content, confirmed_content, status,
+                    pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
+                ) VALUES (?, 'cloud', ?, 'none', 'pending', 0, 0, NULL, ?, ?)
+                ON CONFLICT(sync_key, target_id) DO UPDATE SET
+                    desired_content = CASE
+                        WHEN excluded.desired_content = 'complete' THEN 'complete'
+                        ELSE sync_item_targets.desired_content
+                    END,
+                    status = CASE
+                        WHEN sync_item_targets.status IN ('blocked', 'canceled')
+                             AND excluded.desired_content = sync_item_targets.desired_content
+                        THEN sync_item_targets.status
+                        ELSE 'pending'
+                    END,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(commit.sync_key)
+            .bind(cloud_desired.as_str())
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .context("plan cloud target for prepared sync item")?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_item_targets (
+                    sync_key, target_id, desired_content, confirmed_content, status,
+                    pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
+                ) VALUES (?, 'cloud', 'complete', 'none', 'pending', 0, 0, NULL, ?, ?)
+                ON CONFLICT(sync_key, target_id) DO UPDATE SET
+                    status = CASE
+                        WHEN sync_item_targets.status IN ('blocked', 'canceled')
+                        THEN sync_item_targets.status
+                        ELSE 'pending'
+                    END,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(commit.sync_key)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .context("requeue cloud target for metadata-only sync item update")?;
+        }
     }
 
-    // Re-queue existing LAN peer targets for this updated snapshot.
-    sqlx::query(
-        r#"
-        UPDATE sync_item_targets
-        SET status = 'pending', last_error = NULL, updated_at = ?
-        WHERE sync_key = ?
-          AND target_id LIKE 'peer:%'
-          AND status NOT IN ('blocked', 'canceled')
-        "#,
-    )
-    .bind(now)
-    .bind(commit.sync_key)
-    .execute(&mut *transaction)
-    .await
-    .context("requeue peer targets for updated sync item")?;
+    // Re-queue existing LAN peer targets for this updated snapshot when LAN is permitted.
+    if lan_allowed {
+        sqlx::query(
+            r#"
+            UPDATE sync_item_targets
+            SET status = 'pending', last_error = NULL, updated_at = ?
+            WHERE sync_key = ?
+              AND target_id LIKE 'peer:%'
+              AND status NOT IN ('blocked', 'canceled')
+            "#,
+        )
+        .bind(now)
+        .bind(commit.sync_key)
+        .execute(&mut *transaction)
+        .await
+        .context("requeue peer targets for updated sync item")?;
+    }
 
     transaction
         .commit()
@@ -629,7 +638,9 @@ pub async fn list_items_window_for_peer(
 ) -> Result<(Vec<SyncItemRecord>, u64, bool)> {
     let limit = limit.clamp(1, ecopaste_sync_protocol::MAX_ITEMS_PER_BATCH);
     let latest_seq_raw: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(local_seq) FROM sync_items WHERE prep_state = 'ready' AND item_key IS NOT NULL AND nonce IS NOT NULL",
+        "SELECT MAX(local_seq) FROM sync_items \
+         WHERE prep_state = 'ready' AND item_key IS NOT NULL AND nonce IS NOT NULL \
+           AND (delivery_route IS NULL OR delivery_route <> 'cloud')",
     )
     .fetch_one(pool)
     .await
@@ -854,7 +865,7 @@ pub async fn record_lan_acks(
             LanContentLevel::Metadata => (
                 "metadata",
                 if still_current {
-                    "awaiting_receipt"
+                    "confirmed"
                 } else {
                     "pending"
                 },
@@ -924,6 +935,7 @@ pub async fn pending_cloud_blob_uploads(
         JOIN sync_item_targets t ON t.sync_key = s.sync_key AND t.target_id = 'cloud'
         WHERE s.prep_state = 'ready'
           AND s.deleted = 0
+          AND (s.delivery_route IS NULL OR s.delivery_route <> 'lan')
           AND (? = 0 OR s.history_backfill = 0 OR s.manual_share = 1)
           AND t.desired_content = 'complete'
           AND t.confirmed_content <> 'complete'
@@ -1195,8 +1207,15 @@ pub async fn store_merged_remote_item(
         .map(String::as_str)
         .collect();
     let is_cloud = input.source_target_id == CLOUD_TARGET;
-    let existing_blobs: HashMap<String, (String, Option<String>, bool, bool)> = sqlx::query(
-        "SELECT blob_id, encrypted_path, source_path, cloud_available, local_available \
+    struct ExistingBlobState {
+        encrypted_path: String,
+        source_path: Option<String>,
+        stream_nonce: Option<Vec<u8>>,
+        cloud_available: bool,
+        local_available: bool,
+    }
+    let existing_blobs: HashMap<String, ExistingBlobState> = sqlx::query(
+        "SELECT blob_id, encrypted_path, source_path, stream_nonce, cloud_available, local_available \
          FROM sync_item_blobs WHERE sync_key = ?",
     )
     .bind(input.sync_key)
@@ -1206,12 +1225,13 @@ pub async fn store_merged_remote_item(
     .map(|row| {
         Ok((
             row.try_get::<String, _>("blob_id")?,
-            (
-                row.try_get::<String, _>("encrypted_path")?,
-                row.try_get::<Option<String>, _>("source_path")?,
-                row.try_get::<bool, _>("cloud_available")?,
-                row.try_get::<bool, _>("local_available")?,
-            ),
+            ExistingBlobState {
+                encrypted_path: row.try_get("encrypted_path")?,
+                source_path: row.try_get("source_path")?,
+                stream_nonce: row.try_get("stream_nonce")?,
+                cloud_available: row.try_get("cloud_available")?,
+                local_available: row.try_get("local_available")?,
+            },
         ))
     })
     .collect::<Result<_>>()?;
@@ -1225,10 +1245,11 @@ pub async fn store_merged_remote_item(
         for blob in &snapshot.blobs {
             let prev = existing_blobs.get(&blob.blob_id);
             let cloud_avail = (is_cloud && available_set.contains(blob.blob_id.as_str()))
-                || prev.is_some_and(|p| p.2);
-            let local_avail = prev.is_some_and(|p| p.3);
-            let enc_path = prev.map(|p| p.0.as_str()).unwrap_or("");
-            let src_path = prev.and_then(|p| p.1.as_deref());
+                || prev.is_some_and(|p| p.cloud_available);
+            let local_avail = prev.is_some_and(|p| p.local_available);
+            let enc_path = prev.map(|p| p.encrypted_path.as_str()).unwrap_or("");
+            let src_path = prev.and_then(|p| p.source_path.as_deref());
+            let stream_nonce = prev.and_then(|p| p.stream_nonce.as_deref());
             let role = match blob.role {
                 super::super::model::BlobRole::Image => "image",
                 super::super::model::BlobRole::File => "file",
@@ -1239,7 +1260,7 @@ pub async fn store_merged_remote_item(
                     sync_key, blob_id, role, optional, size, original_size,
                     encrypted_path, source_path, source_is_directory, stream_nonce,
                     stream_commitment, cloud_available, local_available, created_at, updated_at
-                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(input.sync_key)
@@ -1250,6 +1271,7 @@ pub async fn store_merged_remote_item(
             .bind(enc_path)
             .bind(src_path)
             .bind(blob.is_directory_archive)
+            .bind(stream_nonce)
             .bind(blob.stream_commitment)
             .bind(cloud_avail)
             .bind(local_avail)
@@ -1266,8 +1288,8 @@ pub async fn store_merged_remote_item(
         {
             let prev = existing_blobs.get(&icon.blob_id);
             let cloud_avail = (is_cloud && available_set.contains(icon.blob_id.as_str()))
-                || prev.is_some_and(|p| p.2);
-            let local_avail = prev.is_some_and(|p| p.3);
+                || prev.is_some_and(|p| p.cloud_available);
+            let local_avail = prev.is_some_and(|p| p.local_available);
             sqlx::query(
                 r#"
                 INSERT OR IGNORE INTO sync_item_blobs (
@@ -1509,6 +1531,75 @@ pub async fn clear_item_needs_apply(pool: &SqlitePool, sync_key: &str) -> Result
     Ok(())
 }
 
+/// Downgrades `target_id`'s availability to `'metadata'` after an explicit `NotFound` blob error
+/// and clears `needs_blob_pull` when no other complete source remains, preventing poison-pill loops.
+pub async fn downgrade_source_availability_on_missing_blob(
+    pool: &SqlitePool,
+    sync_key: &str,
+    target_id: &str,
+    missing_blob_id: &str,
+) -> Result<bool> {
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin downgrading missing remote blob source")?;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE sync_item_targets
+        SET confirmed_content = CASE
+                WHEN confirmed_content = 'complete' THEN 'metadata'
+                ELSE confirmed_content
+            END,
+            status = CASE
+                WHEN status IN ('blocked', 'canceled') THEN status
+                ELSE 'confirmed'
+            END,
+            updated_at = ?
+        WHERE sync_key = ? AND target_id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(sync_key)
+    .bind(target_id)
+    .execute(&mut *transaction)
+    .await
+    .context("downgrade target availability on missing blob")?;
+    if target_id == CLOUD_TARGET {
+        sqlx::query(
+            "UPDATE sync_item_blobs SET cloud_available = 0, updated_at = ? \
+             WHERE sync_key = ? AND blob_id = ?",
+        )
+        .bind(now)
+        .bind(sync_key)
+        .bind(missing_blob_id)
+        .execute(&mut *transaction)
+        .await
+        .context("clear cloud_available for missing Hub blob")?;
+    }
+    let has_other_complete: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_item_targets \
+         WHERE sync_key = ? AND confirmed_content = 'complete')",
+    )
+    .bind(sync_key)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("check remaining complete blob sources")?;
+    if !has_other_complete {
+        sqlx::query("UPDATE sync_items SET needs_blob_pull = 0, updated_at = ? WHERE sync_key = ?")
+            .bind(now)
+            .bind(sync_key)
+            .execute(&mut *transaction)
+            .await
+            .context("clear needs_blob_pull when no complete source remains")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit missing blob source downgrade")?;
+    Ok(!has_other_complete)
+}
+
 /// Returns `(peer_device_id, remote_seq)` pairs for LAN peers that sent or served `sync_key`.
 pub async fn lan_remote_seqs_for_item(
     pool: &SqlitePool,
@@ -1666,10 +1757,11 @@ pub async fn update_blob_local_source(
     Ok(())
 }
 
-/// Promotes a local item's target to manual `desired_content = 'complete'` and resets errors.
+/// Promotes an item's target to manual `desired_content = 'complete'`, ensures a positive
+/// `local_seq` so Control-Plane pushes metadata when needed, and clears errors / route locks.
 pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool) -> Result<bool> {
-    let Some(sync_key): Option<String> =
-        sqlx::query_scalar("SELECT sync_key FROM sync_items WHERE item_id = ?")
+    let Some((sync_key, current_local_seq)): Option<(String, i64)> =
+        sqlx::query_as("SELECT sync_key, local_seq FROM sync_items WHERE item_id = ?")
             .bind(item_id)
             .fetch_optional(pool)
             .await
@@ -1682,9 +1774,16 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
         .await
         .context("begin manual item delivery request")?;
     let now = Utc::now();
+    let local_seq = if current_local_seq > 0 {
+        current_local_seq
+    } else {
+        crate::db::sync_items::next_local_seq_on(&mut transaction).await?
+    };
     sqlx::query(
-        "UPDATE sync_items SET history_backfill = 0, manual_share = 1, delivery_route = NULL, updated_at = ? WHERE sync_key = ?",
+        "UPDATE sync_items SET local_seq = ?, history_backfill = 0, manual_share = 1, \
+         delivery_route = NULL, updated_at = ? WHERE sync_key = ?",
     )
+    .bind(local_seq)
     .bind(now)
     .bind(&sync_key)
     .execute(&mut *transaction)
@@ -1700,7 +1799,20 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
             ) VALUES (?, 'cloud', 'complete', 'none', 'pending', 0, 0, NULL, ?, ?)
             ON CONFLICT(sync_key, target_id) DO UPDATE SET
                 desired_content = 'complete',
-                status = 'pending',
+                status = CASE
+                    WHEN sync_item_targets.confirmed_content = 'complete' THEN 'confirmed'
+                    ELSE 'pending'
+                END,
+                pushed_local_seq = CASE
+                    WHEN sync_item_targets.confirmed_content = 'complete'
+                    THEN sync_item_targets.pushed_local_seq
+                    ELSE 0
+                END,
+                acked_local_seq = CASE
+                    WHEN sync_item_targets.confirmed_content = 'complete'
+                    THEN sync_item_targets.acked_local_seq
+                    ELSE 0
+                END,
                 last_error = NULL,
                 updated_at = excluded.updated_at
             "#,
@@ -1868,6 +1980,15 @@ pub async fn is_delivery_canceled(
     Ok(canceled)
 }
 
+pub struct DownloadedBlobBinding {
+    pub blob_id: String,
+    pub plaintext_hash: String,
+    pub stream_nonce: Vec<u8>,
+    pub original_size: u64,
+    pub encrypted_size: u64,
+    pub source_path: String,
+}
+
 pub async fn record_external_download_session(
     pool: &SqlitePool,
     sync_key: &str,
@@ -1889,6 +2010,71 @@ pub async fn record_external_download_session(
     .execute(pool)
     .await
     .context("record external download session")?;
+    Ok(())
+}
+
+/// Preserves original blob identity and stream nonce for downloaded external files so a later
+/// Cloud share reuses the existing `blob_id` (allowing instant Hub deduplication) instead of
+/// minting a new random blob and re-uploading the full file.
+pub async fn record_downloaded_external_blobs(
+    pool: &SqlitePool,
+    group_id: &str,
+    sync_key: &str,
+    bindings: &[DownloadedBlobBinding],
+) -> Result<()> {
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin recording downloaded external blobs")?;
+    let now = Utc::now();
+    for binding in bindings {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_content_objects (
+                group_id, plaintext_hash, blob_id, stream_nonce,
+                original_size, encrypted_size, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, plaintext_hash) DO NOTHING
+            "#,
+        )
+        .bind(group_id)
+        .bind(&binding.plaintext_hash)
+        .bind(&binding.blob_id)
+        .bind(&binding.stream_nonce)
+        .bind(i64::try_from(binding.original_size).unwrap_or(i64::MAX))
+        .bind(i64::try_from(binding.encrypted_size).unwrap_or(i64::MAX))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .context("record downloaded sync content object")?;
+
+        sqlx::query(
+            r#"
+            UPDATE sync_item_blobs
+            SET local_available = 1,
+                source_path = ?,
+                stream_nonce = COALESCE(stream_nonce, ?),
+                updated_at = ?
+            WHERE sync_key = ? AND blob_id = ?
+            "#,
+        )
+        .bind(&binding.source_path)
+        .bind(&binding.stream_nonce)
+        .bind(now)
+        .bind(sync_key)
+        .bind(&binding.blob_id)
+        .execute(&mut *transaction)
+        .await
+        .context("bind downloaded external source to sync_item_blobs")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit downloaded external blob bindings")?;
     Ok(())
 }
 
@@ -2091,7 +2277,7 @@ pub fn snapshot_from_meta(meta: &StoredSyncItemMeta, local_device_id: &str) -> S
         favorite_version: resolve(&meta.favorite_version),
         pinned_version: resolve(&meta.pinned_version),
         note_version: resolve(&meta.note_version),
-        is_present: meta.is_present && !meta.deleted,
+        is_present: meta.is_present,
         is_favorite: meta.is_favorite,
         is_pinned: meta.is_pinned,
         note: meta.note.clone(),

@@ -115,60 +115,67 @@ impl SyncManager {
                 let mut snapshot = if pending.deleted {
                     cloud_desired = Some(super::super::item_status::ContentLevel::Complete);
                     repository::snapshot_from_meta(&meta, &device_id)
-                } else if let (Some(existing_key), Some(nonce), Some(ciphertext)) = (
-                    meta.item_key.as_deref(),
-                    meta.nonce.as_deref(),
-                    meta.ciphertext.as_deref(),
-                ) {
-                    let mut existing = crypto::decrypt_item_snapshot(
-                        &key,
-                        existing_key,
-                        meta.deleted,
-                        meta.protected,
-                        nonce,
-                        ciphertext,
-                    )
-                    .unwrap_or_else(|_| repository::snapshot_from_meta(&meta, &device_id));
-                    let updated = repository::snapshot_from_meta(&meta, &device_id);
-                    existing.presence_version = updated.presence_version;
-                    existing.favorite_version = updated.favorite_version;
-                    existing.pinned_version = updated.pinned_version;
-                    existing.note_version = updated.note_version;
-                    existing.is_present = updated.is_present;
-                    existing.is_favorite = updated.is_favorite;
-                    existing.is_pinned = updated.is_pinned;
-                    existing.note = updated.note;
-                    existing
-                } else if let Some(item_id) = meta.item_id.as_deref() {
-                    if let Some(item) = db::items::find_item_by_id(&pool, item_id).await? {
-                        let (snap, blob_rows, content_objects, _, staging) = self
-                            .build_snapshot(&pool, &item, &meta, &device_id, &group, None)
-                            .await?;
-                        staging.retain_for_delivery();
-                        cloud_desired = Some(if item.kind == ClipboardKind::Files {
-                            let total_size = snap
-                                .blobs
-                                .iter()
-                                .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
-                            if permits_automatic_file_upload(
-                                total_size,
-                                settings.auto_upload_max_mb,
-                            ) {
-                                super::super::item_status::ContentLevel::Complete
-                            } else {
-                                super::super::item_status::ContentLevel::Metadata
+                } else {
+                    let decrypted = match (
+                        meta.item_key.as_deref(),
+                        meta.nonce.as_deref(),
+                        meta.ciphertext.as_deref(),
+                    ) {
+                        (Some(existing_key), Some(nonce), Some(ciphertext)) => {
+                            decrypt_stored_snapshot(
+                                &key,
+                                existing_key,
+                                meta.deleted,
+                                meta.protected,
+                                nonce,
+                                ciphertext,
+                            )
+                            .ok()
+                            .filter(|existing| existing.item.is_some())
+                        }
+                        _ => None,
+                    };
+                    if let Some(mut existing) = decrypted {
+                        overlay_meta_crdt_fields(&mut existing, &meta, &device_id);
+                        existing
+                    } else if let Some(item_id) = meta.item_id.as_deref() {
+                        if let Some(item) = db::items::find_item_by_id(&pool, item_id).await? {
+                            let (mut snap, blob_rows, content_objects, _, staging) = self
+                                .build_snapshot(&pool, &item, &meta, &device_id, &group, None)
+                                .await?;
+                            staging.retain_for_delivery();
+                            if snap.content_version.seq == 0 {
+                                let base_seq = snap.max_lamport_seq().max(1);
+                                snap.content_version = FieldVersion::new(base_seq, &device_id);
+                                if snap.presence_version.seq == 0 {
+                                    snap.presence_version = FieldVersion::new(base_seq, &device_id);
+                                }
                             }
+                            cloud_desired = Some(if item.kind == ClipboardKind::Files {
+                                let total_size = snap
+                                    .blobs
+                                    .iter()
+                                    .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+                                if permits_automatic_file_upload(
+                                    total_size,
+                                    settings.auto_upload_max_mb,
+                                ) {
+                                    super::super::item_status::ContentLevel::Complete
+                                } else {
+                                    super::super::item_status::ContentLevel::Metadata
+                                }
+                            } else {
+                                super::super::item_status::ContentLevel::Complete
+                            });
+                            built_blobs = Some(blob_rows);
+                            built_content_objects = content_objects;
+                            snap
                         } else {
-                            super::super::item_status::ContentLevel::Complete
-                        });
-                        built_blobs = Some(blob_rows);
-                        built_content_objects = content_objects;
-                        snap
+                            repository::snapshot_from_meta(&meta, &device_id)
+                        }
                     } else {
                         repository::snapshot_from_meta(&meta, &device_id)
                     }
-                } else {
-                    repository::snapshot_from_meta(&meta, &device_id)
                 };
                 if snapshot.deleted() {
                     snapshot.item = None;
@@ -456,22 +463,25 @@ impl SyncManager {
             return Ok(ContentMaterialization::Completed);
         }
 
-        let cloud_desired = if item.kind == ClipboardKind::Files
-            && !operation.manual_share
-            && !operation.force_files
-        {
-            let total_size = snapshot
-                .blobs
-                .iter()
-                .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
-            if permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
-                super::super::item_status::ContentLevel::Complete
+        let cloud_desired =
+            if operation.delivery_route == Some(db::sync_items::ContentDeliveryRoute::Lan) {
+                None
+            } else if item.kind == ClipboardKind::Files
+                && !operation.manual_share
+                && !operation.force_files
+            {
+                let total_size = snapshot
+                    .blobs
+                    .iter()
+                    .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+                if permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
+                    Some(super::super::item_status::ContentLevel::Complete)
+                } else {
+                    Some(super::super::item_status::ContentLevel::Metadata)
+                }
             } else {
-                super::super::item_status::ContentLevel::Metadata
-            }
-        } else {
-            super::super::item_status::ContentLevel::Complete
-        };
+                Some(super::super::item_status::ContentLevel::Complete)
+            };
 
         let committed = repository::commit_prepared_item(
             pool,
@@ -488,7 +498,7 @@ impl SyncManager {
                 ciphertext: &ciphertext,
                 blobs: &blob_rows,
                 content_objects: &content_objects,
-                cloud_desired: Some(cloud_desired),
+                cloud_desired,
             },
         )
         .await?;
@@ -896,7 +906,8 @@ impl SyncManager {
                             let object = match reusable {
                                 Some(object) => object,
                                 None => {
-                                    let stream_nonce = crypto::new_stream_nonce();
+                                    let stream_nonce =
+                                        crypto::derive_stream_nonce(&key, &content_hash)?;
                                     StoredContentObject {
                                         blob_id: crypto::stream_blob_id(
                                             &key,
