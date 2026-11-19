@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct PreparedSourceIconCache {
+    pub(super) icon_ref: SourceIconRef,
+    pub(super) blob: StoredBlob,
+}
+
 /// Owns all volatile connection, worker and channel state for one sync manager.
 pub(super) struct RuntimeCoordinator {
     pub(super) update_notification_pending: Arc<AtomicBool>,
@@ -10,12 +16,19 @@ pub(super) struct RuntimeCoordinator {
     pub(super) cloud_transfer_wake: Notify,
     pub(super) watch_wake: Notify,
     pub(super) source_asset_wake: Notify,
-    pub(super) local_outbox_wake: [Notify; 2],
+    /// `0` = inline/image worker, `1` = backfill files worker, `2` = realtime files worker.
+    pub(super) local_outbox_wake: [Notify; 3],
     pub(super) attachment_wakes: [Notify; 4],
     pub(super) exchange_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) nearby_wake: Notify,
     pub(super) cleanup_ready: Notify,
     pub(super) realtime_pending: AtomicBool,
+    /// Highest cloud Hub sequence observed via `WatchCloud`, enabling batch-0 pull preemption.
+    pub(super) cloud_observed_latest_seq: AtomicU64,
+    /// Session-scoped memoization for `(group_id, icon_file)` encryption during backfill.
+    pub(super) prepared_source_icons: RwLock<HashMap<(String, String), PreparedSourceIconCache>>,
+    /// Session-scoped set of `(group_id, blob_id)` icons already confirmed stored on Cloud Hub.
+    pub(super) uploaded_source_icons: RwLock<HashSet<(String, String)>>,
     pub(super) lan_cycle_lock: AsyncRwLock<()>,
     pub(super) cloud_cycle_lock: Mutex<()>,
     pub(super) cloud_connect_lock: Mutex<()>,
@@ -64,6 +77,9 @@ impl RuntimeCoordinator {
             nearby_wake: Notify::new(),
             cleanup_ready: Notify::new(),
             realtime_pending: AtomicBool::new(false),
+            cloud_observed_latest_seq: AtomicU64::new(0),
+            prepared_source_icons: RwLock::new(HashMap::new()),
+            uploaded_source_icons: RwLock::new(HashSet::new()),
             lan_cycle_lock: AsyncRwLock::new(()),
             cloud_cycle_lock: Mutex::new(()),
             cloud_connect_lock: Mutex::new(()),
@@ -90,5 +106,17 @@ impl RuntimeCoordinator {
             lan_presence_nonce: AtomicU64::new(presence_nonce),
             nearby_devices: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(super) fn clear_group_caches(&self) {
+        self.cloud_observed_latest_seq.store(0, Ordering::Release);
+        self.prepared_source_icons
+            .write()
+            .expect("prepared source icons poisoned")
+            .clear();
+        self.uploaded_source_icons
+            .write()
+            .expect("uploaded source icons poisoned")
+            .clear();
     }
 }

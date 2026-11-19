@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, mkdtemp, opendir, rename, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  opendir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { acquireAndroidBuildLock } from "./androidBuildLock";
@@ -8,6 +17,11 @@ import { acquireAndroidBuildLock } from "./androidBuildLock";
 const GIBIBYTE = 1024 ** 3;
 const DESKTOP_CACHE_LIMIT = 6 * GIBIBYTE;
 const ANDROID_CACHE_LIMIT = 3 * GIBIBYTE;
+const CACHEDIR_TAG_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55";
+const CACHEDIR_TAG_CONTENT = `${CACHEDIR_TAG_SIGNATURE}
+# This file is a cache directory tag created by cargo.
+# For information about cache directory tags see https://bford.info/cachedir/
+`;
 
 /** 统计目录的逻辑大小；忽略符号链接，避免重复计算链接目标。 */
 async function getPathSize(path: string): Promise<number> {
@@ -70,11 +84,31 @@ async function isCacheLimitExceeded(
   return true;
 }
 
+/**
+ * 补齐 Cargo `CACHEDIR.TAG` 标记，避免目录先于 Cargo 创建（如锁目录或挂载点）导致 `cargo clean` 拒绝清理。
+ */
+async function ensureCargoCacheDirTag(targetDirectory: string) {
+  const tagPath = resolve(targetDirectory, "CACHEDIR.TAG");
+  try {
+    const existing = await readFile(tagPath, "utf8");
+    if (existing.startsWith(CACHEDIR_TAG_SIGNATURE)) {
+      return;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  await writeFile(tagPath, CACHEDIR_TAG_CONTENT, "utf8");
+}
+
 /** 使用 rustup 管理的 Cargo 清理指定 profile，避免清到共享下载缓存。 */
-function cleanCargoProfiles(
+async function cleanCargoProfiles(
   projectRoot: string,
   profiles: string[],
   targetDirectory?: string,
+  targetTriple?: string,
 ) {
   const cargoHome = process.env.CARGO_HOME ?? resolve(homedir(), ".cargo");
   const cargo = resolve(
@@ -82,6 +116,9 @@ function cleanCargoProfiles(
     "bin",
     process.platform === "win32" ? "cargo.exe" : "cargo",
   );
+  if (targetDirectory) {
+    await ensureCargoCacheDirTag(targetDirectory);
+  }
 
   for (const profile of profiles) {
     const args = [
@@ -91,6 +128,9 @@ function cleanCargoProfiles(
       "--manifest-path",
       "src-tauri/Cargo.toml",
     ];
+    if (targetTriple) {
+      args.push("--target", targetTriple);
+    }
     if (targetDirectory) {
       args.push("--target-dir", targetDirectory);
     }
@@ -156,7 +196,7 @@ async function cleanDesktopCargoCache(
 
   let cargoError: unknown;
   try {
-    cleanCargoProfiles(projectRoot, ["dev", "release"], targetRoot);
+    await cleanCargoProfiles(projectRoot, ["dev", "release"], targetRoot);
   } catch (error) {
     cargoError = error;
   } finally {
@@ -193,10 +233,9 @@ export async function cleanAndroidCacheIfNeeded(
   projectRoot: string,
   cleanGradle: () => Promise<void>,
 ) {
-  const androidTargetRoot = resolve(
-    projectRoot,
-    "src-tauri/target/aarch64-linux-android",
-  );
+  const targetRoot = resolve(projectRoot, "src-tauri/target");
+  const androidTargetTriple = "aarch64-linux-android";
+  const androidTargetRoot = resolve(targetRoot, androidTargetTriple);
   const androidRoot = resolve(projectRoot, "src-tauri/gen/android");
   const debugCachePath = resolve(androidTargetRoot, "debug");
   const cachePaths = [
@@ -221,7 +260,12 @@ export async function cleanAndroidCacheIfNeeded(
 
   let debugError: unknown;
   try {
-    cleanCargoProfiles(projectRoot, ["dev"], androidTargetRoot);
+    await cleanCargoProfiles(
+      projectRoot,
+      ["dev"],
+      targetRoot,
+      androidTargetTriple,
+    );
   } catch (error) {
     debugError = error;
   }
@@ -249,10 +293,11 @@ export async function cleanAndroidCacheIfNeeded(
 
   let cargoError: unknown;
   try {
-    cleanCargoProfiles(
+    await cleanCargoProfiles(
       projectRoot,
       debugError ? ["dev", "release"] : ["release"],
-      androidTargetRoot,
+      targetRoot,
+      androidTargetTriple,
     );
   } catch (error) {
     cargoError = error;

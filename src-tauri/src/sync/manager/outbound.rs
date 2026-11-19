@@ -91,7 +91,7 @@ impl SyncManager {
         else {
             return Ok(0);
         };
-        let _enqueue_guard = self.delivery.lock_materialization(None).await;
+        let _enqueue_guard = self.delivery.lock_materialization(None, true).await;
         let max_operations = usize::from(ecopaste_sync_protocol::MAX_ITEMS_PER_BATCH)
             * MAX_SYNC_BATCHES_PER_CONNECTION;
         let mut processed = 0_usize;
@@ -228,10 +228,11 @@ impl SyncManager {
         Ok(processed)
     }
 
-    /// Materializes durable content outbox operations for a single payload lane.
+    /// Materializes durable content outbox operations for a single payload lane and priority scope.
     pub(super) async fn materialize_content_lane(
         &self,
         lane: db::sync_items::OutboxContentLane,
+        scope: db::sync_items::OutboxContentScope,
         max_content: usize,
         preparation_target: Option<&PreparationTarget>,
         cycle: Option<&SyncCycleContext>,
@@ -253,7 +254,11 @@ impl SyncManager {
                 staging,
             });
         };
-        let _enqueue_guard = self.delivery.lock_materialization(Some(lane)).await;
+        let realtime_lock = matches!(scope, db::sync_items::OutboxContentScope::RealtimeOnly);
+        let _enqueue_guard = self
+            .delivery
+            .lock_materialization(Some(lane), realtime_lock)
+            .await;
         let mut processed = 0_usize;
         let mut stored_any = false;
         let mut hit_limit = false;
@@ -263,9 +268,13 @@ impl SyncManager {
 
         let materialize_result: Result<()> = async {
             for _ in 0..max_operations {
-                let Some(operation) =
-                    db::sync_items::next_pending_content(&pool, settings.sync_sensitive, Some(lane))
-                        .await?
+                let Some(operation) = db::sync_items::next_pending_content(
+                    &pool,
+                    settings.sync_sensitive,
+                    Some(lane),
+                    scope,
+                )
+                .await?
                 else {
                     break;
                 };
@@ -373,7 +382,9 @@ impl SyncManager {
         let Some(meta) = repository::load_sync_item_meta(pool, &operation.sync_key).await? else {
             return Ok(ContentMaterialization::Completed);
         };
-        let preparation = if item.kind == ClipboardKind::Files {
+        let preparation = if item.kind == ClipboardKind::Files
+            && (!operation.history_backfill || operation.manual_share)
+        {
             match preparation_target {
                 Some(target)
                     if target.matches_delivery_route(
@@ -505,11 +516,21 @@ impl SyncManager {
         if !committed {
             return Ok(ContentMaterialization::Completed);
         }
-        let source_icon_blobs = blob_rows
-            .iter()
-            .filter(|blob| blob.optional)
-            .map(repository::SyncItemBlobRow::to_stored_blob)
-            .collect::<Vec<_>>();
+        let source_icon_blobs = {
+            let uploaded = self
+                .runtime_state
+                .uploaded_source_icons
+                .read()
+                .expect("uploaded source icons poisoned");
+            blob_rows
+                .iter()
+                .filter(|blob| {
+                    blob.optional
+                        && !uploaded.contains(&(group.group_id.clone(), blob.blob_id.clone()))
+                })
+                .map(repository::SyncItemBlobRow::to_stored_blob)
+                .collect::<Vec<_>>()
+        };
         if !source_icon_blobs.is_empty() {
             repository::enqueue_source_icon_uploads(pool, &group.group_id, &source_icon_blobs)
                 .await?;
@@ -1087,45 +1108,81 @@ impl SyncManager {
         let source_key = source_app_key(&key, app.platform, &app.id);
         let mut icon_ref = None;
         if let Some(icon_file) = app.icon_file.clone() {
-            let store = self.app.state::<AppIconStore>();
-            match store.refresh_metadata(&icon_file) {
-                Ok(metadata) => {
-                    app.icon_file = Some(metadata.file_name.clone());
-                    app.icon_hash = Some(metadata.icon_hash.clone());
-                    app.accent_start = Some(metadata.accent_start.clone());
-                    app.accent_end = Some(metadata.accent_end.clone());
-                    if let Err(error) = db::apps::upsert_app(&pool, &app).await {
-                        log::warn!("persist normalized source app icon metadata failed: {error}");
+            let cache_key = (group.group_id.clone(), icon_file.clone());
+            let cached = self
+                .runtime_state
+                .prepared_source_icons
+                .read()
+                .expect("prepared source icons poisoned")
+                .get(&cache_key)
+                .cloned();
+            let cached_usable = cached.as_ref().is_some_and(|entry| {
+                let uploaded = self
+                    .runtime_state
+                    .uploaded_source_icons
+                    .read()
+                    .expect("uploaded source icons poisoned")
+                    .contains(&(group.group_id.clone(), entry.blob.blob_id.clone()));
+                uploaded || Path::new(&entry.blob.encrypted_path).is_file()
+            });
+            if let Some(entry) = cached.filter(|_| cached_usable) {
+                icon_ref = Some(entry.icon_ref);
+                stored_blobs.push(entry.blob);
+            } else {
+                let store = self.app.state::<AppIconStore>();
+                match store.refresh_metadata(&icon_file) {
+                    Ok(metadata) => {
+                        app.icon_file = Some(metadata.file_name.clone());
+                        app.icon_hash = Some(metadata.icon_hash.clone());
+                        app.accent_start = Some(metadata.accent_start.clone());
+                        app.accent_end = Some(metadata.accent_end.clone());
+                        if let Err(error) = db::apps::upsert_app(&pool, &app).await {
+                            log::warn!(
+                                "persist normalized source app icon metadata failed: {error}"
+                            );
+                        }
+                        let source = store.icon_path(&metadata.file_name);
+                        let source_for_task = source.clone();
+                        let root = blob_root.to_path_buf();
+                        let hash = metadata.icon_hash.clone();
+                        let encrypted = tauri::async_runtime::spawn_blocking(move || {
+                            crypto::encrypt_stable_blob(&source_for_task, &root, &key, &hash)
+                        })
+                        .await;
+                        match encrypted {
+                            Ok(Ok(mut blob)) => {
+                                blob.source_path = Some(source.to_string_lossy().into_owned());
+                                let built_ref = SourceIconRef {
+                                    icon_hash: metadata.icon_hash,
+                                    blob_id: blob.blob_id.clone(),
+                                    original_size: metadata.original_size,
+                                    encrypted_size: blob.size,
+                                };
+                                self.runtime_state
+                                    .prepared_source_icons
+                                    .write()
+                                    .expect("prepared source icons poisoned")
+                                    .insert(
+                                        cache_key,
+                                        super::runtime_state::PreparedSourceIconCache {
+                                            icon_ref: built_ref.clone(),
+                                            blob: blob.clone(),
+                                        },
+                                    );
+                                icon_ref = Some(built_ref);
+                                stored_blobs.push(blob);
+                            }
+                            Ok(Err(error)) => {
+                                log::warn!("encrypt source app icon failed: {error}");
+                            }
+                            Err(error) => {
+                                log::warn!("source app icon encryption task failed: {error}");
+                            }
+                        }
                     }
-                    let source = store.icon_path(&metadata.file_name);
-                    let source_for_task = source.clone();
-                    let root = blob_root.to_path_buf();
-                    let hash = metadata.icon_hash.clone();
-                    let encrypted = tauri::async_runtime::spawn_blocking(move || {
-                        crypto::encrypt_stable_blob(&source_for_task, &root, &key, &hash)
-                    })
-                    .await;
-                    match encrypted {
-                        Ok(Ok(mut blob)) => {
-                            blob.source_path = Some(source.to_string_lossy().into_owned());
-                            icon_ref = Some(SourceIconRef {
-                                icon_hash: metadata.icon_hash,
-                                blob_id: blob.blob_id.clone(),
-                                original_size: metadata.original_size,
-                                encrypted_size: blob.size,
-                            });
-                            stored_blobs.push(blob);
-                        }
-                        Ok(Err(error)) => {
-                            log::warn!("encrypt source app icon failed: {error}");
-                        }
-                        Err(error) => {
-                            log::warn!("source app icon encryption task failed: {error}");
-                        }
+                    Err(error) => {
+                        log::warn!("normalize source app icon {icon_file} failed: {error}");
                     }
-                }
-                Err(error) => {
-                    log::warn!("normalize source app icon {icon_file} failed: {error}");
                 }
             }
         }

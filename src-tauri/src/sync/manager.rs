@@ -578,11 +578,7 @@ struct SyncQuiescenceLocks<'a> {
     _cloud_guard: tokio::sync::MutexGuard<'a, ()>,
     _lan_guard: tokio::sync::RwLockWriteGuard<'a, ()>,
     _maintenance_guard: tokio::sync::MutexGuard<'a, ()>,
-    _enqueue_guard: (
-        tokio::sync::MutexGuard<'a, ()>,
-        tokio::sync::MutexGuard<'a, ()>,
-        tokio::sync::MutexGuard<'a, ()>,
-    ),
+    _enqueue_guard: super::delivery::EnqueueLocks<'a>,
     _apply_guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
@@ -775,8 +771,12 @@ async fn start_runtime(manager: Arc<SyncManager>) {
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
     tauri::async_runtime::spawn(source_asset_worker(manager.clone()));
-    for files in [false, true] {
-        tauri::async_runtime::spawn(local_outbox_worker(manager.clone(), files));
+    for mode in [
+        LocalOutboxWorkerMode::InlineAndImages,
+        LocalOutboxWorkerMode::BackfillFiles,
+        LocalOutboxWorkerMode::RealtimeFiles,
+    ] {
+        tauri::async_runtime::spawn(local_outbox_worker(manager.clone(), mode));
     }
     for realtime_only in [false, true] {
         for sending in [false, true] {
@@ -1026,6 +1026,7 @@ impl SyncManager {
 
     /// Reloads identity config from the current data directory and clears pending captures.
     pub(crate) fn reconcile_after_storage_replacement(&self, app: &AppHandle) -> Result<()> {
+        self.runtime_state.clear_group_caches();
         self.pending_observations
             .lock()
             .expect("pending clipboard observations poisoned")
@@ -1326,6 +1327,12 @@ impl SyncManager {
         }
     }
 
+    /// Wakes background backfill preparation workers after transport drains ready backlog.
+    pub(super) fn notify_local_outbox_backfill(&self) {
+        self.runtime_state.local_outbox_wake[0].notify_one();
+        self.runtime_state.local_outbox_wake[1].notify_one();
+    }
+
     fn wake_attachments(&self) {
         for wake in &self.runtime_state.attachment_wakes {
             wake.notify_one();
@@ -1334,6 +1341,7 @@ impl SyncManager {
 
     fn wake_lan_transfer(&self) {
         self.runtime_state.local_outbox_wake[1].notify_one();
+        self.runtime_state.local_outbox_wake[2].notify_one();
         self.wake_attachments();
         let actors = self
             .runtime_state
@@ -1351,6 +1359,7 @@ impl SyncManager {
 
     fn wake_cloud_transfer(&self) {
         self.runtime_state.local_outbox_wake[1].notify_one();
+        self.runtime_state.local_outbox_wake[2].notify_one();
         self.wake_attachments();
         self.runtime_state.cloud_transfer_wake.notify_one();
     }
@@ -1482,6 +1491,17 @@ impl SyncManager {
             .read()
             .expect("cloud connection route poisoned")
             .clone();
+        let backfill = if settings.enabled && identity.group.is_some() {
+            repository::backfill_progress(
+                &pool,
+                settings.sync_sensitive,
+                settings.cloud_enabled && server_is_configured(&settings),
+                settings.lan_enabled,
+            )
+            .await?
+        } else {
+            None
+        };
         Ok(SyncStatus {
             enabled: settings.enabled,
             lan_enabled: settings.lan_enabled,
@@ -1515,6 +1535,7 @@ impl SyncManager {
                 .read()
                 .expect("cloud server version poisoned")
                 .clone(),
+            backfill,
             peers,
         })
     }
@@ -1806,7 +1827,7 @@ impl SyncManager {
             ClipboardKind::Image => crate::db::sync_items::OutboxContentLane::Image,
             ClipboardKind::Files => crate::db::sync_items::OutboxContentLane::Files,
         };
-        let _enqueue_guard = self.delivery.lock_materialization(Some(lane)).await;
+        let _enqueue_guard = self.delivery.lock_materialization(Some(lane), true).await;
         let meta = repository::load_sync_item_meta(&pool, &item.sync_key).await?;
         let content_pending = meta
             .as_ref()
@@ -2676,6 +2697,7 @@ mod tests {
                 file_content: true,
                 is_cloud: true,
                 language: Language::ZhCN,
+                stream_priority: BLOB_PRIORITY_REALTIME,
                 started: Some(started),
                 transfer: None,
             },
@@ -2778,6 +2800,7 @@ mod tests {
                 file_content: true,
                 is_cloud: true,
                 language: Language::ZhCN,
+                stream_priority: BLOB_PRIORITY_REALTIME,
                 started: Some(started),
                 transfer: None,
             },

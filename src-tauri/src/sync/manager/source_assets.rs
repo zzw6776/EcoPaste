@@ -121,12 +121,23 @@ impl SyncManager {
                 file_content: false,
                 is_cloud: true,
                 language: crate::i18n::current_language(&self.app),
+                stream_priority: BLOB_PRIORITY_SOURCE_ICON,
                 started: None,
                 transfer: None,
             },
         )
         .await?;
         repository::complete_source_icon_uploads(&pool, &group.group_id, &blob_ids).await?;
+        {
+            let mut uploaded = self
+                .runtime_state
+                .uploaded_source_icons
+                .write()
+                .expect("uploaded source icons poisoned");
+            for blob_id in &blob_ids {
+                uploaded.insert((group.group_id.clone(), blob_id.clone()));
+            }
+        }
         for (blob_id, path) in blob_ids.iter().zip(blob_paths) {
             self.delivery.request_staging_release(blob_id, path);
         }

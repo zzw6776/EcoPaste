@@ -311,12 +311,23 @@ impl Drop for PreparationCommitGuard {
     }
 }
 
+/// Holds every local materialization lock during quiescence or sync-group transitions.
+pub(super) struct EnqueueLocks<'a> {
+    _backfill_files: MutexGuard<'a, ()>,
+    _realtime_files: MutexGuard<'a, ()>,
+    _backfill_images: MutexGuard<'a, ()>,
+    _realtime_images: MutexGuard<'a, ()>,
+    _inline: MutexGuard<'a, ()>,
+}
+
 /// Keeps durable delivery state authoritative while projecting progress into short-lived UI tasks.
 pub(super) struct DeliveryCoordinator {
     app: AppHandle,
     enqueue_lock: Mutex<()>,
     image_enqueue_lock: Mutex<()>,
+    realtime_image_enqueue_lock: Mutex<()>,
     file_enqueue_lock: Mutex<()>,
+    realtime_file_enqueue_lock: Mutex<()>,
     transition_lock: Mutex<()>,
     registry: TransferRegistry,
     staging: OutgoingStagingLeases,
@@ -330,34 +341,51 @@ impl DeliveryCoordinator {
             app,
             enqueue_lock: Mutex::new(()),
             image_enqueue_lock: Mutex::new(()),
+            realtime_image_enqueue_lock: Mutex::new(()),
             file_enqueue_lock: Mutex::new(()),
+            realtime_file_enqueue_lock: Mutex::new(()),
             transition_lock: Mutex::new(()),
             staging: OutgoingStagingLeases::default(),
             remote_download_claims: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
-    pub async fn lock_enqueue(
-        &self,
-    ) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
-        let files = self.file_enqueue_lock.lock().await;
-        let images = self.image_enqueue_lock.lock().await;
-        (files, images, self.enqueue_lock.lock().await)
+    pub async fn lock_enqueue(&self) -> EnqueueLocks<'_> {
+        let backfill_files = self.file_enqueue_lock.lock().await;
+        let realtime_files = self.realtime_file_enqueue_lock.lock().await;
+        let backfill_images = self.image_enqueue_lock.lock().await;
+        let realtime_images = self.realtime_image_enqueue_lock.lock().await;
+        let inline = self.enqueue_lock.lock().await;
+        EnqueueLocks {
+            _backfill_files: backfill_files,
+            _realtime_files: realtime_files,
+            _backfill_images: backfill_images,
+            _realtime_images: realtime_images,
+            _inline: inline,
+        }
     }
 
-    /// Serializes only the matching preparation lane during ordinary synchronization.
+    /// Serializes only the matching preparation lane and priority tier so historical backfill
+    /// never blocks freshly copied or manually shared images and files.
     pub async fn lock_materialization(
         &self,
         lane: Option<crate::db::sync_items::OutboxContentLane>,
+        realtime_only: bool,
     ) -> MutexGuard<'_, ()> {
-        match lane {
-            Some(crate::db::sync_items::OutboxContentLane::Files) => {
+        match (lane, realtime_only) {
+            (Some(crate::db::sync_items::OutboxContentLane::Files), true) => {
+                self.realtime_file_enqueue_lock.lock().await
+            }
+            (Some(crate::db::sync_items::OutboxContentLane::Files), false) => {
                 self.file_enqueue_lock.lock().await
             }
-            Some(crate::db::sync_items::OutboxContentLane::Image) => {
+            (Some(crate::db::sync_items::OutboxContentLane::Image), true) => {
+                self.realtime_image_enqueue_lock.lock().await
+            }
+            (Some(crate::db::sync_items::OutboxContentLane::Image), false) => {
                 self.image_enqueue_lock.lock().await
             }
-            Some(crate::db::sync_items::OutboxContentLane::Text) | None => {
+            (Some(crate::db::sync_items::OutboxContentLane::Text) | None, _) => {
                 self.enqueue_lock.lock().await
             }
         }
@@ -482,7 +510,7 @@ impl DeliveryCoordinator {
 
         let _transition_guard = self.transition_lock.lock().await;
         let _commit_guard = if self.registry.preparation_committing(task_id) {
-            Some(self.file_enqueue_lock.lock().await)
+            Some(self.realtime_file_enqueue_lock.lock().await)
         } else {
             None
         };

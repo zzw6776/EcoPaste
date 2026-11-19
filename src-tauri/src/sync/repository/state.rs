@@ -194,6 +194,104 @@ pub async fn status_counts(pool: &SqlitePool, include_sensitive: bool) -> Result
     ))
 }
 
+/// Computes aggregate automatic history backfill progress without exposing per-item details.
+/// Returns `None` once all staged historical backfill items have converged on the active routes.
+pub async fn backfill_progress(
+    pool: &SqlitePool,
+    include_sensitive: bool,
+    cloud_enabled: bool,
+    lan_enabled: bool,
+) -> Result<Option<crate::sync::model::SyncBackfillProgress>> {
+    if !cloud_enabled && !lan_enabled {
+        return Ok(None);
+    }
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_items s
+        WHERE s.history_backfill = 1
+          AND s.manual_share = 0
+          AND s.deleted = 0
+          AND (? OR s.is_sensitive = 0)
+        "#,
+    )
+    .bind(include_sensitive)
+    .fetch_one(pool)
+    .await
+    .context("count automatic history backfill items")?;
+    if total <= 0 {
+        return Ok(None);
+    }
+
+    let remaining: i64 = if cloud_enabled {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_items s
+            LEFT JOIN sync_item_targets t
+              ON t.sync_key = s.sync_key AND t.target_id = 'cloud'
+            WHERE s.history_backfill = 1
+              AND s.manual_share = 0
+              AND s.deleted = 0
+              AND (? OR s.is_sensitive = 0)
+              AND (s.delivery_route IS NULL OR s.delivery_route <> 'lan')
+              AND (
+                  s.prep_state <> 'ready'
+                  OR t.target_id IS NULL
+                  OR (
+                      t.status NOT IN ('confirmed', 'blocked', 'canceled')
+                      OR t.pushed_local_seq < s.local_seq
+                  )
+              )
+            "#,
+        )
+        .bind(include_sensitive)
+        .fetch_one(pool)
+        .await
+        .context("count remaining cloud history backfill items")?
+    } else {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_items s
+            WHERE s.history_backfill = 1
+              AND s.manual_share = 0
+              AND s.deleted = 0
+              AND (? OR s.is_sensitive = 0)
+              AND (s.delivery_route IS NULL OR s.delivery_route <> 'cloud')
+              AND (
+                  s.prep_state <> 'ready'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM sync_peers p
+                      JOIN sync_peer_connections c
+                        ON c.device_id = p.device_id AND c.state = 'online'
+                      LEFT JOIN sync_item_targets t
+                        ON t.sync_key = s.sync_key AND t.target_id = ('peer:' || p.device_id)
+                      WHERE t.target_id IS NULL
+                         OR t.status NOT IN ('confirmed', 'blocked', 'canceled')
+                         OR t.pushed_local_seq < s.local_seq
+                  )
+              )
+            "#,
+        )
+        .bind(include_sensitive)
+        .fetch_one(pool)
+        .await
+        .context("count remaining LAN history backfill items")?
+    };
+
+    if remaining <= 0 {
+        return Ok(None);
+    }
+    let total_u64 = total as u64;
+    let remaining_u64 = (remaining as u64).min(total_u64);
+    Ok(Some(crate::sync::model::SyncBackfillProgress {
+        completed: total_u64.saturating_sub(remaining_u64),
+        total: total_u64,
+    }))
+}
+
 /// Loads device-local external download destinations for the requested items.
 pub async fn external_download_sessions(
     pool: &SqlitePool,

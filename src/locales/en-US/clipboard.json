@@ -285,6 +285,10 @@
   },
   "transferCenter": {
     "active": "In progress",
+    "backfill": {
+      "description": "Syncing history in the background without blocking new copies",
+      "title": "Automatic backfill"
+    },
     "clearFinished": "Clear finished",
     "download": {
       "canceled": "Download canceled",

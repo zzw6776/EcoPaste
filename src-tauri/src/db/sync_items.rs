@@ -47,6 +47,25 @@ pub enum OutboxContentLane {
     Files,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxContentScope {
+    #[cfg(test)]
+    All,
+    RealtimeOnly,
+    BackfillOnly,
+}
+
+impl OutboxContentScope {
+    fn sql_code(self) -> i64 {
+        match self {
+            #[cfg(test)]
+            Self::All => 0,
+            Self::RealtimeOnly => 1,
+            Self::BackfillOnly => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingContentPrep {
     pub sync_key: String,
@@ -553,6 +572,7 @@ pub async fn next_pending_content(
     pool: &SqlitePool,
     include_sensitive: bool,
     lane: Option<OutboxContentLane>,
+    scope: OutboxContentScope,
 ) -> Result<Option<PendingContentPrep>> {
     let now = Utc::now();
     let lane_kind = lane.map(|lane| match lane {
@@ -560,6 +580,7 @@ pub async fn next_pending_content(
         OutboxContentLane::Image => "image",
         OutboxContentLane::Files => "files",
     });
+    let scope_code = scope.sql_code();
     let row = sqlx::query(
         r#"
         SELECT s.sync_key, s.item_id, s.source_revision, s.kind, s.local_seq,
@@ -571,6 +592,11 @@ pub async fn next_pending_content(
           AND (s.next_prep_at IS NULL OR s.next_prep_at <= ?)
           AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
           AND (? IS NULL OR s.kind = ?)
+          AND (
+              ? = 0
+              OR (? = 1 AND (s.history_backfill = 0 OR s.manual_share = 1))
+              OR (? = 2 AND s.history_backfill = 1 AND s.manual_share = 0)
+          )
           AND (c.kind <> 'files' OR c.size IS NOT NULL)
         ORDER BY s.manual_share DESC,
                  s.history_backfill ASC,
@@ -583,6 +609,9 @@ pub async fn next_pending_content(
     .bind(include_sensitive)
     .bind(lane_kind)
     .bind(lane_kind)
+    .bind(scope_code)
+    .bind(scope_code)
+    .bind(scope_code)
     .fetch_optional(pool)
     .await
     .context("query next pending content sync item")?;
@@ -621,12 +650,14 @@ pub async fn next_content_retry_at(
     pool: &SqlitePool,
     include_sensitive: bool,
     lane: OutboxContentLane,
+    scope: OutboxContentScope,
 ) -> Result<Option<DateTime<Utc>>> {
     let lane_kind = match lane {
         OutboxContentLane::Text => "text",
         OutboxContentLane::Image => "image",
         OutboxContentLane::Files => "files",
     };
+    let scope_code = scope.sql_code();
     let value: Option<DateTime<Utc>> = sqlx::query_scalar(
         r#"
         SELECT MIN(s.next_prep_at)
@@ -637,11 +668,19 @@ pub async fn next_content_retry_at(
           AND s.next_prep_at IS NOT NULL
           AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
           AND s.kind = ?
+          AND (
+              ? = 0
+              OR (? = 1 AND (s.history_backfill = 0 OR s.manual_share = 1))
+              OR (? = 2 AND s.history_backfill = 1 AND s.manual_share = 0)
+          )
           AND (c.kind <> 'files' OR c.size IS NOT NULL)
         "#,
     )
     .bind(include_sensitive)
     .bind(lane_kind)
+    .bind(scope_code)
+    .bind(scope_code)
+    .bind(scope_code)
     .fetch_one(pool)
     .await
     .context("query next content prep retry time")?;

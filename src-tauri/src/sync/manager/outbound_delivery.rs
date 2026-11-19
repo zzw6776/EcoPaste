@@ -137,6 +137,7 @@ impl SyncManager {
         let text_run = self
             .materialize_content_lane(
                 db::sync_items::OutboxContentLane::Text,
+                db::sync_items::OutboxContentScope::RealtimeOnly,
                 usize::from(MAX_ITEMS_PER_BATCH),
                 Some(target),
                 Some(cycle),
@@ -148,6 +149,7 @@ impl SyncManager {
         let image_run = self
             .materialize_content_lane(
                 db::sync_items::OutboxContentLane::Image,
+                db::sync_items::OutboxContentScope::RealtimeOnly,
                 4,
                 Some(target),
                 Some(cycle),
@@ -214,7 +216,11 @@ impl SyncManager {
         let mut local_has_more = self
             .prepare_realtime_outbound_lanes(&prep_target, cycle)
             .await?;
-        let mut remote_latest_hint: Option<u64> = None;
+        let observed = self
+            .runtime_state
+            .cloud_observed_latest_seq
+            .load(Ordering::Acquire);
+        let mut remote_latest_hint: Option<u64> = (observed > 0).then_some(observed);
         let mut has_more = false;
         let exchange_lock = self
             .runtime_state
@@ -236,13 +242,23 @@ impl SyncManager {
                     .prepare_realtime_outbound_lanes(&prep_target, cycle)
                     .await?;
             }
+            let observed = self
+                .runtime_state
+                .cloud_observed_latest_seq
+                .load(Ordering::Acquire);
+            if observed > 0 {
+                remote_latest_hint =
+                    Some(remote_latest_hint.map_or(observed, |prev| prev.max(observed)));
+            }
 
             let exchange_guard = exchange_lock.lock().await;
             let mut window = repository::cloud_window_cursor(&pool).await?;
             let (after_seq, before_seq) = window.next_pull_params(remote_latest_hint);
-            let writes =
+            let outbound_batch =
                 repository::pending_outbound_writes(&pool, CLOUD_TARGET, MAX_ITEMS_PER_BATCH)
                     .await?;
+            let writes = outbound_batch.writes;
+            let has_more_writes = outbound_batch.has_more;
             let available_write_count = writes.len();
             let remote_ahead = remote_latest_hint.is_some_and(|latest| latest > window.synced_seq);
             if batch_index > 0
@@ -350,6 +366,9 @@ impl SyncManager {
             };
 
             repository::record_cloud_accepted(&pool, &accepted, &pushed_local_seqs).await?;
+            if !accepted.is_empty() {
+                self.notify_local_outbox_backfill();
+            }
             if !removed_devices.is_empty() {
                 self.apply_removed_devices(
                     &pool,
@@ -413,7 +432,11 @@ impl SyncManager {
             );
 
             let needs_repush = conflict_summary.needs_repush || pull_summary.needs_repush;
-            has_more = outgoing_truncated || pull_more || needs_repush || local_has_more;
+            has_more = outgoing_truncated
+                || has_more_writes
+                || pull_more
+                || needs_repush
+                || local_has_more;
             local_has_more = false;
             if !has_more {
                 break;
@@ -496,8 +519,10 @@ impl SyncManager {
             let exchange_guard = exchange_lock.lock().await;
             let mut window = repository::peer_window_cursor(&pool, peer_device_id).await?;
             let (after_seq, before_seq) = window.next_pull_params(remote_latest_hint);
-            let writes =
+            let outbound_batch =
                 repository::pending_outbound_writes(&pool, target_id, MAX_ITEMS_PER_BATCH).await?;
+            let writes = outbound_batch.writes;
+            let has_more_writes = outbound_batch.has_more;
             let available_write_count = writes.len();
             let remote_ahead = remote_latest_hint.is_some_and(|latest| latest > window.synced_seq);
             if batch_index > 0
@@ -584,6 +609,9 @@ impl SyncManager {
             };
 
             repository::record_lan_acks(&pool, target_id, &acks).await?;
+            if !acks.is_empty() {
+                self.notify_local_outbox_backfill();
+            }
             let pull_summary = self
                 .ingest_remote_records(&pool, group, target_id, &items, false)
                 .await?;
@@ -633,8 +661,11 @@ impl SyncManager {
                 self.emit_updated();
             }
 
-            has_more =
-                outgoing_truncated || pull_more || pull_summary.needs_repush || local_has_more;
+            has_more = outgoing_truncated
+                || has_more_writes
+                || pull_more
+                || pull_summary.needs_repush
+                || local_has_more;
             local_has_more = false;
             if !has_more {
                 break;
@@ -661,20 +692,31 @@ impl SyncManager {
             target: CLOUD_TARGET.to_owned(),
         };
         let mut uploads = repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
-        if uploads.is_empty() && !realtime_only {
-            let image_run = self
-                .materialize_content_lane(
-                    db::sync_items::OutboxContentLane::Image,
-                    2,
-                    Some(&prep_target),
-                    None,
-                )
-                .await?;
-            let prepared_any = image_run.processed > 0;
-            image_run.staging.retain_for_delivery();
-            if prepared_any {
-                self.runtime_state.cloud_transfer_wake.notify_one();
-                uploads = repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
+        if uploads.is_empty() {
+            let scope = if realtime_only {
+                Some(db::sync_items::OutboxContentScope::RealtimeOnly)
+            } else if !self.runtime_state.realtime_pending.load(Ordering::Acquire) {
+                Some(db::sync_items::OutboxContentScope::BackfillOnly)
+            } else {
+                None
+            };
+            if let Some(scope) = scope {
+                let image_run = self
+                    .materialize_content_lane(
+                        db::sync_items::OutboxContentLane::Image,
+                        scope,
+                        2,
+                        Some(&prep_target),
+                        None,
+                    )
+                    .await?;
+                let prepared_any = image_run.processed > 0;
+                image_run.staging.retain_for_delivery();
+                if prepared_any {
+                    self.runtime_state.cloud_transfer_wake.notify_one();
+                    uploads =
+                        repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
+                }
             }
         }
         if uploads.is_empty() {
@@ -691,36 +733,56 @@ impl SyncManager {
 
         let language = crate::i18n::current_language(&self.app);
         let is_files = upload.kind == "files";
+        let is_realtime = !upload.history_backfill || upload.manual_share;
+        let track_transfer = is_files && is_realtime;
+        let operation_total_bytes = upload
+            .blobs
+            .iter()
+            .fold(0_u64, |total, blob| total.saturating_add(blob.size));
+        let stream_priority = if is_realtime {
+            BLOB_PRIORITY_REALTIME
+        } else {
+            BLOB_PRIORITY_BACKFILL
+        };
 
         let mut item_failed = false;
         for blob_row in &upload.blobs {
             let stored_blob = blob_row.to_stored_blob();
-            let transfer = match self
-                .delivery
-                .start_upload(
-                    pool,
-                    super::super::delivery::UploadStartRequest {
-                        target: CLOUD_TARGET,
-                        route: super::super::progress::TransferRoute::Cloud,
-                        sync_key: &upload.sync_key,
-                        item_id: upload.item_id.as_deref(),
-                        operation_total_bytes: blob_row.size,
-                        blob: &stored_blob,
-                    },
-                )
-                .await?
-            {
-                UploadTransferStart::Ready(transfer) => transfer,
-                UploadTransferStart::Canceled => {
+            let transfer = if track_transfer {
+                match self
+                    .delivery
+                    .start_upload(
+                        pool,
+                        super::super::delivery::UploadStartRequest {
+                            target: CLOUD_TARGET,
+                            route: super::super::progress::TransferRoute::Cloud,
+                            sync_key: &upload.sync_key,
+                            item_id: upload.item_id.as_deref(),
+                            operation_total_bytes,
+                            blob: &stored_blob,
+                        },
+                    )
+                    .await?
+                {
+                    UploadTransferStart::Ready(transfer) => transfer,
+                    UploadTransferStart::Canceled => {
+                        item_failed = true;
+                        break;
+                    }
+                }
+            } else {
+                if repository::is_delivery_canceled(pool, CLOUD_TARGET, &upload.sync_key).await? {
                     item_failed = true;
                     break;
                 }
+                None
             };
             let options = BlobUploadOptions {
                 kind: BlobUploadKind::Content,
                 file_content: is_files,
                 is_cloud: true,
                 language,
+                stream_priority,
                 started: None,
                 transfer: transfer.clone(),
             };
@@ -796,6 +858,9 @@ impl SyncManager {
         if !item_failed {
             // Ensure CloudSyncItems also runs if this item's metadata hasn't been pushed yet.
             self.runtime_state.cloud_transfer_wake.notify_one();
+            if upload.history_backfill {
+                self.notify_local_outbox_backfill();
+            }
         }
 
         Ok(true)

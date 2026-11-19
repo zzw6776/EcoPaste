@@ -2,7 +2,7 @@ import { useMount, useUnmount } from "ahooks";
 import { Button, Progress } from "antd";
 import type { TFunction } from "i18next";
 import type { FC, KeyboardEvent, MouseEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Virtuoso } from "react-virtuoso";
 import {
@@ -11,6 +11,7 @@ import {
   downloadRemoteFiles,
   getClipboardItem,
   getSyncStatus,
+  type SyncBackfillProgress,
   type SyncPeerStatus,
   syncItemNow,
   type TransferTask,
@@ -23,9 +24,11 @@ import {
   useSyncTransferTasks,
 } from "@/hooks/useSyncTransferActivity";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
 import { formatBytes } from "@/pages/Preference/utils/storageUsage";
 import { requestClipboardItemLocation } from "@/stores/clipboardItemLocation";
 import { clipboardViewState } from "@/stores/clipboardView";
+import { isCurrentWindowDormant } from "@/stores/windowLifecycle";
 import type { ClipboardGroupRecord, ClipboardItem } from "@/types/clipboard";
 import { cn } from "@/utils/cn";
 import { listClipboardGroupsShared } from "../dataRequests";
@@ -37,6 +40,8 @@ import {
 import { getFileCollectionMeta } from "./cards/fileCollectionMeta";
 import HeaderActionPopoverPanel from "./HeaderActionPopoverPanel";
 
+const SYNC_STATUS_REFRESH_DEBOUNCE_MS = 150;
+
 interface TransferCenterProps {
   compact?: boolean;
 }
@@ -44,17 +49,22 @@ interface TransferCenterProps {
 const TransferCenter: FC<TransferCenterProps> = (props) => {
   const { compact = false } = props;
   const { t, i18n } = useTranslation("clipboard");
+  const lifecycle = useWindowLifecycle();
   const transferTasks = useSyncTransferTasks();
   const [open, setOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [groups, setGroups] = useState<ClipboardGroupRecord[]>([]);
   const [peers, setPeers] = useState<SyncPeerStatus[]>([]);
+  const [backfill, setBackfill] = useState<SyncBackfillProgress | null>(null);
   const [itemsById, setItemsById] = useState(
     () => new Map<string, ClipboardItem | null>(),
   );
   const itemsByIdRef = useRef(itemsById);
   const pendingItemIdsRef = useRef(new Set<string>());
   const mountedRef = useRef(false);
+  const statusTimerRef = useRef<number | null>(null);
+  const statusDirtyRef = useRef(false);
+  const statusLoadedRef = useRef(false);
 
   function cacheItems(entries: Array<readonly [string, ClipboardItem | null]>) {
     if (!mountedRef.current || entries.length === 0) return;
@@ -99,21 +109,57 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
     }
   }
 
-  async function loadPeers() {
+  const clearStatusTimer = useCallback(() => {
+    if (statusTimerRef.current === null) return;
+
+    window.clearTimeout(statusTimerRef.current);
+    statusTimerRef.current = null;
+  }, []);
+
+  const loadSyncStatus = useCallback(async () => {
     try {
       const status = await getSyncStatus();
-      if (mountedRef.current) setPeers(status.peers);
+      if (!mountedRef.current) return;
+
+      statusLoadedRef.current = true;
+      setPeers(status.peers);
+      setBackfill(status.backfill);
     } catch {
       // 命令层已统一显示错误。
     }
-  }
+  }, []);
+
+  const scheduleSyncStatusRefresh = useCallback(() => {
+    if (!mountedRef.current) return;
+    if (isCurrentWindowDormant()) {
+      statusDirtyRef.current = true;
+      clearStatusTimer();
+      return;
+    }
+
+    clearStatusTimer();
+    statusTimerRef.current = window.setTimeout(() => {
+      statusTimerRef.current = null;
+      if (!mountedRef.current || isCurrentWindowDormant()) {
+        statusDirtyRef.current = true;
+        return;
+      }
+      void loadSyncStatus();
+    }, SYNC_STATUS_REFRESH_DEBOUNCE_MS);
+  }, [clearStatusTimer, loadSyncStatus]);
 
   useMount(() => {
     mountedRef.current = true;
+    if (isCurrentWindowDormant()) {
+      statusDirtyRef.current = true;
+      return;
+    }
+    void loadSyncStatus();
   });
 
   useUnmount(() => {
     mountedRef.current = false;
+    clearStatusTimer();
   });
 
   useTauriListen(TAURI_EVENT.CLIPBOARD_GROUPS_UPDATED, () => {
@@ -121,16 +167,36 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
   });
 
   useTauriListen(TAURI_EVENT.SYNC_UPDATED, () => {
-    if (open) void loadPeers();
+    scheduleSyncStatusRefresh();
   });
+
+  useEffect(() => {
+    if (!lifecycle.initialized) return;
+    if (!lifecycle.visible) {
+      if (lifecycle.phase === "dormant") clearStatusTimer();
+      return;
+    }
+
+    if (statusDirtyRef.current || !statusLoadedRef.current) {
+      statusDirtyRef.current = false;
+      clearStatusTimer();
+      void loadSyncStatus();
+    }
+  }, [
+    clearStatusTimer,
+    lifecycle.initialized,
+    lifecycle.phase,
+    lifecycle.visible,
+    loadSyncStatus,
+  ]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: 每次打开读取当前详情，关闭期间不查询展示数据。
   useEffect(() => {
     if (!open) return;
 
     void loadGroups();
-    void loadPeers();
-  }, [open]);
+    void loadSyncStatus();
+  }, [open, loadSyncStatus]);
 
   const activeCount = transferTasks.filter((task) => {
     return isTransferActive(task);
@@ -380,6 +446,12 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
     );
   }
 
+  const backfillPercent =
+    backfill && backfill.total > 0
+      ? Math.min(100, Math.round((backfill.completed / backfill.total) * 100))
+      : 0;
+  const hasIndicatorActivity = activeCount > 0 || backfill !== null;
+
   const content = (
     <HeaderActionPopoverPanel className="gap-2">
       <div className="flex shrink-0 items-center justify-between gap-2">
@@ -399,6 +471,25 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
           />
         </Tooltip>
       </div>
+      {backfill && (
+        <div className="shrink-0 rounded-2 border border-ant-border bg-ant-container p-2">
+          <div className="flex items-center justify-between gap-2 text-sm">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <i className="i-lucide:history size-3.5 shrink-0 text-ant-info" />
+              <span className="truncate font-medium">
+                {t("transferCenter.backfill.title")}
+              </span>
+            </div>
+            <span className="shrink-0 text-ant-secondary text-xs tabular-nums">
+              {backfill.completed} / {backfill.total}
+            </span>
+          </div>
+          <div className="mt-0.5 text-ant-secondary text-xs">
+            {t("transferCenter.backfill.description")}
+          </div>
+          <Progress percent={backfillPercent} showInfo={false} size="small" />
+        </div>
+      )}
       {sorted.length === 0 ? (
         <span className="flex flex-1 items-center justify-center text-center text-ant-secondary text-sm">
           {t("transferCenter.empty")}
@@ -433,16 +524,18 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
         <i
           className={cn(
             "i-lucide:arrow-up-down size-4 stroke-[1.5] transition-colors",
-            activeCount > 0
+            hasIndicatorActivity
               ? "text-ant-info"
               : "text-ant-tertiary group-hover:text-ant-text",
           )}
         />
-        {activeCount > 0 && (
+        {activeCount > 0 ? (
           <span className="absolute top-0 right-0 flex size-4 items-center justify-center rounded-full bg-ant-info-bg text-[10px] text-ant-info">
             {Math.min(activeCount, 9)}
           </span>
-        )}
+        ) : backfill !== null ? (
+          <span className="absolute top-1 right-1 size-1.5 rounded-full bg-ant-info" />
+        ) : null}
       </button>
     </Popover>
   );

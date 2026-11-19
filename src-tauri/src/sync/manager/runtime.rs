@@ -235,7 +235,8 @@ impl SyncManager {
                             CLOUD_TARGET,
                             MAX_ITEMS_PER_BATCH,
                         )
-                        .await?;
+                        .await?
+                        .writes;
                         if let Some(error) = cloud_error.as_deref() {
                             let mut sync_keys = Vec::with_capacity(pending.len());
                             for write in pending {
@@ -815,6 +816,7 @@ impl SyncManager {
         let _enqueue_guard = self.delivery.lock_enqueue().await;
         self.identity.set_group(None)?;
         repository::clear_group_state(pool).await?;
+        self.runtime_state.clear_group_caches();
         self.pending_observations
             .lock()
             .expect("pending clipboard observations poisoned")

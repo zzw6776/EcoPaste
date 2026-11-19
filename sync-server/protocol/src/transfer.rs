@@ -215,6 +215,7 @@ enum Peer {
     Client {
         connection: Connection,
         transfer_id: u64,
+        priority: i32,
     },
     Server {
         receivers: [Arc<tokio::sync::Mutex<mpsc::Receiver<PartRequest>>>; PARALLEL_PARTS],
@@ -234,13 +235,34 @@ impl PartPeer {
         Self(Peer::Client {
             connection,
             transfer_id,
+            priority: -1,
         })
     }
+
+    /// Sets the QUIC stream send priority for outbound part streams (higher sends first).
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        if let Peer::Client {
+            priority: current, ..
+        } = &mut self.0
+        {
+            *current = priority;
+        }
+        self
+    }
+
+    fn priority(&self) -> i32 {
+        match &self.0 {
+            Peer::Client { priority, .. } => *priority,
+            Peer::Server { .. } => -1,
+        }
+    }
+
     async fn stream(&self, index: u64) -> Result<(SendStream, RecvStream)> {
         match &self.0 {
             Peer::Client {
                 connection,
                 transfer_id,
+                ..
             } => {
                 let (mut send, recv) = connection.open_bi().await?;
                 write_frame(
@@ -266,8 +288,9 @@ impl PartPeer {
 
     async fn send_part(&self, index: u64, data: &[u8]) -> Result<()> {
         let (mut send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
-        // Leave control frames and receipts ahead of buffered attachment bytes.
-        send.set_priority(-1)?;
+        // Leave control frames (priority 0) ahead of attachment bytes, while letting realtime
+        // attachments preempt historical backfill and optional source icons.
+        send.set_priority(self.priority())?;
         write_bytes(&mut send, data).await?;
         send.finish()?;
         // Peer receivers acknowledge Response::BlobStored right after writing the part and

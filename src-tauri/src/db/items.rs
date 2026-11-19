@@ -1395,10 +1395,15 @@ mod tests {
         .await
         .unwrap();
         assert!(staged);
-        let first = sync_items::next_pending_content(&pool, false, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = sync_items::next_pending_content(
+            &pool,
+            false,
+            None,
+            sync_items::OutboxContentScope::All,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(first.manual_share && first.force_files);
         assert_eq!(first.item_id, saved.id);
 
@@ -1412,10 +1417,15 @@ mod tests {
         sync_items::cancel_content_prep(&pool, first.local_seq)
             .await
             .unwrap();
-        let current = sync_items::next_pending_content(&pool, false, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let current = sync_items::next_pending_content(
+            &pool,
+            false,
+            None,
+            sync_items::OutboxContentScope::All,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(current.source_revision, "recaptured");
         assert!(current.manual_share && current.force_files);
 
@@ -1426,10 +1436,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!staged);
-        assert!(sync_items::next_pending_content(&pool, false, None)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(sync_items::next_pending_content(
+            &pool,
+            false,
+            None,
+            sync_items::OutboxContentScope::All,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -1488,10 +1503,15 @@ mod tests {
             1
         );
         assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
-        let pending = sync_items::next_pending_content(&pool, false, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let pending = sync_items::next_pending_content(
+            &pool,
+            false,
+            None,
+            sync_items::OutboxContentScope::All,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         sync_items::cancel_content_prep(&pool, pending.local_seq)
             .await
             .unwrap();
