@@ -194,23 +194,34 @@ pub async fn stage_content_on(
         )
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = excluded.item_id,
-            origin = 'local',
+            origin = CASE
+                WHEN sync_items.remote_file_state IS NOT NULL THEN sync_items.origin
+                ELSE 'local'
+            END,
             source_revision = excluded.source_revision,
             kind = excluded.kind,
             is_sensitive = excluded.is_sensitive,
-            deleted = 0,
+            deleted = CASE
+                WHEN sync_items.nonce IS NULL THEN 0
+                ELSE sync_items.deleted
+            END,
             is_present = 1,
-            protected = MAX(sync_items.is_favorite, excluded.is_favorite)
-                     OR MAX(sync_items.is_pinned, excluded.is_pinned),
+            protected = CASE
+                WHEN sync_items.nonce IS NULL THEN (
+                    MAX(sync_items.is_favorite, excluded.is_favorite)
+                    OR MAX(sync_items.is_pinned, excluded.is_pinned)
+                )
+                ELSE sync_items.protected
+            END,
             content_seq = excluded.content_seq,
             content_device_id = '',
             presence_seq = CASE
-                WHEN sync_items.deleted <> 0 OR sync_items.is_present = 0 OR sync_items.presence_seq = 0
+                WHEN sync_items.is_present = 0 OR sync_items.presence_seq = 0
                 THEN excluded.presence_seq
                 ELSE sync_items.presence_seq
             END,
             presence_device_id = CASE
-                WHEN sync_items.deleted <> 0 OR sync_items.is_present = 0 OR sync_items.presence_seq = 0
+                WHEN sync_items.is_present = 0 OR sync_items.presence_seq = 0
                 THEN ''
                 ELSE sync_items.presence_device_id
             END,
@@ -222,9 +233,15 @@ pub async fn stage_content_on(
             next_prep_at = NULL,
             history_backfill = MIN(sync_items.history_backfill, excluded.history_backfill),
             manual_share = MAX(sync_items.manual_share, excluded.manual_share),
-            delivery_route = COALESCE(excluded.delivery_route, sync_items.delivery_route),
-            local_state = 'managed',
-            remote_file_state = NULL,
+            delivery_route = excluded.delivery_route,
+            local_state = CASE
+                WHEN sync_items.remote_file_state IS NOT NULL THEN sync_items.local_state
+                ELSE 'managed'
+            END,
+            remote_file_state = CASE
+                WHEN sync_items.remote_file_state IS NOT NULL THEN sync_items.remote_file_state
+                ELSE NULL
+            END,
             updated_at = excluded.updated_at
         "#,
     )
@@ -330,7 +347,11 @@ pub async fn mark_local_favorite_on(
             item_id = COALESCE(sync_items.item_id, excluded.item_id),
             is_sensitive = excluded.is_sensitive,
             is_favorite = excluded.is_favorite,
-            protected = CASE WHEN sync_items.deleted = 0 THEN (excluded.is_favorite OR sync_items.is_pinned) ELSE 0 END,
+            protected = CASE
+                WHEN sync_items.nonce IS NULL AND sync_items.is_present <> 0
+                THEN (excluded.is_favorite OR sync_items.is_pinned)
+                ELSE sync_items.protected
+            END,
             favorite_seq = excluded.favorite_seq,
             favorite_device_id = '',
             local_seq = excluded.local_seq,
@@ -381,7 +402,11 @@ pub async fn mark_local_pinned_on(
             item_id = COALESCE(sync_items.item_id, excluded.item_id),
             is_sensitive = excluded.is_sensitive,
             is_pinned = excluded.is_pinned,
-            protected = CASE WHEN sync_items.deleted = 0 THEN (sync_items.is_favorite OR excluded.is_pinned) ELSE 0 END,
+            protected = CASE
+                WHEN sync_items.nonce IS NULL AND sync_items.is_present <> 0
+                THEN (sync_items.is_favorite OR excluded.is_pinned)
+                ELSE sync_items.protected
+            END,
             pinned_seq = excluded.pinned_seq,
             pinned_device_id = '',
             local_seq = excluded.local_seq,
@@ -477,8 +502,14 @@ pub async fn mark_local_deleted_on(
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = NULL,
             is_sensitive = excluded.is_sensitive,
-            deleted = 1,
-            protected = 0,
+            deleted = CASE
+                WHEN sync_items.nonce IS NULL THEN 1
+                ELSE sync_items.deleted
+            END,
+            protected = CASE
+                WHEN sync_items.nonce IS NULL THEN 0
+                ELSE sync_items.protected
+            END,
             is_present = 0,
             presence_seq = excluded.presence_seq,
             presence_device_id = '',
@@ -490,7 +521,9 @@ pub async fn mark_local_deleted_on(
             next_prep_at = NULL,
             history_backfill = 0,
             manual_share = 0,
+            delivery_route = NULL,
             remote_file_state = NULL,
+            needs_blob_pull = 0,
             updated_at = excluded.updated_at
         "#,
     )
@@ -534,7 +567,7 @@ pub async fn next_pending_content(
         FROM sync_items s
         JOIN clipboard_items c ON c.id = s.item_id
         WHERE s.prep_state = 'pending_content'
-          AND s.deleted = 0
+          AND s.is_present = 1
           AND (s.next_prep_at IS NULL OR s.next_prep_at <= ?)
           AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
           AND (? IS NULL OR s.kind = ?)
@@ -600,7 +633,7 @@ pub async fn next_content_retry_at(
         FROM sync_items s
         JOIN clipboard_items c ON c.id = s.item_id
         WHERE s.prep_state = 'pending_content'
-          AND s.deleted = 0
+          AND s.is_present = 1
           AND s.next_prep_at IS NOT NULL
           AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
           AND s.kind = ?
@@ -672,12 +705,13 @@ pub async fn next_pending_state(
         return Ok(None);
     };
     let parsed: anyhow::Result<PendingStatePrep> = (|| {
+        let is_present: bool = row.try_get("is_present")?;
         Ok(PendingStatePrep {
             sync_key: row.try_get("sync_key")?,
             item_id: row.try_get("item_id")?,
             is_sensitive: row.try_get("is_sensitive")?,
-            deleted: row.try_get("deleted")?,
-            is_present: row.try_get("is_present")?,
+            deleted: !is_present,
+            is_present,
             is_favorite: row.try_get("is_favorite")?,
             is_pinned: row.try_get("is_pinned")?,
             note: row.try_get("note")?,

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
 };
 
@@ -19,9 +19,15 @@ use crate::{Request, Response, read_frame, write_frame};
 
 pub const PARALLEL_PARTS: usize = 4;
 pub const ATTACHMENTS_PER_DIRECTION: usize = 2;
+/// Per-stream QUIC receive window sized for high-throughput LAN/WAN multipart transfers.
+pub const STREAM_RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+/// Connection-level QUIC send window sized to keep all parallel 4-MiB parts in flight.
+pub const SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 // 64 authenticated 64-KiB encryption blocks. The first part also contains the header.
 const PART_BYTES: u64 = 4 * 1024 * 1024 + 64 * 16;
 const HEADER_BYTES: u64 = 27;
+const IO_BLOCK_BYTES: usize = 256 * 1024;
+const RECEIVE_BUFFER_PERMITS: usize = PARALLEL_PARTS + 2;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Dropping the parent response cancels its part workers and releases their bounded buffers.
@@ -56,7 +62,7 @@ fn part_count(size: u64) -> u64 {
 
 /// Deadlines measure idle time, including slow connections that take minutes per part.
 async fn read_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> Result<()> {
-    for block in bytes.chunks_mut(64 * 1024) {
+    for block in bytes.chunks_mut(IO_BLOCK_BYTES) {
         let mut offset = 0;
         while offset < block.len() {
             let count =
@@ -71,7 +77,7 @@ async fn read_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> R
 }
 
 async fn write_bytes<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<()> {
-    for block in bytes.chunks(64 * 1024) {
+    for block in bytes.chunks(IO_BLOCK_BYTES) {
         let mut offset = 0;
         while offset < block.len() {
             let count =
@@ -284,26 +290,42 @@ impl PartPeer {
     }
 }
 
-/// Reads once in order and keeps at most four encrypted parts in flight.
+/// Reads once in order, keeping up to four encrypted parts in flight while prefetching the next.
 pub async fn send<R: AsyncRead + Unpin>(
     reader: &mut R,
     peer: PartPeer,
     size: u64,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
+    let total_parts = part_count(size);
     let mut tasks = JoinSet::new();
     let mut index = 0;
     let mut completed = 0;
+    let mut prefetched: Option<(u64, Vec<u8>)> = None;
     loop {
-        while index < part_count(size) && tasks.len() < PARALLEL_PARTS {
-            let mut data = vec![0u8; part_size(size, index)];
-            read_bytes(reader, &mut data).await?;
+        while tasks.len() < PARALLEL_PARTS {
+            let (part, data) = if let Some(ready) = prefetched.take() {
+                ready
+            } else if index < total_parts {
+                let mut data = vec![0u8; part_size(size, index)];
+                read_bytes(reader, &mut data).await?;
+                let part = index;
+                index += 1;
+                (part, data)
+            } else {
+                break;
+            };
             let peer = peer.clone();
-            let part = index;
             tasks.spawn(async move {
                 peer.send_part(part, &data).await?;
                 Ok::<_, anyhow::Error>(data.len() as u64)
             });
+        }
+        // Overlap reading/encrypting the next 4-MiB part with the four QUIC part transfers already in flight.
+        if prefetched.is_none() && index < total_parts {
+            let mut data = vec![0u8; part_size(size, index)];
+            read_bytes(reader, &mut data).await?;
+            prefetched = Some((index, data));
             index += 1;
         }
         let Some(done) = tasks.join_next().await else {
@@ -322,23 +344,29 @@ pub async fn receive<W: AsyncWrite + Unpin>(
     size: u64,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(PARALLEL_PARTS);
+    let buffer_permits = Arc::new(Semaphore::new(RECEIVE_BUFFER_PERMITS));
+    let (tx, mut rx) = mpsc::channel(RECEIVE_BUFFER_PERMITS);
     let mut tasks = JoinSet::new();
     for lane in 0..PARALLEL_PARTS {
         let peer = peer.clone();
         let tx = tx.clone();
+        let buffer_permits = buffer_permits.clone();
         tasks.spawn(async move {
             let mut index = lane as u64;
             while index < part_count(size) {
-                let (data, mut send) = peer.receive_part(index, part_size(size, index)).await?;
-                let (written, wait_written) = oneshot::channel();
-                tx.send((index, data, written))
+                let permit = buffer_permits
+                    .clone()
+                    .acquire_owned()
                     .await
                     .map_err(|_| anyhow::anyhow!("transfer canceled"))?;
-                wait_written.await.context("transfer canceled")?;
-                // Per-part credit keeps the buffer bounded; final commit stays with the parent.
+                let (data, mut send) = peer.receive_part(index, part_size(size, index)).await?;
+                // Memory stays strictly bounded by `buffer_permits`; releasing part credit now
+                // lets the sender pipeline the next part while decryption and disk I/O run.
                 write_frame(&mut send, &Response::BlobStored).await?;
                 send.finish()?;
+                tx.send((index, data, permit))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("transfer canceled"))?;
                 index += PARALLEL_PARTS as u64;
             }
             Ok::<_, anyhow::Error>(())
@@ -351,13 +379,13 @@ pub async fn receive<W: AsyncWrite + Unpin>(
     while next < part_count(size) {
         tokio::select! {
             value = rx.recv() => {
-                let (index, data, written) = value.context("transfer ended early")?;
-                pending.insert(index, (data, written));
-                while let Some((data, written)) = pending.remove(&next) {
+                let (index, data, permit) = value.context("transfer ended early")?;
+                pending.insert(index, (data, permit));
+                while let Some((data, permit)) = pending.remove(&next) {
                     writer.write_all(&data).await?;
                     completed += data.len() as u64;
                     progress(completed);
-                    let _ = written.send(());
+                    drop(permit);
                     next += 1;
                 }
             }

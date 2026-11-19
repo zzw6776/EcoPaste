@@ -115,6 +115,7 @@ pub async fn prune_released_items(pool: &SqlitePool, limit: u32) -> Result<u64> 
         FROM sync_items s
         WHERE s.item_id IS NULL
           AND s.deleted = 0
+          AND s.is_present = 1
           AND s.prep_state = 'ready'
           AND s.needs_apply = 0
           AND s.needs_blob_pull = 0
@@ -147,17 +148,23 @@ pub async fn prune_released_items(pool: &SqlitePool, limit: u32) -> Result<u64> 
     Ok(result.rows_affected())
 }
 
-pub async fn status_counts(pool: &SqlitePool) -> Result<(u64, u64, u64)> {
+pub async fn status_counts(pool: &SqlitePool, include_sensitive: bool) -> Result<(u64, u64, u64)> {
     let pending: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*) FROM sync_items s
-        WHERE s.prep_state <> 'ready'
-           OR EXISTS (
-               SELECT 1 FROM sync_item_targets t
-               WHERE t.sync_key = s.sync_key AND t.status IN ('pending', 'awaiting_receipt')
-           )
+        WHERE (s.delivery_route IS NULL OR s.delivery_route <> 'lan')
+          AND (
+              (s.prep_state <> 'ready' AND (? OR s.is_sensitive = 0 OR s.manual_share = 1))
+              OR EXISTS (
+                  SELECT 1 FROM sync_item_targets t
+                  WHERE t.sync_key = s.sync_key
+                    AND t.target_id = 'cloud'
+                    AND t.status = 'pending'
+              )
+          )
         "#,
     )
+    .bind(include_sensitive)
     .fetch_one(pool)
     .await?;
     let manual: i64 = sqlx::query_scalar(
@@ -268,7 +275,7 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
     item_query.push(")");
 
     let mut sync_key_to_item_id = HashMap::new();
-    let mut local_ready_keys = HashSet::new();
+    let mut local_ready_routes: HashMap<String, Option<String>> = HashMap::new();
     for row in item_query.build().fetch_all(pool).await? {
         let sync_key: String = row.try_get("sync_key")?;
         let item_id: String = row.try_get("item_id")?;
@@ -289,14 +296,12 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
         } else {
             SyncItemOrigin::Remote
         };
-        item_facts.local_state = if is_local || local_state == "managed" {
-            SyncLocalContentState::Managed
-        } else {
-            match local_state.as_str() {
-                "external" => SyncLocalContentState::External,
-                "external_missing" => SyncLocalContentState::ExternalMissing,
-                _ => SyncLocalContentState::Missing,
-            }
+        item_facts.local_state = match local_state.as_str() {
+            "external" => SyncLocalContentState::External,
+            "external_missing" => SyncLocalContentState::ExternalMissing,
+            "managed" => SyncLocalContentState::Managed,
+            _ if is_local => SyncLocalContentState::Managed,
+            _ => SyncLocalContentState::Missing,
         };
         item_facts.remote_file_available = remote_file_state.as_deref() == Some("available");
         if prep_state != "ready" {
@@ -304,7 +309,7 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
             item_facts.queued_lan = lan_available && delivery_route.as_deref() != Some("cloud");
             item_facts.preparation_error = prep_error;
         } else if is_local {
-            local_ready_keys.insert(sync_key);
+            local_ready_routes.insert(sync_key, delivery_route);
         }
     }
 
@@ -345,13 +350,16 @@ pub async fn item_statuses(pool: &SqlitePool, item_ids: &[String]) -> Result<Vec
                 }
             }
         }
-        for sync_key in local_ready_keys {
+        for (sync_key, delivery_route) in local_ready_routes {
             if let Some(item_id) = sync_key_to_item_id.get(&sync_key) {
                 if let Some(item_facts) = facts.get_mut(item_id) {
-                    if !cloud_targets_seen.contains(&sync_key) {
+                    if delivery_route.as_deref() != Some("lan")
+                        && !cloud_targets_seen.contains(&sync_key)
+                    {
                         item_facts.queued_cloud = true;
                     }
                     if lan_available
+                        && delivery_route.as_deref() != Some("cloud")
                         && peer_target_counts.get(&sync_key).copied().unwrap_or(0)
                             < online_peer_count
                     {

@@ -27,10 +27,19 @@ use super::model::{StoredBlob, SyncedItemSnapshot};
 const BLOB_MAGIC: &[u8; 8] = b"ECOSBL01";
 const STREAM_NONCE_LEN: usize = 19;
 const CHUNK_SIZE: usize = 64 * 1024;
+const STREAM_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 const TAG_SIZE: usize = 16;
 const SNAPSHOT_AAD_MAGIC: &[u8; 8] = b"ECOSNP01";
+const STREAM_NONCE_DOMAIN: &[u8] = b"ecopaste/stream-nonce/v1\0";
 const STREAM_BLOB_ID_DOMAIN: &[u8] = b"ecopaste/stream-blob-id/v1\0";
 const ITEM_KEY_DOMAIN: &[u8] = b"ecopaste/item-key/v1\0";
+
+/// Authenticated identity captured while decrypting a remote blob stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedBlobStream {
+    pub plaintext_hash: String,
+    pub stream_nonce: Vec<u8>,
+}
 
 struct TemporaryFileCleanup {
     armed: bool,
@@ -81,28 +90,37 @@ impl BlobStreamEncryptor {
         header
     }
 
+    #[cfg(test)]
     pub fn encrypt_next(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(plaintext.len() + TAG_SIZE);
+        buffer.extend_from_slice(plaintext);
+        self.encrypt_next_in_place(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    /// Encrypts one chunk in place, appending the Poly1305 tag to avoid per-chunk allocations.
+    pub fn encrypt_next_in_place(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
         let expected = if self.remaining == 0 {
             0
         } else {
             usize::try_from(self.remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE)
         };
-        if plaintext.len() != expected {
+        if buffer.len() != expected {
             bail!("sync source size changed during upload");
         }
-        self.plaintext_hasher.update(plaintext);
-        self.remaining = self.remaining.saturating_sub(plaintext.len() as u64);
+        self.plaintext_hasher.update(buffer);
+        self.remaining = self.remaining.saturating_sub(buffer.len() as u64);
         if self.remaining == 0 {
             self.encryptor
                 .take()
                 .context("stream encryptor already finalized")?
-                .encrypt_last(plaintext)
+                .encrypt_last_in_place(&[], buffer)
                 .map_err(|_| anyhow::anyhow!("failed to encrypt final blob chunk"))
         } else {
             self.encryptor
                 .as_mut()
                 .context("stream encryptor already finalized")?
-                .encrypt_next(plaintext)
+                .encrypt_next_in_place(&[], buffer)
                 .map_err(|_| anyhow::anyhow!("failed to encrypt blob chunk"))
         }
     }
@@ -120,6 +138,20 @@ impl BlobStreamEncryptor {
     }
 }
 
+/// Derives a group-keyed deterministic stream nonce so identical files share one `blob_id`
+/// across all devices in the same sync group while remaining opaque to the Hub.
+pub fn derive_stream_nonce(key: &[u8; 32], plaintext_hash: &str) -> Result<Vec<u8>> {
+    if plaintext_hash.len() != 64 || !plaintext_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid streaming plaintext hash");
+    }
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(STREAM_NONCE_DOMAIN);
+    hasher.update(plaintext_hash.as_bytes());
+    let digest = hasher.finalize();
+    Ok(digest.as_bytes()[..STREAM_NONCE_LEN].to_vec())
+}
+
+#[cfg(test)]
 pub fn new_stream_nonce() -> Vec<u8> {
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut stream_nonce);
@@ -566,7 +598,7 @@ pub async fn decrypt_blob_stream<R, W, F, C>(
     spec: BlobStreamSpec<'_>,
     mut on_progress: F,
     canceled: C,
-) -> Result<String>
+) -> Result<DecryptedBlobStream>
 where
     R: TokioAsyncRead + Unpin,
     W: TokioAsyncWrite + Unpin,
@@ -587,16 +619,20 @@ where
         bail!("invalid encrypted sync blob size");
     }
 
-    let mut ciphertext_hasher = blake3::Hasher::new();
+    let mut ciphertext_hasher = (!stream_commitment).then(blake3::Hasher::new);
     let mut magic = [0_u8; BLOB_MAGIC.len()];
     TokioAsyncReadExt::read_exact(reader, &mut magic).await?;
     if &magic != BLOB_MAGIC {
         bail!("invalid encrypted sync blob");
     }
-    ciphertext_hasher.update(&magic);
+    if let Some(hasher) = &mut ciphertext_hasher {
+        hasher.update(&magic);
+    }
     let mut stream_nonce = [0_u8; STREAM_NONCE_LEN];
     TokioAsyncReadExt::read_exact(reader, &mut stream_nonce).await?;
-    ciphertext_hasher.update(&stream_nonce);
+    if let Some(hasher) = &mut ciphertext_hasher {
+        hasher.update(&stream_nonce);
+    }
     let mut transferred = header_size;
     on_progress(transferred);
 
@@ -607,7 +643,8 @@ where
         stream_nonce.as_slice().into(),
     ));
     let mut remaining = original_size;
-    let mut buffer = vec![0_u8; CHUNK_SIZE + TAG_SIZE];
+    let mut buffer = Vec::with_capacity(CHUNK_SIZE + TAG_SIZE);
+    let mut write_buffer = Vec::with_capacity(STREAM_WRITE_BUFFER_SIZE);
     let mut plaintext_hasher = blake3::Hasher::new();
     loop {
         if canceled() {
@@ -619,32 +656,39 @@ where
             usize::try_from(remaining.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE)
         };
         let encrypted_length = plaintext_length + TAG_SIZE;
-        TokioAsyncReadExt::read_exact(reader, &mut buffer[..encrypted_length]).await?;
-        ciphertext_hasher.update(&buffer[..encrypted_length]);
+        buffer.resize(encrypted_length, 0);
+        TokioAsyncReadExt::read_exact(reader, &mut buffer).await?;
+        if let Some(hasher) = &mut ciphertext_hasher {
+            hasher.update(&buffer);
+        }
         transferred = transferred.saturating_add(encrypted_length as u64);
         on_progress(transferred);
         remaining = remaining.saturating_sub(plaintext_length as u64);
         let is_last = original_size == 0 || remaining == 0;
-        let plaintext = if is_last {
+        if is_last {
             decryptor
                 .take()
                 .expect("stream decryptor available")
-                .decrypt_last(&buffer[..encrypted_length])
-                .map_err(|_| anyhow::anyhow!("final sync blob authentication failed"))?
+                .decrypt_last_in_place(&[], &mut buffer)
+                .map_err(|_| anyhow::anyhow!("final sync blob authentication failed"))?;
         } else {
             decryptor
                 .as_mut()
                 .expect("stream decryptor available")
-                .decrypt_next(&buffer[..encrypted_length])
-                .map_err(|_| anyhow::anyhow!("sync blob authentication failed"))?
-        };
-        plaintext_hasher.update(&plaintext);
-        tokio::time::timeout(
-            write_timeout,
-            TokioAsyncWriteExt::write_all(writer, &plaintext),
-        )
-        .await
-        .context("remote destination write idle timeout")??;
+                .decrypt_next_in_place(&[], &mut buffer)
+                .map_err(|_| anyhow::anyhow!("sync blob authentication failed"))?;
+        }
+        plaintext_hasher.update(&buffer);
+        write_buffer.extend_from_slice(&buffer);
+        if (is_last || write_buffer.len() >= STREAM_WRITE_BUFFER_SIZE) && !write_buffer.is_empty() {
+            tokio::time::timeout(
+                write_timeout,
+                TokioAsyncWriteExt::write_all(writer, &write_buffer),
+            )
+            .await
+            .context("remote destination write idle timeout")??;
+            write_buffer.clear();
+        }
         if is_last {
             break;
         }
@@ -659,12 +703,19 @@ where
     let actual_id = if stream_commitment {
         stream_blob_id(key, &stream_nonce, &plaintext_hash)?
     } else {
-        ciphertext_hasher.finalize().to_hex().to_string()
+        ciphertext_hasher
+            .expect("ciphertext hasher present for non-stream commitment")
+            .finalize()
+            .to_hex()
+            .to_string()
     };
     if actual_id != expected_hash {
         bail!("blob hash mismatch");
     }
-    Ok(plaintext_hash)
+    Ok(DecryptedBlobStream {
+        plaintext_hash,
+        stream_nonce: stream_nonce.to_vec(),
+    })
 }
 
 pub fn blob_path(root: &Path, blob_id: &str) -> Result<PathBuf> {
@@ -1085,7 +1136,7 @@ mod tests {
         let mut writer = tokio::fs::File::create(&destination).await.unwrap();
         let mut transferred = 0_u64;
 
-        let plaintext_hash = decrypt_blob_stream(
+        let decrypted = decrypt_blob_stream(
             &mut reader,
             &mut writer,
             BlobStreamSpec {
@@ -1105,7 +1156,33 @@ mod tests {
 
         assert_eq!(transferred, encrypted.size);
         assert_eq!(tokio::fs::read(destination).await.unwrap(), bytes);
-        assert_eq!(plaintext_hash, blake3::hash(&bytes).to_hex().to_string());
+        assert_eq!(
+            decrypted.plaintext_hash,
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(
+            Some(decrypted.stream_nonce.as_slice()),
+            encrypted.stream_nonce.as_deref()
+        );
+    }
+
+    #[test]
+    fn derived_stream_nonce_is_deterministic_per_group_key() {
+        let hash = blake3::hash(b"shared payload").to_hex().to_string();
+        let key_a = [11_u8; 32];
+        let key_b = [22_u8; 32];
+
+        let nonce_a1 = derive_stream_nonce(&key_a, &hash).unwrap();
+        let nonce_a2 = derive_stream_nonce(&key_a, &hash).unwrap();
+        let nonce_b = derive_stream_nonce(&key_b, &hash).unwrap();
+
+        assert_eq!(nonce_a1.len(), STREAM_NONCE_LEN);
+        assert_eq!(nonce_a1, nonce_a2);
+        assert_ne!(nonce_a1, nonce_b);
+        assert_eq!(
+            stream_blob_id(&key_a, &nonce_a1, &hash).unwrap(),
+            stream_blob_id(&key_a, &nonce_a2, &hash).unwrap()
+        );
     }
 
     #[test]

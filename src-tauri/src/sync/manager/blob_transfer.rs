@@ -54,15 +54,8 @@ where
         })
         .await
         .context("Android upload source task failed")??;
-        let mut file = tokio::fs::File::from_std(file);
-        return super::super::upload::encrypt_reader(
-            &mut file,
-            original_size,
-            writer,
-            spec,
-            progress,
-        )
-        .await;
+        return super::super::upload::encrypt_std_file(file, original_size, writer, spec, progress)
+            .await;
     }
 
     super::super::upload::encrypt_file(Path::new(source), writer, spec, progress).await
@@ -298,7 +291,7 @@ pub(super) async fn upload_blob_inner(
             BLOB_IDLE_TIMEOUT
         };
         let peer = PartPeer::client(connection.clone(), transfer_id);
-        let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(64 * 1024);
+        let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(2 * 1024 * 1024);
         progress.report_transferred = false;
         let produce = async {
             if streaming {
@@ -523,8 +516,14 @@ pub(super) async fn download_blob(
     let response = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
         .await
         .context("wait for blob download response timeout")??;
-    let Response::BlobReady { size } = response else {
-        bail!("blob is unavailable");
+    let size = match response {
+        Response::BlobReady { size } => size,
+        Response::Error {
+            code: ErrorCode::NotFound,
+            ..
+        } => return Err(RemoteBlobUnavailable.into()),
+        Response::Error { code, message } => return Err(RemoteSyncError { code, message }.into()),
+        _ => bail!("blob is unavailable"),
     };
     if size != manifest.encrypted_size {
         bail!("encrypted blob size mismatch");
@@ -561,7 +560,7 @@ pub(super) async fn download_blob_to_external_path(
     manifest: &BlobManifest,
     destination: &Path,
     context: RemoteBlobTransferContext<'_>,
-) -> Result<ExternalDownloadCommit> {
+) -> Result<(ExternalDownloadCommit, crypto::DecryptedBlobStream)> {
     let parent = destination
         .parent()
         .context("remote file destination has no parent")?;
@@ -579,7 +578,7 @@ pub(super) async fn download_blob_to_external_path(
         armed: true,
     };
     let mut output = tokio::fs::File::create(&archive_or_file).await?;
-    stream_remote_blob_to_writer(manifest, &mut output, context)
+    let decrypted = stream_remote_blob_to_writer(manifest, &mut output, context)
         .await
         .map_err(RemoteBlobTransportFailure::from_error)?;
     drop(output);
@@ -625,11 +624,11 @@ pub(super) async fn download_blob_to_external_path(
                 log::warn!("remove downloaded directory archive failed: {error}");
             }
         }
-        Ok(commit)
+        Ok((commit, decrypted))
     } else {
         let commit = commit_external_download(&archive_or_file, destination).await?;
         temporary_cleanup.armed = false;
-        Ok(commit)
+        Ok((commit, decrypted))
     }
 }
 
@@ -753,7 +752,7 @@ pub(super) async fn stream_remote_blob_to_writer<W>(
     manifest: &BlobManifest,
     output: &mut W,
     context: RemoteBlobTransferContext<'_>,
-) -> Result<()>
+) -> Result<crypto::DecryptedBlobStream>
 where
     W: AsyncWrite + Unpin,
 {
@@ -795,7 +794,7 @@ where
         bail!("encrypted blob size mismatch");
     }
 
-    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+    let (mut reader, mut writer) = tokio::io::duplex(2 * 1024 * 1024);
     let receive = multipart::receive(
         &mut writer,
         PartPeer::client(context.connection.clone(), transfer_id),
@@ -822,8 +821,9 @@ where
     );
     cancelable_transfer(
         async {
-            tokio::try_join!(receive, decrypt)?;
-            confirm_download(&mut recv).await
+            let ((), decrypted) = tokio::try_join!(receive, decrypt)?;
+            confirm_download(&mut recv).await?;
+            Ok(decrypted)
         },
         || context.handle.canceled(),
     )
@@ -835,7 +835,7 @@ pub(super) async fn download_blob_to_android_destination(
     manifest: &BlobManifest,
     destination: &crate::commands::android::AndroidRemoteDownloadTarget,
     context: RemoteBlobTransferContext<'_>,
-) -> Result<String> {
+) -> Result<(String, crypto::DecryptedBlobStream)> {
     use std::os::fd::FromRawFd;
 
     let sink = crate::commands::android::open_android_remote_download_sink(
@@ -889,7 +889,7 @@ pub(super) async fn download_blob_to_android_destination(
             }
         }
     };
-    result?;
+    let decrypted = result?;
     let committed_uri = finish?;
     if context.handle.canceled() {
         if !committed_uri.is_empty() {
@@ -902,7 +902,7 @@ pub(super) async fn download_blob_to_android_destination(
         }
         bail!("transfer canceled");
     }
-    Ok(committed_uri)
+    Ok((committed_uri, decrypted))
 }
 
 #[cfg(not(target_os = "android"))]

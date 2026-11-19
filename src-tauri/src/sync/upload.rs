@@ -1,15 +1,26 @@
 //! Attachment I/O deadlines follow byte progress rather than total file duration.
 use std::{
     future::Future,
+    io::{BufReader, Read},
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
-use std::path::Path;
-
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use anyhow::{Context, Result};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::mpsc,
+};
 
 use crate::settings::Language;
+
+const STREAM_IO_BUFFER_SIZE: usize = 1024 * 1024;
+const ENCRYPT_CHUNK_SIZE: usize = 64 * 1024;
+const ENCRYPT_TAG_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) enum UploadPhase {
@@ -152,7 +163,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; STREAM_IO_BUFFER_SIZE];
     loop {
         if progress.canceled() {
             anyhow::bail!("transfer canceled");
@@ -187,7 +198,7 @@ where
     Ok(())
 }
 
-/// Reads plaintext once, encrypts fixed-size authenticated chunks and writes them immediately.
+/// Reads plaintext once on a dedicated blocking pipeline, encrypts in large batches, and feeds `writer`.
 pub(super) async fn encrypt_file<W>(
     source: &Path,
     writer: &mut W,
@@ -197,43 +208,34 @@ pub(super) async fn encrypt_file<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let FileEncryptionSpec {
-        expected_encrypted_size,
-        expected_blob_id,
-        key,
-        stream_nonce,
-        idle_timeout,
-        language,
-    } = spec;
-    let mut file = tokio::fs::File::open(source).await?;
-    let original_size = file.metadata().await?.len();
-    encrypt_reader(
-        &mut file,
-        original_size,
-        writer,
-        FileEncryptionSpec {
-            expected_encrypted_size,
-            expected_blob_id,
-            key,
-            stream_nonce,
-            idle_timeout,
-            language,
+    let source = source.to_path_buf();
+    let (file, original_size) = timed(
+        spec.idle_timeout,
+        UploadPhase::ReadFile,
+        spec.language,
+        async move {
+            tauri::async_runtime::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
+                let file = std::fs::File::open(&source)?;
+                let original_size = file.metadata()?.len();
+                Ok((file, original_size))
+            })
+            .await
+            .context("open upload source task failed")?
         },
-        progress,
     )
-    .await
+    .await?;
+    encrypt_std_file(file, original_size, writer, spec, progress).await
 }
 
-/// Encrypts an already-open plaintext source without requiring a filesystem path.
-pub(super) async fn encrypt_reader<R, W>(
-    reader: &mut R,
+/// Encrypts an already-open native or Android SAF file descriptor off the async worker threads.
+pub(super) async fn encrypt_std_file<W>(
+    file: std::fs::File,
     original_size: u64,
     writer: &mut W,
     spec: FileEncryptionSpec<'_>,
     progress: &mut UploadProgress,
 ) -> Result<String>
 where
-    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let FileEncryptionSpec {
@@ -247,56 +249,99 @@ where
     if super::crypto::encrypted_blob_size(original_size)? != expected_encrypted_size {
         anyhow::bail!("sync source size changed before upload");
     }
-    let mut encryptor = super::crypto::BlobStreamEncryptor::new(&key, stream_nonce, original_size)?;
-    write_encrypted_chunk(writer, &encryptor.header(), progress).await?;
 
-    let mut remaining = original_size;
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    let cancel_flag = Arc::new(AtomicBool::new(progress.canceled()));
+    let worker_cancel = cancel_flag.clone();
+    let stream_nonce = stream_nonce.to_vec();
+    let expected_blob_id = expected_blob_id.to_owned();
+    let producer = tauri::async_runtime::spawn_blocking(move || -> Result<String> {
+        let mut reader = BufReader::with_capacity(STREAM_IO_BUFFER_SIZE, file);
+        let mut encryptor =
+            super::crypto::BlobStreamEncryptor::new(&key, &stream_nonce, original_size)?;
+        let mut batch = Vec::with_capacity(STREAM_IO_BUFFER_SIZE + ENCRYPT_CHUNK_SIZE);
+        batch.extend_from_slice(&encryptor.header());
+
+        let mut remaining = original_size;
+        let mut chunk = Vec::with_capacity(ENCRYPT_CHUNK_SIZE + ENCRYPT_TAG_SIZE);
+        loop {
+            if worker_cancel.load(Ordering::Acquire) {
+                anyhow::bail!("transfer canceled");
+            }
+            let length = if original_size == 0 {
+                0
+            } else {
+                usize::try_from(remaining.min(ENCRYPT_CHUNK_SIZE as u64))
+                    .unwrap_or(ENCRYPT_CHUNK_SIZE)
+            };
+            chunk.resize(length, 0);
+            if length > 0 {
+                reader.read_exact(&mut chunk)?;
+            }
+            encryptor.encrypt_next_in_place(&mut chunk)?;
+            batch.extend_from_slice(&chunk);
+            remaining = remaining.saturating_sub(length as u64);
+            let is_last = original_size == 0 || remaining == 0;
+            if is_last || batch.len() >= STREAM_IO_BUFFER_SIZE {
+                let outgoing = std::mem::replace(
+                    &mut batch,
+                    if is_last {
+                        Vec::new()
+                    } else {
+                        Vec::with_capacity(STREAM_IO_BUFFER_SIZE + ENCRYPT_CHUNK_SIZE)
+                    },
+                );
+                if tx.blocking_send(outgoing).is_err() {
+                    anyhow::bail!("transfer canceled");
+                }
+            }
+            if is_last {
+                break;
+            }
+        }
+        let mut trailing = [0_u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            anyhow::bail!("sync source size changed before upload");
+        }
+        encryptor.finish(&key, &expected_blob_id)
+    });
+
+    let mut write_result = Ok(());
     loop {
         if progress.canceled() {
-            anyhow::bail!("transfer canceled");
+            cancel_flag.store(true, Ordering::Release);
+            write_result = Err(anyhow::anyhow!("transfer canceled"));
+            break;
         }
-        let length = if original_size == 0 {
-            0
-        } else {
-            usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len())
-        };
         progress.phase = UploadPhase::ReadFile;
-        if length > 0 {
-            timed(
-                idle_timeout,
-                progress.phase,
-                language,
-                reader.read_exact(&mut buffer[..length]),
-            )
-            .await?;
-        }
-        let ciphertext = encryptor.encrypt_next(&buffer[..length])?;
-        write_encrypted_chunk(writer, &ciphertext, progress).await?;
-        remaining = remaining.saturating_sub(length as u64);
-        if original_size == 0 || remaining == 0 {
+        let next = match tokio::time::timeout(idle_timeout, rx.recv()).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(_) => {
+                cancel_flag.store(true, Ordering::Release);
+                write_result = Err(anyhow::Error::new(UploadTimeout {
+                    phase: UploadPhase::ReadFile,
+                    language,
+                }));
+                break;
+            }
+        };
+        if let Err(error) = write_encrypted_chunk(writer, &next, progress).await {
+            cancel_flag.store(true, Ordering::Release);
+            write_result = Err(error);
             break;
         }
     }
-    let mut trailing = [0_u8; 1];
-    progress.phase = UploadPhase::ReadFile;
-    if timed(
-        idle_timeout,
-        progress.phase,
-        language,
-        reader.read(&mut trailing),
-    )
-    .await?
-        != 0
-    {
-        anyhow::bail!("sync source size changed before upload");
-    }
+    drop(rx);
+    let producer_result = producer.await.context("file encryption task failed")?;
+    write_result?;
+    let plaintext_hash = producer_result?;
     progress.phase = UploadPhase::Flush;
     writer.flush().await?;
     if progress.written_bytes != expected_encrypted_size {
         anyhow::bail!("encrypted sync blob size mismatch");
     }
-    encryptor.finish(&key, expected_blob_id)
+    Ok(plaintext_hash)
 }
 
 async fn write_encrypted_chunk<W>(

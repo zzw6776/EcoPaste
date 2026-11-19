@@ -138,7 +138,7 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
         }
     }
 
-    channel.availability = if facts.origin == SyncItemOrigin::Remote {
+    let source_availability = if facts.origin == SyncItemOrigin::Remote {
         facts
             .deliveries
             .iter()
@@ -165,6 +165,21 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
         SyncContentAvailability::Partial
     } else {
         SyncContentAvailability::MetadataOnly
+    };
+    let local_content_available = matches!(
+        facts.local_state,
+        SyncLocalContentState::Managed | SyncLocalContentState::External
+    );
+    // On LAN, there is no server holding an independent replica: a remote item only shows green
+    // once its bytes have reached this device, while source availability still enables Download.
+    channel.availability = if facts.origin == SyncItemOrigin::Remote
+        && !cloud
+        && !local_content_available
+        && source_availability == SyncContentAvailability::Complete
+    {
+        SyncContentAvailability::MetadataOnly
+    } else {
+        source_availability
     };
 
     let queued = if cloud {
@@ -202,7 +217,7 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
         },
         target_available: cloud || facts.lan_available,
         activity: channel.activity,
-        availability: channel.availability,
+        availability: source_availability,
         remote_file_available: facts.remote_file_available,
         needs_complete_delivery,
     });
@@ -287,5 +302,58 @@ mod tests {
         facts.deliveries[0].confirmed = ContentLevel::Complete;
         let complete = derive_item_status(facts);
         assert_eq!(complete.cloud.action, SyncItemAction::Download);
+    }
+
+    #[test]
+    fn undownloaded_remote_lan_file_shows_blue_metadata_but_remains_downloadable() {
+        let mut facts = ItemStatusFacts {
+            item_id: "remote-file".into(),
+            origin: SyncItemOrigin::Remote,
+            local_state: SyncLocalContentState::Missing,
+            queued_lan: false,
+            queued_cloud: false,
+            preparation_error: None,
+            lan_available: true,
+            remote_file_available: true,
+            deliveries: vec![
+                DeliveryFact {
+                    target_id: "peer:android".into(),
+                    desired: ContentLevel::Complete,
+                    confirmed: ContentLevel::Complete,
+                    status: DeliveryStatus::Confirmed,
+                    last_error: None,
+                },
+                DeliveryFact {
+                    target_id: "cloud".into(),
+                    desired: ContentLevel::Complete,
+                    confirmed: ContentLevel::Complete,
+                    status: DeliveryStatus::Confirmed,
+                    last_error: None,
+                },
+            ],
+        };
+
+        let missing = derive_item_status(facts.clone());
+        assert_eq!(
+            missing.lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(missing.lan.activity, SyncItemActivity::Idle);
+        assert_eq!(missing.lan.action, SyncItemAction::Download);
+        // Cloud still reflects Hub completeness directly.
+        assert_eq!(
+            missing.cloud.availability,
+            SyncContentAvailability::Complete
+        );
+        assert_eq!(missing.cloud.action, SyncItemAction::Download);
+
+        // Once saved externally or materialized locally, LAN becomes green.
+        facts.local_state = SyncLocalContentState::External;
+        let downloaded = derive_item_status(facts);
+        assert_eq!(
+            downloaded.lan.availability,
+            SyncContentAvailability::Complete
+        );
+        assert_eq!(downloaded.lan.action, SyncItemAction::Download);
     }
 }

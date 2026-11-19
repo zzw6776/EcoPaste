@@ -108,7 +108,7 @@ impl SyncManager {
             meta.nonce.as_deref(),
             meta.ciphertext.as_deref(),
         ) {
-            if let Ok(snapshot) = crypto::decrypt_item_snapshot(
+            if let Ok(mut snapshot) = decrypt_stored_snapshot(
                 key,
                 item_key,
                 meta.deleted,
@@ -116,6 +116,7 @@ impl SyncManager {
                 nonce,
                 ciphertext,
             ) {
+                overlay_meta_crdt_fields(&mut snapshot, meta, local_device_id);
                 return snapshot;
             }
         }
@@ -170,7 +171,7 @@ impl SyncManager {
             // If a newer local content capture is still encrypting in the background, only a
             // strictly newer remote deletion tombstone may supersede it before prep finishes.
             let local_preparing_newer_content = existing_meta.nonce.is_none()
-                && !existing_meta.deleted
+                && existing_meta.is_present
                 && existing_meta.content_version > remote_snapshot.content_version;
             let remote_deletes = !remote_snapshot.is_present
                 && remote_snapshot.presence_version > existing_meta.presence_version;
@@ -377,10 +378,10 @@ impl SyncManager {
                 LanContentLevel::Complete
             } else {
                 let meta = repository::load_sync_item_meta(pool, &snapshot.sync_key).await?;
-                if meta
-                    .as_ref()
-                    .is_some_and(|row| row.local_state == "managed" && row.item_id.is_some())
-                {
+                if meta.as_ref().is_some_and(|row| {
+                    matches!(row.local_state.as_str(), "managed" | "external")
+                        && row.item_id.is_some()
+                }) {
                     LanContentLevel::Complete
                 } else {
                     if meta.as_ref().is_some_and(|row| row.needs_blob_pull) {
@@ -464,116 +465,82 @@ impl SyncManager {
         let mut applied_any = false;
         let mut has_pending_blobs = false;
 
-        let pending = repository::list_items_needing_apply(pool, 64).await?;
-        if pending.is_empty() {
-            return Ok(false);
-        }
+        loop {
+            let pending = repository::list_items_needing_apply(pool, 64).await?;
+            if pending.is_empty() {
+                break;
+            }
+            let batch_len = pending.len();
 
-        for chunk in pending.chunks(16) {
-            let _apply_guard = self.apply_lock.lock().await;
-            for meta in chunk {
-                let (Some(item_key), Some(nonce), Some(ciphertext)) = (
-                    meta.item_key.as_deref(),
-                    meta.nonce.as_deref(),
-                    meta.ciphertext.as_deref(),
-                ) else {
-                    repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
-                    continue;
-                };
-                let snapshot = match crypto::decrypt_item_snapshot(
-                    &key,
-                    item_key,
-                    meta.deleted,
-                    meta.protected,
-                    nonce,
-                    ciphertext,
-                )
-                .and_then(|snapshot| {
-                    validate_snapshot(&snapshot)?;
-                    Ok(snapshot)
-                }) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        log::warn!(
-                            "discard invalid pending sync item {}: {error:#}",
-                            meta.sync_key
-                        );
+            for chunk in pending.chunks(16) {
+                let _apply_guard = self.apply_lock.lock().await;
+                for meta in chunk {
+                    let (Some(item_key), Some(nonce), Some(ciphertext)) = (
+                        meta.item_key.as_deref(),
+                        meta.nonce.as_deref(),
+                        meta.ciphertext.as_deref(),
+                    ) else {
                         repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
                         continue;
-                    }
-                };
-
-                if !snapshot.is_present {
-                    self.apply_tombstone_snapshot(pool, &snapshot.sync_key)
-                        .await?;
-                    repository::mark_item_applied(pool, &meta.sync_key, None, "managed", None)
-                        .await?;
-                    applied_any = true;
-                    continue;
-                }
-
-                let Some(synced_item) = snapshot.item.as_ref() else {
-                    let existing_id = self.apply_metadata_only_snapshot(pool, &snapshot).await?;
-                    repository::mark_item_applied(
-                        pool,
-                        &meta.sync_key,
-                        existing_id.as_deref(),
-                        "managed",
-                        None,
+                    };
+                    let snapshot = match decrypt_stored_snapshot(
+                        &key,
+                        item_key,
+                        meta.deleted,
+                        meta.protected,
+                        nonce,
+                        ciphertext,
                     )
-                    .await?;
-                    applied_any |= existing_id.is_some();
-                    continue;
-                };
+                    .and_then(|snapshot| {
+                        validate_snapshot(&snapshot)?;
+                        Ok(snapshot)
+                    }) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            log::warn!(
+                                "discard invalid pending sync item {}: {error:#}",
+                                meta.sync_key
+                            );
+                            repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+                            continue;
+                        }
+                    };
 
-                source_assets_pending |= snapshot
-                    .source_app
-                    .as_ref()
-                    .and_then(valid_source_icon)
-                    .is_some();
-
-                let kind = parse_kind(&synced_item.kind)?;
-                match kind {
-                    ClipboardKind::Text => {
-                        let (item_id, item, fingerprint, deduplicated) = self
-                            .apply_materialized_snapshot(pool, &snapshot, group, false)
+                    if !snapshot.is_present {
+                        self.apply_tombstone_snapshot(pool, &snapshot.sync_key)
                             .await?;
+                        repository::mark_item_applied(pool, &meta.sync_key, None, "managed", None)
+                            .await?;
+                        applied_any = true;
+                        continue;
+                    }
+
+                    let Some(synced_item) = snapshot.item.as_ref() else {
+                        let existing_id =
+                            self.apply_metadata_only_snapshot(pool, &snapshot).await?;
                         repository::mark_item_applied(
                             pool,
                             &meta.sync_key,
-                            (!item_id.is_empty()).then_some(item_id.as_str()),
-                            "managed",
+                            existing_id.as_deref(),
+                            &meta.local_state,
                             None,
                         )
                         .await?;
-                        if !item_id.is_empty() {
-                            self.emit_clipboard_item_updated(&item, deduplicated);
-                            if latest_clipboard_item
-                                .as_ref()
-                                .is_none_or(|(latest, _)| item.updated_at >= latest.updated_at)
-                            {
-                                latest_clipboard_item = Some((item, fingerprint));
-                            }
-                            applied_any = true;
-                        }
-                    }
-                    ClipboardKind::Image => {
-                        // Reuse local image immediately if already present on disk (e.g. metadata update).
-                        let already_local = if let Some(existing) =
-                            db::items::find_item_by_sync_key(pool, &snapshot.sync_key).await?
-                        {
-                            existing.kind == ClipboardKind::Image
-                                && self
-                                    .app
-                                    .state::<ImageStore>()
-                                    .origin_path(&existing.content)
-                                    .is_file()
-                        } else {
-                            false
-                        };
-                        if already_local {
-                            let (item_id, item, _, deduplicated) = self
-                                .apply_materialized_snapshot(pool, &snapshot, group, true)
+                        applied_any |= existing_id.is_some();
+                        continue;
+                    };
+
+                    source_assets_pending |= snapshot
+                        .source_app
+                        .as_ref()
+                        .and_then(valid_source_icon)
+                        .is_some();
+
+                    let kind = parse_kind(&synced_item.kind)?;
+                    match kind {
+                        ClipboardKind::Text => {
+                            let (item_id, item, fingerprint, deduplicated) = self
+                                .apply_materialized_snapshot(pool, &snapshot, group, false)
                                 .await?;
                             repository::mark_item_applied(
                                 pool,
@@ -585,92 +552,156 @@ impl SyncManager {
                             .await?;
                             if !item_id.is_empty() {
                                 self.emit_clipboard_item_updated(&item, deduplicated);
+                                if latest_clipboard_item
+                                    .as_ref()
+                                    .is_none_or(|(latest, _)| item.updated_at >= latest.updated_at)
+                                {
+                                    latest_clipboard_item = Some((item, fingerprint));
+                                }
                                 applied_any = true;
                             }
-                        } else {
-                            repository::mark_item_needs_blob_pull(
-                                pool,
-                                &meta.sync_key,
-                                None,
-                                "metadata",
-                                None,
-                            )
-                            .await?;
-                            has_pending_blobs = true;
                         }
-                    }
-                    ClipboardKind::Files => {
-                        let resources = crate::core::paths::resources_dir(&self.app)?;
-                        let source_revision = synced_item
-                            .source_revision
-                            .as_deref()
-                            .unwrap_or(&snapshot.sync_key);
-                        if let Some(existing) = available_materialized_file_item(
-                            pool,
-                            &resources,
-                            &snapshot.sync_key,
-                            source_revision,
-                            snapshot.content_identity.as_deref(),
-                        )
-                        .await?
-                        {
-                            let _ = self.apply_metadata_only_snapshot(pool, &snapshot).await?;
-                            repository::mark_item_applied(
-                                pool,
-                                &meta.sync_key,
-                                Some(&existing.id),
-                                "managed",
-                                None,
-                            )
-                            .await?;
-                            self.emit_clipboard_item_updated(&existing, true);
-                            applied_any = true;
-                            continue;
+                        ClipboardKind::Image => {
+                            // Reuse local image immediately if already present on disk (e.g. metadata update).
+                            let already_local = if let Some(existing) =
+                                db::items::find_item_by_sync_key(pool, &snapshot.sync_key).await?
+                            {
+                                existing.kind == ClipboardKind::Image
+                                    && self
+                                        .app
+                                        .state::<ImageStore>()
+                                        .origin_path(&existing.content)
+                                        .is_file()
+                            } else {
+                                false
+                            };
+                            if already_local {
+                                let (item_id, item, _, deduplicated) = self
+                                    .apply_materialized_snapshot(pool, &snapshot, group, true)
+                                    .await?;
+                                repository::mark_item_applied(
+                                    pool,
+                                    &meta.sync_key,
+                                    (!item_id.is_empty()).then_some(item_id.as_str()),
+                                    "managed",
+                                    None,
+                                )
+                                .await?;
+                                if !item_id.is_empty() {
+                                    self.emit_clipboard_item_updated(&item, deduplicated);
+                                    applied_any = true;
+                                }
+                            } else {
+                                repository::mark_item_needs_blob_pull(
+                                    pool,
+                                    &meta.sync_key,
+                                    None,
+                                    "metadata",
+                                    None,
+                                )
+                                .await?;
+                                has_pending_blobs = true;
+                            }
                         }
+                        ClipboardKind::Files => {
+                            let resources = crate::core::paths::resources_dir(&self.app)?;
+                            let source_revision = synced_item
+                                .source_revision
+                                .as_deref()
+                                .unwrap_or(&snapshot.sync_key);
+                            if let Some(existing) = available_materialized_file_item(
+                                pool,
+                                &resources,
+                                &snapshot.sync_key,
+                                source_revision,
+                                snapshot.content_identity.as_deref(),
+                            )
+                            .await?
+                            {
+                                let _ = self.apply_metadata_only_snapshot(pool, &snapshot).await?;
+                                repository::mark_item_applied(
+                                    pool,
+                                    &meta.sync_key,
+                                    Some(&existing.id),
+                                    "managed",
+                                    None,
+                                )
+                                .await?;
+                                self.emit_clipboard_item_updated(&existing, true);
+                                applied_any = true;
+                                continue;
+                            }
 
-                        // Always materialize or refresh the remote file metadata card immediately.
-                        let origin_device_id = meta.origin_device_id.as_deref().unwrap_or("");
-                        let (card_id, card_item, deduplicated) = self
-                            .apply_remote_file_metadata_snapshot(
-                                pool,
+                            // Preserve externally saved file cards when only metadata (favorite/pin/note) changed.
+                            if matches!(meta.local_state.as_str(), "external" | "external_missing")
+                            {
+                                if let Some(existing) =
+                                    db::items::find_item_by_sync_key(pool, &snapshot.sync_key)
+                                        .await?
+                                {
+                                    let _ =
+                                        self.apply_metadata_only_snapshot(pool, &snapshot).await?;
+                                    repository::mark_item_applied(
+                                        pool,
+                                        &meta.sync_key,
+                                        Some(&existing.id),
+                                        &meta.local_state,
+                                        Some("available"),
+                                    )
+                                    .await?;
+                                    self.emit_clipboard_item_updated(&existing, true);
+                                    applied_any = true;
+                                    continue;
+                                }
+                            }
+
+                            // Always materialize or refresh the remote file metadata card immediately.
+                            let origin_device_id = meta.origin_device_id.as_deref().unwrap_or("");
+                            let (card_id, card_item, deduplicated) = self
+                                .apply_remote_file_metadata_snapshot(
+                                    pool,
+                                    &snapshot,
+                                    origin_device_id,
+                                    group,
+                                )
+                                .await?;
+                            if !card_id.is_empty() {
+                                self.emit_clipboard_item_updated(&card_item, deduplicated);
+                                applied_any = true;
+                            }
+                            if should_defer_remote_file_download(
                                 &snapshot,
-                                origin_device_id,
-                                group,
-                            )
-                            .await?;
-                        if !card_id.is_empty() {
-                            self.emit_clipboard_item_updated(&card_item, deduplicated);
-                            applied_any = true;
-                        }
-                        if should_defer_remote_file_download(
-                            &snapshot,
-                            sync_settings.auto_download_max_mb,
-                            history_target_bytes,
-                        ) {
-                            repository::mark_item_applied(
-                                pool,
-                                &meta.sync_key,
-                                (!card_id.is_empty()).then_some(card_id.as_str()),
-                                "metadata",
-                                Some("available"),
-                            )
-                            .await?;
-                        } else {
-                            repository::mark_item_needs_blob_pull(
-                                pool,
-                                &meta.sync_key,
-                                (!card_id.is_empty()).then_some(card_id.as_str()),
-                                "metadata",
-                                Some("available"),
-                            )
-                            .await?;
-                            has_pending_blobs = true;
+                                sync_settings.auto_download_max_mb,
+                                history_target_bytes,
+                            ) {
+                                repository::mark_item_applied(
+                                    pool,
+                                    &meta.sync_key,
+                                    (!card_id.is_empty()).then_some(card_id.as_str()),
+                                    "metadata",
+                                    Some("available"),
+                                )
+                                .await?;
+                            } else {
+                                repository::mark_item_needs_blob_pull(
+                                    pool,
+                                    &meta.sync_key,
+                                    (!card_id.is_empty()).then_some(card_id.as_str()),
+                                    "metadata",
+                                    Some("available"),
+                                )
+                                .await?;
+                                has_pending_blobs = true;
+                            }
                         }
                     }
                 }
+                drop(_apply_guard);
+                tokio::task::yield_now().await;
             }
-            drop(_apply_guard);
-            tokio::task::yield_now().await;
+            if batch_len < 64 {
+                break;
+            }
         }
 
         if let Some((item, fingerprint)) = latest_clipboard_item.as_ref() {
@@ -760,7 +791,7 @@ impl SyncManager {
             repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
             return Ok(true);
         };
-        let Ok(snapshot) = crypto::decrypt_item_snapshot(
+        let Ok(snapshot) = decrypt_stored_snapshot(
             &key,
             item_key,
             meta.deleted,
@@ -864,7 +895,7 @@ impl SyncManager {
         let transferred = AtomicU64::new(0);
         let mut completed_bytes = 0_u64;
         let mut staged_blobs = Vec::with_capacity(snapshot.blobs.len());
-        let mut pull_error: Option<anyhow::Error> = None;
+        let mut pull_error: Option<(String, anyhow::Error)> = None;
 
         for manifest in &snapshot.blobs {
             let progress = transfer_handle
@@ -890,13 +921,13 @@ impl SyncManager {
                     });
                 }
                 Err(error) => {
-                    pull_error = Some(error);
+                    pull_error = Some((manifest.blob_id.clone(), error));
                     break;
                 }
             }
         }
 
-        if let Some(error) = pull_error {
+        if let Some((failed_blob_id, error)) = pull_error {
             let canceled = transfer_handle
                 .as_ref()
                 .is_some_and(|(_, handle)| handle.canceled());
@@ -922,6 +953,25 @@ impl SyncManager {
                 for blob in staged_blobs {
                     let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
                 }
+                return Ok(true);
+            }
+            if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
+                log::warn!(
+                    "remote blob unavailable on {target_id}; downgrading source availability: syncKey={} blobRef={}",
+                    &meta.sync_key[..meta.sync_key.len().min(12)],
+                    blob_log_ref(&failed_blob_id),
+                );
+                let _ = repository::downgrade_source_availability_on_missing_blob(
+                    pool,
+                    &meta.sync_key,
+                    target_id,
+                    &failed_blob_id,
+                )
+                .await?;
+                for blob in staged_blobs {
+                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+                }
+                self.emit_updated();
                 return Ok(true);
             }
             if source.is_cloud() && should_invalidate_cloud_connection(data_connection, &error) {
@@ -960,11 +1010,18 @@ impl SyncManager {
                         .await
                     {
                         for source_blob in sources {
+                            // Directory archives must stay on the staging-rebuild path (`encrypted_path != ""`)
+                            // because `encrypt_upload_source` streams only regular files/URIs.
+                            let stored_encrypted_path = if source_blob.source_is_directory {
+                                source_blob.encrypted_path.as_str()
+                            } else {
+                                ""
+                            };
                             let _ = repository::update_blob_local_source(
                                 pool,
                                 &meta.sync_key,
                                 &source_blob.blob_id,
-                                "",
+                                stored_encrypted_path,
                                 source_blob.source_path.as_deref(),
                                 source_blob.source_is_directory,
                                 source_blob.stream_nonce.as_deref(),

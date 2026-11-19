@@ -293,6 +293,7 @@ async fn serve_claimed_peer_connection(
     let connection_admission = Arc::new(Semaphore::new(8));
     let connection_blobs = Arc::new(TransferLimits::default());
     let transfers = Arc::new(Transfers::default());
+    let protocol_error_logged = Arc::new(AtomicBool::new(false));
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(value) => value,
@@ -316,6 +317,7 @@ async fn serve_claimed_peer_connection(
         let connection = connection.clone();
         let connection_blobs = connection_blobs.clone();
         let transfers = transfers.clone();
+        let protocol_error_logged = protocol_error_logged.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_peer_stream(
                 manager,
@@ -325,6 +327,7 @@ async fn serve_claimed_peer_connection(
                 (global_admission, connection_admission),
                 connection_blobs,
                 transfers,
+                protocol_error_logged,
             )
             .await
             {
@@ -335,6 +338,7 @@ async fn serve_claimed_peer_connection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer_stream(
     manager: Arc<SyncManager>,
     connection: Connection,
@@ -343,10 +347,26 @@ async fn handle_peer_stream(
     admission_permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     connection_blobs: Arc<TransferLimits>,
     transfers: Arc<Transfers>,
+    protocol_error_logged: Arc<AtomicBool>,
 ) -> Result<()> {
-    let request: Request = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+    let request: Request = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
         .await
-        .context("LAN request frame timeout")??;
+        .context("LAN request frame timeout")?
+    {
+        Ok(request) => request,
+        Err(error @ (FrameError::Decode(_) | FrameError::TooLarge { .. })) => {
+            // Incompatible peer versions otherwise spin-retry streams on the same QUIC connection.
+            connection.close(1_u32.into(), b"incompatible sync protocol frame");
+            if !protocol_error_logged.swap(true, Ordering::AcqRel) {
+                log::warn!(
+                    "closed incompatible LAN peer connection {}: {error}",
+                    connection.remote_id()
+                );
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     drop(admission_permits);
     if let Request::BlobPart { transfer_id, index } = request {
         return transfers.route(transfer_id, index, send, recv).await;
@@ -619,7 +639,7 @@ async fn dispatch_peer(
             let result = async {
                 let session = transfers.register(transfer_id, blob.size)?;
                 write_frame(send, &Response::BlobReady { size: blob.size }).await?;
-                let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+                let (mut reader, mut writer) = tokio::io::duplex(2 * 1024 * 1024);
                 let produce = async {
                     if let Some((source, nonce)) = streaming_source {
                         encrypt_upload_source(
@@ -732,7 +752,7 @@ async fn begin_lan_pull_upload(
     ) else {
         return Ok(None);
     };
-    let snapshot = crypto::decrypt_item_snapshot(
+    let snapshot = decrypt_stored_snapshot(
         &group.content_key_bytes()?,
         item_key,
         meta.deleted,

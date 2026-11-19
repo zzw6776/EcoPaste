@@ -2,6 +2,7 @@ use super::*;
 
 struct RemoteFileDownloadResult {
     external_destinations: Vec<repository::ExternalDownloadTarget>,
+    downloaded_blobs: Vec<repository::DownloadedBlobBinding>,
 }
 
 impl SyncManager {
@@ -31,7 +32,7 @@ impl SyncManager {
             .snapshot()
             .group
             .context("请先创建或加入同步设备组")?;
-        let snapshot = crypto::decrypt_item_snapshot(
+        let snapshot = decrypt_stored_snapshot(
             &group.content_key_bytes()?,
             item_key,
             meta.deleted,
@@ -174,6 +175,16 @@ impl SyncManager {
                     {
                         log::warn!("record external download destinations failed: {error:#}");
                     }
+                    if let Err(error) = repository::record_downloaded_external_blobs(
+                        &pool,
+                        &group.group_id,
+                        &sync_key,
+                        &download.downloaded_blobs,
+                    )
+                    .await
+                    {
+                        log::warn!("record downloaded external blob bindings failed: {error:#}");
+                    }
                     manager
                         .send_lan_acks_for_completed_item(&pool, &group, &sync_key, &item_key_owned)
                         .await;
@@ -294,6 +305,7 @@ impl SyncManager {
         let key = group.content_key_bytes()?;
         let mut completed_bytes = 0_u64;
         let mut external_destinations = Vec::new();
+        let mut downloaded_blobs = Vec::new();
         #[cfg(not(target_os = "android"))]
         let mut committed_downloads = Vec::new();
         #[cfg(target_os = "android")]
@@ -313,7 +325,7 @@ impl SyncManager {
                     };
                     let mut retried = false;
                     let mut only_unavailable = true;
-                    let commit = loop {
+                    let (commit, decrypted) = loop {
                         let attempt = download_blob_to_external_path(
                             manifest,
                             &target,
@@ -328,7 +340,7 @@ impl SyncManager {
                         )
                         .await;
                         match attempt {
-                            Ok(commit) => break commit,
+                            Ok(result) => break result,
                             Err(error)
                                 if !retried
                                     && !handle.canceled()
@@ -363,12 +375,23 @@ impl SyncManager {
                             }
                         }
                     };
+                    let destination_path = commit.destination().to_string_lossy().into_owned();
                     external_destinations.push(repository::ExternalDownloadTarget {
                         destination_kind: "path".to_owned(),
-                        destination: commit.destination().to_string_lossy().into_owned(),
+                        destination: destination_path.clone(),
                         expected_size: manifest.original_size,
                         is_directory: manifest.is_directory_archive,
                     });
+                    if !manifest.is_directory_archive && manifest.stream_commitment {
+                        downloaded_blobs.push(repository::DownloadedBlobBinding {
+                            blob_id: manifest.blob_id.clone(),
+                            plaintext_hash: decrypted.plaintext_hash,
+                            stream_nonce: decrypted.stream_nonce,
+                            original_size: manifest.original_size,
+                            encrypted_size: manifest.encrypted_size,
+                            source_path: destination_path,
+                        });
+                    }
                     committed_downloads.push(commit);
                     if handle.canceled() {
                         bail!("transfer canceled");
@@ -379,7 +402,7 @@ impl SyncManager {
                     let RemoteDownloadDestination::Android(target) = &destination;
                     let mut retried = false;
                     let mut only_unavailable = true;
-                    let committed_uri = loop {
+                    let (committed_uri, decrypted) = loop {
                         let attempt = download_blob_to_android_destination(
                             manifest,
                             target,
@@ -394,7 +417,7 @@ impl SyncManager {
                         )
                         .await;
                         match attempt {
-                            Ok(committed_uri) => break committed_uri,
+                            Ok(result) => break result,
                             Err(error)
                                 if !retried
                                     && !handle.canceled()
@@ -435,6 +458,16 @@ impl SyncManager {
                         expected_size: manifest.original_size,
                         is_directory: manifest.is_directory_archive,
                     });
+                    if !manifest.is_directory_archive && manifest.stream_commitment {
+                        downloaded_blobs.push(repository::DownloadedBlobBinding {
+                            blob_id: manifest.blob_id.clone(),
+                            plaintext_hash: decrypted.plaintext_hash,
+                            stream_nonce: decrypted.stream_nonce,
+                            original_size: manifest.original_size,
+                            encrypted_size: manifest.encrypted_size,
+                            source_path: committed_uri.clone(),
+                        });
+                    }
                     committed_uris.push(committed_uri);
                     if handle.canceled() {
                         bail!("transfer canceled");
@@ -451,6 +484,7 @@ impl SyncManager {
             }
             Ok(RemoteFileDownloadResult {
                 external_destinations,
+                downloaded_blobs,
             })
         }
         .await;

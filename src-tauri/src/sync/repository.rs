@@ -92,16 +92,19 @@ async fn set_state_value_on(
 mod tests {
     use super::*;
     use crate::db::{
-        items::{content_hash, upsert_item_with_sync_outbox},
+        items::{content_hash, upsert_item_with_sync_outbox, upsert_remote_file_item},
         models::{ClipboardItem, ClipboardKind, Platform},
-        sync_items::ContentSyncOptions,
+        sync_items::{
+            mark_local_deleted_on, mark_local_favorite_on, next_pending_state,
+            stage_existing_content, ContentDeliveryRoute, ContentSyncOptions,
+        },
         test_support::memory_pool,
     };
     use crate::sync::{
         crypto,
         model::{
-            BlobManifest, BlobRole, FieldVersion, SyncContentAvailability, SyncItemActivity,
-            SyncedClipboardItem, SyncedItemSnapshot, SNAPSHOT_VERSION,
+            BlobManifest, BlobRole, FieldVersion, SyncContentAvailability, SyncItemAction,
+            SyncItemActivity, SyncedClipboardItem, SyncedItemSnapshot, SNAPSHOT_VERSION,
         },
     };
     use chrono::DateTime;
@@ -808,5 +811,789 @@ mod tests {
             .unwrap();
         assert_eq!(cloud_pull.len(), 1);
         assert_eq!(cloud_pull[0].sync_key, "new-cloud-img");
+    }
+
+    #[tokio::test]
+    async fn lan_only_delivery_route_never_uploads_or_wedges_cloud_and_allows_manual_cloud_upload()
+    {
+        let pool = memory_pool().await;
+        let key = [17_u8; 32];
+        let mut item = sample_item("android-big-file", 1_700_000_600);
+        item.kind = ClipboardKind::Files;
+        item.size = Some(200 * 1024 * 1024);
+
+        upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                delivery_route: Some(ContentDeliveryRoute::Lan),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let manifest = BlobManifest {
+            blob_id: "blob-big-lan".into(),
+            name: "video.mp4".into(),
+            original_size: 200 * 1024 * 1024,
+            encrypted_size: 200 * 1024 * 1024 + 64,
+            role: BlobRole::File,
+            file_index: Some(0),
+            is_directory_archive: false,
+            stream_commitment: true,
+        };
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion::new(1, "dev-android"),
+            presence_version: FieldVersion::new(1, "dev-android"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "files".into(),
+                sub_kind: None,
+                content: "video.mp4".into(),
+                search_text: None,
+                summary: Some("video.mp4".into()),
+                file_types: Some("[\"mp4\"]".into()),
+                size: item.size,
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "android".into(),
+                created_at_ms: item.created_at.timestamp_millis(),
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                source_revision: Some(item.source_revision.clone()),
+                source_device_id: Some("dev-android".into()),
+                source_device_name: Some("Pixel".into()),
+                source_updated_at_ms: Some(item.updated_at.timestamp_millis()),
+            }),
+            blobs: vec![manifest.clone()],
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let blob_row = SyncItemBlobRow {
+            blob_id: manifest.blob_id.clone(),
+            role: "file".into(),
+            optional: false,
+            size: manifest.encrypted_size,
+            original_size: manifest.original_size,
+            encrypted_path: String::new(),
+            source_path: Some("/data/video.mp4".into()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![0x55; 24]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        };
+
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-android",
+                content_identity: None,
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &[blob_row],
+                content_objects: &[],
+                cloud_desired: None,
+            },
+        )
+        .await
+        .unwrap());
+
+        // Neither Cloud Control-Plane nor Cloud Data-Plane may touch a LAN-only item.
+        assert!(pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_cloud_blob_uploads(&pool, false, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(status_counts(&pool, false).await.unwrap().0, 0);
+
+        // Cloud badge must be gray/idle AND clickable for manual upload; LAN ack with Metadata
+        // settles cleanly to blue/idle (not stuck queued in awaiting_receipt).
+        record_lan_acks(
+            &pool,
+            "peer:dev-mac",
+            &[LanItemAck {
+                item_key: item_key.clone(),
+                local_seq: local_seq as u64,
+                level: LanContentLevel::Metadata,
+            }],
+        )
+        .await
+        .unwrap();
+        let statuses = item_statuses(&pool, std::slice::from_ref(&item.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses[0].cloud.availability,
+            SyncContentAvailability::None
+        );
+        assert_eq!(statuses[0].cloud.activity, SyncItemActivity::Idle);
+        assert_eq!(statuses[0].cloud.action, SyncItemAction::Upload);
+        assert_eq!(
+            statuses[0].lan.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(statuses[0].lan.activity, SyncItemActivity::Idle);
+        assert_eq!(status_counts(&pool, false).await.unwrap().0, 0);
+
+        // Clicking Cloud clears `delivery_route` and queues both metadata and blob uploads.
+        assert!(request_item_delivery(&pool, &item.id, true).await.unwrap());
+        assert_eq!(
+            pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            pending_cloud_blob_uploads(&pool, false, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn favorite_and_delete_preserve_committed_aad_and_clear_route_locks() {
+        let pool = memory_pool().await;
+        let key = [19_u8; 32];
+        let item = sample_item("fav-aad", 1_700_000_700);
+        upsert_item_with_sync_outbox(
+            &pool,
+            &item,
+            Some(ContentSyncOptions {
+                delivery_route: Some(ContentDeliveryRoute::Lan),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion::new(1, "dev-a"),
+            presence_version: FieldVersion::new(1, "dev-a"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: "important text".into(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: Some(14),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: item.created_at.timestamp_millis(),
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                source_revision: Some(item.source_revision.clone()),
+                source_device_id: Some("dev-a".into()),
+                source_device_name: Some("Mac".into()),
+                source_updated_at_ms: Some(item.updated_at.timestamp_millis()),
+            }),
+            blobs: Vec::new(),
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-a",
+                content_identity: None,
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &[],
+                content_objects: &[],
+                cloud_desired: None,
+            },
+        )
+        .await
+        .unwrap());
+
+        // Toggling favorite must NOT corrupt stored `protected` AAD before re-encryption.
+        let mut conn = pool.acquire().await.unwrap();
+        mark_local_favorite_on(&mut conn, &item.sync_key, &item.id, false, true, false)
+            .await
+            .unwrap();
+        drop(conn);
+        let meta = load_sync_item_meta(&pool, &item.sync_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(meta.is_favorite);
+        assert!(!meta.protected);
+        let decrypted = crypto::decrypt_item_snapshot(
+            &key,
+            meta.item_key.as_deref().unwrap(),
+            meta.deleted,
+            meta.protected,
+            meta.nonce.as_deref().unwrap(),
+            meta.ciphertext.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decrypted.item.as_ref().map(|i| i.content.as_str()),
+            Some("important text")
+        );
+
+        // Deleting must clear `delivery_route`, keep stored `deleted` AAD intact until re-encrypt,
+        // and surface `deleted = true` via `next_pending_state`.
+        let mut conn = pool.acquire().await.unwrap();
+        mark_local_deleted_on(&mut conn, &item.sync_key, false)
+            .await
+            .unwrap();
+        drop(conn);
+        let route: Option<String> =
+            sqlx::query_scalar("SELECT delivery_route FROM sync_items WHERE sync_key = ?")
+                .bind(&item.sync_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(route, None);
+        let pending = next_pending_state(&pool, true).await.unwrap().unwrap();
+        assert!(pending.deleted);
+        assert!(!pending.is_present);
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_merge_preserves_local_stream_nonce() {
+        let pool = memory_pool().await;
+        let key = [23_u8; 32];
+        let mut item = sample_item("stream-file", 1_700_000_800);
+        item.kind = ClipboardKind::Files;
+        upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let manifest = BlobManifest {
+            blob_id: "blob-stream-keep".into(),
+            name: "doc.pdf".into(),
+            original_size: 4096,
+            encrypted_size: 4160,
+            role: BlobRole::File,
+            file_index: Some(0),
+            is_directory_archive: false,
+            stream_commitment: true,
+        };
+        let mut snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion::new(1, "dev-a"),
+            presence_version: FieldVersion::new(1, "dev-a"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "files".into(),
+                sub_kind: None,
+                content: "doc.pdf".into(),
+                search_text: None,
+                summary: Some("doc.pdf".into()),
+                file_types: Some("[\"pdf\"]".into()),
+                size: Some(4096),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: item.created_at.timestamp_millis(),
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                source_revision: Some(item.source_revision.clone()),
+                source_device_id: Some("dev-a".into()),
+                source_device_name: Some("Mac".into()),
+                source_updated_at_ms: Some(item.updated_at.timestamp_millis()),
+            }),
+            blobs: vec![manifest.clone()],
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let expected_nonce = vec![0xAB_u8; 24];
+        let blob_row = SyncItemBlobRow {
+            blob_id: manifest.blob_id.clone(),
+            role: "file".into(),
+            optional: false,
+            size: manifest.encrypted_size,
+            original_size: manifest.original_size,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/doc.pdf".into()),
+            source_is_directory: false,
+            stream_nonce: Some(expected_nonce.clone()),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        };
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-a",
+                content_identity: None,
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &[blob_row],
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Metadata),
+            },
+        )
+        .await
+        .unwrap());
+
+        // Remote peer favorites the file and pushes back; `stream_nonce` MUST survive!
+        snapshot.is_favorite = true;
+        snapshot.favorite_version = FieldVersion::new(2, "dev-b");
+        let (nonce2, ciphertext2) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, true, &snapshot).unwrap();
+        store_merged_remote_item(
+            &pool,
+            StoreMergedRemoteItem {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                origin_device_id: "dev-b",
+                hub_rev: Some(2),
+                remote_seq: 5,
+                source_target_id: "peer:dev-b",
+                snapshot: &snapshot,
+                nonce: &nonce2,
+                ciphertext: &ciphertext2,
+                available_blob_ids: &[],
+                needs_apply: true,
+                re_push_required: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let blobs = load_item_blobs(&pool, &item.sync_key).await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].stream_nonce, Some(expected_nonce));
+        assert!(blobs[0].local_available);
+        assert_eq!(blobs[0].source_path.as_deref(), Some("/tmp/doc.pdf"));
+    }
+
+    #[tokio::test]
+    async fn external_remote_file_restage_preserves_state_and_manual_delivery_allocates_local_seq()
+    {
+        let pool = memory_pool().await;
+        let key = [29_u8; 32];
+        let mut item = sample_item("ext-file", 1_700_000_900);
+        item.kind = ClipboardKind::Files;
+        item.content = "archive.zip".into();
+        item.remote_file_state = Some("available".into());
+
+        let upserted = upsert_remote_file_item(&pool, &item, "dev-android")
+            .await
+            .unwrap();
+        item.id = upserted.id.clone();
+
+        record_external_download_session(
+            &pool,
+            &item.sync_key,
+            &[ExternalDownloadTarget {
+                destination_kind: "path".into(),
+                destination: "/tmp/archive.zip".into(),
+                expected_size: 1024,
+                is_directory: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Re-staging an externally downloaded remote file for manual Cloud upload must keep
+        // `origin = 'remote'`, `local_state = 'external'`, and `remote_file_state = 'available'`.
+        stage_existing_content(
+            &pool,
+            &item,
+            ContentSyncOptions {
+                force_files: true,
+                manual_share: true,
+                delivery_route: Some(ContentDeliveryRoute::Cloud),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (origin, local_state, remote_file_state): (String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT origin, local_state, remote_file_state FROM sync_items WHERE sync_key = ?",
+            )
+            .bind(&item.sync_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(origin, "remote");
+        assert_eq!(local_state, "external");
+        assert_eq!(remote_file_state.as_deref(), Some("available"));
+
+        // Manually requesting cloud delivery on a ready remote item (`local_seq = 0`) allocates
+        // a positive `local_seq` so Control-Plane pushes its snapshot.
+        let mut remote_text = sample_item("remote-text-for-cloud", 1_700_000_950);
+        let item_key = crypto::derive_item_key(&key, &remote_text.sync_key);
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: remote_text.sync_key.clone(),
+            content_version: FieldVersion::new(1, "dev-b"),
+            presence_version: FieldVersion::new(1, "dev-b"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: remote_text.content.clone(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: remote_text.size,
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "android".into(),
+                created_at_ms: remote_text.created_at.timestamp_millis(),
+                sync_key: remote_text.sync_key.clone(),
+                updated_at_ms: Some(remote_text.updated_at.timestamp_millis()),
+                source_revision: Some(remote_text.source_revision.clone()),
+                source_device_id: Some("dev-b".into()),
+                source_device_name: Some("Phone".into()),
+                source_updated_at_ms: Some(remote_text.updated_at.timestamp_millis()),
+            }),
+            blobs: Vec::new(),
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let inserted = upsert_item_with_sync_outbox(&pool, &remote_text, None)
+            .await
+            .unwrap()
+            .0;
+        remote_text.id = inserted.id;
+        store_merged_remote_item(
+            &pool,
+            StoreMergedRemoteItem {
+                sync_key: &remote_text.sync_key,
+                item_key: &item_key,
+                origin_device_id: "dev-b",
+                hub_rev: None,
+                remote_seq: 9,
+                source_target_id: "peer:dev-b",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                available_blob_ids: &[],
+                needs_apply: false,
+                re_push_required: false,
+            },
+        )
+        .await
+        .unwrap();
+        mark_item_applied(
+            &pool,
+            &remote_text.sync_key,
+            Some(&remote_text.id),
+            "managed",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(local_seq_of(&pool, &remote_text.sync_key).await, 0);
+        assert!(request_item_delivery(&pool, &remote_text.id, true)
+            .await
+            .unwrap());
+        assert!(local_seq_of(&pool, &remote_text.sync_key).await > 0);
+        assert_eq!(
+            pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_remote_blob_downgrades_source_and_clears_poison_pill_pull_queue() {
+        let pool = memory_pool().await;
+        let key = [31_u8; 32];
+        let sync_key = "poison-img-key";
+        let item_key = crypto::derive_item_key(&key, sync_key);
+        let blob_id = "blob-missing-404".to_owned();
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: sync_key.into(),
+            content_version: FieldVersion::new(1, "dev-b"),
+            presence_version: FieldVersion::new(1, "dev-b"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "image".into(),
+                sub_kind: None,
+                content: "gone.png".into(),
+                search_text: None,
+                summary: None,
+                file_types: None,
+                size: Some(128),
+                width: Some(4),
+                height: Some(4),
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: 1_700_000_999_000,
+                sync_key: sync_key.into(),
+                updated_at_ms: Some(1_700_000_999_000),
+                source_revision: Some("rev-gone".into()),
+                source_device_id: Some("dev-b".into()),
+                source_device_name: Some("Peer".into()),
+                source_updated_at_ms: Some(1_700_000_999_000),
+            }),
+            blobs: vec![BlobManifest {
+                blob_id: blob_id.clone(),
+                name: "gone.png".into(),
+                original_size: 128,
+                encrypted_size: 160,
+                role: BlobRole::Image,
+                file_index: None,
+                is_directory_archive: false,
+                stream_commitment: false,
+            }],
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+
+        for target in ["peer:dev-b", CLOUD_TARGET] {
+            store_merged_remote_item(
+                &pool,
+                StoreMergedRemoteItem {
+                    sync_key,
+                    item_key: &item_key,
+                    origin_device_id: "dev-b",
+                    hub_rev: (target == CLOUD_TARGET).then_some(1),
+                    remote_seq: 1,
+                    source_target_id: target,
+                    snapshot: &snapshot,
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                    available_blob_ids: std::slice::from_ref(&blob_id),
+                    needs_apply: true,
+                    re_push_required: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        mark_item_needs_blob_pull(&pool, sync_key, None, "metadata", None)
+            .await
+            .unwrap();
+
+        // Missing on LAN downgrades only LAN; Cloud remains eligible for pull.
+        let exhausted_lan =
+            downgrade_source_availability_on_missing_blob(&pool, sync_key, "peer:dev-b", &blob_id)
+                .await
+                .unwrap();
+        assert!(!exhausted_lan);
+        assert!(
+            list_blob_pull_items_for_source(&pool, "peer:dev-b", None, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_blob_pull_items_for_source(&pool, CLOUD_TARGET, None, 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Missing on Cloud too exhausts all sources and clears `needs_blob_pull` & `cloud_available`.
+        let exhausted_all =
+            downgrade_source_availability_on_missing_blob(&pool, sync_key, CLOUD_TARGET, &blob_id)
+                .await
+                .unwrap();
+        assert!(exhausted_all);
+        let meta = load_sync_item_meta(&pool, sync_key).await.unwrap().unwrap();
+        assert!(!meta.needs_blob_pull);
+        let blobs = load_item_blobs(&pool, sync_key).await.unwrap();
+        assert!(!blobs[0].cloud_available);
+    }
+
+    #[tokio::test]
+    async fn downloaded_external_blobs_bind_local_source_and_content_object() {
+        use super::super::crypto;
+        use super::super::model::{
+            BlobManifest, BlobRole, FieldVersion, SyncedClipboardItem, SyncedItemSnapshot,
+            SNAPSHOT_VERSION,
+        };
+
+        let pool = memory_pool().await;
+        let key = [13_u8; 32];
+        let sync_key = "downloaded-lan-file";
+        let item_key = crypto::derive_item_key(&key, sync_key);
+        let plaintext_hash = "d".repeat(64);
+        let stream_nonce = vec![9_u8; 19];
+        let blob_id = crypto::stream_blob_id(&key, &stream_nonce, &plaintext_hash).unwrap();
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: sync_key.into(),
+            content_version: FieldVersion::new(1, "dev-a"),
+            presence_version: FieldVersion::new(1, "dev-a"),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "files".into(),
+                sub_kind: None,
+                content: "archive.bin".into(),
+                search_text: Some("archive.bin".into()),
+                summary: Some("archive.bin".into()),
+                file_types: None,
+                size: Some(1024),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "android".into(),
+                created_at_ms: 100,
+                sync_key: sync_key.into(),
+                updated_at_ms: Some(100),
+                source_revision: None,
+                source_device_id: Some("dev-a".into()),
+                source_device_name: Some("Phone".into()),
+                source_updated_at_ms: Some(100),
+            }),
+            blobs: vec![BlobManifest {
+                blob_id: blob_id.clone(),
+                name: "archive.bin".into(),
+                original_size: 1024,
+                encrypted_size: 1067,
+                role: BlobRole::File,
+                file_index: Some(0),
+                is_directory_archive: false,
+                stream_commitment: true,
+            }],
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+
+        store_merged_remote_item(
+            &pool,
+            StoreMergedRemoteItem {
+                sync_key,
+                item_key: &item_key,
+                origin_device_id: "dev-a",
+                hub_rev: None,
+                remote_seq: 1,
+                source_target_id: "peer:dev-a",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                available_blob_ids: std::slice::from_ref(&blob_id),
+                needs_apply: false,
+                re_push_required: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        record_downloaded_external_blobs(
+            &pool,
+            "group-1",
+            sync_key,
+            &[DownloadedBlobBinding {
+                blob_id: blob_id.clone(),
+                plaintext_hash: plaintext_hash.clone(),
+                stream_nonce: stream_nonce.clone(),
+                original_size: 1024,
+                encrypted_size: 1067,
+                source_path: "/tmp/archive.bin".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let blobs = load_item_blobs(&pool, sync_key).await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert!(blobs[0].local_available);
+        assert_eq!(blobs[0].source_path.as_deref(), Some("/tmp/archive.bin"));
+        assert_eq!(
+            blobs[0].stream_nonce.as_deref(),
+            Some(stream_nonce.as_slice())
+        );
+
+        let reusable = reusable_content_object(&pool, "group-1", &plaintext_hash)
+            .await
+            .unwrap()
+            .expect("content object recorded");
+        assert_eq!(reusable.blob_id, blob_id);
+        assert_eq!(reusable.stream_nonce, stream_nonce);
     }
 }
