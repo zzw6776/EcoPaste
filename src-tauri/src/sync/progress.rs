@@ -176,10 +176,6 @@ impl TransferRegistry {
         self.start_entry(task, None, TransferPersistence::Durable, true)
     }
 
-    pub fn start_transient(&self, task: TransferTask) -> TransferHandle {
-        self.start_entry(task, None, TransferPersistence::Transient, true)
-    }
-
     #[cfg(target_os = "android")]
     pub fn start_local_import(&self, task: TransferTask) -> TransferHandle {
         self.start_entry(task, None, TransferPersistence::Transient, false)
@@ -229,6 +225,22 @@ impl TransferRegistry {
         }
 
         let entry_id = task.id.clone();
+        let mut superseded = Vec::new();
+        state.entries.retain(|existing_id, entry| {
+            let is_superseded = existing_id != &entry_id
+                && entry.task.operation_id == task.operation_id
+                && entry.task.direction == task.direction
+                && matches!(
+                    entry.task.phase,
+                    TransferPhase::Failed | TransferPhase::Canceled
+                );
+            if is_superseded {
+                superseded.push(existing_id.clone());
+                false
+            } else {
+                true
+            }
+        });
         task.revision = 0;
         let cancel = Arc::new(AtomicBool::new(false));
         let item_id = task.item_id.clone();
@@ -256,6 +268,7 @@ impl TransferRegistry {
             state.local_imports.insert(item_id, entry_id.clone());
         }
         drop(state);
+        self.emit_removed(superseded);
         self.emit(&entry_id, true);
         self.handle(entry_id, cancel)
     }
@@ -850,6 +863,21 @@ impl TransferRegistry {
             log::warn!("emit removed transfer records failed: {error}");
         }
     }
+
+    fn abandon(&self, id: &str) {
+        let removed = {
+            let mut state = self.state.lock().expect("transfer registry poisoned");
+            if let Some(entry) = state.entries.remove(id) {
+                let key = TransferOperationKey::from_task(&entry.task);
+                state.active_operations.remove(&key);
+                state.local_imports.remove(&entry.task.item_id);
+                vec![id.to_owned()]
+            } else {
+                Vec::new()
+            }
+        };
+        self.emit_removed(removed);
+    }
 }
 
 /// Bounds terminal history by completion time while preserving every unfinished operation.
@@ -1067,6 +1095,13 @@ impl TransferHandle {
 
     pub fn mark_canceled(&self, bytes: u64) {
         self.update(TransferPhase::Canceled, bytes, None, None, true);
+    }
+
+    /// Removes an aborted source attempt without leaving a false failure card when falling back
+    /// to another available route.
+    pub fn abandon(&self) {
+        self.component.terminal.store(true, Ordering::Release);
+        self.registry.abandon(&self.entry_id);
     }
 
     fn update(

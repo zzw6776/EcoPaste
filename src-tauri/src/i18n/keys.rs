@@ -69,6 +69,7 @@ pub enum CommandKey {
 #[derive(Debug, Clone, Copy)]
 pub enum SyncKey {
     OpenStream,
+    StreamClosed,
     SendRequest,
     WaitForResponse,
     ReadResponse,

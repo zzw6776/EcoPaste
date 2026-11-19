@@ -1801,4 +1801,134 @@ mod tests {
             (0, 0)
         );
     }
+
+    #[tokio::test]
+    async fn outgoing_blob_source_and_cloud_availability_gate_control_wake() {
+        let pool = memory_pool().await;
+        let key = [42_u8; 32];
+        let mut item = sample_item("img-item", 1_700_002_000);
+        item.kind = ClipboardKind::Image;
+        upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            presence_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "image".to_owned(),
+                sub_kind: None,
+                content: "img.png".to_owned(),
+                search_text: item.search_text.clone(),
+                summary: None,
+                file_types: None,
+                size: Some(128),
+                width: Some(10),
+                height: Some(10),
+                is_sensitive: false,
+                source_platform: "windows".to_owned(),
+                created_at_ms: 1_700_002_000,
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(1_700_002_000),
+                source_revision: Some("rev-img".to_owned()),
+                source_device_id: Some("dev-a".to_owned()),
+                source_device_name: Some("PC".to_owned()),
+                source_updated_at_ms: Some(1_700_002_000),
+            }),
+            blobs: vec![crate::sync::model::BlobManifest {
+                blob_id: "b".repeat(64),
+                name: "img.png".to_owned(),
+                original_size: 128,
+                encrypted_size: 163,
+                role: crate::sync::model::BlobRole::Image,
+                file_index: None,
+                is_directory_archive: false,
+                stream_commitment: false,
+            }],
+            source_app: None,
+            content_identity: Some("hash-img".to_owned()),
+        };
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let blobs = vec![SyncItemBlobRow {
+            blob_id: "b".repeat(64),
+            role: "image".to_owned(),
+            optional: false,
+            size: 163,
+            original_size: 128,
+            encrypted_path: String::new(),
+            source_path: Some("C:/tmp/img.png".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![7_u8; 19]),
+            stream_commitment: false,
+            cloud_available: false,
+            local_available: true,
+        }];
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-a",
+                content_identity: Some("hash-img"),
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &blobs,
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Complete),
+            },
+        )
+        .await
+        .unwrap());
+
+        // Non-stream-committed image with empty encrypted_path must resolve to StagedLease, never DirectStream.
+        let loaded = outgoing_blob(&pool, &"b".repeat(64))
+            .await
+            .unwrap()
+            .expect("outgoing image blob");
+        assert_eq!(
+            loaded.outgoing_source(),
+            Some(crate::sync::model::OutgoingBlobSource::StagedLease)
+        );
+
+        // Once metadata is accepted by Cloud, completing blob upload must not request another control push.
+        let mut seqs = HashMap::new();
+        seqs.insert(item_key.clone(), u64::try_from(local_seq).unwrap());
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key,
+                hub_rev: 1,
+                seq: 10,
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+        let outcome = mark_blob_cloud_available(&pool, &item.sync_key, &"b".repeat(64))
+            .await
+            .unwrap();
+        assert!(outcome.completed);
+        assert!(!outcome.needs_control_push);
+    }
 }

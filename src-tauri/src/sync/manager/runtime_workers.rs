@@ -1165,7 +1165,7 @@ pub(super) async fn attachment_worker(
                                 Ok(handled) => handled_item |= handled,
                                 Err(error) => {
                                     log::warn!("cloud attachment upload deferred: {error:#}");
-                                    manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                                    manager.schedule_attachment_wake(chrono::Duration::seconds(5));
                                     break;
                                 }
                             }
@@ -1211,7 +1211,7 @@ pub(super) async fn attachment_worker(
                             Ok(false) => {}
                             Err(error) => {
                                 log::warn!("LAN attachment download deferred: {error:#}");
-                                manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                                manager.schedule_attachment_wake(chrono::Duration::seconds(5));
                             }
                         }
                     }
@@ -1238,7 +1238,7 @@ pub(super) async fn attachment_worker(
                                 Ok(handled) => handled_item |= handled,
                                 Err(error) => {
                                     log::warn!("cloud attachment download deferred: {error:#}");
-                                    manager.schedule_transfer_wake(chrono::Duration::seconds(5));
+                                    manager.schedule_attachment_wake(chrono::Duration::seconds(5));
                                     break;
                                 }
                             }

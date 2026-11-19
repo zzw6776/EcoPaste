@@ -197,7 +197,10 @@ pub(super) async fn call_cloud(
     let result = async {
         let (mut send, mut recv) =
             match tokio::time::timeout(CLOUD_CONTROL_REQUEST_TIMEOUT, connection.open_bi()).await {
-                Ok(result) => result.context("open cloud sync stream")?,
+                Ok(result) => result.context(crate::i18n::sync::label(
+                    language,
+                    crate::i18n::sync::Key::StreamClosed,
+                ))?,
                 Err(_) => {
                     return Err(cloud_attempt_timeout(
                         CloudAttemptPhase::OpenStream,
@@ -236,6 +239,17 @@ pub(super) async fn call_cloud(
 #[cfg(test)]
 pub(super) fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cloud connection superseded")]
+pub(super) struct CloudConnectionSuperseded;
+
+pub(super) fn is_locally_closed_cloud_connection(connection: &Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(iroh::endpoint::ConnectionError::LocallyClosed)
+    )
 }
 
 pub(super) fn should_invalidate_cloud_connection(

@@ -204,7 +204,8 @@ pub(super) async fn upload_blob_inner(
     let open_elapsed = open_started_at.elapsed();
     let result = async {
         let write_started_at = Instant::now();
-        let streaming = blob.encrypted_path.is_empty();
+        let source_mode = blob.outgoing_source().ok_or(RemoteBlobUnavailable)?;
+        let streaming = matches!(source_mode, OutgoingBlobSource::DirectStream { .. });
         let transfer_id = rand::random();
         let request = match (options.kind, streaming) {
             (BlobUploadKind::Content, true) => Request::PutManagedStreamBlob {
@@ -305,36 +306,40 @@ pub(super) async fn upload_blob_inner(
         let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(2 * 1024 * 1024);
         progress.report_transferred = false;
         let produce = async {
-            if streaming {
-                encrypt_upload_source(
-                    blob.source_path
-                        .as_deref()
-                        .context("streaming upload source is unavailable")?,
-                    &mut encrypted_writer,
-                    upload::FileEncryptionSpec {
-                        expected_encrypted_size: blob.size,
-                        expected_blob_id: &blob.blob_id,
-                        key: group.content_key_bytes()?,
-                        stream_nonce: blob
-                            .stream_nonce
-                            .as_deref()
-                            .context("streaming upload nonce is unavailable")?,
+            match source_mode {
+                OutgoingBlobSource::DirectStream {
+                    source_path,
+                    stream_nonce,
+                } => {
+                    if !source_path.starts_with("content://") && !Path::new(source_path).is_file() {
+                        return Err(RemoteBlobUnavailable.into());
+                    }
+                    encrypt_upload_source(
+                        source_path,
+                        &mut encrypted_writer,
+                        upload::FileEncryptionSpec {
+                            expected_encrypted_size: blob.size,
+                            expected_blob_id: &blob.blob_id,
+                            key: group.content_key_bytes()?,
+                            stream_nonce,
+                            idle_timeout,
+                            language: options.language,
+                        },
+                        progress,
+                    )
+                    .await?;
+                }
+                OutgoingBlobSource::StagedLease => {
+                    let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
+                    upload::copy(
+                        &mut file,
+                        &mut encrypted_writer,
                         idle_timeout,
-                        language: options.language,
-                    },
-                    progress,
-                )
-                .await?;
-            } else {
-                let mut file = tokio::fs::File::open(&blob.encrypted_path).await?;
-                upload::copy(
-                    &mut file,
-                    &mut encrypted_writer,
-                    idle_timeout,
-                    options.language,
-                    progress,
-                )
-                .await?;
+                        options.language,
+                        progress,
+                    )
+                    .await?;
+                }
             }
             encrypted_writer.shutdown().await?;
             Ok::<_, anyhow::Error>(())
@@ -447,6 +452,12 @@ pub(super) fn blob_log_ref(blob_id: &str) -> &str {
     blob_id.get(..12).unwrap_or(blob_id)
 }
 
+fn is_remote_blob_unavailable_error(code: ErrorCode, message: &str) -> bool {
+    code == ErrorCode::NotFound
+        || (message.contains("blob") && message.contains("unavailable"))
+        || message.contains("sync source content changed before upload")
+}
+
 /// Uploads independent encrypted blobs over a small number of parallel QUIC streams.
 pub(super) async fn upload_blobs(
     manager: Arc<SyncManager>,
@@ -529,10 +540,9 @@ pub(super) async fn download_blob(
         .context("wait for blob download response timeout")??;
     let size = match response {
         Response::BlobReady { size } => size,
-        Response::Error {
-            code: ErrorCode::NotFound,
-            ..
-        } => return Err(RemoteBlobUnavailable.into()),
+        Response::Error { code, message } if is_remote_blob_unavailable_error(code, &message) => {
+            return Err(RemoteBlobUnavailable.into());
+        }
         Response::Error { code, message } => return Err(RemoteSyncError { code, message }.into()),
         _ => bail!("blob is unavailable"),
     };
@@ -794,10 +804,9 @@ where
         .context("wait for remote file download response timeout")??;
     let size = match response {
         Response::BlobReady { size } => size,
-        Response::Error {
-            code: ErrorCode::NotFound,
-            ..
-        } => return Err(RemoteBlobUnavailable.into()),
+        Response::Error { code, message } if is_remote_blob_unavailable_error(code, &message) => {
+            return Err(RemoteBlobUnavailable.into());
+        }
         Response::Error { message, .. } => bail!(message),
         _ => bail!("blob is unavailable"),
     };

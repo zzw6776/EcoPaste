@@ -446,6 +446,43 @@ pub struct StoredBlob {
     pub stream_nonce: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingBlobSource<'a> {
+    /// Regular file encrypted on the fly from `source_path` with a stream-committed `blob_id`.
+    DirectStream {
+        source_path: &'a str,
+        stream_nonce: &'a [u8],
+    },
+    /// Ciphertext-hashed blob backed by an on-disk staging file or recreatable via `lease_outgoing_staging`.
+    StagedLease,
+}
+
+impl StoredBlob {
+    /// Resolves how an outgoing blob is supplied to the wire, returning `None` when a streaming
+    /// blob lacks its local source path or deterministic stream nonce.
+    pub fn outgoing_source(&self) -> Option<OutgoingBlobSource<'_>> {
+        if self.encrypted_path.is_empty() {
+            if self.source_is_directory {
+                return Some(OutgoingBlobSource::StagedLease);
+            }
+            let source_path = self
+                .source_path
+                .as_deref()
+                .filter(|path| !path.is_empty())?;
+            let stream_nonce = self
+                .stream_nonce
+                .as_deref()
+                .filter(|nonce| !nonce.is_empty())?;
+            Some(OutgoingBlobSource::DirectStream {
+                source_path,
+                stream_nonce,
+            })
+        } else {
+            Some(OutgoingBlobSource::StagedLease)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredContentObject {
     pub plaintext_hash: String,
