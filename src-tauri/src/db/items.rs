@@ -20,76 +20,29 @@ const SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind, clip
      clipboard_apps.icon_file AS source_app_icon_file, \
      clipboard_apps.accent_start AS source_app_accent_start, \
      clipboard_apps.accent_end AS source_app_accent_end, \
-     sync_remote_file_items.state AS remote_file_state \
+     sync_items.remote_file_state AS remote_file_state \
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id \
-     LEFT JOIN sync_remote_file_items ON sync_remote_file_items.item_id = clipboard_items.id";
+     LEFT JOIN sync_items ON sync_items.item_id = clipboard_items.id";
 const HISTORY_CLEANUP_BATCH_SIZE: i64 = 256;
 /// The same protection predicate is compiled into the age, count and capacity queries.
 macro_rules! evictable_history {
     () => {
         "is_pinned = 0 AND is_favorite = 0 AND NOT EXISTS (
-            SELECT 1 FROM sync_content_outbox manual
-            WHERE manual.item_id = clipboard_items.id
-              AND manual.manual_share = 1
-              AND julianday(manual.updated_at) > julianday('now', '-24 hours')
-        ) AND NOT EXISTS (
             SELECT 1 FROM sync_active_transfers active
             WHERE active.item_id = clipboard_items.id
         ) AND NOT EXISTS (
-            SELECT 1
-            FROM sync_item_events links
-            JOIN sync_delivery_targets receiver
-              ON receiver.event_id = links.event_id
-            WHERE links.item_id = clipboard_items.id
-              AND links.direction = 'local'
-              AND receiver.target_id LIKE 'peer:%'
-              AND receiver.confirmed_content = 'metadata'
-              AND julianday(receiver.updated_at) > julianday('now', '-24 hours')
-              AND NOT EXISTS (
-                  SELECT 1 FROM sync_delivery_targets cloud
-                  WHERE cloud.event_id = links.event_id
-                    AND cloud.target_id = 'cloud'
-                    AND cloud.confirmed_content = 'complete'
-              )
-        ) AND NOT EXISTS (
-            SELECT 1 FROM sync_item_events links
-            JOIN sync_delivery_targets delivery ON delivery.event_id = links.event_id
-            WHERE links.item_id = clipboard_items.id
-              AND delivery.status IN ('pending', 'awaiting_receipt')
-              AND julianday(delivery.updated_at) > julianday('now', '-24 hours')
-        ) AND NOT EXISTS (
-            SELECT 1
-            FROM sync_item_events links
-            JOIN sync_events event ON event.event_id = links.event_id
-            WHERE links.item_id = clipboard_items.id
-              AND links.direction = 'local'
-              AND event.delivery_route IS NOT NULL
-              AND julianday(event.updated_at) > julianday('now', '-24 hours')
-              AND NOT EXISTS (
-                  SELECT 1 FROM sync_delivery_targets canceled
-                  WHERE canceled.event_id = event.event_id
-                    AND canceled.status IN ('blocked', 'canceled')
-                    AND (
-                        (event.delivery_route = 'cloud' AND canceled.target_id = 'cloud')
-                        OR (event.delivery_route = 'lan' AND canceled.target_id LIKE 'peer:%')
-                    )
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM sync_delivery_targets delivery
-                  WHERE delivery.event_id = event.event_id
-                    AND delivery.status = 'confirmed'
-                    AND (
-                        (
-                            event.delivery_route = 'cloud'
-                            AND delivery.target_id = 'cloud'
-                            AND delivery.confirmed_content = 'complete'
-                        )
-                        OR (
-                            event.delivery_route = 'lan'
-                            AND delivery.target_id LIKE 'peer:%'
-                        )
-                    )
+            SELECT 1 FROM sync_items sync_row
+            WHERE sync_row.item_id = clipboard_items.id
+              AND julianday(sync_row.updated_at) > julianday('now', '-24 hours')
+              AND (
+                  (sync_row.manual_share = 1 AND sync_row.prep_state <> 'ready')
+                  OR EXISTS (
+                      SELECT 1 FROM sync_item_targets target
+                      WHERE target.sync_key = sync_row.sync_key
+                        AND target.status IN ('pending', 'awaiting_receipt')
+                        AND julianday(target.updated_at) > julianday('now', '-24 hours')
+                  )
               )
         )"
     };
@@ -123,10 +76,10 @@ const LIST_SELECT_ITEM: &str = "SELECT clipboard_items.id, clipboard_items.kind,
      clipboard_apps.icon_file AS source_app_icon_file, \
      clipboard_apps.accent_start AS source_app_accent_start, \
      clipboard_apps.accent_end AS source_app_accent_end, \
-     sync_remote_file_items.state AS remote_file_state \
+     sync_items.remote_file_state AS remote_file_state \
      FROM clipboard_items \
      LEFT JOIN clipboard_apps ON clipboard_apps.id = clipboard_items.source_app_id \
-     LEFT JOIN sync_remote_file_items ON sync_remote_file_items.item_id = clipboard_items.id";
+     LEFT JOIN sync_items ON sync_items.item_id = clipboard_items.id";
 
 fn kind_tag(kind: ClipboardKind) -> &'static str {
     match kind {
@@ -171,7 +124,7 @@ pub async fn upsert_item(pool: &SqlitePool, item: &ClipboardItem) -> Result<Upse
 pub async fn upsert_item_with_sync_outbox(
     pool: &SqlitePool,
     item: &ClipboardItem,
-    sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
+    sync_options: Option<crate::db::sync_items::ContentSyncOptions>,
 ) -> Result<(UpsertResult, bool)> {
     let mut transaction = pool
         .begin_with("BEGIN IMMEDIATE")
@@ -196,14 +149,14 @@ pub async fn upsert_item_with_sync_outbox(
     // Reusing identical content can change its source revision before a queued share is sent.
     // Carry explicit share intent forward even when automatic synchronization is disabled.
     let pending_manual_share: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sync_content_outbox WHERE item_id = ? AND manual_share = 1)",
+        "SELECT EXISTS(SELECT 1 FROM sync_items WHERE item_id = ? AND manual_share = 1 AND prep_state = 'pending_content')",
     )
     .bind(&id)
     .fetch_one(&mut *transaction)
     .await
     .context("read pending manual share intent")?;
     let sync_options = if pending_manual_share {
-        Some(crate::db::sync_queue::ContentSyncOptions {
+        Some(crate::db::sync_items::ContentSyncOptions {
             manual_share: true,
             ..sync_options.unwrap_or_default()
         })
@@ -218,8 +171,9 @@ pub async fn upsert_item_with_sync_outbox(
                 .fetch_one(&mut *transaction)
                 .await
                 .context("load staged clipboard item revision")?;
-        crate::db::sync_queue::stage_content(
+        crate::db::sync_items::stage_content_on(
             &mut transaction,
+            item,
             &id,
             &sync_key,
             &source_revision,
@@ -257,26 +211,18 @@ pub async fn upsert_synced_item(pool: &SqlitePool, item: &ClipboardItem) -> Resu
     })
 }
 
-/// Atomically creates or refreshes a metadata-only remote file card and its backing event.
+/// Atomically creates or refreshes a metadata-only remote file card and marks its sync row.
 pub async fn upsert_remote_file_item(
     pool: &SqlitePool,
     item: &ClipboardItem,
-    event_id: &str,
     origin_device_id: &str,
 ) -> Result<UpsertResult> {
     let mut transaction = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin remote file metadata upsert")?;
-    let existing: Option<(String, bool)> = sqlx::query_as(
-        r#"
-        SELECT item.id,
-               EXISTS(SELECT 1 FROM sync_remote_file_items remote WHERE remote.item_id = item.id)
-        FROM clipboard_items item
-        WHERE item.sync_key = ?
-        ORDER BY item.created_at DESC
-        LIMIT 1
-        "#,
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM clipboard_items WHERE sync_key = ? ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&item.sync_key)
     .fetch_optional(&mut *transaction)
@@ -284,11 +230,7 @@ pub async fn upsert_remote_file_item(
     .context("find remote file metadata item")?;
 
     let (id, deduplicated) = match existing {
-        Some((id, true)) => {
-            replace_remote_content_on(&mut transaction, &id, item).await?;
-            (id, true)
-        }
-        Some((id, false)) => {
+        Some(id) => {
             replace_remote_content_on(&mut transaction, &id, item).await?;
             (id, true)
         }
@@ -300,25 +242,27 @@ pub async fn upsert_remote_file_item(
     let now = Utc::now();
     sqlx::query(
         r#"
-            INSERT INTO sync_remote_file_items (
-                item_id, event_id, origin_device_id, state, created_at, updated_at
-            ) VALUES (?, ?, ?, 'available', ?, ?)
-            ON CONFLICT(item_id) DO UPDATE SET
-                event_id = excluded.event_id,
-                origin_device_id = excluded.origin_device_id,
-                state = 'available',
-                updated_at = excluded.updated_at
-            "#,
+        INSERT INTO sync_items (
+            sync_key, item_id, origin, origin_device_id, kind,
+            local_state, remote_file_state, created_at, updated_at
+        ) VALUES (?, ?, 'remote', ?, 'files', 'metadata', 'available', ?, ?)
+        ON CONFLICT(sync_key) DO UPDATE SET
+            item_id = excluded.item_id,
+            origin_device_id = COALESCE(excluded.origin_device_id, sync_items.origin_device_id),
+            local_state = 'metadata',
+            remote_file_state = 'available',
+            updated_at = excluded.updated_at
+        "#,
     )
+    .bind(&item.sync_key)
     .bind(&id)
-    .bind(event_id)
     .bind(origin_device_id)
     .bind(now)
     .bind(now)
     .execute(&mut *transaction)
     .await
     .context("register remote file metadata")?;
-    crate::db::sync_item_state::materialize_state_on(&mut transaction, &item.sync_key).await?;
+    apply_cached_sync_metadata_on(&mut transaction, &id, &item.sync_key).await?;
     transaction
         .commit()
         .await
@@ -335,11 +279,11 @@ pub async fn upsert_materialized_synced_item(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin materialized synchronized item upsert")?;
-    let existing: Option<(String, bool)> = sqlx::query_as(
+    let existing: Option<(String, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT item.id,
-               EXISTS(SELECT 1 FROM sync_remote_file_items remote WHERE remote.item_id = item.id)
+        SELECT item.id, sync_row.remote_file_state
         FROM clipboard_items item
+        LEFT JOIN sync_items sync_row ON sync_row.item_id = item.id
         WHERE item.sync_key = ?
         ORDER BY item.created_at DESC
         LIMIT 1
@@ -351,16 +295,19 @@ pub async fn upsert_materialized_synced_item(
     .context("find materialized synchronized item")?;
 
     let (id, deduplicated) = match existing {
-        Some((id, true)) => {
+        Some((id, Some(_))) => {
             replace_remote_content_on(&mut transaction, &id, item).await?;
-            sqlx::query("DELETE FROM sync_remote_file_items WHERE item_id = ?")
-                .bind(&id)
-                .execute(&mut *transaction)
-                .await
-                .context("clear remote file metadata after materialization")?;
+            sqlx::query(
+                "UPDATE sync_items SET remote_file_state = NULL, local_state = 'managed', updated_at = ? WHERE sync_key = ?",
+            )
+            .bind(Utc::now())
+            .bind(&item.sync_key)
+            .execute(&mut *transaction)
+            .await
+            .context("clear remote file metadata after materialization")?;
             (id, true)
         }
-        Some((id, false)) => {
+        Some((id, None)) => {
             if item.kind == ClipboardKind::Files {
                 replace_materialized_file_paths_on(&mut transaction, &id, item).await?;
             }
@@ -372,12 +319,55 @@ pub async fn upsert_materialized_synced_item(
             (item.id.clone(), false)
         }
     };
-    crate::db::sync_item_state::materialize_state_on(&mut transaction, &item.sync_key).await?;
+    apply_cached_sync_metadata_on(&mut transaction, &id, &item.sync_key).await?;
     transaction
         .commit()
         .await
         .context("commit materialized synchronized item upsert")?;
     Ok(UpsertResult { id, deduplicated })
+}
+
+async fn apply_cached_sync_metadata_on(
+    connection: &mut SqliteConnection,
+    item_id: &str,
+    sync_key: &str,
+) -> Result<()> {
+    let state: Option<(i64, bool, i64, bool, i64, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT favorite_seq, is_favorite, pinned_seq, is_pinned, note_seq, note
+        FROM sync_items
+        WHERE sync_key = ?
+        "#,
+    )
+    .bind(sync_key)
+    .fetch_optional(&mut *connection)
+    .await
+    .context("read cached sync metadata")?;
+    let Some((fav_seq, is_favorite, pin_seq, is_pinned, note_seq, note)) = state else {
+        return Ok(());
+    };
+    if fav_seq > 0 || pin_seq > 0 || note_seq > 0 {
+        sqlx::query(
+            r#"
+            UPDATE clipboard_items
+            SET is_favorite = CASE WHEN ? > 0 THEN ? ELSE is_favorite END,
+                is_pinned = CASE WHEN ? > 0 THEN ? ELSE is_pinned END,
+                note = CASE WHEN ? > 0 THEN ? ELSE note END
+            WHERE id = ?
+            "#,
+        )
+        .bind(fav_seq)
+        .bind(is_favorite)
+        .bind(pin_seq)
+        .bind(is_pinned)
+        .bind(note_seq)
+        .bind(note)
+        .bind(item_id)
+        .execute(&mut *connection)
+        .await
+        .context("apply cached sync metadata to clipboard item")?;
+    }
+    Ok(())
 }
 
 async fn merge_synced_item_on(
@@ -501,23 +491,6 @@ async fn replace_materialized_file_paths_on(
     .execute(connection)
     .await
     .context("replace synchronized file paths")?;
-    Ok(())
-}
-
-/// Replaces timestamps with values reconciled from all versioned sync events for an item.
-pub async fn set_synced_item_timestamps(
-    pool: &SqlitePool,
-    item_id: &str,
-    created_at: chrono::DateTime<Utc>,
-    updated_at: chrono::DateTime<Utc>,
-) -> Result<()> {
-    sqlx::query("UPDATE clipboard_items SET created_at = ?, updated_at = ? WHERE id = ?")
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(item_id)
-        .execute(pool)
-        .await
-        .context("reconcile synchronized clipboard timestamps")?;
     Ok(())
 }
 
@@ -758,11 +731,8 @@ pub async fn local_item_ids_for_sync(pool: &SqlitePool) -> Result<Vec<String>> {
     qb.push(
         r#"
         WHERE NOT EXISTS (
-            SELECT 1 FROM sync_item_events remote
-            WHERE remote.item_id = clipboard_items.id AND remote.direction = 'remote'
-        ) OR EXISTS (
-            SELECT 1 FROM sync_item_events local
-            WHERE local.item_id = clipboard_items.id AND local.direction = 'local'
+            SELECT 1 FROM sync_items s
+            WHERE s.sync_key = clipboard_items.sync_key
         )
         ORDER BY clipboard_items.updated_at DESC, clipboard_items.created_at DESC
         "#,
@@ -828,14 +798,22 @@ pub struct DeleteItemOutcome {
 /// 翻转 `is_favorite`（收藏 / 取消收藏），原子记录待同步状态并返回新值。
 pub async fn toggle_item_favorite(pool: &SqlitePool, id: &str) -> Result<ToggleFavoriteOutcome> {
     let mut transaction = pool.begin().await.context("begin favorite update")?;
-    let row: (bool, String, bool) = sqlx::query_as(
-        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite, sync_key, is_sensitive",
+    let row: (bool, bool, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
     )
     .bind(id)
     .fetch_one(&mut *transaction)
     .await
     .context("failed to toggle clipboard item favorite")?;
-    crate::db::sync_item_state::mark_local_favorite(&mut transaction, &row.1, row.2, row.0).await?;
+    crate::db::sync_items::mark_local_favorite_on(
+        &mut transaction,
+        &row.2,
+        id,
+        row.3,
+        row.0,
+        row.1,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -852,19 +830,21 @@ pub async fn mark_item_favorite(
         .begin()
         .await
         .context("begin automatic favorite update")?;
-    let row: Option<(bool, String, bool)> = sqlx::query_as(
-        "UPDATE clipboard_items SET is_favorite = 1 WHERE id = ? AND is_favorite = 0 RETURNING is_favorite, sync_key, is_sensitive",
+    let row: Option<(bool, bool, String, bool)> = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = 1 WHERE id = ? AND is_favorite = 0 RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
     )
     .bind(id)
     .fetch_optional(&mut *transaction)
     .await
     .context("failed to mark clipboard item favorite")?;
-    if let Some((is_favorite, sync_key, is_sensitive)) = row.as_ref() {
-        crate::db::sync_item_state::mark_local_favorite(
+    if let Some((is_favorite, is_pinned, sync_key, is_sensitive)) = row.as_ref() {
+        crate::db::sync_items::mark_local_favorite_on(
             &mut transaction,
             sync_key,
+            id,
             *is_sensitive,
             *is_favorite,
+            *is_pinned,
         )
         .await?;
     }
@@ -872,22 +852,23 @@ pub async fn mark_item_favorite(
         .commit()
         .await
         .context("commit automatic favorite update")?;
-    Ok(row.map(|(is_favorite, _, _)| ToggleFavoriteOutcome { is_favorite }))
+    Ok(row.map(|(is_favorite, _, _, _)| ToggleFavoriteOutcome { is_favorite }))
 }
 
 /// 翻转 `is_pinned`（置顶 / 取消置顶），原子记录待同步状态并返回新值。
 pub async fn toggle_item_pinned(pool: &SqlitePool, id: &str) -> Result<TogglePinnedOutcome> {
     let mut transaction = pool.begin().await.context("begin pinned update")?;
-    let row: (bool, String, bool) = sqlx::query_as(
-        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_pinned, sync_key, is_sensitive",
+    let row: (bool, bool, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
     )
     .bind(id)
     .fetch_one(&mut *transaction)
     .await
     .context("failed to toggle clipboard item pinned")?;
-    crate::db::sync_item_state::mark_local_pinned(&mut transaction, &row.1, row.2, row.0).await?;
+    crate::db::sync_items::mark_local_pinned_on(&mut transaction, &row.2, id, row.3, row.0, row.1)
+        .await?;
     transaction.commit().await.context("commit pinned update")?;
-    Ok(TogglePinnedOutcome { is_pinned: row.0 })
+    Ok(TogglePinnedOutcome { is_pinned: row.1 })
 }
 
 /// 更新备注，传 `None` 清空备注，并在同一事务中记录待同步状态。
@@ -901,7 +882,7 @@ pub async fn update_item_note(pool: &SqlitePool, id: &str, note: Option<&str>) -
     .fetch_one(&mut *transaction)
     .await
     .context("failed to update clipboard item note")?;
-    crate::db::sync_item_state::mark_local_note(&mut transaction, &row.0, row.1, note).await?;
+    crate::db::sync_items::mark_local_note_on(&mut transaction, &row.0, id, row.1, note).await?;
     transaction.commit().await.context("commit note update")?;
     Ok(())
 }
@@ -952,8 +933,7 @@ pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<Option<DeleteIte
         return Ok(None);
     };
 
-    crate::db::sync_item_state::mark_local_deleted(&mut transaction, &sync_key, is_sensitive)
-        .await?;
+    crate::db::sync_items::mark_local_deleted_on(&mut transaction, &sync_key, is_sensitive).await?;
     transaction
         .commit()
         .await
@@ -1150,7 +1130,7 @@ pub async fn clear_items(
         if let Some(file_name) = image_file_name(kind, content) {
             outcome.image_files.push(file_name);
         }
-        crate::db::sync_item_state::mark_local_deleted(&mut transaction, &sync_key, is_sensitive)
+        crate::db::sync_items::mark_local_deleted_on(&mut transaction, &sync_key, is_sensitive)
             .await?;
     }
     transaction
@@ -1344,7 +1324,7 @@ mod tests {
     use crate::db::models::{
         ClipboardApp, ClipboardGroup, ClipboardKind, ClipboardSubKind, Platform,
     };
-    use crate::db::sync_queue::{self, ContentSyncOptions};
+    use crate::db::sync_items::{self, ContentSyncOptions};
     use crate::db::test_support::memory_pool;
     use chrono::DateTime;
 
@@ -1415,7 +1395,7 @@ mod tests {
         .await
         .unwrap();
         assert!(staged);
-        let first = sync_queue::next_ready_content(&pool, false, None)
+        let first = sync_items::next_pending_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
@@ -1429,24 +1409,24 @@ mod tests {
             .unwrap();
         assert!(reused.deduplicated && staged);
         assert_eq!(reused.id, saved.id);
-        sync_queue::complete_content(&pool, first.operation_order)
+        sync_items::cancel_content_prep(&pool, first.local_seq)
             .await
             .unwrap();
-        let current = sync_queue::next_ready_content(&pool, false, None)
+        let current = sync_items::next_pending_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(current.source_revision, "recaptured");
         assert!(current.manual_share && current.force_files);
 
-        sync_queue::complete_content(&pool, current.operation_order)
+        sync_items::cancel_content_prep(&pool, current.local_seq)
             .await
             .unwrap();
         let (_, staged) = upsert_item_with_sync_outbox(&pool, &item, None)
             .await
             .unwrap();
         assert!(!staged);
-        assert!(sync_queue::next_ready_content(&pool, false, None)
+        assert!(sync_items::next_pending_content(&pool, false, None)
             .await
             .unwrap()
             .is_none());
@@ -1456,7 +1436,7 @@ mod tests {
     async fn manual_share_queue_failure_rolls_back_history() {
         let pool = memory_pool().await;
         sqlx::query(
-            "CREATE TRIGGER reject_share BEFORE INSERT ON sync_content_outbox \
+            "CREATE TRIGGER reject_share BEFORE INSERT ON sync_items \
              WHEN NEW.manual_share = 1 BEGIN SELECT RAISE(ABORT, 'queue unavailable'); END",
         )
         .execute(&pool)
@@ -1508,11 +1488,11 @@ mod tests {
             1
         );
         assert!(find_item_by_id(&pool, &item.id).await.unwrap().is_some());
-        let pending = sync_queue::next_ready_content(&pool, false, None)
+        let pending = sync_items::next_pending_content(&pool, false, None)
             .await
             .unwrap()
             .unwrap();
-        sync_queue::complete_content(&pool, pending.operation_order)
+        sync_items::cancel_content_prep(&pool, pending.local_seq)
             .await
             .unwrap();
         assert_eq!(
@@ -1539,7 +1519,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE sync_content_outbox SET updated_at = datetime('now', '-25 hours') WHERE item_id = ?",
+            "UPDATE sync_items SET updated_at = datetime('now', '-25 hours') WHERE item_id = ?",
         )
         .bind(&item.id)
         .execute(&pool)
@@ -1656,40 +1636,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_item_ids_for_sync_excludes_remote_only_records() {
+    async fn local_item_ids_for_sync_excludes_already_indexed_records() {
         let pool = memory_pool().await;
         for id in ["remote", "local", "unlinked"] {
             insert_item(&pool, &sample_item(id)).await.unwrap();
         }
-        for (event_id, item_id, direction, sequence) in [
-            ("remote-event", "remote", "remote", 1),
-            ("local-event", "local", "local", 2),
-        ] {
-            let event = ecopaste_sync_protocol::EncryptedEvent {
-                event_id: event_id.into(),
-                origin_device_id: "device".into(),
-                origin_sequence: sequence,
-                created_at_ms: sequence as i64,
-                nonce: vec![0; 24],
-                ciphertext: vec![1],
-                kind: ecopaste_sync_protocol::SyncEventKind::Content,
-                blob_ids: Vec::new(),
-                optional_blob_ids: Vec::new(),
-                retention_key: None,
-            };
-            crate::sync::repository::insert_event(&pool, &event, true, &[])
-                .await
-                .unwrap();
-            crate::sync::repository::link_event_to_item(&pool, item_id, event_id, direction)
-                .await
-                .unwrap();
+        let now = Utc::now();
+        for (id, origin) in [("remote", "remote"), ("local", "local")] {
+            let item = sample_item(id);
+            sqlx::query(
+                "INSERT INTO sync_items (sync_key, item_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&item.sync_key)
+            .bind(id)
+            .bind(origin)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
 
         let ids = local_item_ids_for_sync(&pool).await.unwrap();
 
-        assert!(ids.iter().any(|id| id == "local"));
-        assert!(ids.iter().any(|id| id == "unlinked"));
+        assert!(!ids.iter().any(|id| id == "local"));
         assert!(!ids.iter().any(|id| id == "remote"));
+        assert!(ids.iter().any(|id| id == "unlinked"));
     }
 
     #[tokio::test]
@@ -1769,28 +1741,13 @@ mod tests {
     #[tokio::test]
     async fn remote_file_metadata_is_atomic_and_promotes_in_place() {
         let pool = memory_pool().await;
-        let event = ecopaste_sync_protocol::EncryptedEvent {
-            event_id: "remote-event".into(),
-            origin_device_id: "origin".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
-            kind: ecopaste_sync_protocol::SyncEventKind::Content,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: None,
-        };
-        crate::sync::repository::insert_event(&pool, &event, false, &[])
-            .await
-            .unwrap();
         let mut remote = sample_item("remote");
         remote.kind = ClipboardKind::Files;
         remote.content = "large.bin".into();
         remote.content_hash = remote.sync_key.clone();
         remote.size = Some(10);
 
-        let inserted = upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+        let inserted = upsert_remote_file_item(&pool, &remote, "origin")
             .await
             .unwrap();
         assert_eq!(inserted.id, "remote");
@@ -1816,33 +1773,11 @@ mod tests {
         let stored = find_item_by_id(&pool, "remote").await.unwrap().unwrap();
         assert_eq!(stored.content, materialized.content);
         assert!(stored.remote_file_state.is_none());
-        let marker_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sync_remote_file_items WHERE item_id = ?")
-                .bind("remote")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(marker_count, 0);
     }
 
     #[tokio::test]
     async fn unavailable_local_file_can_become_a_remote_metadata_card() {
         let pool = memory_pool().await;
-        let event = ecopaste_sync_protocol::EncryptedEvent {
-            event_id: "remote-event".into(),
-            origin_device_id: "origin".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
-            kind: ecopaste_sync_protocol::SyncEventKind::Content,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: None,
-        };
-        crate::sync::repository::insert_event(&pool, &event, false, &[])
-            .await
-            .unwrap();
         let mut local = sample_item("local");
         local.kind = ClipboardKind::Files;
         local.content = "/missing/large.bin".into();
@@ -1854,7 +1789,7 @@ mod tests {
         remote.id = "remote".into();
         remote.content = "large.bin".into();
         remote.content_hash = content_hash(remote.kind, &remote.content);
-        let result = upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+        let result = upsert_remote_file_item(&pool, &remote, "origin")
             .await
             .unwrap();
         let stored = find_item_by_id(&pool, &local.id).await.unwrap().unwrap();
@@ -1898,42 +1833,25 @@ mod tests {
     #[tokio::test]
     async fn repeated_remote_file_event_refreshes_content_metadata() {
         let pool = memory_pool().await;
-        let event = ecopaste_sync_protocol::EncryptedEvent {
-            event_id: "remote-event-1".into(),
-            origin_device_id: "origin".into(),
-            origin_sequence: 1,
-            created_at_ms: 1,
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
-            kind: ecopaste_sync_protocol::SyncEventKind::Content,
-            blob_ids: Vec::new(),
-            optional_blob_ids: Vec::new(),
-            retention_key: None,
-        };
-        crate::sync::repository::insert_event(&pool, &event, false, &[])
-            .await
-            .unwrap();
         let mut remote = sample_item("remote");
         remote.kind = ClipboardKind::Files;
         remote.content = "large.bin".into();
         remote.content_hash = remote.sync_key.clone();
         remote.size = Some(10);
         remote.file_types = Some("f".into());
-        upsert_remote_file_item(&pool, &remote, &event.event_id, "origin")
+        upsert_remote_file_item(&pool, &remote, "origin")
             .await
             .unwrap();
 
-        let mut next_event = event.clone();
-        next_event.event_id = "remote-event-2".into();
-        next_event.origin_sequence = 2;
-        crate::sync::repository::insert_event(&pool, &next_event, false, &[])
-            .await
-            .unwrap();
         let mut refreshed = remote.clone();
         refreshed.source_revision = "new-revision".into();
+        refreshed.source_updated_at = remote
+            .source_updated_at
+            .map(|ts| ts + chrono::Duration::seconds(1));
+        refreshed.updated_at = remote.updated_at + chrono::Duration::seconds(1);
         refreshed.size = Some(20);
         refreshed.file_types = Some("d".into());
-        upsert_remote_file_item(&pool, &refreshed, &next_event.event_id, "origin")
+        upsert_remote_file_item(&pool, &refreshed, "origin")
             .await
             .unwrap();
 
@@ -1941,21 +1859,6 @@ mod tests {
         assert_eq!(stored.size, refreshed.size);
         assert_eq!(stored.file_types, refreshed.file_types);
         assert_eq!(stored.source_revision, refreshed.source_revision);
-    }
-
-    #[tokio::test]
-    async fn remote_file_metadata_rolls_back_when_event_registration_fails() {
-        let pool = memory_pool().await;
-        let mut remote = sample_item("remote");
-        remote.kind = ClipboardKind::Files;
-        remote.content = "large.bin".into();
-
-        assert!(
-            upsert_remote_file_item(&pool, &remote, "missing-event", "origin")
-                .await
-                .is_err()
-        );
-        assert!(find_item_by_id(&pool, "remote").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2845,43 +2748,25 @@ mod tests {
 
     #[tokio::test]
     async fn quota_cleanup_keeps_explicit_delivery_until_success() {
-        use ecopaste_sync_protocol::{EncryptedEvent, SyncEventKind};
-
         let pool = memory_pool().await;
         let item = sample_item("manual-cloud");
-        insert_item(&pool, &item).await.unwrap();
-        let event_id = "manual-cloud-event";
-        crate::sync::repository::insert_event(
+        upsert_item_with_sync_outbox(
             &pool,
-            &EncryptedEvent {
-                event_id: event_id.into(),
-                origin_device_id: "local-device".into(),
-                origin_sequence: 1,
-                created_at_ms: 1,
-                nonce: vec![1; 24],
-                ciphertext: vec![2; 32],
-                kind: SyncEventKind::Content,
-                blob_ids: Vec::new(),
-                optional_blob_ids: Vec::new(),
-                retention_key: None,
-            },
-            true,
-            &[],
+            &item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                delivery_route: Some(sync_items::ContentDeliveryRoute::Cloud),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
-        sqlx::query("UPDATE sync_events SET delivery_route = 'cloud' WHERE event_id = ?")
-            .bind(event_id)
-            .execute(&pool)
-            .await
-            .unwrap();
         let now = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO sync_item_events (item_id, event_id, direction, created_at, updated_at) \
-             VALUES (?, ?, 'local', ?, ?)",
+            "INSERT INTO sync_item_targets (sync_key, target_id, desired_content, confirmed_content, status, created_at, updated_at) \
+             VALUES (?, 'cloud', 'complete', 'none', 'pending', ?, ?)",
         )
-        .bind(&item.id)
-        .bind(event_id)
+        .bind(&item.sync_key)
         .bind(now)
         .bind(now)
         .execute(&pool)
@@ -2896,25 +2781,20 @@ mod tests {
             0
         );
 
-        crate::sync::repository::mark_delivery_error(
-            &pool,
-            "cloud",
-            &[event_id.to_owned()],
-            "offline",
+        sqlx::query(
+            "UPDATE sync_items SET prep_state = 'ready', manual_share = 0 WHERE sync_key = ?",
         )
+        .bind(&item.sync_key)
+        .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
-                .await
-                .unwrap()
-                .removed,
-            0
-        );
-
-        crate::sync::repository::mark_delivered(&pool, "cloud", &[event_id.to_owned()])
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE sync_item_targets SET status = 'confirmed', confirmed_content = 'complete' WHERE sync_key = ?",
+        )
+        .bind(&item.sync_key)
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
                 .await

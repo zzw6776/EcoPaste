@@ -7,7 +7,6 @@ mod pairing_service;
 mod protocol_handlers;
 mod protocol_io;
 mod remote_download;
-mod retention;
 mod runtime;
 mod runtime_connection;
 mod runtime_state;
@@ -41,10 +40,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer, TransferLimits, Transfers};
 use ecopaste_sync_protocol::{
-    limit_lan_content_plan, limit_sync_request, limit_sync_response, read_frame, write_frame,
-    CloudEvent, CursorEvent, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent,
-    ErrorCode, PeerAnnouncement, RemovedDevice, Request, Response, SyncEventKind, ALPN,
-    MAX_EVENTS_PER_BATCH, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    limit_sync_request, read_frame, write_frame, DeviceAnnouncement, ErrorCode, PeerAnnouncement,
+    RemovedDevice, Request, Response, ALPN, MAX_FRAME_BYTES, MAX_ITEMS_PER_BATCH, PROTOCOL_VERSION,
 };
 use iroh::{
     address_lookup::{
@@ -56,7 +53,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, TransportAddr, Watcher,
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use n0_future::{boxed::BoxStream, BufferedStreamExt, StreamExt};
+use n0_future::{boxed::BoxStream, StreamExt};
 use rand::RngCore;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
@@ -83,30 +80,24 @@ use crate::{
     settings::{CloudRelayMode, Language, SettingsStore, SyncSettings},
 };
 
-#[cfg(not(target_os = "android"))]
-use crate::clipboard::WritebackGuard;
-
 use super::{
     crypto,
     delivery::{
         DeliveryCancel, DeliveryCoordinator, OutgoingStagingLease, PreparationCommitGuard,
         PreparationProgress, PreparationTarget, TaskStagingCleanup, UploadTransferStart,
     },
-    delivery_plan::{
-        permits_automatic_file_upload, should_defer_remote_file_download, should_defer_remote_files,
-    },
+    delivery_plan::{permits_automatic_file_upload, should_defer_remote_file_download},
     identity::{
         is_lan_ip, peer_endpoint_addr, server_endpoint_addr, server_is_configured, GroupSecrets,
         IdentityStore, PairingCode,
     },
     model::{
-        BlobManifest, BlobRole, ClipboardEnvelope, CloudDeviceDirectory, CloudDeviceStatus,
-        CloudHubStatus, CloudRecord, CloudRecordPage, DecryptedSyncEvent, IncomingJoinRequest,
-        LinkedSyncEvent, NearbyJoinAttempt, NearbyJoinState, NearbySyncDevice, NearbySyncSpace,
-        SourceAppRef, SourceIconRef, StoredBlob, StoredContentObject, StoredSyncEvent,
-        SyncChannelState, SyncChannelStatus, SyncContentAvailability, SyncItemAction,
-        SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer, SyncStatus,
-        SyncTarget, SyncedClipboardItem, SyncedItemStatePatch,
+        BlobManifest, BlobRole, CloudDeviceDirectory, CloudDeviceStatus, CloudHubStatus,
+        CloudRecord, CloudRecordPage, IncomingJoinRequest, NearbyJoinAttempt, NearbyJoinState,
+        NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef, StoredBlob,
+        StoredContentObject, SyncChannelState, SyncChannelStatus, SyncContentAvailability,
+        SyncItemAction, SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer,
+        SyncStatus, SyncTarget, SyncedClipboardItem, SyncedItemSnapshot,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -131,9 +122,9 @@ const CLOUD_CONTROL_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_RECORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_WATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
+const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 3;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 2;
 const CLOUD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_UPLOAD_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const CLOUD_RECORD_CACHE_DIR: &str = "cloud-records";
@@ -158,7 +149,7 @@ async fn available_materialized_file_item(
         true
     } else if let Some(content_identity) = content_identity {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM sync_item_events WHERE item_id = ? AND content_identity = ?)",
+            "SELECT EXISTS(SELECT 1 FROM sync_items WHERE item_id = ? AND content_identity = ?)",
         )
         .bind(&item.id)
         .bind(content_identity)
@@ -384,13 +375,6 @@ impl SyncConnectionTarget {
             Self::Peer { device_id, .. } => Some(device_id),
         }
     }
-
-    fn remote_batch_source(&self) -> repository::RemoteBatchSource<'_> {
-        match self {
-            Self::Cloud => repository::RemoteBatchSource::Cloud,
-            Self::Peer { device_id, .. } => repository::RemoteBatchSource::Peer { device_id },
-        }
-    }
 }
 
 enum LanPeerSignal {
@@ -471,54 +455,6 @@ struct SyncCycleContext {
     pool: SqlitePool,
 }
 
-#[derive(Clone, Copy)]
-struct SyncExchange<'a> {
-    connection: &'a Connection,
-    target: &'a SyncConnectionTarget,
-    group: &'a GroupSecrets,
-    pool: &'a SqlitePool,
-    device_id: &'a str,
-    device: &'a DeviceAnnouncement,
-    settings: &'a SyncSettings,
-}
-
-struct SyncReadyOutcome {
-    latest_cursor: u64,
-    has_more: bool,
-    event_ids: Vec<String>,
-}
-
-struct SyncBatchResponse {
-    events: Vec<ReceivedSyncEvent>,
-    peers: Vec<PeerAnnouncement>,
-    latest_cursor: u64,
-    removed_devices: Vec<RemovedDevice>,
-    has_more: bool,
-}
-
-struct ReceivedSyncEvent {
-    event: EncryptedEvent,
-    cloud_blob_ids: Option<Vec<String>>,
-}
-
-impl From<CursorEvent> for ReceivedSyncEvent {
-    fn from(value: CursorEvent) -> Self {
-        Self {
-            event: value.event,
-            cloud_blob_ids: None,
-        }
-    }
-}
-
-impl From<CloudEvent> for ReceivedSyncEvent {
-    fn from(value: CloudEvent) -> Self {
-        Self {
-            event: value.event,
-            cloud_blob_ids: Some(value.available_blob_ids),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum CloudAttemptPhase {
     OpenStream,
@@ -554,17 +490,6 @@ impl std::fmt::Display for CloudAttemptTimeout {
 }
 
 impl std::error::Error for CloudAttemptTimeout {}
-
-#[derive(Debug)]
-struct CloudHistoryGap;
-
-impl std::fmt::Display for CloudHistoryGap {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("云端较早的同步事件已按保留策略清理")
-    }
-}
-
-impl std::error::Error for CloudHistoryGap {}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -639,21 +564,8 @@ impl Drop for CleanupWakeGuard<'_> {
     }
 }
 
-/// Retries bootstrap cleanup only when active transfers no longer prevent it.
 fn notify_cleanup_ready(runtime: &RuntimeCoordinator) {
     runtime.cleanup_ready.notify_one();
-    if !runtime.bootstrap_cleanup_pending.load(Ordering::Acquire) {
-        return;
-    }
-    let Ok(_guard) = runtime.lan_cycle_lock.try_write() else {
-        return;
-    };
-    if runtime
-        .bootstrap_cleanup_pending
-        .swap(false, Ordering::AcqRel)
-    {
-        runtime.cloud_transfer_wake.notify_one();
-    }
 }
 
 struct SyncQuiescenceLocks<'a> {
@@ -723,7 +635,7 @@ enum RemoteDownloadDestination {
 }
 
 struct RemoteDownloadRequest<'a> {
-    event: &'a EncryptedEvent,
+    origin_device_id: &'a str,
     group: &'a GroupSecrets,
     manifests: &'a [BlobManifest],
     destination: RemoteDownloadDestination,
@@ -860,9 +772,9 @@ async fn start_runtime(manager: Arc<SyncManager>) {
     for files in [false, true] {
         tauri::async_runtime::spawn(local_outbox_worker(manager.clone(), files));
     }
-    for files in [false, true] {
+    for realtime_only in [false, true] {
         for sending in [false, true] {
-            tauri::async_runtime::spawn(attachment_worker(manager.clone(), files, sending));
+            tauri::async_runtime::spawn(attachment_worker(manager.clone(), realtime_only, sending));
         }
     }
     manager.wake();
@@ -1275,7 +1187,7 @@ impl SyncManager {
                 }
             }
 
-            let connections = manager
+            let mut connections = manager
                 .runtime_state
                 .lan_connections
                 .write()
@@ -1283,6 +1195,15 @@ impl SyncManager {
                 .drain()
                 .map(|(_, connection)| connection)
                 .collect::<Vec<_>>();
+            connections.extend(
+                manager
+                    .runtime_state
+                    .lan_data_connections
+                    .write()
+                    .expect("LAN data connection cache poisoned")
+                    .drain()
+                    .map(|(_, connection)| connection),
+            );
             for connection in &connections {
                 connection.close(0_u32.into(), b"Android Wi-Fi route lost");
             }
@@ -1566,12 +1487,9 @@ impl SyncManager {
             device_name: identity.device_name,
             group_id: identity.group.map(|group| group.group_id),
             endpoint_id: self
-                .runtime_state
-                .endpoint
-                .lock()
-                .await
-                .as_ref()
-                .map(|runtime| runtime.endpoint.id().to_string())
+                .identity
+                .secret_key()
+                .map(|key| key.public().to_string())
                 .unwrap_or_default(),
             cloud_endpoint_id: settings.server_endpoint_id,
             cloud_direct_addresses: settings.server_direct_addresses,
@@ -1600,6 +1518,10 @@ impl SyncManager {
         let cloud_enabled = server_is_configured(&settings);
         if !settings.lan_enabled && !cloud_enabled {
             return Ok(());
+        }
+        let pool = self.pool().await;
+        if let Err(error) = db::sync_items::reset_prep_backoff(&pool).await {
+            log::debug!("reset sync prep backoff failed: {error}");
         }
         #[cfg(target_os = "android")]
         if settings.lan_enabled {
@@ -1726,7 +1648,7 @@ impl SyncManager {
     }
 
     /// Attaches ephemeral watcher context to an already durable content operation and wakes its
-    /// materializer. Losing this context on process exit is safe because the outbox is persistent.
+    /// materializer. Losing this context on process exit is safe because `sync_items` is persistent.
     pub fn notify_content_staged(
         &self,
         item: &ClipboardItem,
@@ -1743,6 +1665,11 @@ impl SyncManager {
                 .insert((item.id.clone(), item.source_revision.clone()), observation);
         }
         if ready {
+            if item.kind != ClipboardKind::Files {
+                self.runtime_state
+                    .realtime_pending
+                    .store(true, Ordering::Release);
+            }
             self.wake_content_outbox();
         }
     }
@@ -1754,9 +1681,58 @@ impl SyncManager {
         self.wake_transfer();
     }
 
-    /// Item-state events can be materialized without opening a content transfer route.
+    /// Item-state mutations wake local snapshot re-encryption and route workers immediately.
     pub fn wake_local_outbox(&self) {
+        self.runtime_state
+            .realtime_pending
+            .store(true, Ordering::Release);
         self.notify_local_outbox();
+        self.wake_transfer();
+    }
+
+    /// Runs local history retention + sync staging cleanup under quiescence locks.
+    pub(crate) async fn run_local_retention_cleanup(&self, trigger: CleanupTrigger) -> bool {
+        if self.is_storage_suspended() {
+            return false;
+        }
+        let _suspension = self.pause_for_resource_cleanup().await;
+        if self.is_storage_suspended() {
+            return false;
+        }
+        let pool = self.pool().await;
+        if let Err(error) =
+            crate::clipboard::cleanup::apply_retention(&self.app, self, &pool, trigger).await
+        {
+            log::warn!("local retention cleanup failed: {error:#}");
+            return false;
+        }
+        true
+    }
+
+    /// Prunes released `sync_items` rows and deletes unreferenced staging ciphertext files.
+    pub(crate) async fn reclaim_released_sync_content(&self, pool: &SqlitePool) -> Result<()> {
+        let _ = self.reclaim_released_sync_content_with_stats(pool).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn reclaim_released_sync_content_with_stats(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<crate::clipboard::shared_files::CleanupStats> {
+        loop {
+            let pruned = repository::prune_released_items(pool, LOCAL_SYNC_GC_BATCH_SIZE).await?;
+            if pruned < u64::from(LOCAL_SYNC_GC_BATCH_SIZE) {
+                break;
+            }
+        }
+        let live_blob_ids = repository::live_sync_blob_ids(pool).await?;
+        let staging_root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
+        let (files, bytes) = tauri::async_runtime::spawn_blocking(move || {
+            remove_unreferenced_sync_staging(&staging_root, &live_blob_ids)
+        })
+        .await
+        .context("sync staging cleanup task failed")??;
+        Ok(crate::clipboard::shared_files::CleanupStats { files, bytes })
     }
 
     pub async fn sync_item_now(
@@ -1820,30 +1796,27 @@ impl SyncManager {
             bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
         let lane = match item.kind {
-            ClipboardKind::Text => crate::db::sync_queue::OutboxContentLane::Text,
-            ClipboardKind::Image => crate::db::sync_queue::OutboxContentLane::Image,
-            ClipboardKind::Files => crate::db::sync_queue::OutboxContentLane::Files,
+            ClipboardKind::Text => crate::db::sync_items::OutboxContentLane::Text,
+            ClipboardKind::Image => crate::db::sync_items::OutboxContentLane::Image,
+            ClipboardKind::Files => crate::db::sync_items::OutboxContentLane::Files,
         };
         let _enqueue_guard = self.delivery.lock_materialization(Some(lane)).await;
-        let content_pending =
-            db::sync_queue::has_pending_content(&pool, &item.id, &item.source_revision).await?;
-        let external_local_event_exists =
-            if remote_content_state == Some(SyncLocalContentState::External) {
-                repository::latest_local_event_for_item(&pool, &item.id)
-                    .await?
-                    .is_some()
-            } else {
-                false
-            };
-        let event_exists = if content_pending
+        let meta = repository::load_sync_item_meta(&pool, &item.sync_key).await?;
+        let content_pending = meta
+            .as_ref()
+            .is_some_and(|row| row.nonce.is_none() && !row.deleted);
+        let external_local_ready = meta
+            .as_ref()
+            .is_some_and(|row| row.origin == "local" && row.nonce.is_some());
+        let delivery_requested = if content_pending
             || (remote_content_state == Some(SyncLocalContentState::External)
-                && !external_local_event_exists)
+                && !external_local_ready)
         {
             false
         } else {
             repository::request_item_delivery(&pool, &item.id, target == SyncTarget::Cloud).await?
         };
-        if event_exists {
+        if delivery_requested {
             if target == SyncTarget::Cloud {
                 self.wake_cloud_transfer();
             } else {
@@ -1864,18 +1837,16 @@ impl SyncManager {
                 Key::RemoteFileNotDownloaded,
             ));
         }
-        db::sync_queue::stage_existing_content(
+        db::sync_items::stage_existing_content(
             &pool,
-            &item.id,
-            &item.sync_key,
-            &item.source_revision,
-            crate::db::sync_queue::ContentSyncOptions {
+            &item,
+            crate::db::sync_items::ContentSyncOptions {
                 force_files: true,
                 manual_share: true,
                 delivery_route: Some(if target == SyncTarget::Cloud {
-                    crate::db::sync_queue::ContentDeliveryRoute::Cloud
+                    crate::db::sync_items::ContentDeliveryRoute::Cloud
                 } else {
-                    crate::db::sync_queue::ContentDeliveryRoute::Lan
+                    crate::db::sync_items::ContentDeliveryRoute::Lan
                 }),
                 ..Default::default()
             },
@@ -2054,19 +2025,18 @@ impl SyncManager {
         let connection = self
             .request_cloud_connection(Duration::from_secs(8))
             .await?;
-        let request = Request::ListEvents {
+        let request = Request::ListItems {
             group_id: group.group_id.clone(),
             access_token: group.access_token_bytes()?,
-            before_cursor,
-            limit: limit.clamp(1, MAX_EVENTS_PER_BATCH),
-            include_states: None,
+            before_seq: before_cursor,
+            limit: limit.clamp(1, MAX_ITEMS_PER_BATCH),
         };
         let (connection, response) = self
             .request_cloud_query(connection, &group, &request)
             .await?;
-        let Response::EventsPage {
-            events,
-            next_before_cursor,
+        let Response::ItemsPage {
+            items,
+            next_before_seq,
             total,
         } = response
         else {
@@ -2076,6 +2046,10 @@ impl SyncManager {
             bail!("云端返回了无效的记录响应");
         };
 
+        let data_connection = self
+            .ensure_cloud_data_connection(&settings)
+            .await
+            .unwrap_or_else(|_| connection.clone());
         let identity = self.identity.snapshot();
         let mut device_names = repository::list_peer_statuses(&self.pool().await)
             .await?
@@ -2085,47 +2059,57 @@ impl SyncManager {
         device_names.insert(identity.device_id, identity.device_name);
         let key = group.content_key_bytes()?;
         let mut records = Vec::new();
-        for cloud_event in events {
-            let event = cloud_event.event;
-            let envelope = match crypto::decrypt_event(&key, &event).and_then(|envelope| {
-                validate_envelope(&envelope)?;
-                Ok(envelope)
+        for record in items {
+            let snapshot = match crypto::decrypt_item_snapshot(
+                &key,
+                &record.item_key,
+                record.deleted,
+                record.protected,
+                &record.nonce,
+                &record.ciphertext,
+            )
+            .and_then(|snapshot| {
+                validate_snapshot(&snapshot)?;
+                Ok(snapshot)
             }) {
-                Ok(envelope) => envelope,
+                Ok(snapshot) => snapshot,
                 Err(error) => {
-                    log::warn!("skip invalid cloud record {}: {error}", event.event_id);
+                    log::warn!("skip invalid cloud record {}: {error}", record.item_key);
                     continue;
                 }
             };
             let device_name = device_names
-                .get(&event.origin_device_id)
+                .get(&record.origin_device_id)
                 .cloned()
-                .unwrap_or_else(|| short_device_id(&event.origin_device_id));
-            let image_path = if envelope.item.kind == "image" {
+                .unwrap_or_else(|| short_device_id(&record.origin_device_id));
+            let is_image = snapshot
+                .item
+                .as_ref()
+                .is_some_and(|item| item.kind == "image");
+            let image_path = if is_image {
                 match self
-                    .cloud_record_image_path(&connection, &group, &envelope)
+                    .cloud_record_image_path(&data_connection, &group, &snapshot)
                     .await
                 {
                     Ok(path) => path,
                     Err(error) => {
-                        log::warn!("load cloud record image {} failed: {error}", event.event_id);
+                        log::warn!(
+                            "load cloud record image {} failed: {error}",
+                            record.item_key
+                        );
                         None
                     }
                 }
             } else {
                 None
             };
-            records.push(cloud_record(
-                cloud_event.cursor,
-                event,
-                envelope,
-                device_name,
-                image_path,
-            ));
+            if let Some(mapped) = cloud_record(&record, snapshot, device_name, image_path) {
+                records.push(mapped);
+            }
         }
         Ok(CloudRecordPage {
             records,
-            next_before_cursor,
+            next_before_cursor: next_before_seq,
             total,
         })
     }
@@ -2281,6 +2265,21 @@ impl SyncManager {
     /// Announces cloud membership without exporting volatile LAN transport routes.
     fn cloud_device_announcement(&self, endpoint: &Endpoint) -> DeviceAnnouncement {
         self.cloud_device_announcement_for(&self.device_announcement(endpoint))
+    }
+
+    /// Builds a lock-free local identity announcement for lightweight LAN receipt frames.
+    pub(super) fn receipt_device_announcement(&self) -> Result<DeviceAnnouncement> {
+        let identity = self.identity.snapshot();
+        let endpoint_id = self.identity.secret_key()?.public().to_string();
+        Ok(DeviceAnnouncement {
+            device_id: identity.device_id,
+            device_name: identity.device_name,
+            platform: std::env::consts::OS.into(),
+            endpoint_id,
+            direct_addresses: Vec::new(),
+            relay_urls: Vec::new(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
     }
 
     fn cloud_device_announcement_for(
@@ -2659,7 +2658,6 @@ mod tests {
             BlobUploadOptions {
                 kind: BlobUploadKind::Content,
                 file_content: true,
-                managed_hub_blob: true,
                 is_cloud: true,
                 language: Language::ZhCN,
                 started: Some(started),
@@ -2705,18 +2703,45 @@ mod tests {
         tokio::fs::write(&path, &bytes).await.unwrap();
         let expected = bytes.clone();
         let peer = tokio::spawn(async move {
+            let transfers = Arc::new(Transfers::default());
             let (mut send, mut recv) = incoming.accept_bi().await.unwrap();
-            assert!(matches!(
-                read_frame(&mut recv).await.unwrap(),
-                Request::PutManagedBlob { .. }
-            ));
+            let Request::PutManagedBlob {
+                size, transfer_id, ..
+            } = read_frame(&mut recv).await.unwrap()
+            else {
+                panic!("expected PutManagedBlob");
+            };
+            let session = transfers.register(transfer_id, size).unwrap();
+            let incoming_parts = incoming.clone();
+            let transfers_for_parts = transfers.clone();
+            let accept_parts = tokio::spawn(async move {
+                while let Ok((part_send, mut part_recv)) = incoming_parts.accept_bi().await {
+                    let Request::BlobPart { transfer_id, index } =
+                        read_frame(&mut part_recv).await.unwrap()
+                    else {
+                        panic!("expected BlobPart");
+                    };
+                    let transfers = transfers_for_parts.clone();
+                    tokio::spawn(async move {
+                        transfers
+                            .route(transfer_id, index, part_send, part_recv)
+                            .await
+                            .unwrap();
+                    });
+                }
+            });
             write_frame(&mut send, &Response::BlobReady { size: 0 })
                 .await
                 .unwrap();
-            assert_eq!(recv.read_to_end(100_000).await.unwrap(), expected);
+            let mut received = Vec::with_capacity(size as usize);
+            multipart::receive(&mut received, session.peer(), size, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(received, expected);
             write_frame(&mut send, &Response::BlobStored).await.unwrap();
             send.finish().unwrap();
             let _ = send.stopped().await;
+            accept_parts.abort();
             incoming
         });
         let (started, mut notifications) = mpsc::unbounded_channel();
@@ -2735,7 +2760,6 @@ mod tests {
             BlobUploadOptions {
                 kind: BlobUploadKind::Content,
                 file_content: true,
-                managed_hub_blob: true,
                 is_cloud: true,
                 language: Language::ZhCN,
                 started: Some(started),
@@ -2986,66 +3010,38 @@ mod tests {
 
     #[test]
     fn unchanged_cloud_group_watch_heartbeat_schedules_no_work() {
-        let mut cursor = 42;
-        let mut availability_cursor = 7;
+        let mut seq = 42;
         let mut removed_at_ms = 1_000;
 
-        let changes = advance_cloud_watch_watermarks(
-            42,
-            7,
-            1_000,
-            &mut cursor,
-            &mut availability_cursor,
-            &mut removed_at_ms,
-        );
+        let changes = advance_cloud_watch_watermarks(42, 1_000, &mut seq, &mut removed_at_ms);
 
         assert_eq!(changes, None);
-        assert_eq!(cursor, 42);
-        assert_eq!(availability_cursor, 7);
+        assert_eq!(seq, 42);
         assert_eq!(removed_at_ms, 1_000);
     }
 
     #[test]
     fn cloud_group_watch_reports_only_advanced_watermarks() {
-        let mut cursor = 42;
-        let mut availability_cursor = 7;
+        let mut seq = 42;
         let mut removed_at_ms = 1_000;
 
         assert_eq!(
-            advance_cloud_watch_watermarks(
-                43,
-                7,
-                900,
-                &mut cursor,
-                &mut availability_cursor,
-                &mut removed_at_ms,
-            ),
+            advance_cloud_watch_watermarks(43, 900, &mut seq, &mut removed_at_ms),
             Some(CloudWatchChanges {
-                events_changed: true,
-                availability_changed: false,
+                items_changed: true,
                 removals_changed: false,
             })
         );
-        assert_eq!(cursor, 43);
-        assert_eq!(availability_cursor, 7);
+        assert_eq!(seq, 43);
         assert_eq!(removed_at_ms, 1_000);
         assert_eq!(
-            advance_cloud_watch_watermarks(
-                40,
-                8,
-                1_001,
-                &mut cursor,
-                &mut availability_cursor,
-                &mut removed_at_ms,
-            ),
+            advance_cloud_watch_watermarks(40, 1_001, &mut seq, &mut removed_at_ms),
             Some(CloudWatchChanges {
-                events_changed: false,
-                availability_changed: true,
+                items_changed: false,
                 removals_changed: true,
             })
         );
-        assert_eq!(cursor, 43);
-        assert_eq!(availability_cursor, 8);
+        assert_eq!(seq, 43);
         assert_eq!(removed_at_ms, 1_001);
     }
 
@@ -3220,166 +3216,35 @@ mod tests {
     }
 
     #[test]
-    fn source_icon_blobs_are_separated_from_required_content() {
-        let required = StoredBlob {
-            blob_id: "required".into(),
-            encrypted_path: "required.bin".into(),
-            size: 10,
-            source_path: None,
-            source_is_directory: false,
-            stream_nonce: None,
-        };
-        let source_icon = StoredBlob {
-            blob_id: "source-icon".into(),
-            encrypted_path: "source-icon.bin".into(),
-            size: 20,
-            source_path: None,
-            source_is_directory: false,
-            stream_nonce: None,
-        };
-        let source_icon_ids = HashSet::from([source_icon.blob_id.clone()]);
-
-        let (required_blobs, source_icon_blobs) = split_source_icon_blobs(
-            vec![required.clone(), source_icon.clone()],
-            &source_icon_ids,
-        );
-
-        assert_eq!(required_blobs.len(), 1);
-        assert_eq!(required_blobs[0].blob_id, required.blob_id);
-        assert_eq!(source_icon_blobs.len(), 1);
-        assert_eq!(source_icon_blobs[0].blob_id, source_icon.blob_id);
-    }
-
-    #[test]
-    fn only_source_icons_are_marked_optional_on_existing_encrypted_events() {
-        let key = [7; 32];
-        let content_id = "a".repeat(64);
-        let icon_id = "b".repeat(64);
-        let mut envelope = ClipboardEnvelope {
-            version: 1,
-            item: SyncedClipboardItem {
-                kind: "image".into(),
-                sub_kind: None,
-                content: String::new(),
-                search_text: None,
-                summary: None,
-                file_types: None,
-                size: Some(128),
-                width: Some(1),
-                height: Some(1),
-                is_sensitive: false,
-                source_platform: "windows".into(),
-                created_at_ms: 100,
-                sync_key: "c".repeat(64),
-                updated_at_ms: Some(100),
-                source_revision: Some("revision".into()),
-                source_device_id: None,
-                source_device_name: None,
-                source_updated_at_ms: None,
-            },
-            blobs: vec![BlobManifest {
-                blob_id: content_id.clone(),
-                name: "image.png".into(),
-                original_size: 128,
-                encrypted_size: 192,
-                role: BlobRole::Image,
-                file_index: None,
-                is_directory_archive: false,
-                stream_commitment: false,
-            }],
-            source_app: Some(SourceAppRef {
-                version: 1,
-                source_key: "d".repeat(64),
-                platform: "windows".into(),
-                display_name: "Example".into(),
-                icon: Some(SourceIconRef {
-                    icon_hash: "e".repeat(64),
-                    blob_id: icon_id.clone(),
-                    original_size: 128,
-                    encrypted_size: 192,
-                }),
-                accent_start: None,
-                accent_end: None,
-            }),
-            content_identity: Some("c".repeat(64)),
-        };
-        let mut manifest = envelope.blobs[0].clone();
-        for (index, kind) in ["text", "image", "files"].into_iter().enumerate() {
-            envelope.item.kind = kind.into();
-            manifest.role = if kind == "files" {
-                BlobRole::File
-            } else {
-                BlobRole::Image
-            };
-            manifest.file_index = (kind == "files").then_some(0);
-            envelope.blobs = if kind == "text" {
-                Vec::new()
-            } else {
-                vec![manifest.clone()]
-            };
-            let expected_blob_ids = envelope
-                .blobs
-                .iter()
-                .map(|blob| blob.blob_id.clone())
-                .chain(std::iter::once(icon_id.clone()))
-                .collect::<Vec<_>>();
-            let mut event = crypto::encrypt_event(
-                &key,
-                "event".into(),
-                "device".into(),
-                index as u64 + 1,
-                100,
-                &envelope,
-            )
-            .unwrap();
-            event.blob_ids = expected_blob_ids.clone();
-            let ciphertext = event.ciphertext.clone();
-            let mut pending = vec![StoredSyncEvent { cursor: 1, event }];
-
-            mark_optional_source_icon_refs(&mut pending, &key);
-
-            assert_eq!(pending[0].event.optional_blob_ids, vec![icon_id.clone()]);
-            assert_eq!(pending[0].event.blob_ids, expected_blob_ids);
-            assert_eq!(pending[0].event.ciphertext, ciphertext);
-        }
-
-        envelope
-            .source_app
-            .as_mut()
-            .unwrap()
-            .icon
-            .as_mut()
-            .unwrap()
-            .blob_id = content_id.clone();
-        let mut event =
-            crypto::encrypt_event(&key, "event".into(), "device".into(), 4, 100, &envelope)
-                .unwrap();
-        event.blob_ids = vec![content_id];
-        let mut pending = vec![StoredSyncEvent { cursor: 1, event }];
-
-        mark_optional_source_icon_refs(&mut pending, &key);
-
-        assert!(pending[0].event.optional_blob_ids.is_empty());
-    }
-
-    #[test]
     fn cloud_record_keeps_complete_sensitive_content_and_image_path() {
         let content = "secret-token-".repeat(20);
-        let event = EncryptedEvent {
-            event_id: "event".into(),
+        let record_row = ecopaste_sync_protocol::SyncItemRecord {
+            seq: 1,
+            hub_rev: 1,
+            item_key: "a".repeat(64),
             origin_device_id: "device".into(),
-            origin_sequence: 1,
-            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            deleted: false,
+            protected: false,
             nonce: vec![0; 24],
             ciphertext: vec![1],
-            kind: ecopaste_sync_protocol::SyncEventKind::Content,
             blob_ids: Vec::new(),
             optional_blob_ids: Vec::new(),
-            retention_key: None,
+            available_blob_ids: Vec::new(),
         };
-        let envelope = ClipboardEnvelope {
-            version: 1,
-            item: SyncedClipboardItem {
+        let snapshot = SyncedItemSnapshot {
+            version: crate::sync::model::SNAPSHOT_VERSION,
+            sync_key: "b".repeat(64),
+            content_version: crate::sync::model::FieldVersion::new(1, "device"),
+            presence_version: crate::sync::model::FieldVersion::new(1, "device"),
+            favorite_version: crate::sync::model::FieldVersion::default(),
+            pinned_version: crate::sync::model::FieldVersion::default(),
+            note_version: crate::sync::model::FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
                 kind: "text".into(),
                 sub_kind: None,
                 content: content.clone(),
@@ -3392,25 +3257,25 @@ mod tests {
                 is_sensitive: true,
                 source_platform: "android".into(),
                 created_at_ms: 1_700_000_000_000,
-                sync_key: "hash".into(),
+                sync_key: "b".repeat(64),
                 updated_at_ms: Some(1_700_000_000_000),
                 source_revision: Some("revision".into()),
                 source_device_id: None,
                 source_device_name: None,
                 source_updated_at_ms: None,
-            },
+            }),
             blobs: Vec::new(),
             source_app: None,
             content_identity: Some("a".repeat(64)),
         };
 
         let record = cloud_record(
-            1,
-            event,
-            envelope,
+            &record_row,
+            snapshot,
             "Android".into(),
             Some("/tmp/image.png".into()),
-        );
+        )
+        .unwrap();
 
         assert!(record.is_sensitive);
         assert_eq!(record.preview, content);

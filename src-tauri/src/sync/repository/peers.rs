@@ -1,14 +1,5 @@
 use super::*;
 
-#[cfg(test)]
-pub async fn upsert_peer(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
-    let mut connection = pool
-        .acquire()
-        .await
-        .context("acquire sync peer connection")?;
-    upsert_peer_on(&mut connection, peer).await
-}
-
 /// Updates peer identity without importing routes announced outside local discovery.
 pub async fn upsert_peer_identity(pool: &SqlitePool, peer: &PeerAnnouncement) -> Result<()> {
     let mut transaction = pool
@@ -307,7 +298,7 @@ pub async fn merge_removed_devices(pool: &SqlitePool, devices: &[RemovedDevice])
             .is_none_or(|restored_at_ms| stored_removed_at_ms > restored_at_ms);
         if effectively_removed {
             let target_id = format!("peer:{}", device.device_id);
-            let deliveries = sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
+            let deliveries = sqlx::query("DELETE FROM sync_item_targets WHERE target_id = ?")
                 .bind(&target_id)
                 .execute(&mut *transaction)
                 .await
@@ -374,7 +365,7 @@ pub async fn remove_peer(pool: &SqlitePool, device_id: &str) -> Result<Option<Re
     .context("remember removed sync peer")?;
 
     let target_id = format!("peer:{device_id}");
-    sqlx::query("DELETE FROM sync_delivery_targets WHERE target_id = ?")
+    sqlx::query("DELETE FROM sync_item_targets WHERE target_id = ?")
         .bind(&target_id)
         .execute(&mut *transaction)
         .await
@@ -459,7 +450,7 @@ pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
     let rows = sqlx::query(
         r#"
         SELECT device_id, device_name, platform, endpoint_id, direct_addresses,
-               relay_urls, pull_cursor, last_seen_ms
+               relay_urls, last_seen_ms
         FROM sync_peers
         ORDER BY last_seen_ms DESC
         "#,
@@ -471,7 +462,6 @@ pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
         .map(|row| {
             let direct: String = row.try_get("direct_addresses")?;
             let relays: String = row.try_get("relay_urls")?;
-            let cursor: i64 = row.try_get("pull_cursor")?;
             Ok(SyncPeer {
                 announcement: PeerAnnouncement {
                     device_id: row.try_get("device_id")?,
@@ -483,10 +473,57 @@ pub async fn list_peers(pool: &SqlitePool) -> Result<Vec<SyncPeer>> {
                     relay_urls: serde_json::from_str(&relays).context("invalid peer relay URLs")?,
                     last_seen_ms: row.try_get("last_seen_ms")?,
                 },
-                pull_cursor: u64::try_from(cursor).context("negative peer cursor")?,
             })
         })
         .collect()
+}
+
+pub async fn peer_window_cursor(pool: &SqlitePool, device_id: &str) -> Result<SyncWindowCursor> {
+    let row = sqlx::query(
+        "SELECT pull_cursor, catchup_before_seq, window_high_seq FROM sync_peers WHERE device_id = ?",
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .context("read peer sliding window cursor")?;
+    let Some(row) = row else {
+        return Ok(SyncWindowCursor::default());
+    };
+    let synced_seq: i64 = row.try_get("pull_cursor")?;
+    let catchup_before: Option<i64> = row.try_get("catchup_before_seq")?;
+    let window_high: i64 = row.try_get("window_high_seq")?;
+    Ok(SyncWindowCursor {
+        synced_seq: u64::try_from(synced_seq).unwrap_or(0),
+        catchup_before: catchup_before.and_then(|value| u64::try_from(value).ok()),
+        window_high: u64::try_from(window_high).unwrap_or(0),
+    })
+}
+
+pub async fn update_peer_window_cursor(
+    pool: &SqlitePool,
+    device_id: &str,
+    window: SyncWindowCursor,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sync_peers
+        SET pull_cursor = ?, catchup_before_seq = ?, window_high_seq = ?, updated_at = ?
+        WHERE device_id = ?
+        "#,
+    )
+    .bind(i64::try_from(window.synced_seq).unwrap_or(i64::MAX))
+    .bind(
+        window
+            .catchup_before
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+    )
+    .bind(i64::try_from(window.window_high).unwrap_or(i64::MAX))
+    .bind(Utc::now())
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("update peer sliding window cursor")?;
+    Ok(())
 }
 
 /// Returns whether at least one paired device currently has an active LAN connection.

@@ -450,36 +450,6 @@ impl TransferRegistry {
         PreparationClaim::Claimed(self.handle(entry_id, cancel))
     }
 
-    pub fn complete_metadata_only_preparation(
-        &self,
-        operation_id: &str,
-        route: TransferRoute,
-        target: &str,
-    ) -> bool {
-        let key = operation_key(operation_id, TransferDirection::Upload, route, target);
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry_id) = state.active_operations.get(&key).cloned() else {
-            return false;
-        };
-        let Some(entry) = state.entries.get(&entry_id) else {
-            return false;
-        };
-        if entry.preparation.is_none()
-            || !matches!(
-                entry.task.phase,
-                TransferPhase::Queued | TransferPhase::Confirming
-            )
-            || entry.cancel.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        state.active_operations.remove(&key);
-        state.entries.remove(&entry_id);
-        drop(state);
-        self.emit_removed(vec![entry_id]);
-        true
-    }
-
     fn prepared(&self, id: &str, route: TransferRoute, target: String) {
         let mut state = self.state.lock().expect("transfer registry poisoned");
         let Some(old_key) = state

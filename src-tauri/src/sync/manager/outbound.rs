@@ -81,7 +81,7 @@ impl SyncManager {
         Some((settings, pool, device_id, group))
     }
 
-    /// Materializes dirty per-item metadata state patches independently of attachment backlogs.
+    /// Materializes dirty per-item metadata mutations and tombstones into encrypted snapshots.
     pub(super) async fn materialize_dirty_states(
         &self,
         cycle: Option<&SyncCycleContext>,
@@ -92,29 +92,121 @@ impl SyncManager {
             return Ok(0);
         };
         let _enqueue_guard = self.delivery.lock_materialization(None).await;
-        let max_operations = usize::from(MAX_EVENTS_PER_BATCH) * MAX_SYNC_BATCHES_PER_CONNECTION;
+        let max_operations = usize::from(ecopaste_sync_protocol::MAX_ITEMS_PER_BATCH)
+            * MAX_SYNC_BATCHES_PER_CONNECTION;
         let mut processed = 0_usize;
+        let key = group.content_key_bytes()?;
 
         let materialize_result: Result<()> = async {
             for _ in 0..max_operations {
-                let Some(state) =
-                    db::sync_item_state::dirty_states(&pool, 1, settings.sync_sensitive)
-                        .await?
-                        .into_iter()
-                        .next()
+                let Some(pending) =
+                    db::sync_items::next_pending_state(&pool, settings.sync_sensitive).await?
                 else {
                     break;
                 };
-                let sequence = repository::next_origin_sequence(&pool).await?;
-                let event = crypto::encrypt_item_state(
-                    &group.content_key_bytes()?,
-                    Uuid::new_v4().simple().to_string(),
-                    device_id.clone(),
-                    sequence,
-                    Utc::now().timestamp_millis(),
-                    &state.patch(),
-                )?;
-                repository::commit_item_state_event(&pool, &event, &state).await?;
+                let Some(meta) = repository::load_sync_item_meta(&pool, &pending.sync_key).await?
+                else {
+                    continue;
+                };
+                let item_key = crypto::derive_item_key(&key, &meta.sync_key);
+                let mut built_blobs: Option<Vec<repository::SyncItemBlobRow>> = None;
+                let mut built_content_objects: Vec<StoredContentObject> = Vec::new();
+                let mut cloud_desired: Option<super::super::item_status::ContentLevel> = None;
+                let mut snapshot = if pending.deleted {
+                    cloud_desired = Some(super::super::item_status::ContentLevel::Complete);
+                    repository::snapshot_from_meta(&meta, &device_id)
+                } else if let (Some(existing_key), Some(nonce), Some(ciphertext)) = (
+                    meta.item_key.as_deref(),
+                    meta.nonce.as_deref(),
+                    meta.ciphertext.as_deref(),
+                ) {
+                    let mut existing = crypto::decrypt_item_snapshot(
+                        &key,
+                        existing_key,
+                        meta.deleted,
+                        meta.protected,
+                        nonce,
+                        ciphertext,
+                    )
+                    .unwrap_or_else(|_| repository::snapshot_from_meta(&meta, &device_id));
+                    let updated = repository::snapshot_from_meta(&meta, &device_id);
+                    existing.presence_version = updated.presence_version;
+                    existing.favorite_version = updated.favorite_version;
+                    existing.pinned_version = updated.pinned_version;
+                    existing.note_version = updated.note_version;
+                    existing.is_present = updated.is_present;
+                    existing.is_favorite = updated.is_favorite;
+                    existing.is_pinned = updated.is_pinned;
+                    existing.note = updated.note;
+                    existing
+                } else if let Some(item_id) = meta.item_id.as_deref() {
+                    if let Some(item) = db::items::find_item_by_id(&pool, item_id).await? {
+                        let (snap, blob_rows, content_objects, _, staging) = self
+                            .build_snapshot(&pool, &item, &meta, &device_id, &group, None)
+                            .await?;
+                        staging.retain_for_delivery();
+                        cloud_desired = Some(if item.kind == ClipboardKind::Files {
+                            let total_size = snap
+                                .blobs
+                                .iter()
+                                .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+                            if permits_automatic_file_upload(
+                                total_size,
+                                settings.auto_upload_max_mb,
+                            ) {
+                                super::super::item_status::ContentLevel::Complete
+                            } else {
+                                super::super::item_status::ContentLevel::Metadata
+                            }
+                        } else {
+                            super::super::item_status::ContentLevel::Complete
+                        });
+                        built_blobs = Some(blob_rows);
+                        built_content_objects = content_objects;
+                        snap
+                    } else {
+                        repository::snapshot_from_meta(&meta, &device_id)
+                    }
+                } else {
+                    repository::snapshot_from_meta(&meta, &device_id)
+                };
+                if snapshot.deleted() {
+                    snapshot.item = None;
+                    snapshot.blobs.clear();
+                    snapshot.source_app = None;
+                    snapshot.content_identity = None;
+                    cloud_desired = Some(super::super::item_status::ContentLevel::Complete);
+                }
+                let deleted = snapshot.deleted();
+                let protected = snapshot.protected();
+                let (nonce, ciphertext) =
+                    crypto::encrypt_item_snapshot(&key, &item_key, deleted, protected, &snapshot)?;
+                let existing_blobs = if deleted {
+                    Vec::new()
+                } else if let Some(blobs) = built_blobs {
+                    blobs
+                } else {
+                    repository::load_item_blobs(&pool, &meta.sync_key).await?
+                };
+                repository::commit_prepared_item(
+                    &pool,
+                    repository::PreparedItemCommit {
+                        sync_key: &meta.sync_key,
+                        item_key: &item_key,
+                        item_id: meta.item_id.as_deref(),
+                        expected_local_seq: pending.local_seq,
+                        origin_device_id: &device_id,
+                        content_identity: snapshot.content_identity.as_deref(),
+                        group_id: &group.group_id,
+                        snapshot: &snapshot,
+                        nonce: &nonce,
+                        ciphertext: &ciphertext,
+                        blobs: &existing_blobs,
+                        content_objects: &built_content_objects,
+                        cloud_desired,
+                    },
+                )
+                .await?;
                 processed += 1;
             }
             Ok(())
@@ -132,7 +224,7 @@ impl SyncManager {
     /// Materializes durable content outbox operations for a single payload lane.
     pub(super) async fn materialize_content_lane(
         &self,
-        lane: db::sync_queue::OutboxContentLane,
+        lane: db::sync_items::OutboxContentLane,
         max_content: usize,
         preparation_target: Option<&PreparationTarget>,
         cycle: Option<&SyncCycleContext>,
@@ -159,12 +251,13 @@ impl SyncManager {
         let mut stored_any = false;
         let mut hit_limit = false;
         let mut materialized_content = 0_usize;
-        let max_operations = usize::from(MAX_EVENTS_PER_BATCH) * MAX_SYNC_BATCHES_PER_CONNECTION;
+        let max_operations = usize::from(ecopaste_sync_protocol::MAX_ITEMS_PER_BATCH)
+            * MAX_SYNC_BATCHES_PER_CONNECTION;
 
         let materialize_result: Result<()> = async {
             for _ in 0..max_operations {
                 let Some(operation) =
-                    db::sync_queue::next_ready_content(&pool, settings.sync_sensitive, Some(lane))
+                    db::sync_items::next_pending_content(&pool, settings.sync_sensitive, Some(lane))
                         .await?
                 else {
                     break;
@@ -191,8 +284,6 @@ impl SyncManager {
                         stored_any = true;
                         staging.extend(content_staging);
                         materialized_content += 1;
-                        // Attachment preparation yields after one record so a backlog never
-                        // starves active exchange or pre-builds staging copies out of order.
                         if has_attachments || materialized_content >= max_content {
                             hit_limit = true;
                             break;
@@ -203,30 +294,29 @@ impl SyncManager {
                             || (!operation.manual_share && is_missing_local_source_error(&error))
                         {
                             log::warn!(
-                                "skip unavailable local sync content preparation: operationOrder={} backfill={} error={error:#}",
-                                operation.operation_order,
+                                "skip unavailable local sync content preparation: syncKey={} backfill={} error={error:#}",
+                                &operation.sync_key[..operation.sync_key.len().min(12)],
                                 operation.history_backfill,
                             );
-                            db::sync_queue::complete_content(&pool, operation.operation_order)
-                                .await?;
+                            db::sync_items::cancel_content_prep(&pool, operation.local_seq).await?;
                             self.discard_pending_observation(
                                 &operation.item_id,
                                 &operation.source_revision,
                             );
                         } else {
-                            let retry_delay = db::sync_queue::fail_content(
+                            db::sync_items::defer_content_prep(
                                 &pool,
-                                operation.operation_order,
+                                &operation.sync_key,
                                 &error.to_string(),
                             )
                             .await?;
                             log::warn!(
-                                "defer local sync content preparation: operationOrder={} retryInSecs={} error={error:#}",
-                                operation.operation_order,
-                                retry_delay.num_seconds(),
+                                "defer local sync content preparation: syncKey={} error={error:#}",
+                                &operation.sync_key[..operation.sync_key.len().min(12)],
                             );
-                            self.schedule_transfer_wake(retry_delay);
+                            self.schedule_transfer_wake(chrono::Duration::seconds(5));
                             self.emit_updated();
+                            break;
                         }
                     }
                 }
@@ -253,7 +343,7 @@ impl SyncManager {
     async fn materialize_content_operation(
         &self,
         pool: &SqlitePool,
-        operation: &db::sync_queue::ContentOutboxOperation,
+        operation: &db::sync_items::PendingContentPrep,
         context: ContentMaterializationContext<'_>,
     ) -> Result<ContentMaterialization> {
         let ContentMaterializationContext {
@@ -263,41 +353,32 @@ impl SyncManager {
             preparation_target,
         } = context;
         let Some(item) = db::items::find_item_by_id(pool, &operation.item_id).await? else {
-            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            db::sync_items::cancel_content_prep(pool, operation.local_seq).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
             return Ok(ContentMaterialization::Completed);
         };
         if item.source_revision != operation.source_revision || item.sync_key != operation.sync_key
         {
-            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            db::sync_items::cancel_content_prep(pool, operation.local_seq).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
             return Ok(ContentMaterialization::Completed);
         }
-        if let Some(stored) = repository::latest_local_event_for_item(pool, &item.id).await? {
-            if !operation.manual_share
-                && event_matches_item_timestamp(&stored.event, group.content_key_bytes()?, &item)
-            {
-                db::sync_queue::complete_content(pool, operation.operation_order).await?;
-                self.discard_pending_observation(&operation.item_id, &operation.source_revision);
-                return Ok(ContentMaterialization::Completed);
-            }
-        } else if operation.history_backfill
-            && repository::event_for_item(pool, &item.id).await?.is_some()
-        {
-            db::sync_queue::complete_content(pool, operation.operation_order).await?;
-            self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+        let Some(meta) = repository::load_sync_item_meta(pool, &operation.sync_key).await? else {
             return Ok(ContentMaterialization::Completed);
-        }
-        let event_id = uuid::Uuid::new_v4().simple().to_string();
+        };
         let preparation = if item.kind == ClipboardKind::Files {
             match preparation_target {
                 Some(target)
-                    if target.matches_delivery_route(operation.delivery_route.as_deref()) =>
+                    if target.matches_delivery_route(
+                        operation
+                            .delivery_route
+                            .map(db::sync_items::ContentDeliveryRoute::as_str),
+                    ) =>
                 {
                     self.start_preparation_transfer(
                         pool,
                         operation,
-                        &event_id,
+                        &operation.sync_key,
                         &item,
                         target,
                         settings.auto_upload_max_mb,
@@ -310,14 +391,14 @@ impl SyncManager {
         } else {
             None
         };
-        let envelope_result = self
-            .build_envelope(pool, &event_id, &item, group, preparation.as_ref())
+        let snapshot_result = self
+            .build_snapshot(pool, &item, &meta, device_id, group, preparation.as_ref())
             .await;
-        let (envelope, blobs, content_objects, fingerprint, staging) = match envelope_result {
+        let (snapshot, blob_rows, content_objects, fingerprint, staging) = match snapshot_result {
             Err(error) => {
                 if let Some(preparation) = &preparation {
                     if preparation.handle.canceled() {
-                        db::sync_queue::complete_content(pool, operation.operation_order).await?;
+                        db::sync_items::cancel_content_prep(pool, operation.local_seq).await?;
                         self.discard_pending_observation(
                             &operation.item_id,
                             &operation.source_revision,
@@ -340,7 +421,7 @@ impl SyncManager {
         );
         let mut preparation_guard = PreparationCommitGuard::new(preparation, preparation_failure);
         if item.kind == ClipboardKind::Files {
-            if let Some(size) = envelope.item.size {
+            if let Some(size) = snapshot.item.as_ref().and_then(|synced| synced.size) {
                 if item.size != Some(size)
                     && db::items::update_file_item_size(pool, &item.id, &item.source_revision, size)
                         .await?
@@ -360,47 +441,70 @@ impl SyncManager {
                 }
             }
         }
-        let sequence = repository::next_origin_sequence(pool).await?;
-        let item_updated_at_ms = item.updated_at.timestamp_millis();
-        let created_at_ms = item_updated_at_ms.min(Utc::now().timestamp_millis());
         let key = group.content_key_bytes()?;
-        let event = crypto::encrypt_event(
-            &key,
-            event_id,
-            device_id.to_owned(),
-            sequence,
-            created_at_ms,
-            &envelope,
-        )?;
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let deleted = snapshot.deleted();
+        let protected = snapshot.protected();
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, deleted, protected, &snapshot)?;
         if !preparation_guard.begin_commit() {
-            db::sync_queue::complete_content(pool, operation.operation_order).await?;
+            db::sync_items::cancel_content_prep(pool, operation.local_seq).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
             if let Some(preparation) = &preparation_guard.progress {
                 preparation.handle.mark_canceled(preparation.processed());
             }
             return Ok(ContentMaterialization::Completed);
         }
-        repository::commit_content_outbox_event(
+
+        let cloud_desired = if item.kind == ClipboardKind::Files
+            && !operation.manual_share
+            && !operation.force_files
+        {
+            let total_size = snapshot
+                .blobs
+                .iter()
+                .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+            if permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
+                super::super::item_status::ContentLevel::Complete
+            } else {
+                super::super::item_status::ContentLevel::Metadata
+            }
+        } else {
+            super::super::item_status::ContentLevel::Complete
+        };
+
+        let committed = repository::commit_prepared_item(
             pool,
-            repository::ContentOutboxCommit {
-                operation_order: operation.operation_order,
-                item_id: &item.id,
-                event: &event,
-                blobs: &blobs,
-                payload_kind: kind_string(item.kind),
+            repository::PreparedItemCommit {
                 sync_key: &item.sync_key,
-                payload_updated_at_ms: item_updated_at_ms,
-                is_sensitive: item.is_sensitive,
-                delivery_route: operation.delivery_route.as_deref(),
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: operation.local_seq,
+                origin_device_id: device_id,
+                content_identity: snapshot.content_identity.as_deref(),
                 group_id: &group.group_id,
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &blob_rows,
                 content_objects: &content_objects,
-                content_identity: envelope
-                    .content_identity
-                    .as_deref()
-                    .context("missing synchronized content identity")?,
+                cloud_desired: Some(cloud_desired),
             },
         )
         .await?;
+        if !committed {
+            return Ok(ContentMaterialization::Completed);
+        }
+        let source_icon_blobs = blob_rows
+            .iter()
+            .filter(|blob| blob.optional)
+            .map(repository::SyncItemBlobRow::to_stored_blob)
+            .collect::<Vec<_>>();
+        if !source_icon_blobs.is_empty() {
+            repository::enqueue_source_icon_uploads(pool, &group.group_id, &source_icon_blobs)
+                .await?;
+            self.runtime_state.source_asset_wake.notify_one();
+        }
         preparation_guard.commit();
         self.delivery.complete_local_import_for_item(&item.id);
         let observation = self
@@ -424,7 +528,7 @@ impl SyncManager {
         }
         Ok(ContentMaterialization::Stored {
             staging,
-            has_attachments: !envelope.blobs.is_empty(),
+            has_attachments: !snapshot.blobs.is_empty(),
         })
     }
 
@@ -607,16 +711,17 @@ impl SyncManager {
         }
     }
 
-    async fn build_envelope(
+    async fn build_snapshot(
         &self,
         pool: &SqlitePool,
-        _event_id: &str,
         item: &ClipboardItem,
+        meta: &repository::StoredSyncItemMeta,
+        device_id: &str,
         group: &GroupSecrets,
         preparation: Option<&PreparationProgress>,
     ) -> Result<(
-        ClipboardEnvelope,
-        Vec<StoredBlob>,
+        SyncedItemSnapshot,
+        Vec<repository::SyncItemBlobRow>,
         Vec<StoredContentObject>,
         Option<ClipboardFingerprint>,
         TaskStagingCleanup,
@@ -650,15 +755,14 @@ impl SyncManager {
                     })?
                     .len();
                 let expected_encrypted_size = crypto::encrypted_blob_size(original_size)?;
-                let reusable = repository::reusable_content_object(
-                    pool,
-                    &group.group_id,
-                    &item.content_hash,
-                    original_size,
-                )
-                .await?
-                .filter(|object| object.encrypted_size == expected_encrypted_size)
-                .map(|object| (object.blob_id, object.stream_nonce));
+                let reusable =
+                    repository::reusable_content_object(pool, &group.group_id, &item.content_hash)
+                        .await?
+                        .filter(|object| {
+                            object.original_size == original_size
+                                && object.encrypted_size == expected_encrypted_size
+                        })
+                        .map(|object| (object.blob_id, object.stream_nonce));
                 let source_for_task = source.clone();
                 let root_for_task = blob_root.clone();
                 let mut blob =
@@ -777,11 +881,11 @@ impl SyncManager {
                                 pool,
                                 &group.group_id,
                                 &content_hash,
-                                size,
                             )
                             .await?
                             .filter(|object| {
-                                object.encrypted_size == encrypted_size
+                                object.original_size == size
+                                    && object.encrypted_size == encrypted_size
                                     && crypto::stream_blob_id(
                                         &key,
                                         &object.stream_nonce,
@@ -876,36 +980,77 @@ impl SyncManager {
                 .context("missing synchronized file content identity")?,
             ClipboardKind::Text | ClipboardKind::Image => item.content_hash.clone(),
         };
+
+        let mut blob_rows = Vec::with_capacity(stored_blobs.len());
+        for (index, blob) in stored_blobs.into_iter().enumerate() {
+            let is_source_icon = index >= source_blob_start;
+            let (role, original_size, stream_commitment) = if is_source_icon {
+                let icon_orig = source_app
+                    .as_ref()
+                    .and_then(|s| s.icon.as_ref())
+                    .map(|i| i.original_size)
+                    .unwrap_or(blob.size);
+                ("source_icon".to_owned(), icon_orig, false)
+            } else {
+                let manifest = &manifests[index];
+                let role = match manifest.role {
+                    BlobRole::Image => "image",
+                    BlobRole::File => "file",
+                };
+                (
+                    role.to_owned(),
+                    manifest.original_size,
+                    manifest.stream_commitment,
+                )
+            };
+            blob_rows.push(repository::SyncItemBlobRow {
+                blob_id: blob.blob_id,
+                role,
+                optional: is_source_icon,
+                size: blob.size,
+                original_size,
+                encrypted_path: blob.encrypted_path,
+                source_path: blob.source_path,
+                source_is_directory: blob.source_is_directory,
+                stream_nonce: blob.stream_nonce,
+                stream_commitment,
+                cloud_available: false,
+                local_available: true,
+            });
+        }
+
+        let mut snapshot = repository::snapshot_from_meta(meta, device_id);
+        snapshot.is_present = true;
+        snapshot.is_favorite = item.is_favorite;
+        snapshot.is_pinned = item.is_pinned;
+        snapshot.note = item.note.clone();
+        snapshot.item = Some(SyncedClipboardItem {
+            kind: kind_string(item.kind).into(),
+            sub_kind: item.sub_kind.map(sub_kind_string).map(str::to_owned),
+            content: item.content.clone(),
+            search_text: item.search_text.clone(),
+            summary: item.summary.clone(),
+            file_types: item.file_types.clone(),
+            size: envelope_size,
+            width: item.width,
+            height: item.height,
+            is_sensitive: item.is_sensitive,
+            source_platform: platform_string(item.platform).into(),
+            created_at_ms: item.created_at.timestamp_millis(),
+            sync_key: item.sync_key.clone(),
+            updated_at_ms: Some(item.updated_at.timestamp_millis()),
+            source_revision: Some(item.source_revision.clone()),
+            source_device_id: item.source_device_id.clone(),
+            source_device_name: item.source_device_name.clone(),
+            source_updated_at_ms: item.source_updated_at.map(|value| value.timestamp_millis()),
+        });
+        snapshot.blobs = manifests;
+        snapshot.source_app = source_app;
+        snapshot.content_identity = Some(content_identity);
+
         Ok((
-            ClipboardEnvelope {
-                version: 1,
-                item: SyncedClipboardItem {
-                    kind: kind_string(item.kind).into(),
-                    sub_kind: item.sub_kind.map(sub_kind_string).map(str::to_owned),
-                    content: item.content.clone(),
-                    search_text: item.search_text.clone(),
-                    summary: item.summary.clone(),
-                    file_types: item.file_types.clone(),
-                    size: envelope_size,
-                    width: item.width,
-                    height: item.height,
-                    is_sensitive: item.is_sensitive,
-                    source_platform: platform_string(item.platform).into(),
-                    created_at_ms: item.created_at.timestamp_millis(),
-                    sync_key: item.sync_key.clone(),
-                    updated_at_ms: Some(item.updated_at.timestamp_millis()),
-                    source_revision: Some(item.source_revision.clone()),
-                    source_device_id: item.source_device_id.clone(),
-                    source_device_name: item.source_device_name.clone(),
-                    source_updated_at_ms: item
-                        .source_updated_at
-                        .map(|value| value.timestamp_millis()),
-                },
-                blobs: manifests,
-                source_app,
-                content_identity: Some(content_identity),
-            },
-            stored_blobs,
+            snapshot,
+            blob_rows,
             content_objects,
             clipboard_fingerprint,
             staging,
@@ -1027,12 +1172,6 @@ impl SyncManager {
             return Ok(());
         }
 
-        struct BackfillCandidate {
-            id: String,
-            sync_key: String,
-            source_revision: String,
-        }
-
         let snapshot = self.app.state::<SettingsStore>().snapshot();
         let sync_sensitive = snapshot.sync.sync_sensitive;
         let auto_upload_max_mb = snapshot.sync.auto_upload_max_mb;
@@ -1061,11 +1200,7 @@ impl SyncManager {
                 continue;
             }
             match item.kind {
-                ClipboardKind::Text => selected.push(BackfillCandidate {
-                    id: item.id,
-                    sync_key: item.sync_key,
-                    source_revision: item.source_revision,
-                }),
+                ClipboardKind::Text => selected.push(item),
                 ClipboardKind::Image => {
                     let path = image_store.origin_path(&item.content);
                     let Ok(metadata) = tokio::fs::metadata(&path).await else {
@@ -1074,11 +1209,7 @@ impl SyncManager {
                     if !metadata.is_file() {
                         continue;
                     }
-                    selected.push(BackfillCandidate {
-                        id: item.id,
-                        sync_key: item.sync_key,
-                        source_revision: item.source_revision,
-                    });
+                    selected.push(item);
                 }
                 ClipboardKind::Files => {
                     let Ok(sources) = self.file_upload_sources(pool, &item, &resources).await
@@ -1097,119 +1228,27 @@ impl SyncManager {
                     if permits_automatic_file_upload(size, auto_upload_max_mb)
                         || sources.iter().all(|source| !source.is_directory)
                     {
-                        selected.push(BackfillCandidate {
-                            id: item.id,
-                            sync_key: item.sync_key,
-                            source_revision: item.source_revision,
-                        });
+                        selected.push(item);
                     }
                 }
             }
         }
-        for candidate in selected.into_iter().rev() {
-            db::sync_queue::stage_existing_content(
+        // Stage newest-first in small cooperative steps so realtime copies always jump ahead.
+        for item in selected {
+            db::sync_items::stage_existing_content(
                 pool,
-                &candidate.id,
-                &candidate.sync_key,
-                &candidate.source_revision,
-                db::sync_queue::ContentSyncOptions {
+                &item,
+                db::sync_items::ContentSyncOptions {
                     history_backfill: true,
                     ..Default::default()
                 },
             )
             .await?;
+            tokio::task::yield_now().await;
         }
         repository::mark_history_backfill_completed(pool, &group.group_id).await?;
         self.notify_local_outbox();
         self.emit_updated();
         Ok(())
-    }
-
-    /// Repairs records already applied by older clients from retained versioned events.
-    pub(super) async fn repair_history_timestamps(
-        &self,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-    ) -> Result<()> {
-        if repository::history_timestamp_repair_completed(pool, &group.group_id).await? {
-            return Ok(());
-        }
-
-        let linked = repository::linked_item_events(pool).await?;
-        let reconciled = self
-            .reconcile_linked_timestamps(pool, group, linked)
-            .await?;
-        repository::mark_history_timestamp_repair_completed(pool, &group.group_id).await?;
-        if reconciled > 0 {
-            self.emit_clipboard_reconciled();
-        }
-        Ok(())
-    }
-
-    pub(super) async fn reconcile_item_timestamps(
-        &self,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        item_id: &str,
-    ) -> Result<()> {
-        let linked = repository::linked_events_for_item(pool, item_id)
-            .await?
-            .into_iter()
-            .map(|stored| LinkedSyncEvent {
-                item_id: item_id.to_owned(),
-                stored,
-            })
-            .collect();
-        let reconciled = self
-            .reconcile_linked_timestamps(pool, group, linked)
-            .await?;
-        if reconciled > 0 {
-            self.emit_clipboard_reconciled();
-        }
-        Ok(())
-    }
-
-    async fn reconcile_linked_timestamps(
-        &self,
-        pool: &SqlitePool,
-        group: &GroupSecrets,
-        linked: Vec<LinkedSyncEvent>,
-    ) -> Result<usize> {
-        let key = group.content_key_bytes()?;
-        let mut timestamps = HashMap::new();
-        for linked_event in linked {
-            let Ok(envelope) = crypto::decrypt_event(&key, &linked_event.stored.event) else {
-                continue;
-            };
-            if envelope.item.updated_at_ms.is_none() {
-                continue;
-            }
-            let (created_at, updated_at) =
-                synced_item_timestamps(&envelope.item, linked_event.stored.event.created_at_ms);
-            timestamps
-                .entry(linked_event.item_id)
-                .and_modify(
-                    |current: &mut (chrono::DateTime<Utc>, chrono::DateTime<Utc>)| {
-                        current.0 = current.0.min(created_at);
-                        current.1 = current.1.max(updated_at);
-                    },
-                )
-                .or_insert((created_at, updated_at));
-        }
-        let reconciled = timestamps.len();
-        for (item_id, (created_at, updated_at)) in timestamps {
-            db::items::set_synced_item_timestamps(pool, &item_id, created_at, updated_at).await?;
-        }
-        Ok(reconciled)
-    }
-
-    /// Notifies the list to reload after synchronized history or metadata changes.
-    pub(super) fn emit_clipboard_reconciled(&self) {
-        if let Err(error) = self.app.emit(
-            crate::clipboard::CLIPBOARD_UPDATED_EVENT,
-            serde_json::json!({ "reconciled": true }),
-        ) {
-            log::warn!("emit clipboard reconciliation update failed: {error}");
-        }
     }
 }

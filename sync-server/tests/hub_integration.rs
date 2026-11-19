@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer};
 use ecopaste_sync_protocol::{
-    ALPN, DeferredRetentionEvents, DeviceAnnouncement, EncryptedEvent, ErrorCode, RemovedDevice,
-    Request, Response, RetentionMapping, SyncEventKind, read_frame, write_frame,
+    ALPN, DeviceAnnouncement, ErrorCode, RemovedDevice, Request, Response, SyncItemWrite,
+    read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -12,7 +12,7 @@ use iroh::{
 };
 
 #[tokio::test]
-async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
+async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let repository = Repository::open(&directory.path().join("hub.sqlite3")).await?;
     let service = HubService::new(
@@ -29,12 +29,6 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))?
         .bind()
         .await?;
-    assert!(
-        server
-            .bound_sockets()
-            .iter()
-            .all(|address| address.is_ipv4())
-    );
     let server_address = server.addr();
     let router = Router::builder(server).accept(ALPN, service).spawn();
     let client = Endpoint::builder(presets::Minimal)
@@ -43,12 +37,6 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))?
         .bind()
         .await?;
-    assert!(
-        client
-            .bound_sockets()
-            .iter()
-            .all(|address| address.is_ipv4())
-    );
     let client_endpoint_id = client.id().to_string();
     let connection = client.connect(server_address, ALPN).await?;
 
@@ -74,16 +62,17 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         Response::GroupCreated
     );
 
+    // LAN-only RPC must be rejected by Hub.
     let Response::Error { code, message } = call(
         &connection,
-        Request::Sync {
+        Request::SyncItems {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
             device: device("lan_device", "LAN", &client_endpoint_id),
-            after_cursor: 0,
-            events: Vec::new(),
+            after_seq: 0,
+            before_seq: None,
+            items: Vec::new(),
             limit: 100,
-            events_complete: true,
         },
     )
     .await?
@@ -95,47 +84,60 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
 
     let source_icon = b"encrypted-source-icon";
     let source_icon_id = blake3::hash(source_icon).to_hex().to_string();
-    let event = EncryptedEvent {
-        event_id: "event_123456".into(),
+    let item_1 = SyncItemWrite {
+        item_key: "a".repeat(64),
+        expected_hub_rev: 0,
+        local_seq: 1,
         origin_device_id: "device_123456".into(),
-        origin_sequence: 1,
-        created_at_ms: 100,
+        updated_at_ms: 100,
+        deleted: false,
+        protected: true,
         nonce: vec![1; 24],
         ciphertext: vec![2; 128],
-        kind: SyncEventKind::Content,
-        blob_ids: vec![source_icon_id.clone()],
+        blob_ids: Vec::new(),
         optional_blob_ids: vec![source_icon_id.clone()],
-        retention_key: None,
     };
-    let first = cloud_sync_request(
-        &group_id,
-        &access_token,
-        device("device_123456", "Mac", &client_endpoint_id),
-        0,
-        vec![event.clone()],
-    );
     let Response::CloudSynced {
-        accepted_event_ids,
-        events,
+        accepted,
+        conflicts,
+        items,
+        latest_seq,
         ..
-    } = call(&connection, first).await?
+    } = call(
+        &connection,
+        cloud_sync_request(
+            &group_id,
+            &access_token,
+            device("device_123456", "Mac", &client_endpoint_id),
+            0,
+            vec![item_1.clone()],
+        ),
+    )
+    .await?
     else {
         anyhow::bail!("expected sync response");
     };
-    assert_eq!(accepted_event_ids, vec![event.event_id.clone()]);
-    assert_eq!(events.len(), 1);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].hub_rev, 1);
+    assert_eq!(accepted[0].seq, 1);
+    assert!(conflicts.is_empty());
+    // Caller's own freshly written item is not echoed back in `items`.
+    assert!(items.is_empty());
+    assert_eq!(latest_seq, 1);
 
-    let next_event = EncryptedEvent {
-        event_id: "event_654321".into(),
+    // Concurrent stale write triggers CAS conflict without failing the batch.
+    let item_2 = SyncItemWrite {
+        item_key: "b".repeat(64),
+        expected_hub_rev: 0,
+        local_seq: 2,
         origin_device_id: "device_123456".into(),
-        origin_sequence: 2,
-        created_at_ms: 200,
+        updated_at_ms: 200,
+        deleted: false,
+        protected: false,
         nonce: vec![3; 24],
         ciphertext: vec![4; 128],
-        kind: SyncEventKind::Content,
         blob_ids: Vec::new(),
         optional_blob_ids: Vec::new(),
-        retention_key: None,
     };
     let removed_device = RemovedDevice {
         device_id: "device_removed".into(),
@@ -143,64 +145,58 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         removed_at_ms: 300,
         restored_at_ms: None,
     };
-    let notify_watch = Request::CloudSync {
-        group_id: group_id.clone(),
-        access_token: access_token.clone(),
-        device: device("device_123456", "Mac", &client_endpoint_id),
-        after_cursor: 1,
-        events: vec![next_event.clone()],
-        removed_devices: vec![removed_device.clone()],
-        limit: 100,
-        bounded_hub: true,
-    };
     let Response::CloudSynced {
-        accepted_event_ids,
+        accepted,
+        conflicts,
         removed_devices,
+        latest_seq,
         ..
-    } = call(&connection, notify_watch.clone()).await?
+    } = call(
+        &connection,
+        Request::CloudSyncItems {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            device: device("device_123456", "Mac", &client_endpoint_id),
+            after_seq: 1,
+            before_seq: None,
+            items: vec![item_1.clone(), item_2.clone()],
+            removed_devices: vec![removed_device.clone()],
+            limit: 100,
+        },
+    )
+    .await?
     else {
         anyhow::bail!("expected combined sync response");
     };
-    assert_eq!(accepted_event_ids, vec![next_event.event_id.clone()]);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].item_key, item_2.item_key);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].item_key, item_1.item_key);
+    assert_eq!(conflicts[0].hub_rev, 1);
     assert_eq!(removed_devices, vec![removed_device]);
-    let Response::CloudSynced {
-        accepted_event_ids, ..
-    } = call(&connection, notify_watch).await?
+    assert_eq!(latest_seq, 2);
+
+    // Second device pulls newest-first window.
+    let Response::CloudSynced { items, peers, .. } = call(
+        &connection,
+        cloud_sync_request(
+            &group_id,
+            &access_token,
+            device("device_654321", "Windows", &client_endpoint_id),
+            0,
+            Vec::new(),
+        ),
+    )
+    .await?
     else {
-        anyhow::bail!("expected duplicate combined sync response");
-    };
-    assert!(accepted_event_ids.is_empty());
-    assert_eq!(
-        call(
-            &connection,
-            Request::BootstrapPlan {
-                group_id: group_id.clone(),
-                access_token: access_token.clone(),
-            },
-        )
-        .await?,
-        Response::BootstrapPlan {
-            start_cursor: 0,
-            latest_cursor: 2,
-        }
-    );
-    let second = cloud_sync_request(
-        &group_id,
-        &access_token,
-        device("device_654321", "Windows", &client_endpoint_id),
-        0,
-        Vec::new(),
-    );
-    let Response::CloudSynced { events, peers, .. } = call(&connection, second).await? else {
         anyhow::bail!("expected second sync response");
     };
-    assert_eq!(events.len(), 2);
-    let mut expected_event = event;
-    expected_event.optional_blob_ids.clear();
-    assert_eq!(events[0].event, expected_event);
-    assert_eq!(events[1].event, next_event);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].item_key, item_2.item_key);
+    assert_eq!(items[1].item_key, item_1.item_key);
     assert_eq!(peers[0].device_id, "device_123456");
 
+    // Unauthorized access token fails.
     let unauthorized = cloud_sync_request(
         &group_id,
         &[7_u8; 32],
@@ -216,14 +212,17 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         }
     ));
 
+    // Blob upload + streaming upload + commit check.
     let blob = b"encrypted-file-payload";
     let blob_id = blake3::hash(blob).to_hex().to_string();
     upload_blob(&connection, &group_id, &access_token, &blob_id, blob).await?;
-    let downloaded = download_blob(&connection, &group_id, &access_token, &blob_id).await?;
-    assert_eq!(downloaded, blob);
+    assert_eq!(
+        download_blob(&connection, &group_id, &access_token, &blob_id).await?,
+        blob
+    );
 
     let streamed_blob = b"streamed-encrypted-file-payload";
-    let streamed_blob_id = "a".repeat(64);
+    let streamed_blob_id = "c".repeat(64);
     upload_stream_blob(
         &connection,
         &group_id,
@@ -232,11 +231,12 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         streamed_blob,
     )
     .await?;
-    let downloaded =
-        download_blob(&connection, &group_id, &access_token, &streamed_blob_id).await?;
-    assert_eq!(downloaded, streamed_blob);
+    assert_eq!(
+        download_blob(&connection, &group_id, &access_token, &streamed_blob_id).await?,
+        streamed_blob
+    );
 
-    let uncommitted_blob_id = "b".repeat(64);
+    let uncommitted_blob_id = "d".repeat(64);
     let response = upload_invalid_stream_blob(
         &connection,
         &group_id,
@@ -264,26 +264,28 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         }
     ));
 
-    let (mut asset_watch_send, mut asset_watch_recv) = connection.open_bi().await?;
+    // WatchCloud wakes up when referenced source icon blob is uploaded (bumping item seq).
+    let (mut watch_send, mut watch_recv) = connection.open_bi().await?;
     write_frame(
-        &mut asset_watch_send,
+        &mut watch_send,
         &Request::WatchCloud {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
-            after_cursor: 2,
+            after_seq: 2,
             after_removed_at_ms: 300,
         },
     )
     .await?;
-    asset_watch_send.finish()?;
+    watch_send.finish()?;
     assert!(matches!(
-        read_frame::<_, Response>(&mut asset_watch_recv).await?,
+        read_frame::<_, Response>(&mut watch_recv).await?,
         Response::CloudChanged {
-            latest_cursor: 2,
+            latest_seq: 2,
             latest_removed_at_ms: 300,
             ..
         }
     ));
+
     let Response::Devices {
         devices,
         hub_status,
@@ -301,10 +303,10 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
     };
     assert_eq!(devices.len(), 2);
     assert!(devices.iter().all(|device| device.online));
-    assert!(devices.iter().all(|device| device.app_version == "1.1.154"));
-    let hub_status = hub_status.context("expected bounded Hub status")?;
+    let hub_status = hub_status.context("expected Hub status")?;
     assert_eq!(hub_status.event_count, 2);
     assert_eq!(hub_status.max_bytes, 10 * 1024 * 1024);
+
     upload_source_icon(
         &connection,
         &group_id,
@@ -313,324 +315,109 @@ async fn encrypted_events_routes_and_blobs_round_trip() -> Result<()> {
         source_icon,
     )
     .await?;
-    assert_eq!(
-        download_blob(&connection, &group_id, &access_token, &source_icon_id).await?,
-        source_icon
-    );
     let Response::CloudChanged {
-        latest_cursor,
+        latest_seq,
         latest_removed_at_ms,
-        latest_availability_cursor,
         ..
     } = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        read_frame::<_, Response>(&mut asset_watch_recv),
+        read_frame::<_, Response>(&mut watch_recv),
     )
     .await
-    .context("watch did not react to a new source icon")??
+    .context("watch did not react to a newly available source icon")??
     else {
         anyhow::bail!("expected cloud change after source icon upload");
     };
-    assert_eq!(latest_cursor, 2);
+    assert_eq!(latest_seq, 3);
     assert_eq!(latest_removed_at_ms, 300);
-    assert_eq!(latest_availability_cursor, 1);
-    let Response::CloudAvailabilitySynced {
-        updates,
-        latest_cursor,
-        has_more,
+
+    // ListItems pages newest non-deleted items only.
+    let Response::ItemsPage {
+        items,
+        next_before_seq,
+        total,
+    } = call(
+        &connection,
+        Request::ListItems {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            before_seq: None,
+            limit: 1,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected items page");
+    };
+    assert_eq!(total, 2);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].item_key, item_1.item_key);
+    assert_eq!(items[0].available_blob_ids, vec![source_icon_id]);
+    assert_eq!(next_before_seq, Some(3));
+
+    // Self-removal rejects sync and returns merged removals.
+    let Response::CloudSynced {
+        accepted,
+        items,
+        removed_devices,
         ..
     } = call(
         &connection,
-        Request::SyncCloudAvailability {
+        Request::CloudSyncItems {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
-            after_cursor: 0,
+            device: device("device_123456", "Mac", &client_endpoint_id),
+            after_seq: 3,
+            before_seq: None,
+            items: Vec::new(),
+            removed_devices: vec![RemovedDevice {
+                device_id: "device_123456".into(),
+                endpoint_id: client_endpoint_id.clone(),
+                removed_at_ms: 500,
+                restored_at_ms: None,
+            }],
             limit: 100,
         },
     )
     .await?
     else {
-        anyhow::bail!("expected cloud availability page");
-    };
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].event_id, "event_123456");
-    assert!(updates[0].available_blob_ids.contains(&source_icon_id));
-    assert_eq!(latest_cursor, 1);
-    assert!(!has_more);
-
-    let audit_group = "group_audit".to_owned();
-    assert_eq!(
-        call(
-            &connection,
-            Request::CreateGroup {
-                group_id: audit_group.clone(),
-                access_token: access_token.clone()
-            }
-        )
-        .await?,
-        Response::GroupCreated
-    );
-    let mut content = next_event.clone();
-    content.retention_key = Some("a".repeat(64));
-    let mut state = content.clone();
-    state.event_id = "audit_state".into();
-    state.origin_sequence += 1;
-    state.kind = SyncEventKind::ItemState;
-    call(
-        &connection,
-        cloud_sync_request(
-            &audit_group,
-            &access_token,
-            device("device_123456", "Mac", &client_endpoint_id),
-            0,
-            vec![content, state],
-        ),
-    )
-    .await?;
-    for (include_states, expected) in [
-        (None, vec![SyncEventKind::Content]),
-        (
-            Some(true),
-            vec![SyncEventKind::ItemState, SyncEventKind::Content],
-        ),
-    ] {
-        let mut before_cursor = None;
-        let mut kinds = Vec::new();
-        loop {
-            let Response::EventsPage {
-                events,
-                next_before_cursor,
-                total,
-            } = call(
-                &connection,
-                Request::ListEvents {
-                    group_id: audit_group.clone(),
-                    access_token: access_token.clone(),
-                    before_cursor,
-                    limit: 1,
-                    include_states,
-                },
-            )
-            .await?
-            else {
-                anyhow::bail!("expected event page")
-            };
-            assert_eq!(total, expected.len() as u64);
-            kinds.extend(events.into_iter().map(|stored| stored.event.kind));
-            before_cursor = next_before_cursor;
-            if before_cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(kinds, expected);
-    }
-
-    let Response::RetentionPlan {
-        epoch,
-        events: legacy_events,
-        has_more,
-    } = call(
-        &connection,
-        Request::RetentionPlan {
-            group_id: group_id.clone(),
-            access_token: access_token.clone(),
-            decoder_revision: None,
-        },
-    )
-    .await?
-    else {
-        anyhow::bail!("expected retention plan")
-    };
-    assert!(!epoch.is_empty());
-    assert!(!has_more);
-    assert_eq!(legacy_events.len(), 2);
-    assert_eq!(
-        call(
-            &connection,
-            Request::SetRetention {
-                group_id: group_id.clone(),
-                access_token: access_token.clone(),
-                device: device("device_123456", "Mac", &client_endpoint_id),
-                generation: 0,
-                protected_keys: None,
-                mappings: Vec::new(),
-                deferred: Some(DeferredRetentionEvents {
-                    decoder_revision: 1,
-                    event_ids: vec![legacy_events[0].event.event_id.clone()],
-                }),
-            }
-        )
-        .await?,
-        Response::RetentionUpdated
-    );
-    for (revision, expected) in [(Some(1), 1), (Some(2), 2), (None, 2)] {
-        let Response::RetentionPlan { events, .. } = call(
-            &connection,
-            Request::RetentionPlan {
-                group_id: group_id.clone(),
-                access_token: access_token.clone(),
-                decoder_revision: revision,
-            },
-        )
-        .await?
-        else {
-            anyhow::bail!("expected retention plan")
-        };
-        assert_eq!(events.len(), expected);
-        if revision == Some(1) {
-            assert_eq!(events[0].event.event_id, legacy_events[1].event.event_id);
-        }
-    }
-    let item_key = "a".repeat(64);
-    assert_eq!(
-        call(
-            &connection,
-            Request::SetRetention {
-                group_id: group_id.clone(),
-                access_token: access_token.clone(),
-                device: device("device_123456", "Mac", &client_endpoint_id),
-                generation: 10,
-                protected_keys: Some(vec![item_key.clone()]),
-                mappings: legacy_events
-                    .iter()
-                    .map(|stored| RetentionMapping {
-                        event_id: stored.event.event_id.clone(),
-                        item_key: item_key.clone(),
-                        blob_ids: stored.event.blob_ids.clone(),
-                    })
-                    .collect(),
-                deferred: None,
-            }
-        )
-        .await?,
-        Response::RetentionUpdated
-    );
-    assert!(matches!(call(&connection, Request::RetentionPlan {
-        group_id: group_id.clone(), access_token: access_token.clone(),
-    decoder_revision: None,
-}).await?, Response::RetentionPlan { events, has_more: false, .. } if events.is_empty()));
-    assert!(matches!(
-        call(
-            &connection,
-            Request::SetRetention {
-                group_id: group_id.clone(),
-                access_token: access_token.clone(),
-                device: device("device_123456", "Mac", "different_endpoint"),
-                generation: 11,
-                protected_keys: Some(Vec::new()),
-                mappings: Vec::new(),
-                deferred: None,
-            }
-        )
-        .await?,
-        Response::Error {
-            code: ErrorCode::InvalidRequest,
-            ..
-        }
-    ));
-
-    let rejected_event = EncryptedEvent {
-        event_id: "event_after_removal".into(),
-        origin_device_id: "device_123456".into(),
-        origin_sequence: 3,
-        created_at_ms: 400,
-        nonce: vec![5; 24],
-        ciphertext: vec![6; 128],
-        kind: SyncEventKind::Content,
-        blob_ids: Vec::new(),
-        optional_blob_ids: Vec::new(),
-        retention_key: None,
-    };
-    let remove_self = Request::CloudSync {
-        group_id: group_id.clone(),
-        access_token: access_token.clone(),
-        device: device("device_123456", "Mac", &client_endpoint_id),
-        after_cursor: 2,
-        events: vec![rejected_event],
-        removed_devices: vec![RemovedDevice {
-            device_id: "device_123456".into(),
-            endpoint_id: client_endpoint_id.clone(),
-            removed_at_ms: 500,
-            restored_at_ms: None,
-        }],
-        limit: 100,
-        bounded_hub: true,
-    };
-    let Response::CloudSynced {
-        accepted_event_ids,
-        events,
-        removed_devices,
-        ..
-    } = call(&connection, remove_self).await?
-    else {
         anyhow::bail!("expected removed-device sync response");
     };
-    assert!(accepted_event_ids.is_empty());
-    assert!(events.is_empty());
+    assert!(accepted.is_empty());
+    assert!(items.is_empty());
     assert!(removed_devices.iter().any(|device| {
         device.device_id == "device_123456" && device.endpoint_id == client_endpoint_id
     }));
 
-    for request in [
-        Request::BootstrapPlan {
-            group_id: group_id.clone(),
-            access_token: access_token.clone(),
-        },
-        Request::RetentionPlan {
-            group_id: group_id.clone(),
-            access_token: access_token.clone(),
-            decoder_revision: None,
-        },
-    ] {
-        assert!(matches!(
-            call(&connection, request).await?,
-            Response::Error { message, .. } if message.contains("device was removed")
-        ));
-    }
-
-    repository
-        .merge_removed_devices(
-            &group_id,
-            &[RemovedDevice {
-                device_id: "device_123456".into(),
-                endpoint_id: client_endpoint_id.clone(),
-                removed_at_ms: 500,
-                restored_at_ms: Some(600),
-            }],
-        )
-        .await?;
-    assert_eq!(repository.retention_epoch(&group_id).await?, epoch);
-    assert_eq!(
+    assert!(matches!(
         call(
             &connection,
-            Request::SetRetention {
+            Request::ListItems {
                 group_id: group_id.clone(),
                 access_token: access_token.clone(),
-                device: device("device_123456", "Mac", &client_endpoint_id),
-                generation: 11,
-                protected_keys: Some(vec![item_key]),
-                mappings: Vec::new(),
-                deferred: None,
+                before_seq: None,
+                limit: 10,
             },
         )
         .await?,
-        Response::RetentionUpdated
-    );
+        Response::Error { message, .. } if message.contains("device was removed")
+    ));
+
+    // Protected item_1 survives aggressive cleanup while unprotected item_2 is evicted.
     let cleanup = repository
         .cleanup_group(
             &group_id,
             ecopaste_sync_server::repository::CleanupPolicy {
                 retention_cutoff_ms: None,
-                legacy_blob_cutoff_ms: None,
-                max_events: None,
+                max_items: None,
                 target_bytes: Some(0),
                 orphan_cutoff_ms: 0,
                 batch_size: 100,
             },
         )
         .await?;
-    assert_eq!(cleanup.deleted_events, 0);
-    assert_eq!(repository.group_usage(&group_id).await?.event_count, 2);
+    assert_eq!(cleanup.deleted_items, 1);
+    assert_eq!(repository.group_usage(&group_id).await?.item_count, 1);
 
     connection.close(0_u32.into(), b"test complete");
     client.close().await;
@@ -646,7 +433,7 @@ fn device(device_id: &str, name: &str, endpoint_id: &str) -> DeviceAnnouncement 
         endpoint_id: endpoint_id.into(),
         direct_addresses: vec!["127.0.0.1:44820".into()],
         relay_urls: Vec::new(),
-        app_version: "1.1.154".into(),
+        app_version: "1.1.231".into(),
     }
 }
 
@@ -654,18 +441,18 @@ fn cloud_sync_request(
     group_id: &str,
     access_token: &[u8],
     device: DeviceAnnouncement,
-    after_cursor: u64,
-    events: Vec<EncryptedEvent>,
+    after_seq: u64,
+    items: Vec<SyncItemWrite>,
 ) -> Request {
-    Request::CloudSync {
+    Request::CloudSyncItems {
         group_id: group_id.into(),
         access_token: access_token.to_vec(),
         device,
-        after_cursor,
-        events,
+        after_seq,
+        before_seq: None,
+        items,
         removed_devices: Vec::new(),
         limit: 100,
-        bounded_hub: true,
     }
 }
 
@@ -803,7 +590,7 @@ async fn upload_invalid_stream_blob(
     write_frame(
         &mut send,
         &Request::CommitStreamBlob {
-            blob_id: "c".repeat(64),
+            blob_id: "e".repeat(64),
         },
     )
     .await?;

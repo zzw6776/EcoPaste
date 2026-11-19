@@ -1,4 +1,3 @@
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEventListener, useMount, useUnmount } from "ahooks";
 import { Empty, Spin } from "antd";
 import type { TFunction } from "i18next";
@@ -47,6 +46,7 @@ import {
   useKeyboardEvent,
 } from "@/hooks/useKeyboardEvent";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
 import { hasActiveClipboardItemDownload } from "@/stores/clipboardItemActivity";
 import {
   type ClipboardItemLocationRequest,
@@ -57,6 +57,11 @@ import { toggleClipboardWindowPinned } from "@/stores/clipboardPin";
 import { clipboardStatsState } from "@/stores/clipboardStats";
 import { clipboardViewState } from "@/stores/clipboardView";
 import { settingsState } from "@/stores/settings";
+import {
+  isCurrentWindowDormant,
+  isCurrentWindowVisible,
+  windowLifecycleState,
+} from "@/stores/windowLifecycle";
 import type {
   ClipboardAction,
   ClipboardGroupRecord,
@@ -67,11 +72,9 @@ import type {
 } from "@/types/clipboard";
 import type { ItemAction } from "@/types/settings";
 import { cn } from "@/utils/cn";
-import { isAndroid, isMac, isMobile, isTauri } from "@/utils/is";
-import { log } from "@/utils/log";
+import { isAndroid, isMac, isMobile } from "@/utils/is";
 import { recordStartupTiming } from "@/utils/startupTiming";
 import { listClipboardGroupsShared } from "../dataRequests";
-import type { WindowVisibilityPayload } from "../hooks/previewController";
 import {
   isSpaceKey,
   useClipboardPreviewController,
@@ -152,9 +155,13 @@ const List: FC<ListProps> = (props) => {
   const hiddenRangeRefreshTimerRef = useRef<number | null>(null);
   const hiddenRangeRefreshInFlightRef = useRef(false);
   const hiddenRangeRefreshPendingRef = useRef(false);
-  // 外壳可先显示；桌面端用原生快照及显隐事件确定列表挂载时的可见性。
-  const clipboardWindowVisibleRef = useRef(!isTauri || isAndroid);
-  const windowVisibilityObservedRef = useRef(false);
+  const previousVisibleRef = useRef<boolean | null>(
+    isAndroid ? windowLifecycleState.visible : null,
+  );
+  const lastAppliedGenerationRef = useRef(
+    isAndroid ? windowLifecycleState.generation : 0,
+  );
+  const lifecycle = useWindowLifecycle();
 
   useEventListener(
     "wheel",
@@ -315,11 +322,7 @@ const List: FC<ListProps> = (props) => {
     [getItem],
   );
 
-  const refreshSyncStatuses = useClipboardSyncStatuses(
-    loadedItems,
-    active,
-    clipboardWindowVisibleRef,
-  );
+  useClipboardSyncStatuses(loadedItems, active);
   const {
     closeHoverPreviewForScroll,
     closePreview,
@@ -378,11 +381,9 @@ const List: FC<ListProps> = (props) => {
   useMount(() => {
     onMounted();
     void loadGroups();
-    void initializeWindowVisibility();
   });
 
   useUnmount(() => {
-    windowVisibilityObservedRef.current = true;
     hiddenRangeRefreshPendingRef.current = false;
     clearHiddenRangeRefreshTimer();
   });
@@ -390,9 +391,7 @@ const List: FC<ListProps> = (props) => {
   useEffect(() => {
     if (!isAndroid || !active) return;
 
-    clipboardWindowVisibleRef.current = true;
     const handleMobileFocus = () => {
-      clipboardWindowVisibleRef.current = true;
       requestReloadAtTopRef.current();
     };
     const handleMobileVisibilityChange = () => {
@@ -433,7 +432,7 @@ const List: FC<ListProps> = (props) => {
     )
       return;
 
-    if (!clipboardWindowVisibleRef.current || !active) {
+    if (!isCurrentWindowVisible() || !active) {
       scheduleHiddenRangeRefresh();
       return;
     }
@@ -504,7 +503,7 @@ const List: FC<ListProps> = (props) => {
   useTauriListen<SourceAppUpdatedPayload>(
     TAURI_EVENT.SOURCE_APP_UPDATED,
     (event) => {
-      if (!clipboardWindowVisibleRef.current) {
+      if (!isCurrentWindowVisible()) {
         scheduleHiddenRangeRefresh();
         return;
       }
@@ -532,60 +531,20 @@ const List: FC<ListProps> = (props) => {
     }
   }
 
-  /** 外壳先显示时，列表挂载后补齐首次显隐；已收到事件就保留事件的新状态。 */
-  async function initializeWindowVisibility() {
-    if (!isTauri || isAndroid) return;
-
-    try {
-      const visible = await getCurrentWebviewWindow().isVisible();
-      if (windowVisibilityObservedRef.current) return;
-
-      handleWindowVisibility({
-        payload: { label: WINDOW_LABEL.CLIPBOARD, visible },
-      });
-    } catch (error) {
-      log.warn("read initial clipboard window visibility failed", error);
-    }
-  }
-
-  /**
-   * 剪贴板窗口显隐变化：更新可见性镜像；显示时按偏好重置分组与滚动位置。
-   * 可见性 ref 供 `handleClipboardUpdated` 判断是否处于冻结态——隐藏期间只记 pending，不立即 reload。
-   */
-  const handleWindowVisibility = (event: {
-    payload: WindowVisibilityPayload;
-  }) => {
-    const { label, visible } = event.payload;
-    if (label !== WINDOW_LABEL.CLIPBOARD) return;
-
-    clipboardWindowVisibleRef.current = visible;
-    if (!visible) {
-      cardKeyboardModeRef.current = false;
-      pendingCardFocusRef.current = null;
-      // 窗口可见且离开顶部时可能累积 pending；趁 hide 后预刷新，
-      // 确保下次 show 的首帧已经是最新数据。
-      if (deferredReloadRef.current) scheduleHiddenRangeRefresh();
-      return;
-    }
-
-    if (active) void refreshSyncStatuses();
-    void flushHiddenRangeRefresh();
-
-    if (!active) return;
-
+  function applyWindowOpenReset() {
     const {
       scrollToTopOnOpen,
       selectCategoryOnOpen,
       selectGroupOnOpen,
       selectRangeOnOpen,
-    } = settings.clipboard.window;
+    } = settingsState.clipboard.window;
     const shouldResetSelection =
       selectRangeOnOpen !== WINDOW_OPEN_SELECTION_PRESERVE ||
       selectCategoryOnOpen !== WINDOW_OPEN_SELECTION_PRESERVE ||
       selectGroupOnOpen !== WINDOW_OPEN_SELECTION_PRESERVE;
     if (!scrollToTopOnOpen && !shouldResetSelection) return;
 
-    closePreview("windowOpenReset");
+    closePreviewRef.current("windowOpenReset");
 
     if (selectRangeOnOpen !== WINDOW_OPEN_SELECTION_PRESERVE) {
       clipboardViewState.range = selectRangeOnOpen;
@@ -609,17 +568,46 @@ const List: FC<ListProps> = (props) => {
     setSelectedId(null);
     virtuosoRef.current?.scrollToIndex({ behavior: "auto", index: 0 });
     consumeDeferredReloadAtTop();
-  };
+  }
 
-  useTauriListen<WindowVisibilityPayload>(
-    TAURI_EVENT.WINDOW_VISIBILITY,
-    (event) => {
-      if (event.payload.label !== WINDOW_LABEL.CLIPBOARD) return;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 生命周期代次和显隐由共享状态推进，打开重置通过 ref 读取最新列表回调。
+  useEffect(() => {
+    if (!lifecycle.initialized) return;
 
-      windowVisibilityObservedRef.current = true;
-      handleWindowVisibility(event);
-    },
-  );
+    if (lifecycle.phase === "dormant") {
+      clearHiddenRangeRefreshTimer();
+    }
+
+    if (!lifecycle.visible) {
+      if (previousVisibleRef.current !== false) {
+        cardKeyboardModeRef.current = false;
+        pendingCardFocusRef.current = null;
+        if (deferredReloadRef.current) {
+          scheduleHiddenRangeRefresh();
+        }
+      }
+      previousVisibleRef.current = false;
+      return;
+    }
+
+    const opened =
+      previousVisibleRef.current === false ||
+      lastAppliedGenerationRef.current !== lifecycle.generation;
+    previousVisibleRef.current = true;
+    lastAppliedGenerationRef.current = lifecycle.generation;
+    if (!opened) return;
+
+    void flushHiddenRangeRefresh();
+    if (!isAndroid && active) {
+      applyWindowOpenReset();
+    }
+  }, [
+    active,
+    lifecycle.generation,
+    lifecycle.initialized,
+    lifecycle.phase,
+    lifecycle.visible,
+  ]);
 
   /**
    * 删除 / 收藏 / 备注命令均不广播 clipboard://updated，故就地改本地镜像，
@@ -1266,12 +1254,16 @@ const List: FC<ListProps> = (props) => {
     reload();
   }
 
-  /** 合并隐藏期间的连续更新，只在最后一次更新静默后重建查询范围。 */
+  /** 合并温隐藏期的连续更新；若已进入 Dormant 深度休眠则仅记脏标记，回到可见时再补齐。 */
   function scheduleHiddenRangeRefresh() {
     hiddenRangeRefreshPendingRef.current = true;
     clearHiddenRangeRefreshTimer();
+    if (isCurrentWindowDormant()) return;
+
     hiddenRangeRefreshTimerRef.current = window.setTimeout(() => {
       hiddenRangeRefreshTimerRef.current = null;
+      if (isCurrentWindowDormant()) return;
+
       void flushHiddenRangeRefresh();
     }, HIDDEN_RANGE_REFRESH_DEBOUNCE_MS);
   }
@@ -1290,7 +1282,7 @@ const List: FC<ListProps> = (props) => {
     } finally {
       hiddenRangeRefreshInFlightRef.current = false;
       if (hiddenRangeRefreshPendingRef.current) {
-        if (clipboardWindowVisibleRef.current) {
+        if (isCurrentWindowVisible()) {
           void flushHiddenRangeRefresh();
         } else {
           scheduleHiddenRangeRefresh();

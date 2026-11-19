@@ -188,12 +188,9 @@ pub(super) async fn call_cloud(
     language: Language,
 ) -> Result<Response> {
     let request_kind = match &request {
-        Request::CloudSync { .. } => "records",
-        Request::SyncCloudAvailability { .. } => "availability",
-        Request::CheckCloudAvailability { .. } => "check-availability",
-        Request::RetentionPlan { .. } => "retention-plan",
-        Request::SetRetention { .. } => "set-retention",
-        Request::BootstrapPlan { .. } => "bootstrap-plan",
+        Request::CloudSyncItems { .. } => "items",
+        Request::ListItems { .. } => "list-items",
+        Request::ListDevices { .. } => "list-devices",
         _ => "control",
     };
     let started = Instant::now();

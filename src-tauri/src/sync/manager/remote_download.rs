@@ -1,7 +1,6 @@
 use super::*;
 
 struct RemoteFileDownloadResult {
-    completed_routes: HashSet<super::super::progress::TransferRoute>,
     external_destinations: Vec<repository::ExternalDownloadTarget>,
 }
 
@@ -21,20 +20,27 @@ impl SyncManager {
         {
             bail!("该文件记录不需要下载");
         }
-        let stored = repository::remote_file_event(&pool, &item_id)
+        let meta = repository::load_sync_item_meta_by_item_id(&pool, &item_id)
             .await?
-            .context("远端文件事件已不可用")?;
+            .context("远端文件元数据已不可用")?;
+        let item_key = meta.item_key.as_deref().context("远端文件标识缺失")?;
+        let nonce = meta.nonce.as_deref().context("远端文件密文缺失")?;
+        let ciphertext = meta.ciphertext.as_deref().context("远端文件密文缺失")?;
         let group = self
             .identity
             .snapshot()
             .group
             .context("请先创建或加入同步设备组")?;
-        let decrypted = crypto::decrypt_sync_event(&group.content_key_bytes()?, &stored.event)?;
-        let DecryptedSyncEvent::Clipboard(envelope) = decrypted else {
-            bail!("远端文件事件类型无效");
-        };
-        validate_envelope(&envelope)?;
-        let mut manifests = envelope
+        let snapshot = crypto::decrypt_item_snapshot(
+            &group.content_key_bytes()?,
+            item_key,
+            meta.deleted,
+            meta.protected,
+            nonce,
+            ciphertext,
+        )?;
+        validate_snapshot(&snapshot)?;
+        let mut manifests = snapshot
             .blobs
             .iter()
             .filter(|blob| blob.role == BlobRole::File)
@@ -46,7 +52,7 @@ impl SyncManager {
         }
 
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
-        let origin_device_id = &stored.event.origin_device_id;
+        let origin_device_id = meta.origin_device_id.clone().unwrap_or_default();
         let status = repository::item_statuses(&pool, std::slice::from_ref(&item_id))
             .await?
             .into_iter()
@@ -54,11 +60,11 @@ impl SyncManager {
             .context("远端文件状态不存在")?;
         let cloud_content_available =
             status.cloud.availability == SyncContentAvailability::Complete;
-        let active_lan_connection = self.cached_lan_connection(origin_device_id).is_some();
+        let active_lan_connection = self.cached_lan_connection(&origin_device_id).is_some();
         let discovered_origin = repository::list_peers(&pool)
             .await?
             .into_iter()
-            .find(|peer| peer.announcement.device_id == origin_device_id.as_str())
+            .find(|peer| peer.announcement.device_id == origin_device_id)
             .is_some_and(|peer| peer_endpoint_addr(&peer.announcement).is_ok());
         let route = preferred_route.unwrap_or_else(|| {
             if settings.lan_enabled && active_lan_connection {
@@ -99,14 +105,14 @@ impl SyncManager {
                 return Err(error);
             }
         };
-        if let Err(error) = repository::mark_applied(&pool, &stored.event.event_id).await {
+        if let Err(error) = repository::clear_item_needs_apply(&pool, &meta.sync_key).await {
             drop(claim);
             self.wake_transfer();
             return Err(error);
         }
         let use_lan = route == super::super::progress::TransferRoute::Lan;
         let target = if use_lan {
-            stored.event.origin_device_id.clone()
+            origin_device_id.clone()
         } else {
             CLOUD_TARGET.to_owned()
         };
@@ -118,7 +124,7 @@ impl SyncManager {
             id: task_id,
             revision: 0,
             started_at_ms: chrono::Utc::now().timestamp_millis(),
-            operation_id: stored.event.event_id.clone(),
+            operation_id: meta.sync_key.clone(),
             item_id: item_id.clone(),
             direction: super::super::progress::TransferDirection::Download,
             route,
@@ -136,6 +142,8 @@ impl SyncManager {
         repository::lock_transfer_item(&pool, &task.id, &item_id).await?;
         let handle = self.delivery.start(task.clone());
         let cleanup_task_id = task.id.clone();
+        let sync_key = meta.sync_key.clone();
+        let item_key_owned = item_key.to_owned();
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
             let _claim = claim;
@@ -143,7 +151,7 @@ impl SyncManager {
             let result = manager
                 .run_remote_file_download(
                     RemoteDownloadRequest {
-                        event: &stored.event,
+                        origin_device_id: &origin_device_id,
                         group: &group,
                         manifests: &manifests,
                         destination,
@@ -157,35 +165,18 @@ impl SyncManager {
             let pool = manager.pool().await;
             match result {
                 Ok(download) => {
-                    let mut lan_receipt_recorded = false;
-                    for completed_route in &download.completed_routes {
-                        let delivered_by_lan =
-                            *completed_route == super::super::progress::TransferRoute::Lan;
-                        if let Err(error) = repository::complete_remote_file_download(
-                            &pool,
-                            &stored.event.origin_device_id,
-                            &stored.event.event_id,
-                            delivered_by_lan,
-                        )
-                        .await
-                        {
-                            log::warn!("record completed remote file download failed: {error:#}");
-                        } else if delivered_by_lan {
-                            lan_receipt_recorded = true;
-                        }
-                    }
                     if let Err(error) = repository::record_external_download_session(
                         &pool,
-                        &stored.event.event_id,
+                        &sync_key,
                         &download.external_destinations,
                     )
                     .await
                     {
                         log::warn!("record external download destinations failed: {error:#}");
                     }
-                    if lan_receipt_recorded {
-                        manager.wake_lan_transfer();
-                    }
+                    manager
+                        .send_lan_acks_for_completed_item(&pool, &group, &sync_key, &item_key_owned)
+                        .await;
                     manager.emit_updated();
                     #[cfg(target_os = "android")]
                     crate::commands::android::notify_overlay_clipboard_changed();
@@ -280,7 +271,7 @@ impl SyncManager {
         transferred: &AtomicU64,
     ) -> Result<RemoteFileDownloadResult> {
         let RemoteDownloadRequest {
-            event,
+            origin_device_id,
             group,
             manifests,
             destination,
@@ -288,11 +279,11 @@ impl SyncManager {
         } = request;
         handle.connecting();
         let (mut active_route, mut connection) =
-            match self.remote_file_connection(event, route).await {
+            match self.remote_file_connection(origin_device_id, route).await {
                 Ok(connection) => (route, connection),
                 Err(error) => {
                     let Some(fallback) = self
-                        .fallback_remote_file_connection(event, route, handle, 0)
+                        .fallback_remote_file_connection(origin_device_id, route, handle, 0)
                         .await?
                     else {
                         return Err(error);
@@ -302,7 +293,6 @@ impl SyncManager {
             };
         let key = group.content_key_bytes()?;
         let mut completed_bytes = 0_u64;
-        let mut completed_route_counts = HashMap::new();
         let mut external_destinations = Vec::new();
         #[cfg(not(target_os = "android"))]
         let mut committed_downloads = Vec::new();
@@ -352,7 +342,7 @@ impl SyncManager {
                                 transferred.store(completed_bytes, Ordering::Release);
                                 let Some((fallback_route, fallback_connection)) = self
                                     .fallback_remote_file_connection(
-                                        event,
+                                        origin_device_id,
                                         active_route,
                                         handle,
                                         completed_bytes,
@@ -418,7 +408,7 @@ impl SyncManager {
                                 transferred.store(completed_bytes, Ordering::Release);
                                 let Some((fallback_route, fallback_connection)) = self
                                     .fallback_remote_file_connection(
-                                        event,
+                                        origin_device_id,
                                         active_route,
                                         handle,
                                         completed_bytes,
@@ -452,10 +442,6 @@ impl SyncManager {
                 }
                 completed_bytes = completed_bytes.saturating_add(manifest.encrypted_size);
                 transferred.store(completed_bytes, Ordering::Release);
-                let completed = completed_route_counts
-                    .entry(active_route)
-                    .or_insert(0_usize);
-                *completed = completed.saturating_add(1);
             }
             if handle.canceled() {
                 bail!("transfer canceled");
@@ -463,12 +449,7 @@ impl SyncManager {
             if !handle.begin_finalizing(completed_bytes) {
                 bail!("transfer canceled");
             }
-            let completed_routes = completed_route_counts
-                .into_iter()
-                .filter_map(|(route, count)| (count == manifests.len()).then_some(route))
-                .collect();
             Ok(RemoteFileDownloadResult {
-                completed_routes,
                 external_destinations,
             })
         }
@@ -506,7 +487,7 @@ impl SyncManager {
     /// Tries the other configured transport while keeping one logical download task.
     async fn fallback_remote_file_connection(
         self: &Arc<Self>,
-        event: &EncryptedEvent,
+        origin_device_id: &str,
         failed_route: super::super::progress::TransferRoute,
         handle: &super::super::progress::TransferHandle,
         transferred_bytes: u64,
@@ -525,11 +506,13 @@ impl SyncManager {
             _ => return Ok(None),
         };
         let target = match fallback_route {
-            super::super::progress::TransferRoute::Lan => event.origin_device_id.clone(),
+            super::super::progress::TransferRoute::Lan => origin_device_id.to_owned(),
             super::super::progress::TransferRoute::Cloud => CLOUD_TARGET.to_owned(),
         };
         handle.reroute(fallback_route, target, transferred_bytes);
-        let connection = self.remote_file_connection(event, fallback_route).await?;
+        let connection = self
+            .remote_file_connection(origin_device_id, fallback_route)
+            .await?;
         if handle.canceled() {
             bail!("transfer canceled");
         }
@@ -538,7 +521,7 @@ impl SyncManager {
 
     async fn remote_file_connection(
         self: &Arc<Self>,
-        event: &EncryptedEvent,
+        origin_device_id: &str,
         route: super::super::progress::TransferRoute,
     ) -> Result<Connection> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
@@ -546,7 +529,7 @@ impl SyncManager {
             if !server_is_configured(&settings) {
                 bail!("云端同步未配置");
             }
-            return self.request_cloud_connection(Duration::from_secs(8)).await;
+            return self.ensure_cloud_data_connection(&settings).await;
         }
         if !settings.lan_enabled {
             bail!(crate::i18n::commands::label(
@@ -558,20 +541,24 @@ impl SyncManager {
         let peer = repository::list_peers(&pool)
             .await?
             .into_iter()
-            .find(|peer| peer.announcement.device_id == event.origin_device_id)
+            .find(|peer| peer.announcement.device_id == origin_device_id)
             .context("来源设备当前不可达")?;
         let address = peer_endpoint_addr(&peer.announcement)?;
-        if let Some(connection) = self.cached_lan_connection(&event.origin_device_id) {
-            if lan_connection_matches_discovery(&connection, &address) {
-                return Ok(connection);
+        if let Some(control) = self.cached_lan_connection(origin_device_id) {
+            if lan_connection_matches_discovery(&control, &address) {
+                return Ok(self
+                    .lan_data_connection_or_fallback(&settings, origin_device_id, &control)
+                    .await);
             }
-            self.invalidate_lan_connection(&event.origin_device_id, connection.stable_id());
-            connection.close(0_u32.into(), b"LAN route no longer discovered");
+            self.invalidate_lan_connection(origin_device_id, control.stable_id());
+            control.close(0_u32.into(), b"LAN route no longer discovered");
         }
         let endpoint = self.ensure_endpoint(&settings).await?;
         let connection = connect_peer(&endpoint, address, Duration::from_secs(8)).await?;
         super::protocol_handlers::spawn_peer_connection_service(self.clone(), connection.clone());
-        self.store_lan_connection(&event.origin_device_id, connection.clone());
-        Ok(connection)
+        self.store_lan_connection(origin_device_id, connection.clone());
+        Ok(self
+            .lan_data_connection_or_fallback(&settings, origin_device_id, &connection)
+            .await)
     }
 }

@@ -1,16 +1,18 @@
-//! 系统剪贴板的跨设备稳定语义指纹。
+//! 系统剪贴板的跨设备稳定语义指纹与本地写回抑制状态机。
 //!
-//! 数据库 `content_hash` 负责历史去重；这里的指纹只用于判断同步内容是否已经是当前
-//! 系统剪贴板内容，从而避免远程桌面与 EcoPaste 双向同步形成反馈循环。
+//! 数据库 `content_hash` 负责历史去重；本模块同时承担两项职责：
+//! 1. 判断远端同步内容是否已等同于当前系统剪贴板语义内容，避免远程桌面或跨端重入重复写剪贴板；
+//! 2. 统一管理本地手动复制/粘贴与同步自动写回的待确认令牌（带 TTL 兜底），在系统监听回调
+//!    到达时按语义指纹（文本纯文本表示、图片解码像素、文件规范化路径）精准拦截自身写回回环。
 
-use std::sync::Mutex;
-
-#[cfg(any(not(target_os = "android"), test))]
 use std::{
     collections::VecDeque,
-    sync::LazyLock,
+    sync::Mutex,
     time::{Duration, Instant},
 };
+
+#[cfg(any(not(target_os = "android"), test))]
+use std::sync::LazyLock;
 
 #[cfg(any(not(target_os = "android"), test))]
 use image::{imageops::FilterType, ImageReader, Rgba, RgbaImage};
@@ -21,6 +23,10 @@ const TEXT_DOMAIN: &[u8] = b"ecopaste-clipboard-text-v1\0";
 #[cfg(any(not(target_os = "android"), test))]
 const IMAGE_DOMAIN: &[u8] = b"ecopaste-clipboard-image-v1\0";
 const FILES_DOMAIN: &[u8] = b"ecopaste-clipboard-files-v1\0";
+#[cfg(any(not(target_os = "android"), test))]
+const LOCAL_FILES_DOMAIN: &[u8] = b"ecopaste-clipboard-local-files-v1\0";
+/// 登记的本地写回令牌有效时长：监听事件通常在毫秒级到达，给足冗余同时避免系统未发变更通知时吞掉后续真实复制。
+const WRITEBACK_SUPPRESS_TTL: Duration = Duration::from_secs(2);
 #[cfg(any(not(target_os = "android"), test))]
 const PERCEPTUAL_HASH_COLUMNS: u32 = 16;
 #[cfg(any(not(target_os = "android"), test))]
@@ -137,6 +143,12 @@ impl ClipboardFingerprint {
         Some(Self::exact(hasher.finalize().to_hex().to_string()))
     }
 
+    /// 本地文件剪贴板写回令牌：仅对路径列表做零文件 I/O 的规范化摘要，避免监听线程阻塞在大文件读取上。
+    #[cfg(any(not(target_os = "android"), test))]
+    pub fn local_files_suppression_token(content: &str) -> String {
+        local_files_suppression_token_with_case(content, cfg!(target_os = "windows"))
+    }
+
     /// 写回保护继续使用与监听端一致的字符串形式。
     pub fn as_str(&self) -> &str {
         &self.exact
@@ -250,9 +262,16 @@ pub struct ClipboardFingerprintState {
 struct FingerprintState {
     generation: u64,
     current: Option<ClipboardFingerprint>,
-    write_pending: bool,
+    pending_writebacks: VecDeque<PendingWriteback>,
     #[cfg(any(not(target_os = "android"), test))]
     recent_synced_images: VecDeque<RecentSyncedImage>,
+}
+
+struct PendingWriteback {
+    generation: u64,
+    token: String,
+    published: Option<ClipboardFingerprint>,
+    recorded_at: Instant,
 }
 
 #[cfg(any(not(target_os = "android"), test))]
@@ -265,8 +284,6 @@ struct RecentSyncedImage {
 #[derive(Clone)]
 pub struct ClipboardObservation {
     generation: u64,
-    previous: Option<ClipboardFingerprint>,
-    restore_previous: bool,
     #[cfg(any(not(target_os = "android"), test))]
     outbound_image: Option<ClipboardFingerprint>,
 }
@@ -274,7 +291,6 @@ pub struct ClipboardObservation {
 pub struct ClipboardWrite {
     generation: u64,
     previous: Option<ClipboardFingerprint>,
-    previous_write_pending: bool,
 }
 
 impl ClipboardFingerprintState {
@@ -282,23 +298,19 @@ impl ClipboardFingerprintState {
         Self::default()
     }
 
-    /// 系统报告一次剪贴板变化时先失效旧值；确认是自身写回后可恢复。
+    /// 系统报告一次剪贴板变化时先失效当前语义指纹；若后续确认命中自身写回则按登记值恢复。
     pub fn begin_observation(&self) -> ClipboardObservation {
         let mut state = self
             .inner
             .lock()
             .expect("clipboard fingerprint state poisoned");
         state.generation = state.generation.wrapping_add(1);
-        let observation = ClipboardObservation {
+        state.current = None;
+        ClipboardObservation {
             generation: state.generation,
-            previous: state.current.take(),
-            restore_previous: state.write_pending,
             #[cfg(any(not(target_os = "android"), test))]
             outbound_image: None,
-        };
-        state.current = None;
-        state.write_pending = false;
-        observation
+        }
     }
 
     /// 仅在观察期间没有更新的剪贴板事件时提交结果，防止慢速文件任务覆盖新内容。
@@ -315,24 +327,46 @@ impl ClipboardFingerprintState {
             return false;
         }
         state.current = Some(fingerprint);
-        state.write_pending = false;
         true
     }
 
-    /// 仅恢复同步写回前预发布的目标；普通写回不能把变化前的旧指纹重新标成当前内容。
-    #[cfg(any(not(target_os = "android"), test))]
-    pub fn restore_observation(&self, observation: ClipboardObservation) {
+    /// 判断本次系统监听事件是否对应未过期的自身写回：命中则消费单次令牌，并在当前代次恢复语义指纹。
+    pub fn consume_pending_writeback(
+        &self,
+        observation: &ClipboardObservation,
+        token: &str,
+        observed_fingerprint: Option<&ClipboardFingerprint>,
+    ) -> bool {
+        self.consume_pending_writeback_at(observation, token, observed_fingerprint, Instant::now())
+    }
+
+    fn consume_pending_writeback_at(
+        &self,
+        observation: &ClipboardObservation,
+        token: &str,
+        observed_fingerprint: Option<&ClipboardFingerprint>,
+        now: Instant,
+    ) -> bool {
         let mut state = self
             .inner
             .lock()
             .expect("clipboard fingerprint state poisoned");
-        if state.generation == observation.generation
-            && state.current.is_none()
-            && observation.restore_previous
-        {
-            state.current = observation.previous;
-            state.write_pending = false;
+        prune_pending_writebacks(&mut state, now);
+        let Some(index) = state
+            .pending_writebacks
+            .iter()
+            .position(|entry| entry.token == token)
+        else {
+            return false;
+        };
+        let entry = state
+            .pending_writebacks
+            .remove(index)
+            .expect("checked pending writeback index");
+        if state.generation == observation.generation && state.current.is_none() {
+            state.current = entry.published.or_else(|| observed_fingerprint.cloned());
         }
+        true
     }
 
     /// Captures clipboard changes while an asynchronous sync download is running.
@@ -373,30 +407,63 @@ impl ClipboardFingerprintState {
         remember_synced_image_at(&mut state, fingerprint.clone(), Instant::now(), None);
     }
 
-    /// 写系统剪贴板前先发布目标指纹；写入失败时可按代次安全回滚。
+    /// 写系统剪贴板前登记本地抑制令牌并按需发布目标语义指纹；写入失败时可按代次安全回滚。
+    pub fn begin_write_with_token(
+        &self,
+        token: String,
+        published: Option<ClipboardFingerprint>,
+        synced: bool,
+    ) -> ClipboardWrite {
+        self.begin_write_at(token, published, synced, Instant::now())
+    }
+
+    /// 同步文本等令牌与语义指纹同源时的便捷写前登记入口。
+    #[cfg(test)]
     pub fn begin_write(&self, fingerprint: ClipboardFingerprint) -> ClipboardWrite {
+        let token = fingerprint.as_str().to_owned();
+        self.begin_write_with_token(token, Some(fingerprint), true)
+    }
+
+    fn begin_write_at(
+        &self,
+        token: String,
+        published: Option<ClipboardFingerprint>,
+        synced: bool,
+        now: Instant,
+    ) -> ClipboardWrite {
+        let _ = synced;
         let mut state = self
             .inner
             .lock()
             .expect("clipboard fingerprint state poisoned");
+        prune_pending_writebacks(&mut state, now);
         state.generation = state.generation.wrapping_add(1);
         let generation = state.generation;
         #[cfg(any(not(target_os = "android"), test))]
-        let recent_image = fingerprint
-            .perceptual_image
-            .as_ref()
-            .map(|_| fingerprint.clone());
-        let previous = state.current.replace(fingerprint);
-        let previous_write_pending = state.write_pending;
-        state.write_pending = true;
+        let recent_image = if synced {
+            published.as_ref().and_then(|fingerprint| {
+                fingerprint
+                    .perceptual_image
+                    .as_ref()
+                    .map(|_| fingerprint.clone())
+            })
+        } else {
+            None
+        };
+        let previous = std::mem::replace(&mut state.current, published.clone());
+        state.pending_writebacks.push_back(PendingWriteback {
+            generation,
+            token,
+            published,
+            recorded_at: now,
+        });
         #[cfg(any(not(target_os = "android"), test))]
         if let Some(recent_image) = recent_image {
-            remember_synced_image_at(&mut state, recent_image, Instant::now(), Some(generation));
+            remember_synced_image_at(&mut state, recent_image, now, Some(generation));
         }
         ClipboardWrite {
             generation,
             previous,
-            previous_write_pending,
         }
     }
 
@@ -405,13 +472,15 @@ impl ClipboardFingerprintState {
             .inner
             .lock()
             .expect("clipboard fingerprint state poisoned");
+        state
+            .pending_writebacks
+            .retain(|entry| entry.generation != write.generation);
         #[cfg(any(not(target_os = "android"), test))]
         state
             .recent_synced_images
             .retain(|recent| recent.write_generation != Some(write.generation));
         if state.generation == write.generation {
             state.current = write.previous;
-            state.write_pending = write.previous_write_pending;
         }
     }
 
@@ -440,14 +509,6 @@ impl ClipboardFingerprintState {
     }
 }
 
-#[cfg(target_os = "android")]
-impl ClipboardObservation {
-    /// 判断本次系统通知是否对应此前尚未回执的同步写回。
-    pub fn matches_pending_writeback(&self, fingerprint: &ClipboardFingerprint) -> bool {
-        self.restore_previous && self.previous.as_ref() == Some(fingerprint)
-    }
-}
-
 #[cfg(any(not(target_os = "android"), test))]
 impl ClipboardObservation {
     /// 把监听阶段已完成的图片指纹带到异步同步入队阶段，不重新读取或解码图片。
@@ -459,6 +520,59 @@ impl ClipboardObservation {
     pub fn outbound_image(&self) -> Option<&ClipboardFingerprint> {
         self.outbound_image.as_ref()
     }
+}
+
+fn prune_pending_writebacks(state: &mut FingerprintState, now: Instant) {
+    state.pending_writebacks.retain(|entry| {
+        now.checked_duration_since(entry.recorded_at)
+            .is_some_and(|age| age <= WRITEBACK_SUPPRESS_TTL)
+    });
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn local_files_suppression_token_with_case(content: &str, case_insensitive: bool) -> String {
+    let mut normalized = content
+        .split('\n')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_local_file_path(value, case_insensitive))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    hash_parts(LOCAL_FILES_DOMAIN, normalized.iter().map(String::as_bytes))
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn normalize_local_file_path(path: &str, case_insensitive: bool) -> String {
+    let stripped = path.strip_prefix("file://").unwrap_or(path);
+    let unified = if case_insensitive {
+        stripped.replace('\\', "/")
+    } else {
+        stripped.to_owned()
+    };
+    let trimmed = trim_trailing_path_separators(&unified);
+    if case_insensitive {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn trim_trailing_path_separators(path: &str) -> &str {
+    if path == "/" {
+        return path;
+    }
+    if path.len() == 3 && path.as_bytes()[1] == b':' && path.as_bytes()[2] == b'/' {
+        return path;
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/";
+    }
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        return &path[..3];
+    }
+    trimmed
 }
 
 #[cfg(any(not(target_os = "android"), test))]
@@ -583,34 +697,128 @@ mod tests {
         let _write = state.begin_write(expected.clone());
         let observation = state.begin_observation();
 
-        state.restore_observation(observation);
-
+        assert!(state.consume_pending_writeback(&observation, expected.as_str(), Some(&expected)));
         assert!(state.matches(&expected));
+        // 单次消费后，同内容的下一次真实复制不再被吞。
+        let next = state.begin_observation();
+        assert!(!state.consume_pending_writeback(&next, expected.as_str(), Some(&expected)));
     }
 
     #[test]
-    fn ordinary_writeback_does_not_restore_the_previous_fingerprint() {
+    fn ordinary_observation_without_pending_write_does_not_restore_previous() {
         let state = ClipboardFingerprintState::new();
         let previous = exact_fingerprint("previous");
         let copied = state.begin_observation();
         assert!(state.commit_observation(&copied, previous.clone()));
 
-        let ordinary_writeback = state.begin_observation();
-        state.restore_observation(ordinary_writeback);
-
+        let ordinary = state.begin_observation();
+        assert!(!state.consume_pending_writeback(&ordinary, previous.as_str(), Some(&previous)));
         assert!(!state.matches(&previous));
     }
 
     #[test]
-    fn failed_write_rolls_back_if_no_newer_event_arrived() {
+    fn supports_multiple_pending_writebacks_and_preserves_unrelated_copy() {
+        let state = ClipboardFingerprintState::new();
+        let first = exact_fingerprint("first");
+        let second = exact_fingerprint("second");
+        let unrelated = exact_fingerprint("unrelated");
+        let _w1 = state.begin_write(first.clone());
+        let _w2 = state.begin_write(second.clone());
+
+        let obs_unrelated = state.begin_observation();
+        assert!(!state.consume_pending_writeback(
+            &obs_unrelated,
+            unrelated.as_str(),
+            Some(&unrelated)
+        ));
+        assert!(state.commit_observation(&obs_unrelated, unrelated));
+
+        let obs_first = state.begin_observation();
+        assert!(state.consume_pending_writeback(&obs_first, first.as_str(), Some(&first)));
+        let obs_second = state.begin_observation();
+        assert!(state.consume_pending_writeback(&obs_second, second.as_str(), Some(&second)));
+        assert!(state.matches(&second));
+    }
+
+    #[test]
+    fn expired_pending_writeback_is_ignored() {
+        let state = ClipboardFingerprintState::new();
+        let now = Instant::now();
+        let expected = exact_fingerprint("expired");
+        let _write = state.begin_write_at(
+            expected.as_str().to_owned(),
+            Some(expected.clone()),
+            false,
+            now - WRITEBACK_SUPPRESS_TTL - Duration::from_millis(1),
+        );
+        let observation = state.begin_observation();
+
+        assert!(!state.consume_pending_writeback_at(
+            &observation,
+            expected.as_str(),
+            Some(&expected),
+            now,
+        ));
+    }
+
+    #[test]
+    fn failed_write_rolls_back_state_and_cancels_suppression() {
         let state = ClipboardFingerprintState::new();
         let previous = exact_fingerprint("previous");
+        let failed = exact_fingerprint("failed");
         let _initial = state.begin_write(previous.clone());
-        let write = state.begin_write(exact_fingerprint("failed"));
+        let write = state.begin_write(failed.clone());
 
         state.rollback_write(write);
 
         assert!(state.matches(&previous));
+        let observation = state.begin_observation();
+        assert!(!state.consume_pending_writeback(&observation, failed.as_str(), Some(&failed)));
+    }
+
+    #[test]
+    fn windows_cf_html_wrapped_writeback_matches_original_fragment() {
+        let state = ClipboardFingerprintState::new();
+        let macos_fragment = text_item(
+            "<meta charset='utf-8'><span>Hello Windows</span>",
+            Some(ClipboardSubKind::Html),
+            Some("Hello Windows"),
+        );
+        let written_fp = ClipboardFingerprint::from_text_item(&macos_fragment).unwrap();
+        let _write = state.begin_write(written_fp);
+
+        let windows_readback = text_item(
+            "<html>\r\n<body>\r\n<!--StartFragment--><meta charset='utf-8'><span>Hello Windows</span><!--EndFragment-->\r\n</body>\r\n</html>",
+            Some(ClipboardSubKind::Html),
+            Some("Hello Windows"),
+        );
+        let observed_fp = ClipboardFingerprint::from_text_item(&windows_readback).unwrap();
+        let observation = state.begin_observation();
+
+        assert!(state.consume_pending_writeback(
+            &observation,
+            observed_fp.as_str(),
+            Some(&observed_fp),
+        ));
+        assert!(state.matches(&observed_fp));
+    }
+
+    #[test]
+    fn local_files_token_normalizes_separators_trailing_slashes_and_case() {
+        assert_eq!(
+            local_files_suppression_token_with_case(
+                "C:\\Users\\Test\\Docs\\\nD:\\Data\\report.pdf",
+                true,
+            ),
+            local_files_suppression_token_with_case(
+                "file://d:/data/report.pdf\nc:/users/test/docs",
+                true,
+            )
+        );
+        assert_eq!(
+            local_files_suppression_token_with_case("/Users/test/folder/\n/tmp/a.txt", false),
+            local_files_suppression_token_with_case("file:///tmp/a.txt\n/Users/test/folder", false)
+        );
     }
 
     #[test]
@@ -625,7 +833,11 @@ mod tests {
         assert!(!second_device.matches(&fingerprint));
         let _remote_write = second_device.begin_write(fingerprint.clone());
         let local_callback = second_device.begin_observation();
-        second_device.restore_observation(local_callback);
+        assert!(second_device.consume_pending_writeback(
+            &local_callback,
+            fingerprint.as_str(),
+            Some(&fingerprint),
+        ));
 
         let rustdesk_reflection = first_device.begin_observation();
         assert!(first_device.commit_observation(&rustdesk_reflection, fingerprint.clone()));

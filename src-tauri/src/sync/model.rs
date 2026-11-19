@@ -4,21 +4,289 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::CloudRelayMode;
 
+pub const SNAPSHOT_VERSION: u16 = 1;
+
+/// Lamport clock + device-id tie-breaker for one independently mergeable CRDT field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[cbor(map)]
+pub struct FieldVersion {
+    #[n(0)]
+    pub seq: u64,
+    #[n(1)]
+    pub device_id: String,
+}
+
+impl FieldVersion {
+    pub fn new(seq: u64, device_id: impl Into<String>) -> Self {
+        Self {
+            seq,
+            device_id: device_id.into(),
+        }
+    }
+}
+
+/// Complete encrypted per-item snapshot carried inside `SyncItemWrite` / `SyncItemRecord`.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
-pub struct ClipboardEnvelope {
+pub struct SyncedItemSnapshot {
     #[n(0)]
     pub version: u16,
     #[n(1)]
-    pub item: SyncedClipboardItem,
+    pub sync_key: String,
     #[n(2)]
-    pub blobs: Vec<BlobManifest>,
+    pub content_version: FieldVersion,
     #[n(3)]
+    pub presence_version: FieldVersion,
+    #[n(4)]
+    pub favorite_version: FieldVersion,
+    #[n(5)]
+    pub pinned_version: FieldVersion,
+    #[n(6)]
+    pub note_version: FieldVersion,
+    #[n(7)]
+    pub is_present: bool,
+    #[n(8)]
+    pub is_favorite: bool,
+    #[n(9)]
+    pub is_pinned: bool,
+    #[n(10)]
+    pub note: Option<String>,
+    #[n(11)]
+    pub item: Option<SyncedClipboardItem>,
+    #[n(12)]
+    pub blobs: Vec<BlobManifest>,
+    #[n(13)]
     #[cbor(default)]
     pub source_app: Option<SourceAppRef>,
-    #[n(4)]
+    #[n(14)]
     #[cbor(default)]
     pub content_identity: Option<String>,
+}
+
+impl SyncedItemSnapshot {
+    pub fn deleted(&self) -> bool {
+        !self.is_present
+    }
+
+    pub fn protected(&self) -> bool {
+        self.is_present && (self.is_favorite || self.is_pinned)
+    }
+
+    pub fn max_lamport_seq(&self) -> u64 {
+        self.content_version
+            .seq
+            .max(self.presence_version.seq)
+            .max(self.favorite_version.seq)
+            .max(self.pinned_version.seq)
+            .max(self.note_version.seq)
+    }
+
+    pub fn updated_at_ms(&self) -> i64 {
+        self.item
+            .as_ref()
+            .map(|item| item.updated_at_ms.unwrap_or(item.created_at_ms))
+            .unwrap_or(0)
+    }
+}
+
+/// Outcome of a commutative per-field CRDT join between a local snapshot and a remote snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedSnapshot {
+    pub snapshot: SyncedItemSnapshot,
+    /// True when the merged result differs from `local` (local DB/UI needs update).
+    pub local_changed: bool,
+    /// True when the merged result differs from `remote` (caller should push merged state back).
+    pub remote_changed: bool,
+}
+
+/// Joins two snapshots for the same `sync_key` field-by-field using Lamport LWW versions.
+pub fn merge_snapshots(local: &SyncedItemSnapshot, remote: &SyncedItemSnapshot) -> MergedSnapshot {
+    let take_remote_presence = remote.presence_version > local.presence_version;
+    let (presence_version, is_present) = if take_remote_presence {
+        (remote.presence_version.clone(), remote.is_present)
+    } else {
+        (local.presence_version.clone(), local.is_present)
+    };
+
+    let take_remote_favorite = remote.favorite_version > local.favorite_version;
+    let (favorite_version, is_favorite) = if take_remote_favorite {
+        (remote.favorite_version.clone(), remote.is_favorite)
+    } else {
+        (local.favorite_version.clone(), local.is_favorite)
+    };
+
+    let take_remote_pinned = remote.pinned_version > local.pinned_version;
+    let (pinned_version, is_pinned) = if take_remote_pinned {
+        (remote.pinned_version.clone(), remote.is_pinned)
+    } else {
+        (local.pinned_version.clone(), local.is_pinned)
+    };
+
+    let take_remote_note = remote.note_version > local.note_version;
+    let (note_version, note) = if take_remote_note {
+        (remote.note_version.clone(), remote.note.clone())
+    } else {
+        (local.note_version.clone(), local.note.clone())
+    };
+
+    let take_remote_content = match remote.content_version.cmp(&local.content_version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => local.item.is_none() && remote.item.is_some(),
+    };
+    let (content_version, mut item, mut blobs, mut source_app, mut content_identity) =
+        if take_remote_content {
+            (
+                remote.content_version.clone(),
+                remote.item.clone(),
+                remote.blobs.clone(),
+                remote.source_app.clone(),
+                remote.content_identity.clone(),
+            )
+        } else {
+            (
+                local.content_version.clone(),
+                local.item.clone(),
+                local.blobs.clone(),
+                local.source_app.clone(),
+                local.content_identity.clone(),
+            )
+        };
+
+    // Preserve earliest creation time and latest reuse time when both sides carry content.
+    if let (Some(merged_item), Some(other_item)) = (
+        item.as_mut(),
+        if take_remote_content {
+            local.item.as_ref()
+        } else {
+            remote.item.as_ref()
+        },
+    ) {
+        merged_item.created_at_ms = merged_item.created_at_ms.min(other_item.created_at_ms);
+        let merged_updated = merged_item
+            .updated_at_ms
+            .unwrap_or(merged_item.created_at_ms);
+        let other_updated = other_item.updated_at_ms.unwrap_or(other_item.created_at_ms);
+        merged_item.updated_at_ms = Some(merged_updated.max(other_updated));
+    }
+
+    // Tombstones carry no clipboard payload or blob references.
+    if !is_present {
+        item = None;
+        blobs.clear();
+        source_app = None;
+        content_identity = None;
+    }
+
+    let snapshot = SyncedItemSnapshot {
+        version: SNAPSHOT_VERSION,
+        sync_key: local.sync_key.clone(),
+        content_version,
+        presence_version,
+        favorite_version,
+        pinned_version,
+        note_version,
+        is_present,
+        is_favorite,
+        is_pinned,
+        note,
+        item,
+        blobs,
+        source_app,
+        content_identity,
+    };
+
+    let local_changed = &snapshot != local;
+    let remote_changed = &snapshot != remote;
+    MergedSnapshot {
+        snapshot,
+        local_changed,
+        remote_changed,
+    }
+}
+
+/// Sliding-window pagination cursor for newest-first synchronization without backlog HoL blocking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncWindowCursor {
+    /// Every sequence `<= synced_seq` has been completely pulled.
+    pub synced_seq: u64,
+    /// When catching up a multi-page gap, the next older page requests `seq < catchup_before`.
+    pub catchup_before: Option<u64>,
+    /// Upper bound of the active catch-up window; once `catchup_before` drains to `None`,
+    /// `synced_seq` advances atomically to `window_high`.
+    pub window_high: u64,
+}
+
+impl SyncWindowCursor {
+    /// Selects `(after_seq, before_seq)` for the next pull RPC.
+    ///
+    /// When `remote_latest_seq > window_high`, freshly created items preempt downward catch-up
+    /// (`before_seq = None`) so realtime copies are never delayed by historical gaps.
+    pub fn next_pull_params(&self, remote_latest_seq: Option<u64>) -> (u64, Option<u64>) {
+        if let Some(latest) = remote_latest_seq {
+            if latest > self.window_high && self.catchup_before.is_some() {
+                // Preempt catch-up with the newest slice above `window_high`.
+                return (self.window_high, None);
+            }
+        }
+        (self.synced_seq, self.catchup_before)
+    }
+
+    /// Advances the sliding window after receiving one newest-first response.
+    pub fn apply_response(
+        &mut self,
+        requested_after: u64,
+        requested_before: Option<u64>,
+        response_latest_seq: u64,
+        pruned_through_seq: u64,
+        next_before_seq: Option<u64>,
+    ) {
+        if pruned_through_seq > self.synced_seq {
+            self.synced_seq = pruned_through_seq;
+            if self
+                .catchup_before
+                .is_some_and(|before| before <= pruned_through_seq)
+            {
+                self.catchup_before = None;
+            }
+        }
+        if requested_before.is_none() {
+            // Top-of-stream fetch.
+            if requested_after == self.window_high && self.catchup_before.is_some() {
+                // Preemptive fetch of brand-new items above an in-progress catch-up window.
+                if let Some(next_before) = next_before_seq {
+                    // Gap also exists above old `window_high`; widen catch-up smoothly by keeping
+                    // the lower cursor so nothing between `synced_seq` and `response_latest_seq` is lost.
+                    self.window_high = self.window_high.max(response_latest_seq);
+                    self.catchup_before = Some(next_before);
+                } else {
+                    // All new items above `window_high` were fetched in one shot.
+                    self.window_high = self.window_high.max(response_latest_seq);
+                }
+            } else if let Some(next_before) = next_before_seq {
+                self.window_high = self.window_high.max(response_latest_seq);
+                self.catchup_before = Some(next_before);
+            } else {
+                self.window_high = self.window_high.max(response_latest_seq);
+                self.synced_seq = self.synced_seq.max(self.window_high);
+                self.catchup_before = None;
+            }
+        } else if let Some(next_before) = next_before_seq {
+            self.window_high = self.window_high.max(response_latest_seq);
+            self.catchup_before = Some(next_before);
+        } else {
+            // Catch-up window drained all the way down to `requested_after`, so everything
+            // `<= window_high` is now synced. Keep `synced_seq` capped at the previous `window_high`
+            // so any items written above `window_high` during catch-up are pulled next.
+            self.synced_seq = self.synced_seq.max(self.window_high);
+            self.window_high = self.synced_seq;
+            self.catchup_before = None;
+        }
+    }
+
+    pub fn has_catchup_pending(&self) -> bool {
+        self.catchup_before.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -64,43 +332,6 @@ pub struct SyncedClipboardItem {
     #[n(17)]
     #[cbor(default)]
     pub source_updated_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-#[cbor(map)]
-pub struct SyncedItemStatePatch {
-    #[n(0)]
-    pub sync_key: String,
-    #[n(1)]
-    #[cbor(default)]
-    pub is_favorite: Option<bool>,
-    #[n(2)]
-    #[cbor(default)]
-    pub is_pinned: Option<bool>,
-    #[n(3)]
-    #[cbor(default)]
-    pub note: Option<String>,
-    #[n(4)]
-    #[cbor(default)]
-    pub note_changed: bool,
-    #[n(5)]
-    #[cbor(default)]
-    pub is_present: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecryptedSyncEvent {
-    Clipboard(Box<ClipboardEnvelope>),
-    ItemState(SyncedItemStatePatch),
-}
-
-impl DecryptedSyncEvent {
-    pub fn sync_key(&self) -> &str {
-        match self {
-            Self::Clipboard(envelope) => &envelope.item.sync_key,
-            Self::ItemState(patch) => &patch.sync_key,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -163,59 +394,6 @@ pub enum BlobRole {
     Image,
     #[n(1)]
     File,
-}
-
-#[cfg(test)]
-mod blob_manifest_tests {
-    use super::*;
-
-    #[derive(Encode)]
-    #[cbor(map)]
-    struct LegacyBlobManifest {
-        #[n(0)]
-        blob_id: String,
-        #[n(1)]
-        name: String,
-        #[n(2)]
-        original_size: u64,
-        #[n(3)]
-        encrypted_size: u64,
-        #[n(4)]
-        role: BlobRole,
-        #[n(5)]
-        file_index: Option<u32>,
-        #[n(6)]
-        is_directory_archive: bool,
-    }
-
-    #[test]
-    fn legacy_blob_manifest_defaults_to_ciphertext_identity() {
-        let encoded = minicbor::to_vec(LegacyBlobManifest {
-            blob_id: "a".repeat(64),
-            name: "example.bin".into(),
-            original_size: 4,
-            encrypted_size: 47,
-            role: BlobRole::File,
-            file_index: Some(0),
-            is_directory_archive: false,
-        })
-        .unwrap();
-        let decoded: BlobManifest = minicbor::decode(&encoded).unwrap();
-
-        assert!(!decoded.stream_commitment);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StoredSyncEvent {
-    pub cursor: u64,
-    pub event: ecopaste_sync_protocol::EncryptedEvent,
-}
-
-#[derive(Debug, Clone)]
-pub struct LinkedSyncEvent {
-    pub item_id: String,
-    pub stored: StoredSyncEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +580,19 @@ pub struct SyncItemStatus {
     pub cloud: SyncItemChannelStatus,
 }
 
+impl SyncItemStatus {
+    pub fn idle(item_id: String) -> Self {
+        let idle = SyncItemChannelStatus::idle();
+        Self {
+            item_id,
+            origin: SyncItemOrigin::Local,
+            local_state: SyncLocalContentState::Managed,
+            lan: idle.clone(),
+            cloud: idle,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudRecord {
@@ -454,185 +645,6 @@ pub struct CloudHubStatus {
 pub struct CloudDeviceDirectory {
     pub devices: Vec<CloudDeviceStatus>,
     pub hub_status: Option<CloudHubStatus>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Encode, Decode)]
-    #[cbor(map)]
-    struct LegacySyncedClipboardItem {
-        #[n(0)]
-        kind: String,
-        #[n(1)]
-        sub_kind: Option<String>,
-        #[n(2)]
-        content: String,
-        #[n(3)]
-        search_text: Option<String>,
-        #[n(4)]
-        summary: Option<String>,
-        #[n(5)]
-        file_types: Option<String>,
-        #[n(6)]
-        size: Option<i64>,
-        #[n(7)]
-        width: Option<i64>,
-        #[n(8)]
-        height: Option<i64>,
-        #[n(9)]
-        is_sensitive: bool,
-        #[n(10)]
-        source_platform: String,
-        #[n(11)]
-        created_at_ms: i64,
-        #[n(12)]
-        content_hash: String,
-    }
-
-    #[derive(Encode, Decode)]
-    #[cbor(map)]
-    struct LegacyClipboardEnvelope {
-        #[n(0)]
-        version: u16,
-        #[n(1)]
-        item: LegacySyncedClipboardItem,
-        #[n(2)]
-        blobs: Vec<BlobManifest>,
-    }
-
-    fn legacy_item() -> LegacySyncedClipboardItem {
-        LegacySyncedClipboardItem {
-            kind: "text".into(),
-            sub_kind: None,
-            content: "hello".into(),
-            search_text: None,
-            summary: Some("hello".into()),
-            file_types: None,
-            size: Some(5),
-            width: None,
-            height: None,
-            is_sensitive: false,
-            source_platform: "macos".into(),
-            created_at_ms: 123,
-            content_hash: "hash".into(),
-        }
-    }
-
-    #[test]
-    fn synced_item_defaults_missing_updated_at_for_legacy_events() {
-        let legacy = legacy_item();
-
-        let encoded = minicbor::to_vec(legacy).unwrap();
-        let decoded: SyncedClipboardItem = minicbor::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.created_at_ms, 123);
-        assert_eq!(decoded.updated_at_ms, None);
-    }
-
-    #[test]
-    fn legacy_decoder_ignores_updated_at_from_new_events() {
-        let current = SyncedClipboardItem {
-            kind: "text".into(),
-            sub_kind: None,
-            content: "hello".into(),
-            search_text: None,
-            summary: Some("hello".into()),
-            file_types: None,
-            size: Some(5),
-            width: None,
-            height: None,
-            is_sensitive: false,
-            source_platform: "macos".into(),
-            created_at_ms: 123,
-            sync_key: "hash".into(),
-            updated_at_ms: Some(456),
-            source_revision: Some("revision".into()),
-            source_device_id: None,
-            source_device_name: None,
-            source_updated_at_ms: None,
-        };
-
-        let encoded = minicbor::to_vec(current).unwrap();
-        let decoded: LegacySyncedClipboardItem = minicbor::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.created_at_ms, 123);
-        assert_eq!(decoded.content_hash, "hash");
-    }
-
-    #[test]
-    fn current_envelope_defaults_source_app_from_legacy_event() {
-        let legacy = LegacyClipboardEnvelope {
-            version: 1,
-            item: legacy_item(),
-            blobs: Vec::new(),
-        };
-
-        let encoded = minicbor::to_vec(legacy).unwrap();
-        let decoded: ClipboardEnvelope = minicbor::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.item.content, "hello");
-        assert_eq!(decoded.source_app, None);
-        assert_eq!(decoded.content_identity, None);
-    }
-
-    #[test]
-    fn legacy_envelope_ignores_source_app_from_current_event() {
-        let current = ClipboardEnvelope {
-            version: 1,
-            item: SyncedClipboardItem {
-                kind: "text".into(),
-                sub_kind: None,
-                content: "hello".into(),
-                search_text: None,
-                summary: Some("hello".into()),
-                file_types: None,
-                size: Some(5),
-                width: None,
-                height: None,
-                is_sensitive: false,
-                source_platform: "macos".into(),
-                created_at_ms: 123,
-                sync_key: "hash".into(),
-                updated_at_ms: Some(456),
-                source_revision: Some("revision".into()),
-                source_device_id: None,
-                source_device_name: None,
-                source_updated_at_ms: None,
-            },
-            blobs: Vec::new(),
-            source_app: Some(SourceAppRef {
-                version: 1,
-                source_key: "a".repeat(64),
-                platform: "macos".into(),
-                display_name: "Example".into(),
-                icon: None,
-                accent_start: Some("#112233".into()),
-                accent_end: Some("#445566".into()),
-            }),
-            content_identity: Some("b".repeat(64)),
-        };
-
-        let encoded = minicbor::to_vec(current).unwrap();
-        let decoded: LegacyClipboardEnvelope = minicbor::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.item.content, "hello");
-        assert!(decoded.blobs.is_empty());
-    }
-}
-
-impl SyncItemStatus {
-    pub fn idle(item_id: String) -> Self {
-        let idle = SyncItemChannelStatus::idle();
-        Self {
-            item_id,
-            origin: SyncItemOrigin::Local,
-            local_state: SyncLocalContentState::Managed,
-            lan: idle.clone(),
-            cloud: idle,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -698,5 +710,107 @@ pub struct IncomingJoinRequest {
 #[derive(Debug, Clone)]
 pub struct SyncPeer {
     pub announcement: PeerAnnouncement,
-    pub pull_cursor: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_snapshot(device: &str) -> SyncedItemSnapshot {
+        SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: "sync-key-1".into(),
+            content_version: FieldVersion::new(1, device),
+            presence_version: FieldVersion::new(1, device),
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "text".into(),
+                sub_kind: None,
+                content: "hello".into(),
+                search_text: Some("hello".into()),
+                summary: Some("hello".into()),
+                file_types: None,
+                size: Some(5),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".into(),
+                created_at_ms: 100,
+                sync_key: "sync-key-1".into(),
+                updated_at_ms: Some(100),
+                source_revision: Some("rev-1".into()),
+                source_device_id: Some(device.into()),
+                source_device_name: Some("Mac".into()),
+                source_updated_at_ms: Some(100),
+            }),
+            blobs: Vec::new(),
+            source_app: None,
+            content_identity: None,
+        }
+    }
+
+    #[test]
+    fn merge_snapshots_is_commutative_and_preserves_independent_fields() {
+        let mut device_a = sample_snapshot("dev-a");
+        device_a.is_favorite = true;
+        device_a.favorite_version = FieldVersion::new(2, "dev-a");
+
+        let mut device_b = sample_snapshot("dev-a");
+        device_b.note = Some("important".into());
+        device_b.note_version = FieldVersion::new(2, "dev-b");
+
+        let ab = merge_snapshots(&device_a, &device_b);
+        let ba = merge_snapshots(&device_b, &device_a);
+        assert_eq!(ab.snapshot, ba.snapshot);
+        assert!(ab.snapshot.is_favorite);
+        assert_eq!(ab.snapshot.note.as_deref(), Some("important"));
+        assert!(ab.local_changed && ab.remote_changed);
+    }
+
+    #[test]
+    fn merge_snapshots_strips_payload_when_tombstone_wins() {
+        let local = sample_snapshot("dev-a");
+        let mut remote = sample_snapshot("dev-b");
+        remote.is_present = false;
+        remote.presence_version = FieldVersion::new(5, "dev-b");
+        remote.item = None;
+
+        let merged = merge_snapshots(&local, &remote);
+        assert!(merged.snapshot.deleted());
+        assert!(merged.snapshot.item.is_none());
+        assert!(merged.snapshot.blobs.is_empty());
+        assert!(merged.local_changed);
+    }
+
+    #[test]
+    fn sliding_window_preempts_catchup_when_newer_items_arrive() {
+        let mut window = SyncWindowCursor::default();
+        // Initial pull sees latest=100, gets 100..=51, next_before=51.
+        let (after, before) = window.next_pull_params(None);
+        assert_eq!((after, before), (0, None));
+        window.apply_response(after, before, 100, 0, Some(51));
+        assert_eq!(window.synced_seq, 0);
+        assert_eq!(window.catchup_before, Some(51));
+        assert_eq!(window.window_high, 100);
+
+        // Brand-new item 101 arrives -> preempts downward catch-up!
+        let (after, before) = window.next_pull_params(Some(101));
+        assert_eq!((after, before), (100, None));
+        window.apply_response(after, before, 101, 0, None);
+        assert_eq!(window.window_high, 101);
+        assert_eq!(window.catchup_before, Some(51));
+
+        // Now resume catch-up for 50..=1 and finish.
+        let (after, before) = window.next_pull_params(Some(101));
+        assert_eq!((after, before), (0, Some(51)));
+        window.apply_response(after, before, 101, 0, None);
+        assert_eq!(window.synced_seq, 101);
+        assert_eq!(window.catchup_before, None);
+    }
 }

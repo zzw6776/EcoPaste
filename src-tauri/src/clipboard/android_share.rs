@@ -276,7 +276,7 @@ fn shared_delivery_route(
     item: &ClipboardItem,
     auto_upload_max_mb: u32,
     lan_connected: bool,
-) -> Option<crate::db::sync_queue::ContentDeliveryRoute> {
+) -> Option<crate::db::sync_items::ContentDeliveryRoute> {
     let target = crate::sync::android_share_delivery_target(
         item.kind == crate::db::models::ClipboardKind::Files,
         item.size.and_then(|size| u64::try_from(size).ok()),
@@ -284,8 +284,8 @@ fn shared_delivery_route(
         lan_connected,
     )?;
     Some(match target {
-        crate::sync::SyncTarget::Lan => crate::db::sync_queue::ContentDeliveryRoute::Lan,
-        crate::sync::SyncTarget::Cloud => crate::db::sync_queue::ContentDeliveryRoute::Cloud,
+        crate::sync::SyncTarget::Lan => crate::db::sync_items::ContentDeliveryRoute::Lan,
+        crate::sync::SyncTarget::Cloud => crate::db::sync_items::ContentDeliveryRoute::Cloud,
     })
 }
 
@@ -570,7 +570,7 @@ pub(crate) async fn receive(
             &item,
             source_app.as_ref(),
             None,
-            Some(crate::db::sync_queue::ContentSyncOptions {
+            Some(crate::db::sync_items::ContentSyncOptions {
                 manual_share: true,
                 delivery_route: initial_delivery_route,
                 ..Default::default()
@@ -596,13 +596,13 @@ pub(crate) async fn receive(
             .map(|manager| manager.inner().clone());
         let initial_route = match initial_delivery_route.unwrap_or({
             if lan_connected {
-                crate::db::sync_queue::ContentDeliveryRoute::Lan
+                crate::db::sync_items::ContentDeliveryRoute::Lan
             } else {
-                crate::db::sync_queue::ContentDeliveryRoute::Cloud
+                crate::db::sync_items::ContentDeliveryRoute::Cloud
             }
         }) {
-            crate::db::sync_queue::ContentDeliveryRoute::Cloud => crate::sync::TransferRoute::Cloud,
-            crate::db::sync_queue::ContentDeliveryRoute::Lan => crate::sync::TransferRoute::Lan,
+            crate::db::sync_items::ContentDeliveryRoute::Cloud => crate::sync::TransferRoute::Cloud,
+            crate::db::sync_items::ContentDeliveryRoute::Lan => crate::sync::TransferRoute::Lan,
         };
         let task_id = manager.as_ref().map(|manager| {
             manager.start_shared_file_import(&item.id, pending.declared_bytes, initial_route)
@@ -664,12 +664,10 @@ pub(crate) async fn receive(
                             {
                                 manager.finish_shared_file_import(task_id, total_bytes);
                             }
-                            match crate::db::sync_queue::stage_existing_content(
+                            match crate::db::sync_items::stage_existing_content(
                                 &pool,
-                                &item.id,
-                                &item.sync_key,
-                                &item.source_revision,
-                                crate::db::sync_queue::ContentSyncOptions {
+                                &item,
+                                crate::db::sync_items::ContentSyncOptions {
                                     manual_share: true,
                                     delivery_route,
                                     ..Default::default()
@@ -694,7 +692,7 @@ pub(crate) async fn receive(
                                             manager.shared_file_import_canceled(task_id)
                                         });
                                     if canceled {
-                                        crate::db::sync_queue::complete_content(
+                                        crate::db::sync_items::cancel_content_prep(
                                             &pool,
                                             operation_order,
                                         )

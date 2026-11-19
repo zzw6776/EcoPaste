@@ -79,7 +79,6 @@ impl CapacityPolicy {
 pub(crate) enum CleanupTrigger {
     Scheduled,
     Capacity,
-    CloudBootstrap,
 }
 
 /// Coalesces clipboard writes and checks quiet growth from downloads only with an active limit.
@@ -180,11 +179,6 @@ pub(crate) async fn apply_retention(
     pool: &SqlitePool,
     trigger: CleanupTrigger,
 ) -> Result<()> {
-    if trigger != CleanupTrigger::CloudBootstrap
-        && crate::sync::repository::cloud_bootstrap_in_progress(pool).await?
-    {
-        return Ok(());
-    }
     let settings = app.state::<SettingsStore>();
     let history = settings.snapshot().clipboard.history;
     let quota = StorageQuota::from_history(&history);

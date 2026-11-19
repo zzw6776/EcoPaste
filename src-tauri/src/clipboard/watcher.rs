@@ -25,7 +25,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::app_store::AppIconStore;
 use super::apps_registry::AppsRegistry;
 use super::fingerprint::{ClipboardFingerprint, ClipboardFingerprintState, ClipboardObservation};
-use super::guard::WritebackGuard;
 use super::ingest::{build_item_with_settings, calculate_current_file_item_size};
 #[cfg(not(target_os = "android"))]
 use super::read::ClipboardReader;
@@ -246,7 +245,7 @@ pub async fn persist_and_notify(
     observation: Option<ClipboardObservation>,
 ) -> crate::core::Result<UpsertResult> {
     let sync_options = crate::sync::should_stage_local_item(app, item)
-        .then_some(crate::db::sync_queue::ContentSyncOptions::default());
+        .then_some(crate::db::sync_items::ContentSyncOptions::default());
     persist_and_notify_with_sync(app, pool, item, source_app, observation, sync_options).await
 }
 
@@ -257,7 +256,7 @@ pub(crate) async fn persist_and_notify_with_sync(
     item: &ClipboardItem,
     source_app: Option<&ClipboardApp>,
     observation: Option<ClipboardObservation>,
-    sync_options: Option<crate::db::sync_queue::ContentSyncOptions>,
+    sync_options: Option<crate::db::sync_items::ContentSyncOptions>,
 ) -> crate::core::Result<UpsertResult> {
     let mut item_to_write = item.clone();
     if let Some(manager) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -428,13 +427,10 @@ fn spawn_file_size_backfill(app: AppHandle) {
     });
 }
 
-/// 启动监听：注册 [`WritebackGuard`] / [`ImageStore`] / [`AppIconStore`] 到 Tauri `State`
+/// 启动监听：注册 [`ClipboardFingerprintState`] / [`ImageStore`] / [`AppIconStore`] 到 Tauri `State`
 /// （供写回时打标记 / 取图 / 取来源应用图标），并在独立线程上跑 OS 级监听。
 /// 应在 `setup` 中、连接池就绪后调用一次。store 创建失败属致命配置错误，直接返回错误。
 pub fn init(app: &AppHandle) -> crate::core::Result<()> {
-    let guard = Arc::new(WritebackGuard::new());
-    app.manage(guard.clone());
-
     let fingerprints = Arc::new(ClipboardFingerprintState::new());
     app.manage(fingerprints.clone());
 
@@ -479,7 +475,6 @@ pub fn init(app: &AppHandle) -> crate::core::Result<()> {
     #[cfg(not(target_os = "android"))]
     spawn_watch_thread(
         app.clone(),
-        guard,
         fingerprints,
         store,
         app_icon_store,
@@ -534,17 +529,14 @@ async fn persist_android_text(
         Ok(Some(item)) => item,
         _ => return,
     };
-    let fingerprint = ClipboardFingerprint::from_text_item(&item);
-    let delayed_writeback = fingerprint
-        .as_ref()
-        .is_some_and(|fingerprint| observation.matches_pending_writeback(fingerprint));
-    if delayed_writeback {
-        if let Some(fingerprint) = fingerprint {
-            fingerprints.commit_observation(&observation, fingerprint);
+    if let Some(fingerprint) = ClipboardFingerprint::from_text_item(&item) {
+        if fingerprints.consume_pending_writeback(
+            &observation,
+            fingerprint.as_str(),
+            Some(&fingerprint),
+        ) {
+            return;
         }
-        return;
-    }
-    if let Some(fingerprint) = fingerprint {
         fingerprints.commit_observation(&observation, fingerprint);
     }
     let source_app = source.map(|source| {
@@ -566,7 +558,6 @@ async fn persist_android_text(
 #[cfg(not(target_os = "android"))]
 fn spawn_watch_thread(
     app: AppHandle,
-    guard: Arc<WritebackGuard>,
     fingerprints: Arc<ClipboardFingerprintState>,
     store: ImageStore,
     app_icon_store: AppIconStore,
@@ -588,7 +579,6 @@ fn spawn_watch_thread(
             let handler = ClipboardChangeHandler {
                 reader,
                 app,
-                guard,
                 fingerprints,
                 store,
                 app_icon_store,
@@ -620,7 +610,6 @@ fn spawn_watch_thread(
 struct ClipboardChangeHandler {
     reader: ClipboardReader,
     app: AppHandle,
-    guard: Arc<WritebackGuard>,
     fingerprints: Arc<ClipboardFingerprintState>,
     store: ImageStore,
     app_icon_store: AppIconStore,
@@ -638,9 +627,8 @@ impl ClipboardHandler for ClipboardChangeHandler {
         }
 
         // **先**抓前台应用：等异步入库再问，前台早就切回我们自己了。
-        // 自身写回的事件会在下方 guard 处被丢弃，但 detect 仍会无害地返回我们自己的 bundle id——
-        // 顺序换不得：guard 判定依赖 content_hash，必须先把 payload 读出来才能判，
-        // 而 read_all 期间用户可能已经切走前台。
+        // 自身写回的事件会在下方语义状态机处被丢弃，但 detect 仍会无害地返回我们自己的 bundle id——
+        // 顺序换不得：回环判定依赖读出的 payload，而 read_all 期间用户可能已经切走前台。
         let source = source::detect_frontmost(&self.app_icon_store, &self.registry);
 
         // 用户在偏好里勾选了「过滤此应用」时，本次复制整条直接丢弃——不读取、不入库、不 emit。
@@ -669,7 +657,7 @@ impl ClipboardHandler for ClipboardChangeHandler {
             .map(|s| s.snapshot())
             .unwrap_or_default();
 
-        // 同步读取 + 转换（含图片落盘）：拿到 content_hash 才能判定是否为自身写回。
+        // 同步读取 + 转换（含图片落盘）：拿到载荷语义后判定是否为自身写回。
         let payload = match read_with_retry(&CLIPBOARD_READ_RETRY_DELAYS, || {
             self.reader.read_with_capture(&settings.clipboard.capture)
         }) {
@@ -699,37 +687,43 @@ impl ClipboardHandler for ClipboardChangeHandler {
         };
         // `build_item_with_settings` 会先应用 `max_image_bytes` 门禁；只有确认收录的图片
         // 才做完整 RGBA 解码生成语义指纹，避免超限图片产生无效的大块像素分配。
-        let image_fingerprint = match &payload {
-            super::payload::ClipboardPayload::Image(image) => {
-                ClipboardFingerprint::from_image_bytes(&image.bytes)
+        let semantic_fingerprint = match item.kind {
+            ClipboardKind::Image => match &payload {
+                super::payload::ClipboardPayload::Image(image) => {
+                    ClipboardFingerprint::from_image_bytes(&image.bytes)
+                }
+                _ => None,
+            },
+            ClipboardKind::Text => ClipboardFingerprint::from_text_item(&item),
+            ClipboardKind::Files => None,
+        };
+        let suppression_token = match item.kind {
+            ClipboardKind::Files => {
+                ClipboardFingerprint::local_files_suppression_token(&item.content)
             }
-            _ => None,
+            ClipboardKind::Image | ClipboardKind::Text => semantic_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.as_str().to_owned())
+                .unwrap_or_else(|| item.content_hash.clone()),
         };
 
-        // 自身写回触发的变更：跳过入库，避免回环。
-        let suppression = image_fingerprint
-            .as_ref()
-            .map(ClipboardFingerprint::as_str)
-            .unwrap_or(&item.content_hash);
-        if self.guard.should_skip(suppression) {
-            let fingerprint =
-                image_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
-            if let Some(fingerprint) = fingerprint {
-                self.fingerprints
-                    .commit_observation(&observation, fingerprint);
-            } else {
-                self.fingerprints.restore_observation(observation);
-            }
+        // 自身手动/自动写回触发的系统变更：消费单次抑制令牌并恢复语义指纹，避免回环与二次入库。
+        if self.fingerprints.consume_pending_writeback(
+            &observation,
+            &suppression_token,
+            semantic_fingerprint.as_ref(),
+        ) {
             return;
         }
 
         // RustDesk 等远程剪贴板可能重新采样像素，使精确 RGBA 指纹失效。这里只与最近
         // 真正参与同步的同尺寸图片做短期感知匹配，不改变数据库的精确历史去重语义。
-        if image_fingerprint
-            .as_ref()
-            .is_some_and(|fingerprint| self.fingerprints.matches_recent_synced_image(fingerprint))
+        if item.kind == ClipboardKind::Image
+            && semantic_fingerprint.as_ref().is_some_and(|fingerprint| {
+                self.fingerprints.matches_recent_synced_image(fingerprint)
+            })
         {
-            if let Some(fingerprint) = image_fingerprint {
+            if let Some(fingerprint) = semantic_fingerprint {
                 self.fingerprints
                     .commit_observation(&observation, fingerprint);
             }
@@ -739,25 +733,19 @@ impl ClipboardHandler for ClipboardChangeHandler {
 
         let sync_observation = if item.kind == ClipboardKind::Files {
             Some(observation)
-        } else {
-            let fingerprint =
-                image_fingerprint.or_else(|| ClipboardFingerprint::from_text_item(&item));
-            if let Some(fingerprint) = fingerprint {
-                self.fingerprints
-                    .commit_observation(&observation, fingerprint.clone());
-                if item.kind == ClipboardKind::Image {
-                    if settings.sync.enabled
-                        && crate::sync::should_stage_local_item(&self.app, &item)
-                    {
-                        self.fingerprints.remember_synced_image(&fingerprint);
-                    }
-                    Some(observation.with_outbound_image(fingerprint))
-                } else {
-                    None
+        } else if let Some(fingerprint) = semantic_fingerprint {
+            self.fingerprints
+                .commit_observation(&observation, fingerprint.clone());
+            if item.kind == ClipboardKind::Image {
+                if settings.sync.enabled && crate::sync::should_stage_local_item(&self.app, &item) {
+                    self.fingerprints.remember_synced_image(&fingerprint);
                 }
+                Some(observation.with_outbound_image(fingerprint))
             } else {
                 None
             }
+        } else {
+            None
         };
 
         let source_app =
@@ -787,7 +775,7 @@ mod tests {
     use clipboard_rs::{Clipboard, ClipboardContext};
 
     use super::*;
-    use crate::clipboard::{build_item, ImageStore, WritebackGuard};
+    use crate::clipboard::{build_item, ImageStore};
     use crate::db::items::find_item_by_id;
     use crate::db::test_support::memory_pool;
 
@@ -862,7 +850,7 @@ mod tests {
     #[ignore = "touches the real system clipboard; run with --ignored on a desktop session"]
     async fn end_to_end_text_ingests_once_then_dedups() {
         let pool = memory_pool().await;
-        let guard = WritebackGuard::new();
+        let fingerprints = ClipboardFingerprintState::new();
         let (_dir, store) = temp_image_store();
 
         // 串行锁只覆盖触碰真实剪贴板的同步段，await DB 前即释放（不跨 await 持锁）。
@@ -880,7 +868,13 @@ mod tests {
                 .unwrap()
                 .expect("should map to item")
         };
-        assert!(!guard.should_skip(&item.content_hash));
+        let observation = fingerprints.begin_observation();
+        let observed = ClipboardFingerprint::from_text_item(&item).unwrap();
+        assert!(!fingerprints.consume_pending_writeback(
+            &observation,
+            observed.as_str(),
+            Some(&observed),
+        ));
 
         // 首次入库：新行。
         let first = upsert_item(&pool, &item).await.unwrap();
@@ -910,7 +904,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "touches the real system clipboard; run with --ignored on a desktop session"]
-    async fn writeback_guard_suppresses_self_copy() {
+    async fn fingerprint_state_suppresses_self_copy() {
         let (_dir, store) = temp_image_store();
         let _serial = crate::clipboard::test_lock::serial();
         let ctx = ClipboardContext::new().unwrap();
@@ -924,9 +918,16 @@ mod tests {
         let item = build_item(&store, &payload).unwrap().unwrap();
 
         // 模拟写回前登记 → 监听读到同内容 → 被抑制。
-        let guard = WritebackGuard::new();
-        guard.suppress(item.content_hash.clone());
-        assert!(guard.should_skip(&item.content_hash));
+        let fingerprints = ClipboardFingerprintState::new();
+        let expected = ClipboardFingerprint::from_text_item(&item).unwrap();
+        let _write = fingerprints.begin_write(expected);
+        let observation = fingerprints.begin_observation();
+        let observed = ClipboardFingerprint::from_text_item(&item).unwrap();
+        assert!(fingerprints.consume_pending_writeback(
+            &observation,
+            observed.as_str(),
+            Some(&observed),
+        ));
     }
 
     // 验证真实剪贴板图片链路：set_image（OS 原生 TIFF）→ read_with_capture 解码为 PNG →
