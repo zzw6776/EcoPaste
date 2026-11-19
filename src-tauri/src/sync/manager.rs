@@ -95,8 +95,8 @@ use super::{
     model::{
         BlobManifest, BlobRole, CloudDeviceDirectory, CloudDeviceStatus, CloudHubStatus,
         CloudRecord, CloudRecordPage, FieldVersion, IncomingJoinRequest, NearbyJoinAttempt,
-        NearbyJoinState, NearbySyncDevice, NearbySyncSpace, SourceAppRef, SourceIconRef,
-        StoredBlob, StoredContentObject, SyncChannelState, SyncChannelStatus,
+        NearbyJoinState, NearbySyncDevice, NearbySyncSpace, OutgoingBlobSource, SourceAppRef,
+        SourceIconRef, StoredBlob, StoredContentObject, SyncChannelState, SyncChannelStatus,
         SyncContentAvailability, SyncItemAction, SyncItemStatus, SyncLocalContentState,
         SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
         SyncedItemSnapshot,
@@ -1314,6 +1314,17 @@ impl SyncManager {
         });
     }
 
+    pub(super) fn schedule_attachment_wake(&self, delay: chrono::Duration) {
+        let delay = delay.to_std().unwrap_or(Duration::ZERO);
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
+                manager.wake_attachments();
+            }
+        });
+    }
+
     async fn sync_activity_guard(&self) -> SyncReadGuard<'_> {
         SyncReadGuard {
             guard: Some(self.runtime_state.lan_cycle_lock.read().await),
@@ -2208,12 +2219,18 @@ impl SyncManager {
         group: &GroupSecrets,
         blob: &StoredBlob,
     ) -> Result<StoredBlob> {
-        let expected = PathBuf::from(&blob.encrypted_path);
+        let root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
+        let expected = if blob.encrypted_path.is_empty() || blob.encrypted_path == SYNC_STAGING_DIR
+        {
+            crypto::blob_path(&root, &blob.blob_id)?
+        } else {
+            PathBuf::from(&blob.encrypted_path)
+        };
         let rebuild_lock = self.delivery.staging_rebuild_lock(&blob.blob_id);
-        let original = blob.clone();
+        let mut original = blob.clone();
+        original.encrypted_path = expected.to_string_lossy().into_owned();
         let source = blob.source_path.as_deref().map(PathBuf::from);
         let nonce = blob.stream_nonce.clone();
-        let root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
         let key = group.content_key_bytes()?;
         let source_is_directory = blob.source_is_directory;
         let rebuilt = tauri::async_runtime::spawn_blocking(move || -> Result<StoredBlob> {

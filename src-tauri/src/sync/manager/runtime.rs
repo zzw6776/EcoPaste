@@ -177,6 +177,7 @@ impl SyncManager {
         }
 
         let mut cloud_succeeded = false;
+        let mut cloud_superseded = false;
         let mut cloud_error = None;
         if cycle.target != SyncTarget::Lan {
             let cloud_cycle_started_at = Instant::now();
@@ -210,6 +211,21 @@ impl SyncManager {
                                 cloud_cycle_started_at.elapsed().as_millis()
                             );
                         }
+                        Err(error)
+                            if error.downcast_ref::<CloudConnectionSuperseded>().is_some()
+                                || is_locally_closed_cloud_connection(&connection) =>
+                        {
+                            cloud_superseded = true;
+                            log::debug!(
+                                "cloud sync cycle superseded by local connection replacement: connectionId={}",
+                                connection.stable_id()
+                            );
+                            if self.cached_cloud_connection().is_some_and(|current| {
+                                current.stable_id() != connection.stable_id()
+                            }) {
+                                self.wake_cloud_transfer();
+                            }
+                        }
                         Err(error) => {
                             log::warn!(
                                 "cloud sync cycle failed: connectionId={} error={error:#}",
@@ -229,7 +245,7 @@ impl SyncManager {
                             None,
                             true,
                         );
-                    } else {
+                    } else if !cloud_superseded {
                         let pending = repository::pending_outbound_writes(
                             &pool,
                             CLOUD_TARGET,
@@ -296,13 +312,17 @@ impl SyncManager {
                     .unwrap_or_else(|| "当前没有可用的局域网设备".to_owned())
             );
         }
-        if cycle.target == SyncTarget::Cloud && !cloud_succeeded {
+        if cycle.target == SyncTarget::Cloud && !cloud_succeeded && !cloud_superseded {
             bail!(
                 "{}",
                 cloud_error.unwrap_or_else(|| "云端同步未配置".to_owned())
             );
         }
-        if cycle.target != SyncTarget::Lan && server_is_configured(&settings) && !cloud_succeeded {
+        if cycle.target != SyncTarget::Lan
+            && server_is_configured(&settings)
+            && !cloud_succeeded
+            && !cloud_superseded
+        {
             bail!(
                 "{}",
                 cloud_error.unwrap_or_else(|| "云端同步失败".to_owned())

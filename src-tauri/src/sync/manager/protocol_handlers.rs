@@ -587,30 +587,13 @@ async fn dispatch_peer(
                 .await?;
                 return Ok(());
             };
-            let streaming_source = if blob.encrypted_path.is_empty() {
-                let Some(source) = blob.source_path.as_deref() else {
-                    write_frame(
-                        send,
-                        &Response::Error {
-                            code: ErrorCode::NotFound,
-                            message: "blob source is unavailable".to_owned(),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                let nonce = blob
-                    .stream_nonce
-                    .as_deref()
-                    .context("streaming blob nonce is unavailable")?;
-                Some((source.to_owned(), nonce.to_vec()))
-            } else {
-                None
-            };
-            let staged = if streaming_source.is_none() {
-                match manager.lease_outgoing_staging(&group, &blob).await {
-                    Ok(staged) => Some(staged),
-                    Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
+            let (streaming_source, staged) = match blob.outgoing_source() {
+                Some(OutgoingBlobSource::DirectStream {
+                    source_path,
+                    stream_nonce,
+                }) => {
+                    if !source_path.starts_with("content://") && !Path::new(source_path).is_file() {
+                        let _ = repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
                         write_frame(
                             send,
                             &Response::Error {
@@ -621,19 +604,45 @@ async fn dispatch_peer(
                         .await?;
                         return Ok(());
                     }
-                    Err(error) => return Err(error),
+                    (Some((source_path.to_owned(), stream_nonce.to_vec())), None)
                 }
-            } else {
-                None
+                Some(OutgoingBlobSource::StagedLease) => {
+                    match manager.lease_outgoing_staging(&group, &blob).await {
+                        Ok(staged) => (None, Some(staged)),
+                        Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
+                            let _ =
+                                repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
+                            write_frame(
+                                send,
+                                &Response::Error {
+                                    code: ErrorCode::NotFound,
+                                    message: "blob is unavailable".to_owned(),
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => {
+                    let _ = repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
+                    write_frame(
+                        send,
+                        &Response::Error {
+                            code: ErrorCode::NotFound,
+                            message: "blob is unavailable".to_owned(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
-            let upload = begin_lan_pull_upload(manager, connection, &pool, &group, &blob).await?;
-            if let Some(upload) = &upload {
-                upload.handle.connecting();
-            }
+            let transfer_lock_id = lock_lan_pull_item(&pool, &blob).await?;
             let mut progress = super::super::upload::UploadProgress::new(
                 connection.stable_id(),
                 blob_log_ref(&blob.blob_id),
-                upload.as_ref().map(|upload| upload.handle.clone()),
+                None,
             );
             progress.report_transferred = false;
             let result = async {
@@ -671,38 +680,18 @@ async fn dispatch_peer(
                     writer.shutdown().await?;
                     Ok::<(), anyhow::Error>(())
                 };
-                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |bytes| {
-                    if let Some(upload) = &upload {
-                        upload.handle.transferred(bytes);
-                    }
-                });
-                cancelable_transfer(
-                    multipart::until_stopped(send, async {
-                        tokio::try_join!(produce, transmit)?;
-                        Ok(())
-                    }),
-                    || {
-                        upload
-                            .as_ref()
-                            .is_some_and(|upload| upload.handle.canceled())
-                    },
-                )
+                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |_| {});
+                multipart::until_stopped(send, async {
+                    tokio::try_join!(produce, transmit)?;
+                    Ok(())
+                })
                 .await?;
                 write_frame(send, &Response::BlobStored).await?;
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            if let Some(upload) = upload {
-                match &result {
-                    Ok(()) => upload.handle.completed(upload.total_bytes),
-                    Err(_) if upload.handle.canceled() => {
-                        upload.handle.mark_canceled(progress.written_bytes);
-                    }
-                    Err(error) => upload
-                        .handle
-                        .failed(progress.written_bytes, error.to_string()),
-                }
-                if let Err(error) = repository::unlock_transfer_item(&pool, &upload.task_id).await {
+            if let Some(lock_id) = transfer_lock_id {
+                if let Err(error) = repository::unlock_transfer_item(&pool, &lock_id).await {
                     log::warn!("release LAN pull transfer protection failed: {error:#}");
                 }
             }
@@ -725,89 +714,17 @@ async fn dispatch_peer(
     Ok(())
 }
 
-struct LanPullUpload {
-    handle: super::super::progress::TransferHandle,
-    task_id: String,
-    total_bytes: u64,
-}
-
-/// Registers a receiver-initiated LAN pull in the same sender-side task lifecycle as a push.
-async fn begin_lan_pull_upload(
-    manager: &SyncManager,
-    connection: &Connection,
-    pool: &SqlitePool,
-    group: &GroupSecrets,
-    blob: &StoredBlob,
-) -> Result<Option<LanPullUpload>> {
+/// Protects the local clipboard item from history cleanup while a LAN peer streams its blob.
+async fn lock_lan_pull_item(pool: &SqlitePool, blob: &StoredBlob) -> Result<Option<String>> {
     let Some((sync_key, item_id)) = repository::item_id_for_blob(pool, &blob.blob_id).await? else {
         return Ok(None);
     };
-    let Some(meta) = repository::load_sync_item_meta(pool, &sync_key).await? else {
-        return Ok(None);
-    };
-    let (Some(item_key), Some(nonce), Some(ciphertext)) = (
-        meta.item_key.as_deref(),
-        meta.nonce.as_deref(),
-        meta.ciphertext.as_deref(),
-    ) else {
-        return Ok(None);
-    };
-    let snapshot = decrypt_stored_snapshot(
-        &group.content_key_bytes()?,
-        item_key,
-        meta.deleted,
-        meta.protected,
-        nonce,
-        ciphertext,
-    )?;
-    validate_snapshot(&snapshot)?;
-    let file_manifests = snapshot
-        .blobs
-        .iter()
-        .filter(|manifest| manifest.role == BlobRole::File)
-        .collect::<Vec<_>>();
-    let Some(manifest) = file_manifests
-        .iter()
-        .find(|manifest| manifest.blob_id == blob.blob_id)
-    else {
-        return Ok(None);
-    };
-    let Some(peer_device_id) =
-        repository::peer_device_id_by_endpoint(pool, &connection.remote_id().to_string()).await?
-    else {
-        return Ok(None);
-    };
-    let target = format!("peer:{peer_device_id}");
-    let operation_total_bytes = file_manifests.iter().fold(0_u64, |total, manifest| {
-        total.saturating_add(manifest.encrypted_size)
-    });
-    let task_key = format!("{sync_key}\0{target}\0{}\0lan-pull", blob.blob_id);
-    let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
-    repository::lock_transfer_item(pool, &task_id, &item_id).await?;
-    let handle = manager
-        .delivery
-        .start_transient(super::super::progress::TransferTask {
-            id: task_id.clone(),
-            revision: 0,
-            started_at_ms: chrono::Utc::now().timestamp_millis(),
-            operation_id: sync_key,
-            item_id,
-            direction: super::super::progress::TransferDirection::Upload,
-            route: super::super::progress::TransferRoute::Lan,
-            target,
-            file_name: (file_manifests.len() == 1).then(|| manifest.name.clone()),
-            phase: super::super::progress::TransferPhase::Queued,
-            transferred_bytes: 0,
-            total_bytes: operation_total_bytes,
-            speed_bytes_per_second: 0,
-            elapsed_ms: 0,
-            eta_seconds: None,
-            error: None,
-            cancellable: true,
-        });
-    Ok(Some(LanPullUpload {
-        handle,
-        task_id,
-        total_bytes: manifest.encrypted_size,
-    }))
+    let lock_id = format!(
+        "lan-pull:{}:{}:{}",
+        sync_key,
+        blob.blob_id,
+        Uuid::new_v4().simple()
+    );
+    repository::lock_transfer_item(pool, &lock_id, &item_id).await?;
+    Ok(Some(lock_id))
 }

@@ -22,9 +22,14 @@ pub struct SyncItemBlobRow {
 
 impl SyncItemBlobRow {
     pub fn to_stored_blob(&self) -> StoredBlob {
+        let encrypted_path = if !self.stream_commitment && self.encrypted_path.is_empty() {
+            super::super::manager::SYNC_STAGING_DIR.to_owned()
+        } else {
+            self.encrypted_path.clone()
+        };
         StoredBlob {
             blob_id: self.blob_id.clone(),
-            encrypted_path: self.encrypted_path.clone(),
+            encrypted_path,
             size: self.size,
             source_path: self.source_path.clone(),
             source_is_directory: self.source_is_directory,
@@ -1177,12 +1182,18 @@ pub async fn pending_cloud_blob_uploads(
     Ok(uploads)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudBlobAvailableOutcome {
+    pub completed: bool,
+    pub needs_control_push: bool,
+}
+
 /// Marks one content blob uploaded to Cloud and promotes the cloud target to `Complete` once all blobs land.
 pub async fn mark_blob_cloud_available(
     pool: &SqlitePool,
     sync_key: &str,
     blob_id: &str,
-) -> Result<bool> {
+) -> Result<CloudBlobAvailableOutcome> {
     let mut transaction = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -1208,13 +1219,21 @@ pub async fn mark_blob_cloud_available(
     .await
     .context("count remaining cloud blobs for item")?;
 
-    let completed = if remaining == 0 {
+    let (completed, needs_control_push) = if remaining == 0 {
         let current_seq: i64 =
             sqlx::query_scalar("SELECT local_seq FROM sync_items WHERE sync_key = ?")
                 .bind(sync_key)
                 .fetch_optional(&mut *transaction)
                 .await?
                 .unwrap_or(0);
+        let pushed_local_seq: i64 = sqlx::query_scalar(
+            "SELECT pushed_local_seq FROM sync_item_targets \
+             WHERE sync_key = ? AND target_id = 'cloud'",
+        )
+        .bind(sync_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or(0);
         let result = sqlx::query(
             r#"
             UPDATE sync_item_targets
@@ -1235,15 +1254,19 @@ pub async fn mark_blob_cloud_available(
         .execute(&mut *transaction)
         .await
         .context("promote cloud target to complete")?;
-        result.rows_affected() > 0
+        let updated = result.rows_affected() > 0;
+        (updated, updated && pushed_local_seq < current_seq)
     } else {
-        false
+        (false, false)
     };
     transaction
         .commit()
         .await
         .context("commit cloud blob availability")?;
-    Ok(completed)
+    Ok(CloudBlobAvailableOutcome {
+        completed,
+        needs_control_push,
+    })
 }
 
 /// Persists a merged remote snapshot received from Cloud or a LAN peer.
@@ -1857,7 +1880,8 @@ pub async fn load_item_blobs(pool: &SqlitePool, sync_key: &str) -> Result<Vec<Sy
 pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<StoredBlob>> {
     let row = sqlx::query(
         r#"
-        SELECT blob_id, encrypted_path, size, source_path, source_is_directory, stream_nonce
+        SELECT blob_id, encrypted_path, size, source_path, source_is_directory,
+               stream_nonce, stream_commitment
         FROM sync_item_blobs
         WHERE blob_id = ? AND local_available = 1
         ORDER BY CASE WHEN encrypted_path <> '' THEN 0 ELSE 1 END ASC
@@ -1869,9 +1893,16 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
     .await
     .context("lookup outgoing sync item blob")?;
     if let Some(row) = row {
+        let raw_encrypted_path: String = row.try_get("encrypted_path")?;
+        let stream_commitment: bool = row.try_get("stream_commitment")?;
+        let encrypted_path = if !stream_commitment && raw_encrypted_path.is_empty() {
+            super::super::manager::SYNC_STAGING_DIR.to_owned()
+        } else {
+            raw_encrypted_path
+        };
         return Ok(Some(StoredBlob {
             blob_id: row.try_get("blob_id")?,
-            encrypted_path: row.try_get("encrypted_path")?,
+            encrypted_path,
             size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
             source_path: row.try_get("source_path")?,
             source_is_directory: row.try_get("source_is_directory")?,
@@ -1893,14 +1924,30 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
     let Some(row) = icon_row else {
         return Ok(None);
     };
+    let raw_encrypted_path: String = row.try_get("encrypted_path")?;
+    let encrypted_path = if raw_encrypted_path.is_empty() {
+        super::super::manager::SYNC_STAGING_DIR.to_owned()
+    } else {
+        raw_encrypted_path
+    };
     Ok(Some(StoredBlob {
         blob_id: row.try_get("blob_id")?,
-        encrypted_path: row.try_get("encrypted_path")?,
+        encrypted_path,
         size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
         source_path: row.try_get("source_path")?,
         source_is_directory: false,
         stream_nonce: row.try_get("stream_nonce")?,
     }))
+}
+
+pub async fn mark_blob_local_unavailable(pool: &SqlitePool, blob_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sync_item_blobs SET local_available = 0, updated_at = ? WHERE blob_id = ?")
+        .bind(Utc::now())
+        .bind(blob_id)
+        .execute(pool)
+        .await
+        .context("mark sync item blob local_available = 0")?;
+    Ok(())
 }
 
 pub async fn item_id_for_blob(

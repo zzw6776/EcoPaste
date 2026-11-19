@@ -222,6 +222,7 @@ impl SyncManager {
             .load(Ordering::Acquire);
         let mut remote_latest_hint: Option<u64> = (observed > 0).then_some(observed);
         let mut has_more = false;
+        let mut active_connection = connection.clone();
         let exchange_lock = self
             .runtime_state
             .exchange_locks
@@ -232,6 +233,16 @@ impl SyncManager {
             .clone();
 
         for batch_index in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
+            if active_connection.close_reason().is_some() {
+                if let Some(replacement) = self
+                    .cached_cloud_connection()
+                    .filter(|candidate| self.cloud_group_is_ready(candidate, &group.group_id))
+                {
+                    active_connection = replacement;
+                } else if is_locally_closed_cloud_connection(&active_connection) {
+                    return Err(CloudConnectionSuperseded.into());
+                }
+            }
             if batch_index > 0
                 && self
                     .runtime_state
@@ -318,10 +329,13 @@ impl SyncManager {
             let submitted_keys = pushed_local_seqs.keys().cloned().collect::<Vec<_>>();
 
             let started_at = Instant::now();
-            let response = match call_cloud(connection, request, language).await {
+            let response = match call_cloud(&active_connection, request, language).await {
                 Ok(response) => response,
                 Err(error) => {
                     drop(exchange_guard);
+                    if is_locally_closed_cloud_connection(&active_connection) {
+                        return Err(CloudConnectionSuperseded.into());
+                    }
                     let _ = self
                         .mark_delivery_error_by_item_keys(
                             &pool,
@@ -330,8 +344,8 @@ impl SyncManager {
                             &error.to_string(),
                         )
                         .await;
-                    if should_invalidate_cloud_connection(connection, &error) {
-                        self.invalidate_cloud_connection(connection.stable_id());
+                    if should_invalidate_cloud_connection(&active_connection, &error) {
+                        self.invalidate_cloud_connection(active_connection.stable_id());
                         self.runtime_state.watch_wake.notify_one();
                     }
                     return Err(error);
@@ -746,6 +760,7 @@ impl SyncManager {
         };
 
         let mut item_failed = false;
+        let mut needs_control_push = false;
         for blob_row in &upload.blobs {
             let stored_blob = blob_row.to_stored_blob();
             let transfer = if track_transfer {
@@ -788,12 +803,15 @@ impl SyncManager {
             };
             let mut upload_started = false;
             let result = async {
-                let (staged, _lease) = if stored_blob.encrypted_path.is_empty() {
-                    (stored_blob.clone(), None)
-                } else {
-                    let (staged, lease) = self.lease_outgoing_staging(group, &stored_blob).await?;
-                    (staged, Some(lease))
-                };
+                let (staged, _lease) =
+                    match stored_blob.outgoing_source().ok_or(RemoteBlobUnavailable)? {
+                        OutgoingBlobSource::DirectStream { .. } => (stored_blob.clone(), None),
+                        OutgoingBlobSource::StagedLease => {
+                            let (staged, lease) =
+                                self.lease_outgoing_staging(group, &stored_blob).await?;
+                            (staged, Some(lease))
+                        }
+                    };
                 upload_started = true;
                 upload_blob(data_connection, group, &staged, options).await
             }
@@ -801,12 +819,13 @@ impl SyncManager {
 
             match result {
                 Ok(()) => {
-                    let completed = repository::mark_blob_cloud_available(
+                    let outcome = repository::mark_blob_cloud_available(
                         pool,
                         &upload.sync_key,
                         &blob_row.blob_id,
                     )
                     .await?;
+                    needs_control_push |= outcome.needs_control_push;
                     if !blob_row.encrypted_path.is_empty()
                         && blob_row.source_path.is_some()
                         && blob_row.stream_nonce.is_some()
@@ -816,7 +835,7 @@ impl SyncManager {
                             PathBuf::from(&blob_row.encrypted_path),
                         );
                     }
-                    if completed {
+                    if outcome.completed {
                         self.emit_updated();
                     }
                 }
@@ -831,6 +850,8 @@ impl SyncManager {
                         }
                     }
                     if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
+                        let _ =
+                            repository::mark_blob_local_unavailable(pool, &blob_row.blob_id).await;
                         self.delivery
                             .blocked(pool, CLOUD_TARGET, &upload.sync_key, &error.to_string())
                             .await?;
@@ -856,8 +877,9 @@ impl SyncManager {
         }
 
         if !item_failed {
-            // Ensure CloudSyncItems also runs if this item's metadata hasn't been pushed yet.
-            self.runtime_state.cloud_transfer_wake.notify_one();
+            if needs_control_push {
+                self.runtime_state.cloud_transfer_wake.notify_one();
+            }
             if upload.history_backfill {
                 self.notify_local_outbox_backfill();
             }

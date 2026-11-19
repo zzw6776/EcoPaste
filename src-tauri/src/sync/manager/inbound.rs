@@ -860,10 +860,16 @@ impl SyncManager {
             return Ok(true);
         }
 
-        let is_files = synced_item.kind == "files";
-        let transfer_handle = if is_files {
+        let is_realtime_files = synced_item.kind == "files"
+            && (realtime_only
+                || updated_at.timestamp_millis()
+                    >= Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(VIP_REALTIME_RECENCY_MS));
+        let transfer_handle = if is_realtime_files {
             if let Some(item_id) = meta.item_id.as_deref() {
-                let task_id = Uuid::new_v4().simple().to_string();
+                let task_key = format!("{}\0{target_id}\0download", meta.sync_key);
+                let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
                 repository::lock_transfer_item(pool, &task_id, item_id).await?;
                 let handle = self.delivery.start(super::super::progress::TransferTask {
                     id: task_id.clone(),
@@ -931,6 +937,35 @@ impl SyncManager {
             let canceled = transfer_handle
                 .as_ref()
                 .is_some_and(|(_, handle)| handle.canceled());
+            if !canceled && error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
+                log::warn!(
+                    "remote blob unavailable on {target_id}; downgrading source availability: syncKey={} blobRef={}",
+                    &meta.sync_key[..meta.sync_key.len().min(12)],
+                    blob_log_ref(&failed_blob_id),
+                );
+                let exhausted = repository::downgrade_source_availability_on_missing_blob(
+                    pool,
+                    &meta.sync_key,
+                    target_id,
+                    &failed_blob_id,
+                )
+                .await?;
+                if let Some((task_id, handle)) = &transfer_handle {
+                    if exhausted {
+                        let bytes = transferred.load(Ordering::Acquire);
+                        handle.failed(bytes, error.to_string());
+                    } else {
+                        handle.abandon();
+                    }
+                    let _ = repository::unlock_transfer_item(pool, task_id).await;
+                }
+                drop(download_claim);
+                for blob in staged_blobs {
+                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+                }
+                self.emit_updated();
+                return Ok(true);
+            }
             if let Some((task_id, handle)) = &transfer_handle {
                 let bytes = transferred.load(Ordering::Acquire);
                 if canceled {
@@ -953,25 +988,6 @@ impl SyncManager {
                 for blob in staged_blobs {
                     let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
                 }
-                return Ok(true);
-            }
-            if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
-                log::warn!(
-                    "remote blob unavailable on {target_id}; downgrading source availability: syncKey={} blobRef={}",
-                    &meta.sync_key[..meta.sync_key.len().min(12)],
-                    blob_log_ref(&failed_blob_id),
-                );
-                let _ = repository::downgrade_source_availability_on_missing_blob(
-                    pool,
-                    &meta.sync_key,
-                    target_id,
-                    &failed_blob_id,
-                )
-                .await?;
-                for blob in staged_blobs {
-                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
-                }
-                self.emit_updated();
                 return Ok(true);
             }
             if source.is_cloud() && should_invalidate_cloud_connection(data_connection, &error) {
@@ -1010,9 +1026,13 @@ impl SyncManager {
                         .await
                     {
                         for source_blob in sources {
-                            // Directory archives must stay on the staging-rebuild path (`encrypted_path != ""`)
-                            // because `encrypt_upload_source` streams only regular files/URIs.
-                            let stored_encrypted_path = if source_blob.source_is_directory {
+                            // Images and directory archives use ciphertext-hashed `blob_id`s
+                            // (`stream_commitment = false`) and must stay on the staging-rebuild
+                            // path (`encrypted_path != ""`) because `encrypt_upload_source`
+                            // streams only stream-committed regular files/URIs.
+                            let stored_encrypted_path = if source_blob.source_is_directory
+                                || item.kind == ClipboardKind::Image
+                            {
                                 source_blob.encrypted_path.as_str()
                             } else {
                                 ""
