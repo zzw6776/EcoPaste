@@ -250,19 +250,18 @@ mod tests {
             .unwrap());
         }
 
-        let writes = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+        let batch = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
             .await
             .unwrap();
-        assert_eq!(writes.len(), 2);
-        // Realtime item MUST come first even though its timestamp was earlier!
+        // Realtime item MUST be sent in its own dedicated batch without piggybacking backfill,
+        // while flagging `has_more` so the control loop advances to backfill immediately after.
+        assert_eq!(batch.writes.len(), 1);
+        assert!(batch.has_more);
         assert_eq!(
-            writes[0].item_key,
+            batch.writes[0].item_key,
             crypto::derive_item_key(&key, &realtime_item.sync_key)
         );
-        assert_eq!(
-            writes[1].item_key,
-            crypto::derive_item_key(&key, &backfill_item.sync_key)
-        );
+        let writes = batch.writes;
 
         // Confirm cloud & LAN inline ack -> card status becomes immediately green!
         let seqs = writes
@@ -280,6 +279,17 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // Once realtime is accepted, the next batch serves historical backfill.
+        let backfill_batch = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+            .await
+            .unwrap();
+        assert_eq!(backfill_batch.writes.len(), 1);
+        assert!(!backfill_batch.has_more);
+        assert_eq!(
+            backfill_batch.writes[0].item_key,
+            crypto::derive_item_key(&key, &backfill_item.sync_key)
+        );
         record_lan_acks(
             &pool,
             "peer:dev-b",
@@ -386,10 +396,12 @@ mod tests {
         assert!(pending_outbound_writes(&pool, CLOUD_TARGET, 10)
             .await
             .unwrap()
+            .writes
             .is_empty());
         assert!(pending_outbound_writes(&pool, "peer:dev-other", 10)
             .await
             .unwrap()
+            .writes
             .is_empty());
 
         // The sender's `remote_seq` (42) must be persisted for later `AckLanItems`.
@@ -578,7 +590,8 @@ mod tests {
         .unwrap();
         let lan_writes = pending_outbound_writes(&pool, "peer:dev-b", 10)
             .await
-            .unwrap();
+            .unwrap()
+            .writes;
         assert_eq!(lan_writes.len(), 1);
         assert_eq!(lan_writes[0].blob_ids, vec![local_blob.blob_id]);
     }
@@ -924,6 +937,7 @@ mod tests {
         assert!(pending_outbound_writes(&pool, CLOUD_TARGET, 10)
             .await
             .unwrap()
+            .writes
             .is_empty());
         assert!(pending_cloud_blob_uploads(&pool, false, 10)
             .await
@@ -966,6 +980,7 @@ mod tests {
             pending_outbound_writes(&pool, CLOUD_TARGET, 10)
                 .await
                 .unwrap()
+                .writes
                 .len(),
             1
         );
@@ -1364,6 +1379,7 @@ mod tests {
             pending_outbound_writes(&pool, CLOUD_TARGET, 10)
                 .await
                 .unwrap()
+                .writes
                 .len(),
             1
         );
@@ -1595,5 +1611,194 @@ mod tests {
             .expect("content object recorded");
         assert_eq!(reusable.blob_id, blob_id);
         assert_eq!(reusable.stream_nonce, stream_nonce);
+    }
+
+    #[tokio::test]
+    async fn backfill_progress_and_backlog_watermarks_track_convergence_cleanly() {
+        let pool = memory_pool().await;
+        let key = [37_u8; 32];
+        let bf_a = sample_item("bf-a", 1_700_000_100);
+        let bf_b = sample_item("bf-b", 1_700_000_200);
+        let rt = sample_item("rt-now", 1_700_000_300);
+
+        for (item, backfill) in [(&bf_a, true), (&bf_b, true), (&rt, false)] {
+            upsert_item_with_sync_outbox(
+                &pool,
+                item,
+                Some(ContentSyncOptions {
+                    history_backfill: backfill,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Scope isolation: RealtimeOnly never returns backfill items; BackfillOnly never returns realtime.
+        let rt_prep = crate::db::sync_items::next_pending_content(
+            &pool,
+            false,
+            Some(crate::db::sync_items::OutboxContentLane::Text),
+            crate::db::sync_items::OutboxContentScope::RealtimeOnly,
+        )
+        .await
+        .unwrap()
+        .expect("realtime pending content");
+        assert_eq!(rt_prep.sync_key, rt.sync_key);
+
+        let bf_prep = crate::db::sync_items::next_pending_content(
+            &pool,
+            false,
+            Some(crate::db::sync_items::OutboxContentLane::Text),
+            crate::db::sync_items::OutboxContentScope::BackfillOnly,
+        )
+        .await
+        .unwrap()
+        .expect("backfill pending content");
+        assert_eq!(bf_prep.sync_key, bf_b.sync_key);
+
+        // Before anything is confirmed, backfill progress reports 0 / 2.
+        let progress = backfill_progress(&pool, false, true, false)
+            .await
+            .unwrap()
+            .expect("active backfill progress");
+        assert_eq!(progress.completed, 0);
+        assert_eq!(progress.total, 2);
+        assert_eq!(
+            count_ready_backfill_backlog(&pool, true, false)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+
+        // Prepare both backfill items -> ready backlog reaches 2.
+        for item in [&bf_a, &bf_b] {
+            let local_seq = local_seq_of(&pool, &item.sync_key).await;
+            let item_key = crypto::derive_item_key(&key, &item.sync_key);
+            let snapshot = SyncedItemSnapshot {
+                version: SNAPSHOT_VERSION,
+                sync_key: item.sync_key.clone(),
+                content_version: FieldVersion::new(1, "dev-a"),
+                presence_version: FieldVersion::new(1, "dev-a"),
+                favorite_version: FieldVersion::default(),
+                pinned_version: FieldVersion::default(),
+                note_version: FieldVersion::default(),
+                is_present: true,
+                is_favorite: false,
+                is_pinned: false,
+                note: None,
+                item: Some(SyncedClipboardItem {
+                    kind: "text".into(),
+                    sub_kind: None,
+                    content: item.content.clone(),
+                    search_text: item.search_text.clone(),
+                    summary: item.summary.clone(),
+                    file_types: None,
+                    size: None,
+                    width: None,
+                    height: None,
+                    is_sensitive: false,
+                    source_platform: "macos".into(),
+                    created_at_ms: item.created_at.timestamp_millis(),
+                    sync_key: item.sync_key.clone(),
+                    updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                    source_revision: Some(item.source_revision.clone()),
+                    source_device_id: Some("dev-a".into()),
+                    source_device_name: Some("Mac".into()),
+                    source_updated_at_ms: Some(item.updated_at.timestamp_millis()),
+                }),
+                blobs: Vec::new(),
+                source_app: None,
+                content_identity: None,
+            };
+            let (nonce, ciphertext) =
+                crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+            assert!(commit_prepared_item(
+                &pool,
+                PreparedItemCommit {
+                    sync_key: &item.sync_key,
+                    item_key: &item_key,
+                    item_id: Some(&item.id),
+                    expected_local_seq: local_seq,
+                    origin_device_id: "dev-a",
+                    content_identity: None,
+                    group_id: "group-1",
+                    snapshot: &snapshot,
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                    blobs: &[],
+                    content_objects: &[],
+                    cloud_desired: Some(ContentLevel::Complete),
+                },
+            )
+            .await
+            .unwrap());
+        }
+
+        assert_eq!(
+            count_ready_backfill_backlog(&pool, true, false)
+                .await
+                .unwrap(),
+            (2, 0)
+        );
+
+        // Confirm first backfill item -> progress becomes 1 / 2 and ready backlog drops to 1.
+        let batch = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+            .await
+            .unwrap();
+        assert_eq!(batch.writes.len(), 2);
+        let first = &batch.writes[0];
+        let mut seqs = HashMap::new();
+        seqs.insert(first.item_key.clone(), first.local_seq);
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: first.item_key.clone(),
+                hub_rev: 1,
+                seq: 1,
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+
+        let progress = backfill_progress(&pool, false, true, false)
+            .await
+            .unwrap()
+            .expect("halfway backfill progress");
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 2);
+        assert_eq!(
+            count_ready_backfill_backlog(&pool, true, false)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+
+        // Confirm second backfill item -> progress disappears (`None`) and backlog hits 0.
+        let second = &batch.writes[1];
+        seqs.insert(second.item_key.clone(), second.local_seq);
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: second.item_key.clone(),
+                hub_rev: 2,
+                seq: 2,
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            backfill_progress(&pool, false, true, false).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            count_ready_backfill_backlog(&pool, true, false)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
     }
 }

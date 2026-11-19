@@ -164,6 +164,11 @@ export interface CleanCacheResult {
   storageUsage: StorageUsage;
 }
 
+export interface SyncBackfillProgress {
+  completed: number;
+  total: number;
+}
+
 export interface SyncStatus {
   enabled: boolean;
   lanEnabled: boolean;
@@ -188,6 +193,7 @@ export interface SyncStatus {
   cloudConnectedAddress: string | null;
   cloudTransport: string | null;
   cloudServerVersion: string | null;
+  backfill: SyncBackfillProgress | null;
   peers: SyncPeerStatus[];
 }
 

@@ -455,6 +455,13 @@ pub struct StoredContentObject {
     pub encrypted_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBackfillProgress {
+    pub completed: u64,
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -481,6 +488,7 @@ pub struct SyncStatus {
     pub cloud_connected_address: Option<String>,
     pub cloud_transport: Option<String>,
     pub cloud_server_version: Option<String>,
+    pub backfill: Option<SyncBackfillProgress>,
     pub peers: Vec<SyncPeerStatus>,
 }
 

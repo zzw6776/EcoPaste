@@ -285,6 +285,10 @@
   },
   "transferCenter": {
     "active": "进行中",
+    "backfill": {
+      "description": "后台同步历史记录，不阻塞最新复制",
+      "title": "自动回填"
+    },
     "clearFinished": "清空已结束",
     "download": {
       "canceled": "下载已取消",

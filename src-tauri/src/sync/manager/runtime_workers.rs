@@ -1,8 +1,30 @@
 use super::*;
 
-pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) {
+const BACKFILL_READY_ITEMS_WATERMARK: i64 = 64;
+const BACKFILL_READY_BLOBS_WATERMARK: i64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LocalOutboxWorkerMode {
+    InlineAndImages,
+    BackfillFiles,
+    RealtimeFiles,
+}
+
+impl LocalOutboxWorkerMode {
+    fn wake_index(self) -> usize {
+        match self {
+            Self::InlineAndImages => 0,
+            Self::BackfillFiles => 1,
+            Self::RealtimeFiles => 2,
+        }
+    }
+}
+
+pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, mode: LocalOutboxWorkerMode) {
+    let wake_index = mode.wake_index();
+    let files = mode != LocalOutboxWorkerMode::InlineAndImages;
     loop {
-        manager.runtime_state.local_outbox_wake[usize::from(files)]
+        manager.runtime_state.local_outbox_wake[wake_index]
             .notified()
             .await;
         loop {
@@ -36,30 +58,84 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                 break;
             }
             let activity = manager.sync_activity_guard().await;
-            if !files {
+            if mode == LocalOutboxWorkerMode::InlineAndImages {
                 let prepared = async {
-                    let mut count = manager.materialize_dirty_states(None).await?;
+                    let mut realtime_count = manager.materialize_dirty_states(None).await?;
                     let text_run = manager
                         .materialize_content_lane(
                             db::sync_items::OutboxContentLane::Text,
+                            db::sync_items::OutboxContentScope::RealtimeOnly,
                             16,
                             None,
                             None,
                         )
                         .await?;
-                    count += text_run.processed;
+                    realtime_count += text_run.processed;
                     text_run.staging.retain_for_delivery();
                     let image_run = manager
                         .materialize_content_lane(
                             db::sync_items::OutboxContentLane::Image,
+                            db::sync_items::OutboxContentScope::RealtimeOnly,
                             2,
                             None,
                             None,
                         )
                         .await?;
-                    count += image_run.processed;
+                    realtime_count += image_run.processed;
                     image_run.staging.retain_for_delivery();
-                    Ok::<usize, anyhow::Error>(count)
+                    if realtime_count > 0 {
+                        return Ok::<usize, anyhow::Error>(realtime_count);
+                    }
+                    if manager
+                        .runtime_state
+                        .realtime_pending
+                        .load(Ordering::Acquire)
+                        || manager.is_storage_suspended()
+                    {
+                        return Ok(0);
+                    }
+                    let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                    if !settings.enabled || manager.identity.snapshot().group.is_none() {
+                        return Ok(0);
+                    }
+                    let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
+                    let pool = manager.pool().await;
+                    let (unpushed_items, pending_blobs) = repository::count_ready_backfill_backlog(
+                        &pool,
+                        cloud_enabled,
+                        settings.lan_enabled,
+                    )
+                    .await?;
+                    let mut backfill_count = 0_usize;
+                    if unpushed_items < BACKFILL_READY_ITEMS_WATERMARK {
+                        let text_run = manager
+                            .materialize_content_lane(
+                                db::sync_items::OutboxContentLane::Text,
+                                db::sync_items::OutboxContentScope::BackfillOnly,
+                                16,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        backfill_count += text_run.processed;
+                        text_run.staging.retain_for_delivery();
+                    }
+                    if unpushed_items < BACKFILL_READY_ITEMS_WATERMARK
+                        && pending_blobs < BACKFILL_READY_BLOBS_WATERMARK
+                    {
+                        let image_run = manager
+                            .materialize_content_lane(
+                                db::sync_items::OutboxContentLane::Image,
+                                db::sync_items::OutboxContentScope::BackfillOnly,
+                                2,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        backfill_count += image_run.processed;
+                        image_run.staging.retain_for_delivery();
+                    }
+                    Ok::<usize, anyhow::Error>(backfill_count)
                 }
                 .await;
                 drop(activity);
@@ -69,16 +145,56 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                     Err(error) => {
                         log::warn!("materialize local sync outbox failed: {error:#}");
                         tokio::select! {
-                            _ = manager.runtime_state.local_outbox_wake[0].notified() => {}
+                            _ = manager.runtime_state.local_outbox_wake[wake_index].notified() => {}
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         }
                     }
                 }
                 continue;
             }
+            let file_scope = if mode == LocalOutboxWorkerMode::RealtimeFiles {
+                db::sync_items::OutboxContentScope::RealtimeOnly
+            } else {
+                db::sync_items::OutboxContentScope::BackfillOnly
+            };
+            if mode == LocalOutboxWorkerMode::BackfillFiles {
+                if manager
+                    .runtime_state
+                    .realtime_pending
+                    .load(Ordering::Acquire)
+                {
+                    drop(activity);
+                    break;
+                }
+                let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
+                let pool = manager.pool().await;
+                match repository::count_ready_backfill_backlog(
+                    &pool,
+                    cloud_enabled,
+                    settings.lan_enabled,
+                )
+                .await
+                {
+                    Ok((unpushed_items, pending_blobs))
+                        if unpushed_items >= BACKFILL_READY_ITEMS_WATERMARK
+                            || pending_blobs >= BACKFILL_READY_BLOBS_WATERMARK =>
+                    {
+                        drop(activity);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("read local backfill backlog count failed: {error:#}");
+                        drop(activity);
+                        break;
+                    }
+                }
+            }
             let prepared = manager
                 .materialize_content_lane(
                     db::sync_items::OutboxContentLane::Files,
+                    file_scope,
                     1,
                     target.as_ref(),
                     None,
@@ -101,6 +217,7 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                             &pool,
                             settings.sync_sensitive,
                             db::sync_items::OutboxContentLane::Files,
+                            file_scope,
                         )
                         .await
                         {
@@ -116,7 +233,7 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                     };
                     let delay = (retry_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake[1].notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[wake_index].notified() => {}
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
@@ -127,7 +244,7 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, files: bool) 
                 Err(error) => {
                     log::warn!("materialize local sync outbox failed: {error:#}");
                     tokio::select! {
-                        _ = manager.runtime_state.local_outbox_wake[1].notified() => {}
+                        _ = manager.runtime_state.local_outbox_wake[wake_index].notified() => {}
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     }
                 }
@@ -927,6 +1044,10 @@ pub(super) fn apply_cloud_watch_watermarks(
     seq: &mut u64,
     removed_at_ms: &mut i64,
 ) {
+    manager
+        .runtime_state
+        .cloud_observed_latest_seq
+        .fetch_max(latest_seq, Ordering::AcqRel);
     let Some(changes) =
         advance_cloud_watch_watermarks(latest_seq, latest_removed_at_ms, seq, removed_at_ms)
     else {

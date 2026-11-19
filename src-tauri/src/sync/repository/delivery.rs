@@ -33,12 +33,22 @@ impl SyncItemBlobRow {
     }
 }
 
+const BACKFILL_CONTROL_BATCH_LIMIT: u16 = 64;
+
 #[derive(Debug, Clone)]
 pub struct PendingCloudBlobUpload {
     pub sync_key: String,
     pub item_id: Option<String>,
     pub kind: String,
+    pub history_backfill: bool,
+    pub manual_share: bool,
     pub blobs: Vec<SyncItemBlobRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOutboundBatch {
+    pub writes: Vec<SyncItemWrite>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -526,16 +536,20 @@ pub async fn commit_prepared_item(
 
 /// Selects the highest-priority pending outbound item writes for `target_id` (Cloud or a LAN peer).
 ///
-/// Always orders realtime/manual items (`history_backfill = 0`) and newest clipboard timestamps
-/// ahead of historical backfill so fresh copies are never delayed by backlog.
+/// Realtime/manual items (`history_backfill = 0 || manual_share = 1`) are always dispatched in
+/// their own dedicated batch without piggybacking historical backfill so fresh copies finish in
+/// one fast round-trip; backfill items run in bounded 64-item slices for fast preemption.
 pub async fn pending_outbound_writes(
     pool: &SqlitePool,
     target_id: &str,
     limit: u16,
-) -> Result<Vec<SyncItemWrite>> {
+) -> Result<PendingOutboundBatch> {
     let is_cloud = target_id == CLOUD_TARGET;
     let route_exclude = if is_cloud { "lan" } else { "cloud" };
-    let rows = sqlx::query(
+    let effective_limit = limit.max(1);
+    let realtime_fetch_limit = i64::from(effective_limit) + 1;
+
+    let mut rows = sqlx::query(
         r#"
         SELECT s.sync_key, s.item_key, s.hub_rev, s.local_seq,
                COALESCE(s.origin_device_id, '') AS origin_device_id,
@@ -550,6 +564,7 @@ pub async fn pending_outbound_writes(
           AND s.nonce IS NOT NULL
           AND s.ciphertext IS NOT NULL
           AND (s.delivery_route IS NULL OR s.delivery_route <> ?)
+          AND (s.history_backfill = 0 OR s.manual_share = 1)
           AND (
               t.target_id IS NULL
               OR (
@@ -558,7 +573,6 @@ pub async fn pending_outbound_writes(
               )
           )
         ORDER BY s.manual_share DESC,
-                 s.history_backfill ASC,
                  s.payload_updated_at_ms DESC,
                  s.local_seq DESC
         LIMIT ?
@@ -566,13 +580,96 @@ pub async fn pending_outbound_writes(
     )
     .bind(target_id)
     .bind(route_exclude)
-    .bind(i64::from(limit.max(1)))
+    .bind(realtime_fetch_limit)
     .fetch_all(pool)
     .await
-    .context("query pending outbound sync item writes")?;
+    .context("query pending realtime outbound sync item writes")?;
+
+    let has_more = if !rows.is_empty() {
+        let truncated = rows.len() > usize::from(effective_limit);
+        rows.truncate(usize::from(effective_limit));
+        if truncated {
+            true
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM sync_items s
+                    LEFT JOIN sync_item_targets t
+                      ON t.sync_key = s.sync_key AND t.target_id = ?
+                    WHERE s.prep_state = 'ready'
+                      AND s.local_seq > 0
+                      AND s.item_key IS NOT NULL
+                      AND s.nonce IS NOT NULL
+                      AND s.ciphertext IS NOT NULL
+                      AND (s.delivery_route IS NULL OR s.delivery_route <> ?)
+                      AND s.history_backfill = 1
+                      AND s.manual_share = 0
+                      AND (
+                          t.target_id IS NULL
+                          OR (
+                              t.status NOT IN ('blocked', 'canceled')
+                              AND (t.pushed_local_seq < s.local_seq OR t.acked_local_seq < s.local_seq)
+                          )
+                      )
+                )
+                "#,
+            )
+            .bind(target_id)
+            .bind(route_exclude)
+            .fetch_one(pool)
+            .await
+            .context("check remaining backfill outbound writes")?
+        }
+    } else {
+        let backfill_limit = effective_limit.min(BACKFILL_CONTROL_BATCH_LIMIT);
+        let backfill_fetch_limit = i64::from(backfill_limit) + 1;
+        rows = sqlx::query(
+            r#"
+            SELECT s.sync_key, s.item_key, s.hub_rev, s.local_seq,
+                   COALESCE(s.origin_device_id, '') AS origin_device_id,
+                   s.payload_updated_at_ms, s.deleted, s.protected,
+                   s.nonce, s.ciphertext
+            FROM sync_items s
+            LEFT JOIN sync_item_targets t
+              ON t.sync_key = s.sync_key AND t.target_id = ?
+            WHERE s.prep_state = 'ready'
+              AND s.local_seq > 0
+              AND s.item_key IS NOT NULL
+              AND s.nonce IS NOT NULL
+              AND s.ciphertext IS NOT NULL
+              AND (s.delivery_route IS NULL OR s.delivery_route <> ?)
+              AND s.history_backfill = 1
+              AND s.manual_share = 0
+              AND (
+                  t.target_id IS NULL
+                  OR (
+                      t.status NOT IN ('blocked', 'canceled')
+                      AND (t.pushed_local_seq < s.local_seq OR t.acked_local_seq < s.local_seq)
+                  )
+              )
+            ORDER BY s.payload_updated_at_ms DESC,
+                     s.local_seq DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(target_id)
+        .bind(route_exclude)
+        .bind(backfill_fetch_limit)
+        .fetch_all(pool)
+        .await
+        .context("query pending backfill outbound sync item writes")?;
+        let truncated = rows.len() > usize::from(backfill_limit);
+        rows.truncate(usize::from(backfill_limit));
+        truncated
+    };
 
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PendingOutboundBatch {
+            writes: Vec::new(),
+            has_more: false,
+        });
     }
 
     let sync_keys = rows
@@ -626,7 +723,104 @@ pub async fn pending_outbound_writes(
             optional_blob_ids,
         });
     }
-    Ok(writes)
+    Ok(PendingOutboundBatch { writes, has_more })
+}
+
+/// Counts ready historical backfill items still awaiting outbound control push or cloud blob
+/// upload so local backfill preparation can apply simple watermark backpressure.
+pub async fn count_ready_backfill_backlog(
+    pool: &SqlitePool,
+    cloud_enabled: bool,
+    lan_enabled: bool,
+) -> Result<(i64, i64)> {
+    if cloud_enabled {
+        let unpushed_items: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_items s
+            LEFT JOIN sync_item_targets t
+              ON t.sync_key = s.sync_key AND t.target_id = 'cloud'
+            WHERE s.prep_state = 'ready'
+              AND s.local_seq > 0
+              AND s.history_backfill = 1
+              AND s.manual_share = 0
+              AND (s.delivery_route IS NULL OR s.delivery_route <> 'lan')
+              AND (
+                  t.target_id IS NULL
+                  OR (
+                      t.status NOT IN ('blocked', 'canceled')
+                      AND (t.pushed_local_seq < s.local_seq OR t.acked_local_seq < s.local_seq)
+                  )
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .context("count ready unpushed cloud backfill items")?;
+
+        let pending_blobs: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_items s
+            JOIN sync_item_targets t
+              ON t.sync_key = s.sync_key AND t.target_id = 'cloud'
+            WHERE s.prep_state = 'ready'
+              AND s.deleted = 0
+              AND s.history_backfill = 1
+              AND s.manual_share = 0
+              AND (s.delivery_route IS NULL OR s.delivery_route <> 'lan')
+              AND t.desired_content = 'complete'
+              AND t.confirmed_content <> 'complete'
+              AND t.status NOT IN ('blocked', 'canceled')
+              AND EXISTS (
+                  SELECT 1 FROM sync_item_blobs b
+                  WHERE b.sync_key = s.sync_key
+                    AND b.optional = 0
+                    AND b.cloud_available = 0
+                    AND b.local_available = 1
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .context("count ready pending cloud backfill blobs")?;
+
+        return Ok((unpushed_items, pending_blobs));
+    }
+
+    if lan_enabled {
+        let unpushed_items: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_items s
+            WHERE s.prep_state = 'ready'
+              AND s.local_seq > 0
+              AND s.history_backfill = 1
+              AND s.manual_share = 0
+              AND (s.delivery_route IS NULL OR s.delivery_route <> 'cloud')
+              AND EXISTS (
+                  SELECT 1
+                  FROM sync_peers p
+                  JOIN sync_peer_connections c
+                    ON c.device_id = p.device_id AND c.state = 'online'
+                  LEFT JOIN sync_item_targets t
+                    ON t.sync_key = s.sync_key AND t.target_id = ('peer:' || p.device_id)
+                  WHERE t.target_id IS NULL
+                     OR (
+                         t.status NOT IN ('blocked', 'canceled')
+                         AND (t.pushed_local_seq < s.local_seq OR t.acked_local_seq < s.local_seq)
+                     )
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .context("count ready unpushed LAN backfill items")?;
+
+        return Ok((unpushed_items, 0));
+    }
+
+    Ok((0, 0))
 }
 
 /// Serves one newest-first window of local ready items to a requesting LAN peer.
@@ -975,6 +1169,8 @@ pub async fn pending_cloud_blob_uploads(
             sync_key,
             item_id: row.try_get("item_id")?,
             kind: row.try_get("kind")?,
+            history_backfill: row.try_get("history_backfill")?,
+            manual_share: row.try_get("manual_share")?,
             blobs,
         });
     }

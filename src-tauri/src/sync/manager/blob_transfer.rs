@@ -76,12 +76,17 @@ impl BlobUploadKind {
     }
 }
 
+pub(super) const BLOB_PRIORITY_REALTIME: i32 = -1;
+pub(super) const BLOB_PRIORITY_BACKFILL: i32 = -10;
+pub(super) const BLOB_PRIORITY_SOURCE_ICON: i32 = -20;
+
 #[derive(Clone)]
 pub(super) struct BlobUploadOptions {
     pub(super) kind: BlobUploadKind,
     pub(super) file_content: bool,
     pub(super) is_cloud: bool,
     pub(super) language: Language,
+    pub(super) stream_priority: i32,
     pub(super) started: Option<mpsc::UnboundedSender<String>>,
     pub(super) transfer: Option<super::super::progress::TransferHandle>,
 }
@@ -93,8 +98,13 @@ pub(super) async fn upload_blob(
     blob: &StoredBlob,
     options: BlobUploadOptions,
 ) -> Result<()> {
-    let limits = attachment_limits(connection);
-    let _slot = limits.acquire(options.file_content, true).await?;
+    let _slot = match options.kind {
+        BlobUploadKind::Content => {
+            let limits = attachment_limits(connection);
+            limits.acquire(options.file_content, true).await?
+        }
+        BlobUploadKind::SourceIcon => source_icon_limits(connection).acquire_owned().await?,
+    };
     let _sync_activity = SyncActivityGuard::acquire();
     let started_at = Instant::now();
     if let Some(transfer) = &options.transfer {
@@ -290,7 +300,8 @@ pub(super) async fn upload_blob_inner(
         } else {
             BLOB_IDLE_TIMEOUT
         };
-        let peer = PartPeer::client(connection.clone(), transfer_id);
+        let peer = PartPeer::client(connection.clone(), transfer_id)
+            .with_priority(options.stream_priority);
         let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(2 * 1024 * 1024);
         progress.report_transferred = false;
         let produce = async {
@@ -1036,6 +1047,24 @@ async fn confirm_download(recv: &mut RecvStream) -> Result<()> {
         Response::Error { code, message } => Err(RemoteSyncError { code, message }.into()),
         _ => bail!("invalid download confirmation"),
     }
+}
+
+/// Keeps optional source-icon uploads on a single low-priority slot isolated from content images.
+fn source_icon_limits(connection: &Connection) -> Arc<Semaphore> {
+    static LIMITS: std::sync::OnceLock<StdMutex<HashMap<usize, Weak<Semaphore>>>> =
+        std::sync::OnceLock::new();
+    let mut limits = LIMITS
+        .get_or_init(StdMutex::default)
+        .lock()
+        .expect("source icon limits poisoned");
+    limits.retain(|_, value| value.strong_count() > 0);
+    let entry = limits.entry(connection.stable_id()).or_default();
+    if let Some(existing) = entry.upgrade() {
+        return existing;
+    }
+    let value = Arc::new(Semaphore::new(1));
+    *entry = Arc::downgrade(&value);
+    value
 }
 
 /// Shares attachment limits across automatic and manual transfers on the same connection.

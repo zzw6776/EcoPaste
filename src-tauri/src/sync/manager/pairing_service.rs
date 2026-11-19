@@ -100,6 +100,7 @@ impl SyncManager {
             if switching_group {
                 repository::clear_group_state(&pool).await?;
             }
+            self.runtime_state.clear_group_caches();
             self.pending_observations
                 .lock()
                 .expect("pending clipboard observations poisoned")
@@ -233,6 +234,7 @@ impl SyncManager {
         let _enqueue_guard = self.delivery.lock_enqueue().await;
         self.identity.set_group(None)?;
         repository::clear_group_state(&pool).await?;
+        self.runtime_state.clear_group_caches();
         self.pending_observations
             .lock()
             .expect("pending clipboard observations poisoned")
