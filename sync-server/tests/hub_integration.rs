@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use ecopaste_sync_protocol::transfer::{self as multipart, PartPeer};
 use ecopaste_sync_protocol::{
-    ALPN, DeviceAnnouncement, ErrorCode, RemovedDevice, Request, Response, SyncItemWrite,
-    read_frame, write_frame,
+    ALPN, CloudBlobCheck, DeviceAnnouncement, ErrorCode, RemovedDevice, Request, Response,
+    SyncItemWrite, read_frame, write_frame,
 };
 use ecopaste_sync_server::{repository::Repository, service::HubService};
 use iroh::{
@@ -352,8 +352,89 @@ async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
     assert_eq!(total, 2);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].item_key, item_1.item_key);
-    assert_eq!(items[0].available_blob_ids, vec![source_icon_id]);
+    assert_eq!(items[0].available_blob_ids, vec![source_icon_id.clone()]);
     assert_eq!(next_before_seq, Some(3));
+
+    // CheckCloudBlobs returns only size-matched blobs physically stored on Hub.
+    let missing_blob_id = "f".repeat(64);
+    let Response::CloudBlobsChecked { available_blob_ids } = call(
+        &connection,
+        Request::CheckCloudBlobs {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            blobs: vec![
+                CloudBlobCheck {
+                    blob_id: source_icon_id.clone(),
+                    size: source_icon.len() as u64,
+                },
+                CloudBlobCheck {
+                    blob_id: missing_blob_id.clone(),
+                    size: 128,
+                },
+            ],
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected CloudBlobsChecked response");
+    };
+    assert_eq!(available_blob_ids, vec![source_icon_id.clone()]);
+
+    let Response::CloudBlobsChecked { available_blob_ids } = call(
+        &connection,
+        Request::CheckCloudBlobs {
+            group_id: group_id.clone(),
+            access_token: access_token.clone(),
+            blobs: vec![CloudBlobCheck {
+                blob_id: source_icon_id.clone(),
+                size: (source_icon.len() + 1) as u64,
+            }],
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected CloudBlobsChecked response for size mismatch");
+    };
+    assert!(available_blob_ids.is_empty());
+
+    // Pushing an item referencing an existing Hub blob reports it immediately in AcceptedItem.
+    let item_3 = SyncItemWrite {
+        item_key: "c".repeat(64),
+        expected_hub_rev: 0,
+        local_seq: 3,
+        origin_device_id: "device_123456".into(),
+        updated_at_ms: 350,
+        deleted: false,
+        protected: false,
+        nonce: vec![5; 24],
+        ciphertext: vec![6; 128],
+        blob_ids: vec![source_icon_id.clone(), missing_blob_id],
+        optional_blob_ids: Vec::new(),
+    };
+    let Response::CloudSynced {
+        accepted: item_3_accepted,
+        latest_seq: item_3_latest_seq,
+        ..
+    } = call(
+        &connection,
+        cloud_sync_request(
+            &group_id,
+            &access_token,
+            device("device_123456", "Mac", &client_endpoint_id),
+            3,
+            vec![item_3],
+        ),
+    )
+    .await?
+    else {
+        anyhow::bail!("expected CloudSynced response for item_3");
+    };
+    assert_eq!(item_3_accepted.len(), 1);
+    assert_eq!(
+        item_3_accepted[0].available_blob_ids,
+        vec![source_icon_id.clone()]
+    );
+    assert_eq!(item_3_latest_seq, 4);
 
     // Self-removal rejects sync and returns merged removals.
     let Response::CloudSynced {
@@ -367,7 +448,7 @@ async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
             group_id: group_id.clone(),
             access_token: access_token.clone(),
             device: device("device_123456", "Mac", &client_endpoint_id),
-            after_seq: 3,
+            after_seq: 4,
             before_seq: None,
             items: Vec::new(),
             removed_devices: vec![RemovedDevice {
@@ -403,7 +484,7 @@ async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
         Response::Error { message, .. } if message.contains("device was removed")
     ));
 
-    // Protected item_1 survives aggressive cleanup while unprotected item_2 is evicted.
+    // Protected item_1 survives aggressive cleanup while unprotected items are evicted.
     let cleanup = repository
         .cleanup_group(
             &group_id,
@@ -416,7 +497,7 @@ async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
             },
         )
         .await?;
-    assert_eq!(cleanup.deleted_items, 1);
+    assert_eq!(cleanup.deleted_items, 2);
     assert_eq!(repository.group_usage(&group_id).await?.item_count, 1);
 
     connection.close(0_u32.into(), b"test complete");

@@ -50,4 +50,32 @@ export const router = createHashRouter([
     },
     path: "/update",
   },
+  {
+    lazy: async () => {
+      const page = await import("@/pages/SyncPopups");
+      return { Component: page.CloudDevicesPage };
+    },
+    path: "/cloud-devices",
+  },
+  {
+    lazy: async () => {
+      const page = await import("@/pages/SyncPopups");
+      return { Component: page.CloudRecordsPage };
+    },
+    path: "/cloud-records",
+  },
+  {
+    lazy: async () => {
+      const page = await import("@/pages/SyncPopups");
+      return { Component: page.CloudDetailsPage };
+    },
+    path: "/cloud-details",
+  },
+  {
+    lazy: async () => {
+      const page = await import("@/pages/SyncPopups");
+      return { Component: page.LanDetailsPage };
+    },
+    path: "/lan-details",
+  },
 ]);

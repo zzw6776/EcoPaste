@@ -790,14 +790,17 @@ pub(super) fn parse_android_lan_multicast_interfaces(value: &str) -> BTreeSet<Ip
 /// Publishes and downloads optional source icons without delaying clipboard synchronization.
 pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
     let mut upload_failure_count = 0_usize;
+    let mut icon_cooldowns: HashMap<String, (usize, Instant)> = HashMap::new();
+    let mut had_cloud_connection = false;
+    let mut next_retry_at: Option<Instant> = None;
     loop {
-        if upload_failure_count == 0 {
-            manager.runtime_state.source_asset_wake.notified().await;
-        } else {
+        if let Some(deadline) = next_retry_at {
             tokio::select! {
                 _ = manager.runtime_state.source_asset_wake.notified() => {},
-                _ = tokio::time::sleep(retry_delay(upload_failure_count)) => {},
+                _ = tokio::time::sleep_until(deadline.into()) => {},
             }
+        } else {
+            manager.runtime_state.source_asset_wake.notified().await;
         }
         manager.wait_while_storage_suspended().await;
         let _staging_guard = manager.sync_activity_guard().await;
@@ -807,16 +810,29 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
         let settings = manager.app.state::<SettingsStore>().snapshot().sync;
         let Some(group) = manager.identity.snapshot().group else {
             upload_failure_count = 0;
+            icon_cooldowns.clear();
+            had_cloud_connection = false;
+            next_retry_at = None;
             continue;
         };
         if !settings.enabled {
             upload_failure_count = 0;
+            icon_cooldowns.clear();
+            had_cloud_connection = false;
+            next_retry_at = None;
             continue;
         }
 
         let connection = manager
             .cached_cloud_data_connection()
             .or_else(|| manager.cached_cloud_connection());
+        let has_cloud_connection = connection.is_some();
+        if has_cloud_connection && !had_cloud_connection {
+            icon_cooldowns.clear();
+        }
+        had_cloud_connection = has_cloud_connection;
+
+        let mut soonest_retry: Option<Instant> = None;
         if settings.cloud_enabled {
             let publish_started_at = Instant::now();
             match manager
@@ -836,10 +852,12 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
                 }
                 Err(error) => {
                     upload_failure_count = upload_failure_count.saturating_add(1);
+                    let delay = retry_delay(upload_failure_count);
+                    soonest_retry = Some(Instant::now() + delay);
                     log::warn!(
                         "publish queued source app icons failed: attempt={} retryInSecs={} error={error}",
                         upload_failure_count,
-                        retry_delay(upload_failure_count).as_secs()
+                        delay.as_secs()
                     );
                 }
             }
@@ -849,17 +867,31 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
 
         let started_at = Instant::now();
         match manager
-            .refresh_source_app_assets(connection.as_ref(), &group)
+            .refresh_source_app_assets(connection.as_ref(), &group, &mut icon_cooldowns)
             .await
         {
-            Ok(0) => {}
-            Ok(pending_count) => log::info!(
-                "source app asset refresh completed: pendingAssets={pending_count} cloudConnection={} totalMs={}",
-                connection.is_some(),
-                started_at.elapsed().as_millis()
-            ),
-            Err(error) => log::warn!("refresh source app icons failed: {error}"),
+            Ok(outcome) => {
+                if outcome.resolved > 0 {
+                    log::info!(
+                        "source app asset refresh completed: resolved={} unresolved={} cloudConnection={} totalMs={}",
+                        outcome.resolved,
+                        outcome.unresolved,
+                        has_cloud_connection,
+                        started_at.elapsed().as_millis()
+                    );
+                }
+                if let Some(icon_retry) = outcome.next_retry_at {
+                    soonest_retry =
+                        Some(soonest_retry.map_or(icon_retry, |cur| cur.min(icon_retry)));
+                }
+            }
+            Err(error) => {
+                let fallback = Instant::now() + retry_delay(1);
+                soonest_retry = Some(soonest_retry.map_or(fallback, |cur| cur.min(fallback)));
+                log::warn!("refresh source app icons failed: {error}");
+            }
         }
+        next_retry_at = soonest_retry;
     }
 }
 
@@ -1121,6 +1153,7 @@ pub(super) async fn attachment_worker(
     sending: bool,
 ) {
     let lane = usize::from(realtime_only) * 2 + usize::from(sending);
+    let mut failure_count = 0_u32;
     loop {
         manager.runtime_state.attachment_wakes[lane]
             .notified()
@@ -1130,9 +1163,11 @@ pub(super) async fn attachment_worker(
             let storage_epoch = manager.storage_epoch();
             let settings = manager.app.state::<SettingsStore>().snapshot().sync;
             let Some(group) = manager.identity.snapshot().group else {
+                failure_count = 0;
                 break;
             };
             if !settings.enabled {
+                failure_count = 0;
                 break;
             }
             let pool = {
@@ -1144,6 +1179,7 @@ pub(super) async fn attachment_worker(
             };
 
             let mut handled_item = false;
+            let mut had_error = false;
             if sending {
                 // LAN attachments are receiver-pulled via `GetBlob`; only Cloud needs sender uploads.
                 if settings.cloud_enabled
@@ -1165,13 +1201,13 @@ pub(super) async fn attachment_worker(
                                 Ok(handled) => handled_item |= handled,
                                 Err(error) => {
                                     log::warn!("cloud attachment upload deferred: {error:#}");
-                                    manager.schedule_attachment_wake(chrono::Duration::seconds(5));
-                                    break;
+                                    had_error = true;
                                 }
                             }
                         }
                         Err(error) => {
                             log::debug!("cloud data connection unavailable for upload: {error:#}");
+                            had_error = true;
                         }
                     }
                 }
@@ -1211,7 +1247,7 @@ pub(super) async fn attachment_worker(
                             Ok(false) => {}
                             Err(error) => {
                                 log::warn!("LAN attachment download deferred: {error:#}");
-                                manager.schedule_attachment_wake(chrono::Duration::seconds(5));
+                                had_error = true;
                             }
                         }
                     }
@@ -1238,8 +1274,7 @@ pub(super) async fn attachment_worker(
                                 Ok(handled) => handled_item |= handled,
                                 Err(error) => {
                                     log::warn!("cloud attachment download deferred: {error:#}");
-                                    manager.schedule_attachment_wake(chrono::Duration::seconds(5));
-                                    break;
+                                    had_error = true;
                                 }
                             }
                         }
@@ -1247,14 +1282,24 @@ pub(super) async fn attachment_worker(
                             log::debug!(
                                 "cloud data connection unavailable for download: {error:#}"
                             );
+                            had_error = true;
                         }
                     }
                 }
             }
 
-            if !handled_item {
-                break;
+            if handled_item {
+                failure_count = 0;
+                continue;
             }
+            if had_error {
+                failure_count = failure_count.saturating_add(1);
+                let delay = retry_delay(usize::try_from(failure_count).unwrap_or(1).min(4));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            failure_count = 0;
+            break;
         }
     }
 }

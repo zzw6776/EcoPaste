@@ -12,9 +12,16 @@ const Modal: FC<AppModalProps> = (props) => {
   const { onCancel, open, ...rest } = props;
 
   useAndroidBack(open === true, onCancel);
-  useCloseAppOverlay(open === true, onCancel);
+  const overlayResetKey = useCloseAppOverlay(open === true, onCancel);
 
-  return <AntdModal {...rest} onCancel={onCancel} open={open} />;
+  return (
+    <AntdModal
+      key={overlayResetKey}
+      {...rest}
+      onCancel={onCancel}
+      open={open}
+    />
+  );
 };
 
 export default Modal;

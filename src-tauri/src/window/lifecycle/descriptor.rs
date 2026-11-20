@@ -7,9 +7,12 @@
 use tauri::AppHandle;
 
 use super::super::{
-    build_onboarding_window, build_preference_window, build_update_window, preview,
-    CLIPBOARD_PREVIEW_WINDOW_LABEL, CLIPBOARD_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL,
-    PREFERENCE_WINDOW_LABEL, UPDATE_WINDOW_LABEL,
+    build_cloud_details_window, build_cloud_devices_window, build_cloud_records_window,
+    build_lan_details_window, build_onboarding_window, build_preference_window,
+    build_update_window, preview, CLIPBOARD_PREVIEW_WINDOW_LABEL, CLIPBOARD_WINDOW_LABEL,
+    CLOUD_DETAILS_WINDOW_LABEL, CLOUD_DEVICES_WINDOW_LABEL, CLOUD_RECORDS_WINDOW_LABEL,
+    LAN_DETAILS_WINDOW_LABEL, ONBOARDING_WINDOW_LABEL, PREFERENCE_WINDOW_LABEL,
+    UPDATE_WINDOW_LABEL,
 };
 use crate::core::Result;
 
@@ -76,6 +79,30 @@ static DESCRIPTORS: &[WindowDescriptor] = &[
         emits_lifecycle: true,
         retain_policy: RetainPolicy::Permanent,
         build: Some(build_update_window),
+    },
+    WindowDescriptor {
+        label: CLOUD_DEVICES_WINDOW_LABEL,
+        emits_lifecycle: true,
+        retain_policy: RetainPolicy::DestroyWhenIdle,
+        build: Some(build_cloud_devices_window),
+    },
+    WindowDescriptor {
+        label: CLOUD_RECORDS_WINDOW_LABEL,
+        emits_lifecycle: true,
+        retain_policy: RetainPolicy::DestroyWhenIdle,
+        build: Some(build_cloud_records_window),
+    },
+    WindowDescriptor {
+        label: CLOUD_DETAILS_WINDOW_LABEL,
+        emits_lifecycle: true,
+        retain_policy: RetainPolicy::DestroyWhenIdle,
+        build: Some(build_cloud_details_window),
+    },
+    WindowDescriptor {
+        label: LAN_DETAILS_WINDOW_LABEL,
+        emits_lifecycle: true,
+        retain_policy: RetainPolicy::DestroyWhenIdle,
+        build: Some(build_lan_details_window),
     },
     WindowDescriptor {
         label: CLIPBOARD_PREVIEW_WINDOW_LABEL,

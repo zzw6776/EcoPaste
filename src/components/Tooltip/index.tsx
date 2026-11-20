@@ -37,7 +37,14 @@ export const resolveOverlayTooltipProps = (
  * 调用方与原生 Tooltip 完全兼容，传入的 `align` 会整体覆盖默认值。
  */
 const Tooltip: FC<TooltipProps> = (props) => {
-  const { align, defaultOpen, onOpenChange, open, ...rest } = props;
+  const {
+    align,
+    defaultOpen,
+    destroyOnHidden = true,
+    onOpenChange,
+    open,
+    ...rest
+  } = props;
   const [innerOpen, setInnerOpen] = useState(defaultOpen ?? false);
   const mergedOpen = open ?? innerOpen;
 
@@ -46,7 +53,7 @@ const Tooltip: FC<TooltipProps> = (props) => {
     onOpenChange?.(nextOpen);
   }
 
-  useCloseAppOverlay(mergedOpen, () => {
+  const overlayResetKey = useCloseAppOverlay(mergedOpen, () => {
     handleOpenChange(false);
   });
 
@@ -55,6 +62,8 @@ const Tooltip: FC<TooltipProps> = (props) => {
       align={
         align ?? { overflow: { adjustY: true, shiftX: true, shiftY: true } }
       }
+      destroyOnHidden={destroyOnHidden}
+      key={overlayResetKey}
       onOpenChange={handleOpenChange}
       open={mergedOpen}
       {...rest}

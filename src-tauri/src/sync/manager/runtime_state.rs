@@ -6,6 +6,17 @@ pub(super) struct PreparedSourceIconCache {
     pub(super) blob: StoredBlob,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ServingCatchupEntry {
+    pub(super) device_id: String,
+    pub(super) device_name: String,
+    pub(super) served_items: u64,
+    pub(super) remaining_items: u64,
+    pub(super) served_attachments: u64,
+    pub(super) active_window: bool,
+    pub(super) last_activity: Instant,
+}
+
 /// Owns all volatile connection, worker and channel state for one sync manager.
 pub(super) struct RuntimeCoordinator {
     pub(super) update_notification_pending: Arc<AtomicBool>,
@@ -29,6 +40,8 @@ pub(super) struct RuntimeCoordinator {
     pub(super) prepared_source_icons: RwLock<HashMap<(String, String), PreparedSourceIconCache>>,
     /// Session-scoped set of `(group_id, blob_id)` icons already confirmed stored on Cloud Hub.
     pub(super) uploaded_source_icons: RwLock<HashSet<(String, String)>>,
+    /// Per-connection memoization of `(connection_id, blob_id)` checked via `CheckCloudBlobs`.
+    pub(super) checked_cloud_blobs: RwLock<HashSet<(usize, String)>>,
     pub(super) lan_cycle_lock: AsyncRwLock<()>,
     pub(super) cloud_cycle_lock: Mutex<()>,
     pub(super) cloud_connect_lock: Mutex<()>,
@@ -58,6 +71,9 @@ pub(super) struct RuntimeCoordinator {
     pub(super) android_lan_multicast_interfaces: RwLock<BTreeSet<Ipv4Addr>>,
     pub(super) lan_presence_nonce: AtomicU64,
     pub(super) nearby_devices: RwLock<HashMap<String, NearbyDeviceEntry>>,
+    pub(super) inbound_metadata_peak_bp: AtomicU64,
+    pub(super) inbound_attachment_completed: AtomicU64,
+    pub(super) serving_catchup_sessions: RwLock<HashMap<String, ServingCatchupEntry>>,
 }
 
 impl RuntimeCoordinator {
@@ -80,6 +96,7 @@ impl RuntimeCoordinator {
             cloud_observed_latest_seq: AtomicU64::new(0),
             prepared_source_icons: RwLock::new(HashMap::new()),
             uploaded_source_icons: RwLock::new(HashSet::new()),
+            checked_cloud_blobs: RwLock::new(HashSet::new()),
             lan_cycle_lock: AsyncRwLock::new(()),
             cloud_cycle_lock: Mutex::new(()),
             cloud_connect_lock: Mutex::new(()),
@@ -105,11 +122,17 @@ impl RuntimeCoordinator {
             android_lan_multicast_interfaces: RwLock::new(BTreeSet::new()),
             lan_presence_nonce: AtomicU64::new(presence_nonce),
             nearby_devices: RwLock::new(HashMap::new()),
+            inbound_metadata_peak_bp: AtomicU64::new(0),
+            inbound_attachment_completed: AtomicU64::new(0),
+            serving_catchup_sessions: RwLock::new(HashMap::new()),
         }
     }
 
     pub(super) fn clear_group_caches(&self) {
         self.cloud_observed_latest_seq.store(0, Ordering::Release);
+        self.inbound_metadata_peak_bp.store(0, Ordering::Release);
+        self.inbound_attachment_completed
+            .store(0, Ordering::Release);
         self.prepared_source_icons
             .write()
             .expect("prepared source icons poisoned")
@@ -117,6 +140,10 @@ impl RuntimeCoordinator {
         self.uploaded_source_icons
             .write()
             .expect("uploaded source icons poisoned")
+            .clear();
+        self.checked_cloud_blobs
+            .write()
+            .expect("checked cloud blobs poisoned")
             .clear();
     }
 }

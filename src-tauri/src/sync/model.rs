@@ -327,6 +327,27 @@ impl SyncWindowCursor {
     pub fn has_catchup_pending(&self) -> bool {
         self.catchup_before.is_some()
     }
+
+    /// Returns `(completed, total)` for an active catch-up window while collapsing sparse sequence
+    /// holes above `catchup_before` using the count of records already fetched in that window.
+    pub fn catchup_counts(&self, pulled_in_window: u64) -> (u64, u64) {
+        let Some(before) = self.catchup_before else {
+            return (0, 0);
+        };
+        let high = self.window_high.max(self.synced_seq).max(before);
+        let span = high.saturating_sub(self.synced_seq);
+        if span == 0 {
+            return (0, 0);
+        }
+        let raw_completed = high.saturating_sub(before).min(span);
+        let completed = if pulled_in_window > 0 {
+            pulled_in_window.min(raw_completed).max(1)
+        } else {
+            raw_completed
+        };
+        let remaining = before.saturating_sub(self.synced_seq);
+        (completed, completed.saturating_add(remaining))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -499,6 +520,35 @@ pub struct SyncBackfillProgress {
     pub total: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncInboundCatchupSources {
+    pub cloud: bool,
+    pub peers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncInboundCatchupProgress {
+    pub metadata_completed: u64,
+    pub metadata_total: u64,
+    pub metadata_sources: SyncInboundCatchupSources,
+    pub attachment_completed: u64,
+    pub attachment_total: u64,
+    pub attachment_sources: SyncInboundCatchupSources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPeerCatchupStatus {
+    pub device_id: String,
+    pub device_name: String,
+    pub served_items: u64,
+    pub remaining_items: u64,
+    pub served_attachments: u64,
+    pub active_transfers: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -526,6 +576,8 @@ pub struct SyncStatus {
     pub cloud_transport: Option<String>,
     pub cloud_server_version: Option<String>,
     pub backfill: Option<SyncBackfillProgress>,
+    pub inbound_catchup: Option<SyncInboundCatchupProgress>,
+    pub serving_catchups: Vec<SyncPeerCatchupStatus>,
     pub peers: Vec<SyncPeerStatus>,
 }
 
@@ -936,5 +988,16 @@ mod tests {
         window.apply_response(after, before, 101, 0, None);
         assert_eq!(window.synced_seq, 101);
         assert_eq!(window.catchup_before, None);
+    }
+
+    #[test]
+    fn catchup_counts_collapses_sparse_sequence_holes() {
+        let sparse_window = SyncWindowCursor {
+            synced_seq: 0,
+            catchup_before: Some(483),
+            window_high: 317_729,
+        };
+        assert_eq!(sparse_window.catchup_counts(256), (256, 739));
+        assert_eq!(sparse_window.catchup_counts(0), (317_246, 317_729));
     }
 }

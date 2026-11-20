@@ -1,4 +1,4 @@
-use ecopaste_sync_protocol::{LanContentLevel, LanItemAck, MAX_ITEMS_PER_BATCH};
+use ecopaste_sync_protocol::{CloudBlobCheck, LanContentLevel, LanItemAck, MAX_ITEMS_PER_BATCH};
 
 use super::*;
 
@@ -278,6 +278,7 @@ impl SyncManager {
                 && !remote_ahead
                 && !local_has_more
             {
+                has_more = false;
                 break;
             }
 
@@ -457,8 +458,134 @@ impl SyncManager {
             }
         }
 
+        if !has_more {
+            match self
+                .verify_existing_cloud_blobs(
+                    &active_connection,
+                    &pool,
+                    group,
+                    &cycle.settings,
+                    language,
+                )
+                .await
+            {
+                Ok(needs_control_push) => {
+                    has_more = needs_control_push;
+                }
+                Err(error) => {
+                    if is_locally_closed_cloud_connection(&active_connection) {
+                        return Err(CloudConnectionSuperseded.into());
+                    }
+                    if should_invalidate_cloud_connection(&active_connection, &error) {
+                        self.invalidate_cloud_connection(active_connection.stable_id());
+                        self.runtime_state.watch_wake.notify_one();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         self.runtime_state.source_asset_wake.notify_one();
         Ok(SyncConnectionOutcome { has_more })
+    }
+
+    /// Checks once per Cloud connection whether blobs belonging to deferred LAN-routed or
+    /// metadata-only items already exist on the Cloud Hub, promoting matching items to green
+    /// without re-uploading attachment bytes.
+    async fn verify_existing_cloud_blobs(
+        &self,
+        connection: &Connection,
+        pool: &SqlitePool,
+        group: &GroupSecrets,
+        settings: &SyncSettings,
+        language: Language,
+    ) -> Result<bool> {
+        let candidates = repository::pending_cloud_blob_verifications(
+            pool,
+            settings.sync_sensitive,
+            MAX_ITEMS_PER_BATCH.saturating_mul(2),
+        )
+        .await?;
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let connection_id = connection.stable_id();
+        let mut to_check = Vec::new();
+        let mut queued_blob_ids = HashSet::new();
+        {
+            let checked = self
+                .runtime_state
+                .checked_cloud_blobs
+                .read()
+                .expect("checked cloud blobs poisoned");
+            for entry in candidates {
+                if checked.contains(&(connection_id, entry.blob_id.clone()))
+                    || !queued_blob_ids.insert(entry.blob_id.clone())
+                {
+                    continue;
+                }
+                to_check.push(CloudBlobCheck {
+                    blob_id: entry.blob_id,
+                    size: entry.size,
+                });
+            }
+        }
+        if to_check.is_empty() {
+            return Ok(false);
+        }
+
+        let checked_keys: Vec<(usize, String)> = to_check
+            .iter()
+            .map(|entry| (connection_id, entry.blob_id.clone()))
+            .collect();
+        let mut available_blob_ids = Vec::new();
+        for chunk in to_check.chunks(usize::from(MAX_ITEMS_PER_BATCH)) {
+            let response = call_cloud(
+                connection,
+                Request::CheckCloudBlobs {
+                    group_id: group.group_id.clone(),
+                    access_token: group.access_token_bytes()?,
+                    blobs: chunk.to_vec(),
+                },
+                language,
+            )
+            .await?;
+            let Response::CloudBlobsChecked {
+                available_blob_ids: chunk_hits,
+            } = response
+            else {
+                if let Response::Error { code, message } = response {
+                    return Err(RemoteSyncError { code, message }.into());
+                }
+                bail!("云端返回了无效的附件校验响应");
+            };
+            available_blob_ids.extend(chunk_hits);
+        }
+
+        {
+            let mut checked = self
+                .runtime_state
+                .checked_cloud_blobs
+                .write()
+                .expect("checked cloud blobs poisoned");
+            checked.retain(|(id, _)| *id == connection_id);
+            checked.extend(checked_keys);
+        }
+
+        let promotion =
+            repository::promote_cloud_blobs_available(pool, &available_blob_ids).await?;
+        if promotion.promoted_items > 0 {
+            log::info!(
+                "verified existing cloud blobs without re-upload: checked={} hits={} promotedItems={} needsControlPush={}",
+                queued_blob_ids.len(),
+                available_blob_ids.len(),
+                promotion.promoted_items,
+                promotion.needs_control_push,
+            );
+            self.emit_updated();
+        }
+        Ok(promotion.needs_control_push)
     }
 
     /// Runs the LAN peer control-plane sync loop (`SyncItems`) over a peer connection.
@@ -545,6 +672,7 @@ impl SyncManager {
                 && !remote_ahead
                 && !local_has_more
             {
+                has_more = false;
                 break;
             }
 
@@ -748,7 +876,13 @@ impl SyncManager {
         let language = crate::i18n::current_language(&self.app);
         let is_files = upload.kind == "files";
         let is_realtime = !upload.history_backfill || upload.manual_share;
-        let track_transfer = is_files && is_realtime;
+        let track_transfer = super::tracks_individual_transfer(
+            &upload.kind,
+            is_realtime,
+            upload.manual_share,
+            upload.payload_updated_at_ms,
+            Utc::now().timestamp_millis(),
+        );
         let operation_total_bytes = upload
             .blobs
             .iter()
@@ -802,6 +936,7 @@ impl SyncManager {
                 transfer: transfer.clone(),
             };
             let mut upload_started = false;
+            let mut unhealthy_connection = false;
             let result = async {
                 let (staged, _lease) =
                     match stored_blob.outgoing_source().ok_or(RemoteBlobUnavailable)? {
@@ -813,7 +948,10 @@ impl SyncManager {
                         }
                     };
                 upload_started = true;
-                upload_blob(data_connection, group, &staged, options).await
+                let (result, unhealthy) =
+                    upload_blob_with_probe(data_connection, group, &staged, options).await;
+                unhealthy_connection = unhealthy;
+                result
             }
             .await;
 
@@ -864,7 +1002,9 @@ impl SyncManager {
                                 &error.to_string(),
                             )
                             .await?;
-                        if should_invalidate_cloud_connection(data_connection, &error) {
+                        if unhealthy_connection
+                            || should_invalidate_cloud_connection(data_connection, &error)
+                        {
                             self.invalidate_cloud_data_connection(data_connection.stable_id());
                         }
                         return Err(error);

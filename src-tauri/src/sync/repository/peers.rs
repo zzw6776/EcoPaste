@@ -672,3 +672,68 @@ fn channel_state(value: Option<&str>) -> SyncChannelState {
         _ => SyncChannelState::Idle,
     }
 }
+
+/// Resolves a paired LAN peer's `(device_id, device_name)` from its QUIC endpoint identity.
+pub async fn peer_by_endpoint_id(
+    pool: &SqlitePool,
+    endpoint_id: &str,
+) -> Result<Option<(String, String)>> {
+    sqlx::query_as("SELECT device_id, device_name FROM sync_peers WHERE endpoint_id = ? LIMIT 1")
+        .bind(endpoint_id)
+        .fetch_optional(pool)
+        .await
+        .context("lookup sync peer by endpoint id")
+}
+
+/// Sums `(completed, total)` sequence progress across online LAN peers currently running catch-up,
+/// along with deduplicated display names of active peers.
+///
+/// Collapses sparse sequence gaps above `catchup_before_seq` to the actual count of pulled items
+/// recorded in `sync_item_targets` when available so historical sequence holes do not inflate the
+/// initial catch-up percentage.
+pub async fn inbound_lan_catchup_window(pool: &SqlitePool) -> Result<(u64, u64, Vec<String>)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT p.device_name, p.pull_cursor, p.catchup_before_seq, p.window_high_seq,
+               (
+                   SELECT COUNT(*)
+                   FROM sync_item_targets t
+                   WHERE t.target_id = ('peer:' || p.device_id)
+                     AND t.remote_seq >= p.catchup_before_seq
+               ) AS pulled_in_window
+        FROM sync_peers p
+        JOIN sync_peer_connections c ON c.device_id = p.device_id AND c.state = 'online'
+        WHERE p.catchup_before_seq IS NOT NULL
+        ORDER BY p.device_name ASC, p.device_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("read inbound LAN peer catchup cursors")?;
+
+    let mut completed = 0_u64;
+    let mut total = 0_u64;
+    let mut peer_names = Vec::new();
+    for row in rows {
+        let device_name: String = row.try_get("device_name")?;
+        let synced = u64::try_from(row.try_get::<i64, _>("pull_cursor")?).unwrap_or(0);
+        let before = row
+            .try_get::<Option<i64>, _>("catchup_before_seq")?
+            .and_then(|value| u64::try_from(value).ok());
+        let high = u64::try_from(row.try_get::<i64, _>("window_high_seq")?).unwrap_or(0);
+        let pulled = u64::try_from(row.try_get::<i64, _>("pulled_in_window")?).unwrap_or(0);
+        let cursor = super::super::model::SyncWindowCursor {
+            synced_seq: synced,
+            catchup_before: before,
+            window_high: high,
+        };
+        let (peer_completed, peer_total) = cursor.catchup_counts(pulled);
+        completed = completed.saturating_add(peer_completed);
+        total = total.saturating_add(peer_total);
+        let trimmed = device_name.trim();
+        if peer_total > 0 && !trimmed.is_empty() && !peer_names.iter().any(|name| name == trimmed) {
+            peer_names.push(trimmed.to_owned());
+        }
+    }
+    Ok((completed, total, peer_names))
+}

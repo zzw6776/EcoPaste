@@ -3,10 +3,6 @@ use sqlx::Row;
 
 use super::*;
 
-/// Freshness grace window for the dedicated VIP realtime download worker. Allows modest clock skew
-/// between paired devices while keeping older historical catch-up strictly on the General worker.
-const VIP_REALTIME_RECENCY_MS: i64 = 120_000;
-
 #[derive(Default)]
 pub(super) struct IngestBatchSummary {
     pub(super) needs_apply: bool,
@@ -746,7 +742,7 @@ impl SyncManager {
         let min_updated_at_ms = realtime_only.then(|| {
             Utc::now()
                 .timestamp_millis()
-                .saturating_sub(VIP_REALTIME_RECENCY_MS)
+                .saturating_sub(super::REALTIME_TRANSFER_RECENCY_MS)
         });
         let candidates =
             repository::list_blob_pull_items_for_source(pool, target_id, min_updated_at_ms, 4)
@@ -789,6 +785,7 @@ impl SyncManager {
             meta.ciphertext.as_deref(),
         ) else {
             repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            self.emit_updated();
             return Ok(true);
         };
         let Ok(snapshot) = decrypt_stored_snapshot(
@@ -804,14 +801,17 @@ impl SyncManager {
             Ok(s)
         }) else {
             repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            self.emit_updated();
             return Ok(true);
         };
         if !snapshot.is_present || snapshot.blobs.is_empty() {
             repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            self.emit_updated();
             return Ok(true);
         }
         let Some(synced_item) = snapshot.item.as_ref() else {
             repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
+            self.emit_updated();
             return Ok(true);
         };
         if synced_item.kind == "files"
@@ -829,6 +829,7 @@ impl SyncManager {
                 Some("available"),
             )
             .await?;
+            self.emit_updated();
             return Ok(true);
         }
 
@@ -857,16 +858,19 @@ impl SyncManager {
             } else {
                 repository::clear_item_needs_apply(pool, &meta.sync_key).await?;
             }
+            self.emit_updated();
             return Ok(true);
         }
 
-        let is_realtime_files = synced_item.kind == "files"
-            && (realtime_only
-                || updated_at.timestamp_millis()
-                    >= Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(VIP_REALTIME_RECENCY_MS));
-        let transfer_handle = if is_realtime_files {
+        let is_files = synced_item.kind == "files";
+        let track_transfer = super::tracks_individual_transfer(
+            &synced_item.kind,
+            true,
+            false,
+            updated_at.timestamp_millis(),
+            Utc::now().timestamp_millis(),
+        );
+        let transfer_handle = if track_transfer {
             if let Some(item_id) = meta.item_id.as_deref() {
                 let task_key = format!("{}\0{target_id}\0download", meta.sync_key);
                 let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
@@ -888,7 +892,7 @@ impl SyncManager {
                     elapsed_ms: 0,
                     eta_seconds: None,
                     error: None,
-                    cancellable: true,
+                    cancellable: is_files,
                 });
                 Some((task_id, handle))
             } else {
@@ -990,7 +994,9 @@ impl SyncManager {
                 }
                 return Ok(true);
             }
-            if source.is_cloud() && should_invalidate_cloud_connection(data_connection, &error) {
+            if source.is_cloud()
+                && should_invalidate_cloud_data_connection(data_connection, &error).await
+            {
                 self.invalidate_cloud_data_connection(data_connection.stable_id());
             }
             return Err(error);
@@ -1086,6 +1092,9 @@ impl SyncManager {
                     .await;
                 #[cfg(target_os = "android")]
                 crate::commands::android::notify_overlay_clipboard_changed();
+                self.runtime_state
+                    .inbound_attachment_completed
+                    .fetch_add(1, Ordering::AcqRel);
                 self.runtime_state.source_asset_wake.notify_one();
                 self.emit_updated();
                 Ok(true)

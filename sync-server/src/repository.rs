@@ -485,7 +485,7 @@ impl Repository {
                 .context("encrypted item snapshot is too large")?;
             let now = now_ms();
 
-            match existing {
+            let new_hub_rev = match existing {
                 Some((existing_hub_rev_raw, existing_bytes)) => {
                     let existing_hub_rev =
                         u64::try_from(existing_hub_rev_raw).context("negative hub_rev")?;
@@ -530,25 +530,11 @@ impl Repository {
                     .await
                     .context("update encrypted hub item")?;
 
-                    replace_item_blob_refs(
-                        &mut transaction,
-                        group_id,
-                        &write.item_key,
-                        &content_blobs,
-                        &optional_blobs,
-                        now,
-                    )
-                    .await?;
-
                     used_bytes = apply_signed_delta(used_bytes, delta);
                     byte_delta = byte_delta
                         .checked_add(delta)
                         .context("item byte delta overflow")?;
-                    accepted.push(AcceptedItem {
-                        item_key: write.item_key.clone(),
-                        hub_rev: new_hub_rev,
-                        seq: next_seq,
-                    });
+                    new_hub_rev
                 }
                 None => {
                     if max_available_bytes.is_some_and(|maximum| {
@@ -583,16 +569,6 @@ impl Repository {
                     .await
                     .context("insert encrypted hub item")?;
 
-                    replace_item_blob_refs(
-                        &mut transaction,
-                        group_id,
-                        &write.item_key,
-                        &content_blobs,
-                        &optional_blobs,
-                        now,
-                    )
-                    .await?;
-
                     used_bytes = used_bytes.saturating_add(new_bytes as u64);
                     byte_delta = byte_delta
                         .checked_add(new_bytes)
@@ -600,13 +576,32 @@ impl Repository {
                     count_delta = count_delta
                         .checked_add(1)
                         .context("item count delta overflow")?;
-                    accepted.push(AcceptedItem {
-                        item_key: write.item_key.clone(),
-                        hub_rev: new_hub_rev,
-                        seq: next_seq,
-                    });
+                    new_hub_rev
                 }
-            }
+            };
+
+            replace_item_blob_refs(
+                &mut transaction,
+                group_id,
+                &write.item_key,
+                &content_blobs,
+                &optional_blobs,
+                now,
+            )
+            .await?;
+
+            let mut referenced_blobs = content_blobs;
+            referenced_blobs.extend(optional_blobs);
+            let available_blob_ids =
+                find_and_touch_available_blobs(&mut transaction, group_id, &referenced_blobs, now)
+                    .await?;
+
+            accepted.push(AcceptedItem {
+                item_key: write.item_key.clone(),
+                hub_rev: new_hub_rev,
+                seq: next_seq,
+                available_blob_ids,
+            });
         }
 
         if !accepted.is_empty() {
@@ -1363,6 +1358,49 @@ async fn load_items_by_keys(
         .collect::<Result<Vec<_>>>()?;
     attach_item_blobs(transaction, group_id, &mut items).await?;
     Ok(items)
+}
+
+/// Finds referenced blobs already stored for the group and refreshes their orphan grace timestamp.
+async fn find_and_touch_available_blobs(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_id: &str,
+    blob_ids: &[String],
+    now: i64,
+) -> Result<Vec<String>> {
+    if blob_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::new("SELECT blob_id FROM blobs WHERE group_id = ");
+    query.push_bind(group_id).push(" AND blob_id IN (");
+    let mut separated = query.separated(", ");
+    for blob_id in blob_ids {
+        separated.push_bind(blob_id);
+    }
+    query.push(") ORDER BY blob_id");
+    let available: Vec<String> = query
+        .build_query_scalar()
+        .fetch_all(&mut **transaction)
+        .await
+        .context("lookup available blobs for accepted sync item")?;
+    if !available.is_empty() {
+        let mut touch = sqlx::QueryBuilder::new("UPDATE blobs SET created_at_ms = ");
+        touch
+            .push_bind(now)
+            .push(" WHERE group_id = ")
+            .push_bind(group_id)
+            .push(" AND blob_id IN (");
+        let mut separated = touch.separated(", ");
+        for blob_id in &available {
+            separated.push_bind(blob_id);
+        }
+        touch.push(")");
+        touch
+            .build()
+            .execute(&mut **transaction)
+            .await
+            .context("refresh Hub blob orphan grace period for accepted item")?;
+    }
+    Ok(available)
 }
 
 async fn attach_item_blobs(

@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
+import type { SyncPeerStatus } from "@/commands";
+import {
+  createSyncStatusRefresh,
+  resolveUsagePercent,
+  resolveUsageTone,
+  shortenEndpointId,
+  sortLanPeersForDisplay,
+  summarizeLanPeers,
+} from "./SyncStatusIcons.logic";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -8,6 +16,28 @@ function deferred<T>() {
     resolve = accept;
   });
   return { promise, resolve };
+}
+
+function makePeer(
+  deviceId: string,
+  deviceName: string,
+  state: SyncPeerStatus["state"],
+): SyncPeerStatus {
+  return {
+    connectedAddress: null,
+    deviceId,
+    deviceName,
+    directAddresses: [],
+    endpointId: deviceId,
+    lastAttemptAt: null,
+    lastError: null,
+    lastSeenAt: null,
+    lastSuccessAt: null,
+    platform: "macos",
+    relayUrls: [],
+    state,
+    transport: null,
+  };
 }
 
 test("coalesces an event burst and reads the latest status once more", async () => {
@@ -94,4 +124,48 @@ test("skips hidden updates and refreshes once after becoming active", async () =
   reads[1].resolve(2);
   await reopened;
   assert.deepEqual(written, [2]);
+});
+
+test("computes bounded quota usage percentages and alert tones", () => {
+  assert.equal(resolveUsagePercent(50, 0), null);
+  assert.equal(resolveUsagePercent(0, 1000), 0);
+  assert.equal(resolveUsagePercent(744, 1000), 74);
+  assert.equal(resolveUsagePercent(1500, 1000), 100);
+
+  assert.equal(resolveUsageTone(null), "normal");
+  assert.equal(resolveUsageTone(74), "normal");
+  assert.equal(resolveUsageTone(75), "warning");
+  assert.equal(resolveUsageTone(89), "warning");
+  assert.equal(resolveUsageTone(90), "error");
+});
+
+test("sorts and summarizes LAN peers with online devices first", () => {
+  const peers = [
+    makePeer("3", "Windows", "idle"),
+    makePeer("1", "Android", "error"),
+    makePeer("2", "MacBook", "online"),
+    makePeer("4", "iMac", "online"),
+  ];
+
+  const sorted = sortLanPeersForDisplay(peers);
+  assert.deepEqual(
+    sorted.map((peer) => {
+      return peer.deviceName;
+    }),
+    ["iMac", "MacBook", "Android", "Windows"],
+  );
+  assert.deepEqual(summarizeLanPeers(peers), {
+    connectingCount: 0,
+    errorCount: 1,
+    onlineCount: 2,
+    totalCount: 4,
+  });
+});
+
+test("shortens long endpoint identifiers cleanly", () => {
+  assert.equal(shortenEndpointId("short-id"), "short-id");
+  assert.equal(
+    shortenEndpointId("abcdefghijklmnopqrstuvwxyz123456"),
+    "abcdef…123456",
+  );
 });

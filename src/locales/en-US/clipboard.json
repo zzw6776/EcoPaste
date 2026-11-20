@@ -154,7 +154,7 @@
       "error": "Cloud sync failed; click to retry",
       "errorWithReason": "Cloud: {{reason}}; retrying automatically, or click to retry",
       "idle": "Cloud: sync not yet confirmed",
-      "manual": "Cloud: content availability not yet confirmed; click to upload",
+      "manual": "Cloud: content not uploaded yet; click to upload",
       "metadataOnly": "Cloud: record only synced; click to upload the file",
       "partial": "Cloud: content ready on {{content}}/{{total}} targets",
       "queued": "Cloud: waiting to sync",
@@ -184,20 +184,63 @@
     }
   },
   "syncStatus": {
+    "actions": {
+      "copied": "Copied",
+      "copy": "Copy",
+      "details": "Details",
+      "moreInfo": "Node & network details",
+      "nodeDetailsHint": "Dual channels, IDs & routes",
+      "openSettings": "Sync settings",
+      "retry": "Retry"
+    },
     "candidateAddresses": "Candidate addresses: {{count}}",
     "cloud": {
-      "activeRoute": "Last successful route ({{transport}}): {{address}}",
+      "activeRoute": "Active route ({{transport}}): {{address}}",
+      "channelTransfer": "Event & file transfer",
+      "channelWatch": "Live push watch",
       "connecting": "Cloud is connecting",
+      "customRelay": "Custom relay",
       "degraded": "Cloud is partially degraded",
+      "devicesHint": "Manage paired devices",
+      "devicesSummary": "{{online}}/{{total}} online",
+      "directOnly": "Direct only (no relay)",
       "disabled": "Cloud is disabled",
       "error": "Cloud connection error",
       "idle": "Cloud is disconnected",
+      "nodeAddresses": "Direct addresses",
+      "nodeId": "Hub Node ID",
       "online": "Cloud is connected",
-      "pending": "{{count}} events waiting to upload",
+      "pending": "{{count}} pending upload",
+      "pendingClear": "Upload queue clear",
+      "publicRelay": "Public relay",
+      "quota": {
+        "blobs": "{{count}} file objects",
+        "eventsCount": "Record count",
+        "eventsUnlimited": "{{count}} · Unlimited",
+        "eventsUsage": "{{used}} / {{max}} ({{percent}}%)",
+        "fetchFailed": "Cloud quota & limits unavailable",
+        "loading": "Loading cloud quota...",
+        "oldest": "Oldest {{time}}",
+        "refresh": "Refresh quota",
+        "retention": "Retention: {{days}}",
+        "retentionForever": "Keep forever",
+        "storageSpace": "Storage capacity",
+        "storageUnlimited": "{{used}} · Unlimited",
+        "storageUsage": "{{used}} / {{max}} ({{percent}}%)",
+        "title": "Cloud limits & usage"
+      },
       "reconnect": "Reconnect now",
-      "serverVersion": "Server version: v{{version}}",
-      "serverVersionUnknown": "Server version: Unknown",
-      "title": "Cloud"
+      "recordsCount": "{{count}} records",
+      "recordsHint": "Browse cloud history",
+      "relayAuthConfigured": "Auth token configured",
+      "relayModeLabel": "Relay policy",
+      "relayUrls": "Relay URLs",
+      "serverVersion": "v{{version}}",
+      "serverVersionUnknown": "Version unknown",
+      "setupPrompt": "Enable cloud sync and configure your Hub to sync across networks.",
+      "title": "Cloud Sync",
+      "unpairedPrompt": "Create or join a sync space in settings first.",
+      "watchLabel": "Live watch: {{state}}"
     },
     "devices": {
       "current": "This device",
@@ -220,17 +263,28 @@
       "versionUnknown": "Version unknown"
     },
     "lan": {
+      "candidateList": "Candidate direct addresses",
       "connecting": "LAN is connecting",
+      "currentDevice": "This device: {{name}}",
       "degraded": "Some LAN connections are degraded",
+      "detailsTitle": "LAN Node & Peer Details",
       "disabled": "LAN sync is disabled",
+      "disabledPrompt": "Enable LAN sync for automatic mDNS discovery and high-speed direct transfers.",
       "error": "LAN connection error",
       "idle": "No online LAN devices",
-      "noPeers": "No paired devices",
+      "localNode": "Local LAN node",
+      "noPeers": "No paired devices discovered",
+      "noPeersHint": "Ensure devices are on the same LAN and paired in sync settings.",
       "online": "LAN is connected",
+      "onlineRatio": "{{online}}/{{total}} online",
+      "peerId": "Peer ID",
+      "peersSection": "Paired devices",
       "reconnectAll": "Reconnect all devices",
       "reconnectDevice": "Reconnect {{device}}",
-      "title": "LAN devices"
+      "title": "LAN Devices",
+      "unpairedPrompt": "Not in a sync space yet. Pair devices in sync settings."
     },
+    "lastAttempt": "Last attempt: {{time}}",
     "lastSeen": "Last seen: {{time}}",
     "lastSuccess": "Last success: {{time}}",
     "nextRetry": "Next retry: {{time}}",
@@ -286,8 +340,20 @@
   "transferCenter": {
     "active": "In progress",
     "backfill": {
-      "description": "Syncing history in the background without blocking new copies",
-      "title": "Automatic backfill"
+      "attachments": "Syncing images & files",
+      "description": "Runs quietly in background without delaying live sync",
+      "fromSource": "from {{source}}",
+      "inbound": "Syncing text & records",
+      "inboundAttachments": "{{completed}} / {{total}}",
+      "inboundMetadata": "{{percent}}%",
+      "outbound": "Uploading local history",
+      "serving": "Syncing to {{device}}",
+      "servingActive": "{{transfers}} active",
+      "servingDone": "{{served}} synced",
+      "servingMedia": "{{count}} files & images",
+      "servingProgress": "{{served}}/{{total}} records",
+      "sourceSeparator": ", ",
+      "title": "History Sync"
     },
     "clearFinished": "Clear finished",
     "download": {
@@ -299,7 +365,14 @@
       "queued": "Waiting to download",
       "transferring": "Downloading"
     },
-    "empty": "No file transfer activity",
+    "empty": "No transfer activity",
+    "emptyActive": "No active transfers",
+    "emptyFinished": "No finished transfers",
+    "filter": {
+      "active": "Active",
+      "all": "All",
+      "finished": "Finished"
+    },
     "import": {
       "canceled": "Import canceled",
       "completed": "Import complete",
@@ -310,8 +383,10 @@
       "queued": "Waiting to upload",
       "transferring": "Importing"
     },
-    "item": "File transfer",
+    "item": "Sync transfer",
     "itemCount": "{{count}} items",
+    "itemMissing": "Original clipboard item was removed",
+    "locateHint": "Locate in list",
     "recent": "Recent activity",
     "retry": "Retry",
     "route": {
@@ -320,10 +395,21 @@
       "lanDevice": "Wi-Fi · {{device}}",
       "local": "Local"
     },
+    "serve": {
+      "available": "Already on target device",
+      "canceled": "Send canceled",
+      "completed": "Sent",
+      "confirming": "Awaiting confirmation",
+      "connecting": "Connecting to device",
+      "failed": "Send failed",
+      "preparing": "Preparing to send",
+      "queued": "Waiting for device",
+      "transferring": "Sending"
+    },
     "startedAt": "Started: {{time}}",
-    "title": "File transfers",
+    "title": "Transfer Center",
     "upload": {
-      "available": "File already available; no upload needed",
+      "available": "Already available; no upload needed",
       "canceled": "Upload canceled",
       "completed": "Upload complete",
       "confirming": "Waiting for confirmation",

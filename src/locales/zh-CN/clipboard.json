@@ -154,7 +154,7 @@
       "error": "云端同步失败，点击重试",
       "errorWithReason": "云端：{{reason}}，等待重试或点击重试",
       "idle": "云端：尚无同步确认",
-      "manual": "云端：内容状态尚未确认，点击上传",
+      "manual": "云端：内容尚未上传，点击上传",
       "metadataOnly": "云端：仅记录已同步，点击上传文件",
       "partial": "云端：部分内容已就绪（{{content}}/{{total}}）",
       "queued": "云端：等待同步",
@@ -184,20 +184,63 @@
     }
   },
   "syncStatus": {
+    "actions": {
+      "copied": "已复制",
+      "copy": "复制",
+      "details": "详情",
+      "moreInfo": "节点与网络详情",
+      "nodeDetailsHint": "双通道、节点 ID 与路由",
+      "openSettings": "同步设置",
+      "retry": "重试"
+    },
     "candidateAddresses": "{{count}} 个候选地址",
     "cloud": {
-      "activeRoute": "最近成功路径（{{transport}}）：{{address}}",
+      "activeRoute": "当前路线（{{transport}}）：{{address}}",
+      "channelTransfer": "事件与文件传输",
+      "channelWatch": "实时推送监听",
       "connecting": "云端正在连接",
+      "customRelay": "自定义中继",
       "degraded": "云端部分链路异常",
+      "devicesHint": "查看与管理设备",
+      "devicesSummary": "{{online}}/{{total}} 台在线",
+      "directOnly": "仅直连（关闭中继）",
       "disabled": "云端未启用",
       "error": "云端连接异常",
       "idle": "云端未连接",
+      "nodeAddresses": "直连地址",
+      "nodeId": "Hub 节点 ID",
       "online": "云端连接正常",
-      "pending": "{{count}} 条事件等待上传",
+      "pending": "{{count}} 条等待上传",
+      "pendingClear": "上传队列已清空",
+      "publicRelay": "公共中继",
+      "quota": {
+        "blobs": "{{count}} 个文件对象",
+        "eventsCount": "记录条数",
+        "eventsUnlimited": "{{count}} 条 · 不限条数",
+        "eventsUsage": "{{used}} / {{max}} 条 ({{percent}}%)",
+        "fetchFailed": "暂未获取到云端条数与容量限制",
+        "loading": "正在读取云端配额...",
+        "oldest": "最早 {{time}}",
+        "refresh": "刷新配额",
+        "retention": "保留 {{days}}",
+        "retentionForever": "永久保留",
+        "storageSpace": "存储容量",
+        "storageUnlimited": "{{used}} · 不限容量",
+        "storageUsage": "{{used}} / {{max}} ({{percent}}%)",
+        "title": "云端条数与容量限制"
+      },
       "reconnect": "立即重连",
-      "serverVersion": "服务端版本：v{{version}}",
-      "serverVersionUnknown": "服务端版本：未知",
-      "title": "云端"
+      "recordsCount": "共 {{count}} 条记录",
+      "recordsHint": "浏览云端历史",
+      "relayAuthConfigured": "已配置认证令牌",
+      "relayModeLabel": "中继策略",
+      "relayUrls": "中继地址",
+      "serverVersion": "v{{version}}",
+      "serverVersionUnknown": "版本未知",
+      "setupPrompt": "启用云端同步并配置 Hub 地址后，可跨网络同步剪贴板与文件。",
+      "title": "云端同步",
+      "unpairedPrompt": "请先在同步设置中创建或加入同步空间。",
+      "watchLabel": "实时监听：{{state}}"
     },
     "devices": {
       "current": "本机",
@@ -220,17 +263,28 @@
       "versionUnknown": "版本未知"
     },
     "lan": {
+      "candidateList": "候选直连地址",
       "connecting": "局域网正在连接",
+      "currentDevice": "本机：{{name}}",
       "degraded": "局域网部分连接异常",
+      "detailsTitle": "局域网节点与设备详情",
       "disabled": "局域网同步未启用",
+      "disabledPrompt": "启用局域网同步后，同一网络内的设备会通过 mDNS 自动发现并高速直连。",
       "error": "局域网连接异常",
       "idle": "当前没有在线设备",
-      "noPeers": "暂无已配对设备",
+      "localNode": "本机局域网节点",
+      "noPeers": "暂无已发现的配对设备",
+      "noPeersHint": "请确保设备处于同一局域网并已在同步设置完成配对。",
       "online": "局域网连接正常",
+      "onlineRatio": "{{online}}/{{total}} 在线",
+      "peerId": "节点 ID",
+      "peersSection": "已配对设备详情",
       "reconnectAll": "重新连接全部设备",
       "reconnectDevice": "重新连接 {{device}}",
-      "title": "局域网设备"
+      "title": "局域网设备",
+      "unpairedPrompt": "尚未加入同步空间，请在同步设置中完成配对。"
     },
+    "lastAttempt": "最近尝试：{{time}}",
     "lastSeen": "最近发现：{{time}}",
     "lastSuccess": "最近成功：{{time}}",
     "nextRetry": "下次重试：{{time}}",
@@ -286,8 +340,20 @@
   "transferCenter": {
     "active": "进行中",
     "backfill": {
-      "description": "后台同步历史记录，不阻塞最新复制",
-      "title": "自动回填"
+      "attachments": "同步图片与文件",
+      "description": "后台静默同步，不阻塞实时传输",
+      "fromSource": "来自 {{source}}",
+      "inbound": "同步文本与记录",
+      "inboundAttachments": "{{completed}} / {{total}}",
+      "inboundMetadata": "{{percent}}%",
+      "outbound": "上传本地历史",
+      "serving": "同步至 {{device}}",
+      "servingActive": "传输中 {{transfers}}",
+      "servingDone": "已同步 {{served}} 条",
+      "servingMedia": "图片与文件 {{count}}",
+      "servingProgress": "记录 {{served}}/{{total}}",
+      "sourceSeparator": "、",
+      "title": "历史记录同步"
     },
     "clearFinished": "清空已结束",
     "download": {
@@ -299,7 +365,14 @@
       "queued": "等待下载",
       "transferring": "正在下载"
     },
-    "empty": "暂无文件传输记录",
+    "empty": "暂无传输记录",
+    "emptyActive": "暂无进行中的传输",
+    "emptyFinished": "暂无已结束的记录",
+    "filter": {
+      "active": "进行中",
+      "all": "全部",
+      "finished": "已结束"
+    },
     "import": {
       "canceled": "导入已取消",
       "completed": "导入完成",
@@ -310,8 +383,10 @@
       "queued": "等待上传",
       "transferring": "正在导入"
     },
-    "item": "文件传输",
+    "item": "传输记录",
     "itemCount": "{{count}} 个项目",
+    "itemMissing": "原剪贴板记录已清理，无法跳转定位",
+    "locateHint": "点击定位原记录",
     "recent": "最近记录",
     "retry": "重试",
     "route": {
@@ -320,10 +395,21 @@
       "lanDevice": "Wi-Fi · {{device}}",
       "local": "本地"
     },
+    "serve": {
+      "available": "目标设备已有该内容",
+      "canceled": "发送已取消",
+      "completed": "发送完成",
+      "confirming": "等待设备确认",
+      "connecting": "正在连接设备",
+      "failed": "发送失败",
+      "preparing": "正在准备发送",
+      "queued": "等待设备接收",
+      "transferring": "正在发送"
+    },
     "startedAt": "开始时间：{{time}}",
-    "title": "文件传输",
+    "title": "传输中心",
     "upload": {
-      "available": "文件已存在，无需上传",
+      "available": "内容已存在，无需上传",
       "canceled": "上传已取消",
       "completed": "上传完成",
       "confirming": "等待确认",

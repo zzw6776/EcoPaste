@@ -22,6 +22,7 @@ const LOCAL_IMPORT_TARGET: &str = "import";
 pub enum TransferDirection {
     Upload,
     Download,
+    Serve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -174,6 +175,12 @@ impl TransferRegistry {
     /// Joins parallel attachment streams into one Rust-owned user-visible operation.
     pub fn start(&self, task: TransferTask) -> TransferHandle {
         self.start_entry(task, None, TransferPersistence::Durable, true)
+    }
+
+    /// Starts one independent passive `GetBlob` serve task so multi-blob cards never wedge in
+    /// `Queued` if a peer pulls remaining blobs from another route.
+    pub fn start_serve(&self, task: TransferTask) -> TransferHandle {
+        self.start_entry(task, None, TransferPersistence::Durable, false)
     }
 
     #[cfg(target_os = "android")]

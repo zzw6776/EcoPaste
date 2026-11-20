@@ -207,6 +207,9 @@ function channelClassName(
       break;
   }
   if (activity === "queued") return "text-ant-secondary";
+  if (channel.action === "upload" || channel.action === "download") {
+    return "text-ant-info";
+  }
   return "text-ant-tertiary";
 }
 

@@ -1,5 +1,25 @@
 use super::*;
 
+pub(super) struct SourceAssetRefreshOutcome {
+    pub(super) resolved: usize,
+    pub(super) unresolved: usize,
+    pub(super) next_retry_at: Option<Instant>,
+}
+
+fn record_icon_failure(
+    cooldowns: &mut HashMap<String, (usize, Instant)>,
+    icon_hash: &str,
+    now: Instant,
+    delay: Duration,
+) -> (usize, Instant) {
+    let failures = cooldowns
+        .get(icon_hash)
+        .map_or(1, |(count, _)| count.saturating_add(1));
+    let retry_at = now + delay;
+    cooldowns.insert(icon_hash.to_owned(), (failures, retry_at));
+    (failures, retry_at)
+}
+
 impl SyncManager {
     /// Creates or refreshes the local alias before the clipboard row references it.
     pub(super) async fn resolve_received_source_app(
@@ -56,31 +76,69 @@ impl SyncManager {
         Ok(app.id)
     }
 
-    /// Retries all missing source icons through the currently available peer or Hub connection.
+    /// Retries missing source icons with per-icon backoff so missing blobs never trigger busy loops.
     pub(super) async fn refresh_source_app_assets(
         &self,
         connection: Option<&Connection>,
         group: &GroupSecrets,
-    ) -> Result<usize> {
+        cooldowns: &mut HashMap<String, (usize, Instant)>,
+    ) -> Result<SourceAssetRefreshOutcome> {
         let pool = self.pool().await;
         let store = self.app.state::<AppIconStore>();
-        let mut pending_count = 0;
-        for asset in db::apps::source_app_assets(&pool, &group.group_id).await? {
+        let assets = db::apps::source_app_assets(&pool, &group.group_id).await?;
+        let active_hashes: HashSet<&str> = assets
+            .iter()
+            .map(|asset| asset.icon_hash.as_str())
+            .collect();
+        cooldowns.retain(|hash, _| active_hashes.contains(hash.as_str()));
+
+        let now = Instant::now();
+        let mut resolved = 0_usize;
+        let mut unresolved = 0_usize;
+        let mut next_retry_at: Option<Instant> = None;
+        for asset in &assets {
             if asset.is_attached && store.icon_file_for_hash(&asset.icon_hash).is_some() {
+                cooldowns.remove(&asset.icon_hash);
                 continue;
             }
-            pending_count += 1;
-            if let Err(error) = self
-                .refresh_source_app_asset(connection, group, &pool, &asset)
+            if let Some((_, retry_at)) = cooldowns.get(&asset.icon_hash) {
+                if now < *retry_at {
+                    unresolved += 1;
+                    next_retry_at = Some(next_retry_at.map_or(*retry_at, |cur| cur.min(*retry_at)));
+                    continue;
+                }
+            }
+            match self
+                .refresh_source_app_asset(connection, group, &pool, asset)
                 .await
             {
-                log::debug!(
-                    "source app icon {} remains pending: {error}",
-                    asset.icon_hash
-                );
+                Ok(()) => {
+                    cooldowns.remove(&asset.icon_hash);
+                    resolved += 1;
+                }
+                Err(error) => {
+                    let failures = cooldowns
+                        .get(&asset.icon_hash)
+                        .map_or(1, |(count, _)| count.saturating_add(1));
+                    let delay = super::runtime_workers::retry_delay(failures);
+                    let (_, retry_at) =
+                        record_icon_failure(cooldowns, &asset.icon_hash, now, delay);
+                    unresolved += 1;
+                    next_retry_at = Some(next_retry_at.map_or(retry_at, |cur| cur.min(retry_at)));
+                    log::debug!(
+                        "source app icon {} remains pending (attempt={} retryInSecs={}): {error}",
+                        asset.icon_hash,
+                        failures,
+                        delay.as_secs(),
+                    );
+                }
             }
         }
-        Ok(pending_count)
+        Ok(SourceAssetRefreshOutcome {
+            resolved,
+            unresolved,
+            next_retry_at,
+        })
     }
 
     /// Publishes queued local source icons and removes them only after the Hub acknowledges them.
@@ -276,5 +334,26 @@ impl SyncManager {
             source_is_directory: false,
             stream_nonce: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_icon_failure_increments_attempts_per_icon() {
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+        let (attempts, retry_at) =
+            record_icon_failure(&mut cooldowns, "hash-a", now, Duration::from_secs(2));
+        assert_eq!(attempts, 1);
+        assert_eq!(retry_at, now + Duration::from_secs(2));
+
+        let (attempts, retry_at) =
+            record_icon_failure(&mut cooldowns, "hash-a", now, Duration::from_secs(5));
+        assert_eq!(attempts, 2);
+        assert_eq!(retry_at, now + Duration::from_secs(5));
+        assert_eq!(cooldowns.len(), 1);
     }
 }

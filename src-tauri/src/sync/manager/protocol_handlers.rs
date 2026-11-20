@@ -503,6 +503,21 @@ async fn dispatch_peer(
             ecopaste_sync_protocol::limit_sync_response(&mut response, had_more)?;
             write_frame(send, &response).await?;
 
+            let (served_count, next_before_seq) = lan_sync_serve_progress(&response);
+            let remaining_count = match next_before_seq {
+                Some(next_before) => {
+                    repository::count_items_remaining_for_peer(&pool, after_seq, next_before)
+                        .await?
+                }
+                None => 0,
+            };
+            manager.record_peer_catchup_serve(
+                &device.device_id,
+                &device.device_name,
+                served_count,
+                remaining_count,
+                next_before_seq.is_some(),
+            );
             manager.emit_updated();
             if needs_blob_pull {
                 manager.wake_attachments();
@@ -638,11 +653,59 @@ async fn dispatch_peer(
                     return Ok(());
                 }
             };
+            let peer_info =
+                repository::peer_by_endpoint_id(&pool, &connection.remote_id().to_string()).await?;
+            let serve_info = repository::blob_serve_info(&pool, &blob.blob_id).await?;
+            if let Some((ref peer_device_id, ref peer_name)) = peer_info {
+                manager.touch_peer_catchup(peer_device_id, peer_name, false);
+            }
+            let now_ms = Utc::now().timestamp_millis();
+            let serve_handle = match (&peer_info, &serve_info) {
+                (Some((peer_device_id, _)), Some(info))
+                    if super::tracks_individual_transfer(
+                        &info.kind,
+                        !info.history_backfill,
+                        info.manual_share,
+                        info.payload_updated_at_ms,
+                        now_ms,
+                    ) =>
+                {
+                    let target = format!("peer:{peer_device_id}");
+                    let task_key = format!("{}\0{target}\0serve\0{}", info.sync_key, blob.blob_id);
+                    let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
+                    let handle =
+                        manager
+                            .delivery
+                            .start_serve(super::super::progress::TransferTask {
+                                id: task_id,
+                                revision: 0,
+                                started_at_ms: now_ms,
+                                operation_id: info.sync_key.clone(),
+                                item_id: info.item_id.clone(),
+                                direction: super::super::progress::TransferDirection::Serve,
+                                route: super::super::progress::TransferRoute::Lan,
+                                target,
+                                file_name: info.single_file_name.clone(),
+                                phase: super::super::progress::TransferPhase::Connecting,
+                                transferred_bytes: 0,
+                                total_bytes: blob.size,
+                                speed_bytes_per_second: 0,
+                                elapsed_ms: 0,
+                                eta_seconds: None,
+                                error: None,
+                                cancellable: true,
+                            });
+                    handle.transferred(0);
+                    Some(handle)
+                }
+                _ => None,
+            };
+            manager.emit_updated();
             let transfer_lock_id = lock_lan_pull_item(&pool, &blob).await?;
             let mut progress = super::super::upload::UploadProgress::new(
                 connection.stable_id(),
                 blob_log_ref(&blob.blob_id),
-                None,
+                serve_handle.clone(),
             );
             progress.report_transferred = false;
             let result = async {
@@ -680,16 +743,42 @@ async fn dispatch_peer(
                     writer.shutdown().await?;
                     Ok::<(), anyhow::Error>(())
                 };
-                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |_| {});
-                multipart::until_stopped(send, async {
-                    tokio::try_join!(produce, transmit)?;
-                    Ok(())
-                })
+                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |bytes| {
+                    if let Some(handle) = &serve_handle {
+                        handle.transferred(bytes);
+                    }
+                });
+                super::cancelable_transfer(
+                    multipart::until_stopped(send, async {
+                        tokio::try_join!(produce, transmit)?;
+                        Ok(())
+                    }),
+                    || {
+                        serve_handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.canceled())
+                    },
+                )
                 .await?;
                 write_frame(send, &Response::BlobStored).await?;
                 Ok::<_, anyhow::Error>(())
             }
             .await;
+            if let Some(handle) = &serve_handle {
+                match &result {
+                    Ok(()) => handle.completed(blob.size),
+                    Err(_) if handle.canceled() => handle.mark_canceled(progress.written_bytes),
+                    Err(error) => handle.failed(progress.written_bytes, error.to_string()),
+                }
+            }
+            if let Some((ref peer_device_id, ref peer_name)) = peer_info {
+                manager.touch_peer_catchup(
+                    peer_device_id,
+                    peer_name,
+                    result.is_ok() && serve_info.is_some(),
+                );
+            }
+            manager.emit_updated();
             if let Some(lock_id) = transfer_lock_id {
                 if let Err(error) = repository::unlock_transfer_item(&pool, &lock_id).await {
                     log::warn!("release LAN pull transfer protection failed: {error:#}");
@@ -707,7 +796,8 @@ async fn dispatch_peer(
         | Request::PutManagedBlob { .. }
         | Request::PutManagedSourceIcon { .. }
         | Request::PutManagedStreamBlob { .. }
-        | Request::CommitStreamBlob { .. } => {
+        | Request::CommitStreamBlob { .. }
+        | Request::CheckCloudBlobs { .. } => {
             bail!("LAN peer does not support this cloud operation")
         }
     }
@@ -727,4 +817,56 @@ async fn lock_lan_pull_item(pool: &SqlitePool, blob: &StoredBlob) -> Result<Opti
     );
     repository::lock_transfer_item(pool, &lock_id, &item_id).await?;
     Ok(Some(lock_id))
+}
+
+fn lan_sync_serve_progress(response: &Response) -> (u64, Option<u64>) {
+    match response {
+        Response::LanSynced {
+            items,
+            next_before_seq,
+            ..
+        } => (u64::try_from(items.len()).unwrap_or(0), *next_before_seq),
+        _ => (0, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_record(seq: u64) -> ecopaste_sync_protocol::SyncItemRecord {
+        ecopaste_sync_protocol::SyncItemRecord {
+            seq,
+            hub_rev: 0,
+            item_key: format!("key-{seq}"),
+            origin_device_id: "dev-a".to_owned(),
+            updated_at_ms: 1_700_000_000,
+            deleted: false,
+            protected: false,
+            nonce: vec![1; 12],
+            ciphertext: vec![2; 16],
+            blob_ids: Vec::new(),
+            optional_blob_ids: Vec::new(),
+            available_blob_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lan_sync_serve_progress_reads_actual_sent_items_and_continuation() {
+        let truncated_page = Response::LanSynced {
+            acks: Vec::new(),
+            items: vec![dummy_record(20), dummy_record(19)],
+            latest_seq: 20,
+            next_before_seq: Some(19),
+        };
+        assert_eq!(lan_sync_serve_progress(&truncated_page), (2, Some(19)));
+
+        let final_catchup_page = Response::LanSynced {
+            acks: Vec::new(),
+            items: vec![dummy_record(3), dummy_record(2), dummy_record(1)],
+            latest_seq: 20,
+            next_before_seq: None,
+        };
+        assert_eq!(lan_sync_serve_progress(&final_catchup_page), (3, None));
+    }
 }

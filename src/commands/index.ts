@@ -169,6 +169,29 @@ export interface SyncBackfillProgress {
   total: number;
 }
 
+export interface SyncInboundCatchupSources {
+  cloud: boolean;
+  peers: string[];
+}
+
+export interface SyncInboundCatchupProgress {
+  metadataCompleted: number;
+  metadataTotal: number;
+  metadataSources: SyncInboundCatchupSources;
+  attachmentCompleted: number;
+  attachmentTotal: number;
+  attachmentSources: SyncInboundCatchupSources;
+}
+
+export interface SyncPeerCatchupStatus {
+  deviceId: string;
+  deviceName: string;
+  servedItems: number;
+  remainingItems: number;
+  servedAttachments: number;
+  activeTransfers: number;
+}
+
 export interface SyncStatus {
   enabled: boolean;
   lanEnabled: boolean;
@@ -194,10 +217,12 @@ export interface SyncStatus {
   cloudTransport: string | null;
   cloudServerVersion: string | null;
   backfill: SyncBackfillProgress | null;
+  inboundCatchup: SyncInboundCatchupProgress | null;
+  servingCatchups: SyncPeerCatchupStatus[];
   peers: SyncPeerStatus[];
 }
 
-export type TransferDirection = "upload" | "download";
+export type TransferDirection = "upload" | "download" | "serve";
 export type TransferRoute = "lan" | "cloud";
 export type TransferPhase =
   | "queued"
@@ -413,10 +438,12 @@ export const listCloudRecords = async (beforeCursor?: number, limit = 30) => {
   );
 };
 
-export const listCloudDevices = async () => {
+export const listCloudDevices = async (options?: { silent?: boolean }) => {
   return call<CloudDeviceDirectory>(
     TAURI_COMMAND.LIST_CLOUD_DEVICES,
     "commands:labels.loadCloudDevices",
+    void 0,
+    options?.silent,
   );
 };
 
@@ -762,6 +789,7 @@ const call = async <T>(
   command: string,
   labelKey: string,
   args?: Record<string, unknown>,
+  silent = false,
 ): Promise<T> => {
   if (!isTauri) {
     if (command === TAURI_COMMAND.GET_SETTINGS) {
@@ -794,12 +822,14 @@ const call = async <T>(
     const appError = toAppError(error);
 
     log.error(`invoke ${command} failed`, appError);
-    getMessageApi().error(
-      i18n.t("commands:error", {
-        label: i18n.t(labelKey),
-        message: appError.message,
-      }),
-    );
+    if (!silent) {
+      getMessageApi().error(
+        i18n.t("commands:error", {
+          label: i18n.t(labelKey),
+          message: appError.message,
+        }),
+      );
+    }
 
     throw appError;
   }
