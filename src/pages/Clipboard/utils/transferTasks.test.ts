@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TransferTask } from "@/commands";
 import {
+  isTransferFailed,
   sortTransferTasksForDisplay,
+  transferDirectionIconClass,
   transferRouteIconClass,
   upsertTransferTask,
 } from "./transferTasks";
@@ -69,4 +71,21 @@ test("shows active transfers before terminal history", () => {
     tasks.map((task) => task.id),
     ["new-active", "old-active", "new-completed", "old-completed"],
   );
+});
+
+test("maps direction icons and failure state cleanly", () => {
+  assert.equal(
+    transferDirectionIconClass(transferTask({ direction: "upload" })),
+    "i-lucide:arrow-up-right",
+  );
+  assert.equal(
+    transferDirectionIconClass(transferTask({ direction: "download" })),
+    "i-lucide:arrow-down-left",
+  );
+  assert.equal(
+    transferDirectionIconClass(transferTask({ direction: "serve" })),
+    "i-lucide:arrow-left-right",
+  );
+  assert.equal(isTransferFailed(transferTask({ phase: "failed" })), true);
+  assert.equal(isTransferFailed(transferTask({ phase: "completed" })), false);
 });

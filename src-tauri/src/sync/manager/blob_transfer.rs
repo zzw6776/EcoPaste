@@ -98,12 +98,30 @@ pub(super) async fn upload_blob(
     blob: &StoredBlob,
     options: BlobUploadOptions,
 ) -> Result<()> {
+    upload_blob_with_probe(connection, group, blob, options)
+        .await
+        .0
+}
+
+/// Uploads one attachment and reports whether a Cloud stall also failed the `CloudHealth` probe.
+pub(super) async fn upload_blob_with_probe(
+    connection: &Connection,
+    group: &GroupSecrets,
+    blob: &StoredBlob,
+    options: BlobUploadOptions,
+) -> (Result<()>, bool) {
     let _slot = match options.kind {
         BlobUploadKind::Content => {
             let limits = attachment_limits(connection);
-            limits.acquire(options.file_content, true).await?
+            match limits.acquire(options.file_content, true).await {
+                Ok(permit) => permit,
+                Err(error) => return (Err(error), false),
+            }
         }
-        BlobUploadKind::SourceIcon => source_icon_limits(connection).acquire_owned().await?,
+        BlobUploadKind::SourceIcon => match source_icon_limits(connection).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => return (Err(error.into()), false),
+        },
     };
     let _sync_activity = SyncActivityGuard::acquire();
     let started_at = Instant::now();
@@ -128,9 +146,12 @@ pub(super) async fn upload_blob(
         Utc::now().timestamp_millis(),
     );
     let result = upload_blob_inner(connection, group, blob, &options, &mut progress).await;
+    let mut unhealthy_connection = false;
     if let Err(error) = &result {
-        let probe = if options.is_cloud && super::super::upload::is_network_timeout(error) {
-            check_stalled_cloud_upload(connection).await
+        let probe = if options.is_cloud && is_cloud_data_timeout(error) {
+            let status = check_stalled_cloud_upload(connection).await;
+            unhealthy_connection = status != "healthy";
+            status
         } else {
             "not-needed"
         };
@@ -155,7 +176,7 @@ pub(super) async fn upload_blob(
             Err(error) => transfer.failed(progress.written_bytes, error.to_string()),
         }
     }
-    result.map(|_| ())
+    (result.map(|_| ()), unhealthy_connection)
 }
 
 /// Diagnoses a stalled upload; the watch supervisor owns connection recovery.

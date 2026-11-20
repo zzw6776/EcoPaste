@@ -348,6 +348,12 @@ impl SyncManager {
                                         .downcast_ref::<RemoteBlobTransportFailure>()
                                         .is_some() =>
                             {
+                                self.evict_unhealthy_cloud_data_connection(
+                                    active_route,
+                                    &connection,
+                                    &error,
+                                )
+                                .await;
                                 only_unavailable &= error
                                     .downcast_ref::<RemoteBlobTransportFailure>()
                                     .is_some_and(|failure| failure.unavailable);
@@ -371,6 +377,12 @@ impl SyncManager {
                                 retried = true;
                             }
                             Err(error) => {
+                                self.evict_unhealthy_cloud_data_connection(
+                                    active_route,
+                                    &connection,
+                                    &error,
+                                )
+                                .await;
                                 return Err(conclude_remote_blob_failure(error, only_unavailable));
                             }
                         }
@@ -425,6 +437,12 @@ impl SyncManager {
                                         .downcast_ref::<RemoteBlobTransportFailure>()
                                         .is_some() =>
                             {
+                                self.evict_unhealthy_cloud_data_connection(
+                                    active_route,
+                                    &connection,
+                                    &error,
+                                )
+                                .await;
                                 only_unavailable &= error
                                     .downcast_ref::<RemoteBlobTransportFailure>()
                                     .is_some_and(|failure| failure.unavailable);
@@ -448,6 +466,12 @@ impl SyncManager {
                                 retried = true;
                             }
                             Err(error) => {
+                                self.evict_unhealthy_cloud_data_connection(
+                                    active_route,
+                                    &connection,
+                                    &error,
+                                )
+                                .await;
                                 return Err(conclude_remote_blob_failure(error, only_unavailable));
                             }
                         }
@@ -515,6 +539,25 @@ impl SyncManager {
                 }
                 Err(error)
             }
+        }
+    }
+
+    async fn evict_unhealthy_cloud_data_connection(
+        &self,
+        route: super::super::progress::TransferRoute,
+        connection: &Connection,
+        error: &anyhow::Error,
+    ) {
+        if route != super::super::progress::TransferRoute::Cloud {
+            return;
+        }
+        let timed_out = error
+            .downcast_ref::<RemoteBlobTransportFailure>()
+            .is_some_and(|failure| failure.timed_out);
+        let unhealthy = should_invalidate_cloud_data_connection(connection, error).await
+            || (timed_out && check_stalled_cloud_upload(connection).await != "healthy");
+        if unhealthy {
+            self.invalidate_cloud_data_connection(connection.stable_id());
         }
     }
 

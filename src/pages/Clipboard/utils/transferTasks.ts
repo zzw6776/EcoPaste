@@ -12,10 +12,20 @@ export function isTransferActive(task: TransferTask) {
   return !terminalPhases.includes(task.phase);
 }
 
+export function isTransferFailed(task: TransferTask) {
+  return task.phase === "failed";
+}
+
 export function transferRouteIconClass(task: TransferTask) {
   if (task.target === "import") return "i-lucide:hard-drive-download";
   if (task.phase === "preparing") return "i-lucide:loader-circle";
   return task.route === "lan" ? "i-lucide:wifi" : "i-lucide:cloud";
+}
+
+export function transferDirectionIconClass(task: TransferTask) {
+  if (task.direction === "download") return "i-lucide:arrow-down-left";
+  if (task.direction === "serve") return "i-lucide:arrow-left-right";
+  return "i-lucide:arrow-up-right";
 }
 
 /** Applies one Rust-owned operation update without recreating transfer semantics in the UI. */

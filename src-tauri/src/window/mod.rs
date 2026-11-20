@@ -27,6 +27,10 @@ pub const PREFERENCE_WINDOW_LABEL: &str = "preference";
 pub const CLIPBOARD_PREVIEW_WINDOW_LABEL: &str = "clipboard-preview";
 pub const ONBOARDING_WINDOW_LABEL: &str = "onboarding";
 pub const UPDATE_WINDOW_LABEL: &str = "update";
+pub const CLOUD_DEVICES_WINDOW_LABEL: &str = "cloud-devices";
+pub const CLOUD_RECORDS_WINDOW_LABEL: &str = "cloud-records";
+pub const CLOUD_DETAILS_WINDOW_LABEL: &str = "cloud-details";
+pub const LAN_DETAILS_WINDOW_LABEL: &str = "lan-details";
 
 /// 偏好页定位高亮事件。前端收到后切到目标设置项所在分类并滚动高亮。
 const PREFERENCE_HIGHLIGHT_EVENT: &str = "preference://highlight-setting";
@@ -387,34 +391,49 @@ pub fn build_onboarding_window(_app_handle: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn build_cloud_devices_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn build_cloud_records_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn build_cloud_details_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn build_lan_details_window(_app_handle: &AppHandle) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "android"))]
-/// 按需重建 preference 窗口。preference 不再由 Tauri 配置预创建（改为 `DestroyWhenIdle`），
-/// 故所有选项必须在此用 builder 完整复刻原 `tauri.conf.json` 声明，否则重建后行为漂移。
-///
-/// 建窗后保持 `visible: false`：由 [`show_window`] 统一走恢复几何 + 平台 show 流程，
-/// 与其它窗口的显示路径一致。
-pub fn build_preference_window(app_handle: &AppHandle) -> Result<()> {
-    if app_handle
-        .get_webview_window(PREFERENCE_WINDOW_LABEL)
-        .is_some()
-    {
+fn build_secondary_window(
+    app_handle: &AppHandle,
+    label: &str,
+    route: &str,
+    title: &str,
+    size: (f64, f64),
+    min_size: (f64, f64),
+) -> Result<()> {
+    if app_handle.get_webview_window(label).is_some() {
         return Ok(());
     }
 
-    let builder = WebviewWindowBuilder::new(
-        app_handle,
-        PREFERENCE_WINDOW_LABEL,
-        WebviewUrl::App("index.html/#/preference".into()),
-    )
-    .title("EcoPaste Preference")
-    .inner_size(960.0, 600.0)
-    .min_inner_size(960.0, 600.0)
-    .center()
-    .maximizable(false)
-    .skip_taskbar(true)
-    .accept_first_mouse(true)
-    .disable_drag_drop_handler()
-    .visible(false);
+    let builder = WebviewWindowBuilder::new(app_handle, label, WebviewUrl::App(route.into()))
+        .title(title)
+        .inner_size(size.0, size.1)
+        .min_inner_size(min_size.0, min_size.1)
+        .center()
+        .maximizable(false)
+        .skip_taskbar(true)
+        .accept_first_mouse(true)
+        .disable_drag_drop_handler()
+        .visible(false);
 
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -423,9 +442,78 @@ pub fn build_preference_window(app_handle: &AppHandle) -> Result<()> {
 
     builder
         .build()
-        .map_err(|err| anyhow::anyhow!("build preference window: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("build window {label}: {err}"))?;
 
     Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+/// 按需重建 preference 窗口。preference 不再由 Tauri 配置预创建（改为 `DestroyWhenIdle`），
+/// 故所有选项必须在此用 builder 完整复刻原 `tauri.conf.json` 声明，否则重建后行为漂移。
+///
+/// 建窗后保持 `visible: false`：由 [`show_window`] 统一走恢复几何 + 平台 show 流程，
+/// 与其它窗口的显示路径一致。
+pub fn build_preference_window(app_handle: &AppHandle) -> Result<()> {
+    build_secondary_window(
+        app_handle,
+        PREFERENCE_WINDOW_LABEL,
+        "index.html/#/preference",
+        "EcoPaste Preference",
+        (960.0, 600.0),
+        (960.0, 600.0),
+    )
+}
+
+#[cfg(not(target_os = "android"))]
+/// 按需创建或重建云端设备弹窗窗口。
+pub fn build_cloud_devices_window(app_handle: &AppHandle) -> Result<()> {
+    build_secondary_window(
+        app_handle,
+        CLOUD_DEVICES_WINDOW_LABEL,
+        "index.html/#/cloud-devices",
+        "EcoPaste Cloud Devices",
+        (540.0, 560.0),
+        (420.0, 400.0),
+    )
+}
+
+#[cfg(not(target_os = "android"))]
+/// 按需创建或重建云端剪贴板记录弹窗窗口。
+pub fn build_cloud_records_window(app_handle: &AppHandle) -> Result<()> {
+    build_secondary_window(
+        app_handle,
+        CLOUD_RECORDS_WINDOW_LABEL,
+        "index.html/#/cloud-records",
+        "EcoPaste Cloud Records",
+        (580.0, 620.0),
+        (440.0, 420.0),
+    )
+}
+
+#[cfg(not(target_os = "android"))]
+/// 按需创建或重建云端节点与网络详情弹窗窗口。
+pub fn build_cloud_details_window(app_handle: &AppHandle) -> Result<()> {
+    build_secondary_window(
+        app_handle,
+        CLOUD_DETAILS_WINDOW_LABEL,
+        "index.html/#/cloud-details",
+        "EcoPaste Cloud Details",
+        (500.0, 520.0),
+        (400.0, 380.0),
+    )
+}
+
+#[cfg(not(target_os = "android"))]
+/// 按需创建或重建局域网节点与设备详情弹窗窗口。
+pub fn build_lan_details_window(app_handle: &AppHandle) -> Result<()> {
+    build_secondary_window(
+        app_handle,
+        LAN_DETAILS_WINDOW_LABEL,
+        "index.html/#/lan-details",
+        "EcoPaste LAN Details",
+        (520.0, 540.0),
+        (400.0, 400.0),
+    )
 }
 
 #[cfg(not(target_os = "android"))]

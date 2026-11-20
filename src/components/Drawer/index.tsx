@@ -12,9 +12,11 @@ const Drawer: FC<AppDrawerProps> = (props) => {
   const { onClose, open, ...rest } = props;
 
   useAndroidBack(open === true, onClose);
-  useCloseAppOverlay(open === true, onClose);
+  const overlayResetKey = useCloseAppOverlay(open === true, onClose);
 
-  return <AntdDrawer {...rest} onClose={onClose} open={open} />;
+  return (
+    <AntdDrawer key={overlayResetKey} {...rest} onClose={onClose} open={open} />
+  );
 };
 
 export default Drawer;

@@ -403,6 +403,10 @@ impl DeliveryCoordinator {
         self.registry.start(task)
     }
 
+    pub fn start_serve(&self, task: TransferTask) -> TransferHandle {
+        self.registry.start_serve(task)
+    }
+
     #[cfg(target_os = "android")]
     pub fn start_local_import(&self, task: TransferTask) -> TransferHandle {
         self.registry.start_local_import(task)

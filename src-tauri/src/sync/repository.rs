@@ -103,8 +103,9 @@ mod tests {
     use crate::sync::{
         crypto,
         model::{
-            BlobManifest, BlobRole, FieldVersion, SyncContentAvailability, SyncItemAction,
-            SyncItemActivity, SyncedClipboardItem, SyncedItemSnapshot, SNAPSHOT_VERSION,
+            BlobManifest, BlobRole, FieldVersion, SyncContentAvailability,
+            SyncInboundCatchupSources, SyncItemAction, SyncItemActivity, SyncedClipboardItem,
+            SyncedItemSnapshot, SNAPSHOT_VERSION,
         },
     };
     use chrono::DateTime;
@@ -274,6 +275,7 @@ mod tests {
                 item_key: writes[0].item_key.clone(),
                 hub_rev: 1,
                 seq: 1,
+                available_blob_ids: Vec::new(),
             }],
             &seqs,
         )
@@ -1756,6 +1758,7 @@ mod tests {
                 item_key: first.item_key.clone(),
                 hub_rev: 1,
                 seq: 1,
+                available_blob_ids: Vec::new(),
             }],
             &seqs,
         )
@@ -1784,6 +1787,7 @@ mod tests {
                 item_key: second.item_key.clone(),
                 hub_rev: 2,
                 seq: 2,
+                available_blob_ids: Vec::new(),
             }],
             &seqs,
         )
@@ -1920,6 +1924,7 @@ mod tests {
                 item_key,
                 hub_rev: 1,
                 seq: 10,
+                available_blob_ids: Vec::new(),
             }],
             &seqs,
         )
@@ -1930,5 +1935,561 @@ mod tests {
             .unwrap();
         assert!(outcome.completed);
         assert!(!outcome.needs_control_push);
+    }
+
+    #[tokio::test]
+    async fn inbound_catchup_and_blob_serve_queries_match_reachable_state() {
+        let pool = memory_pool().await;
+        let peer = PeerAnnouncement {
+            device_id: "dev-peer".to_owned(),
+            device_name: "Phone".to_owned(),
+            platform: "android".to_owned(),
+            endpoint_id: "ep-peer".to_owned(),
+            direct_addresses: vec!["192.168.1.50:4443".to_owned()],
+            relay_urls: Vec::new(),
+            last_seen_ms: 1_700_000_000,
+        };
+        upsert_peer_identity(&pool, &peer).await.unwrap();
+        assert_eq!(
+            peer_by_endpoint_id(&pool, "ep-peer").await.unwrap(),
+            Some(("dev-peer".to_owned(), "Phone".to_owned()))
+        );
+
+        mark_peer_online(&pool, "dev-peer", Some("192.168.1.50:4443"), Some("direct"))
+            .await
+            .unwrap();
+        update_peer_window_cursor(
+            &pool,
+            "dev-peer",
+            SyncWindowCursor {
+                synced_seq: 100,
+                catchup_before: Some(250),
+                window_high: 400,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inbound_lan_catchup_window(&pool).await.unwrap(),
+            (150, 300, vec!["Phone".to_owned()])
+        );
+
+        let mut item = sample_item("/tmp/report.pdf", 1_700_003_000);
+        item.kind = ClipboardKind::Files;
+        upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let key = [11_u8; 32];
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-peer".to_owned(),
+            },
+            presence_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-peer".to_owned(),
+            },
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "files".to_owned(),
+                sub_kind: None,
+                content: "/tmp/report.pdf".to_owned(),
+                search_text: item.search_text.clone(),
+                summary: None,
+                file_types: None,
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "android".to_owned(),
+                created_at_ms: 1_700_003_000,
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(1_700_003_000),
+                source_revision: Some("rev-file".to_owned()),
+                source_device_id: Some("dev-peer".to_owned()),
+                source_device_name: Some("Phone".to_owned()),
+                source_updated_at_ms: Some(1_700_003_000),
+            }),
+            blobs: vec![crate::sync::model::BlobManifest {
+                blob_id: "c".repeat(64),
+                name: "report.pdf".to_owned(),
+                original_size: 2048,
+                encrypted_size: 2083,
+                role: crate::sync::model::BlobRole::File,
+                file_index: Some(0),
+                is_directory_archive: false,
+                stream_commitment: true,
+            }],
+            source_app: None,
+            content_identity: None,
+        };
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let blobs = vec![SyncItemBlobRow {
+            blob_id: "c".repeat(64),
+            role: "file".to_owned(),
+            optional: false,
+            size: 2083,
+            original_size: 2048,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/report.pdf".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![3_u8; 19]),
+            stream_commitment: true,
+            cloud_available: true,
+            local_available: true,
+        }];
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-peer",
+                content_identity: None,
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &blobs,
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Complete),
+            },
+        )
+        .await
+        .unwrap());
+
+        let info = blob_serve_info(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .expect("serve info");
+        assert_eq!(info.item_id, item.id);
+        assert_eq!(info.kind, "files");
+        assert!(!info.history_backfill);
+        assert_eq!(info.single_file_name.as_deref(), Some("report.pdf"));
+
+        // Mark cloud confirmed and flag `needs_blob_pull`: reachable only when cloud is enabled.
+        sqlx::query(
+            "UPDATE sync_item_targets SET confirmed_content = 'complete', status = 'confirmed' \
+             WHERE sync_key = ? AND target_id = 'cloud'",
+        )
+        .bind(&item.sync_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        mark_item_needs_blob_pull(
+            &pool,
+            &item.sync_key,
+            Some(&item.id),
+            "metadata",
+            Some("available"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_reachable_pending_blob_pulls(&pool, true, true)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reachable_pending_blob_pull_summary(&pool, true, true)
+                .await
+                .unwrap(),
+            (
+                1,
+                SyncInboundCatchupSources {
+                    cloud: true,
+                    peers: Vec::new(),
+                },
+            )
+        );
+        assert_eq!(
+            count_reachable_pending_blob_pulls(&pool, false, true)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // When an online LAN peer also holds the complete item, attachment summary prefers that peer.
+        sqlx::query(
+            "INSERT INTO sync_item_targets \
+             (sync_key, target_id, desired_content, confirmed_content, status, created_at, updated_at) \
+             VALUES (?, 'peer:dev-peer', 'complete', 'complete', 'confirmed', datetime('now'), datetime('now'))",
+        )
+        .bind(&item.sync_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reachable_pending_blob_pull_summary(&pool, true, true)
+                .await
+                .unwrap(),
+            (
+                1,
+                SyncInboundCatchupSources {
+                    cloud: false,
+                    peers: vec!["Phone".to_owned()],
+                },
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_accepted_promotes_metadata_only_item_when_hub_reports_available_blobs() {
+        let pool = memory_pool().await;
+        let key = [42_u8; 32];
+        let mut item = sample_item("oversized-reuse", 1_700_004_000);
+        item.kind = ClipboardKind::Files;
+        upsert_item_with_sync_outbox(&pool, &item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        let local_seq = local_seq_of(&pool, &item.sync_key).await;
+        let blob_id = "d".repeat(64);
+        let snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: item.sync_key.clone(),
+            content_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            presence_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: Some(SyncedClipboardItem {
+                kind: "files".to_owned(),
+                sub_kind: None,
+                content: "archive.zip".to_owned(),
+                search_text: item.search_text.clone(),
+                summary: None,
+                file_types: None,
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_sensitive: false,
+                source_platform: "macos".to_owned(),
+                created_at_ms: 1_700_004_000,
+                sync_key: item.sync_key.clone(),
+                updated_at_ms: Some(1_700_004_000),
+                source_revision: Some("rev-oversized".to_owned()),
+                source_device_id: Some("dev-a".to_owned()),
+                source_device_name: Some("Mac".to_owned()),
+                source_updated_at_ms: Some(1_700_004_000),
+            }),
+            blobs: vec![BlobManifest {
+                blob_id: blob_id.clone(),
+                name: "archive.zip".to_owned(),
+                original_size: 2048,
+                encrypted_size: 2080,
+                role: BlobRole::File,
+                file_index: Some(0),
+                is_directory_archive: false,
+                stream_commitment: true,
+            }],
+            source_app: None,
+            content_identity: Some("hash-archive".to_owned()),
+        };
+        let item_key = crypto::derive_item_key(&key, &item.sync_key);
+        let (nonce, ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+        let blobs = vec![SyncItemBlobRow {
+            blob_id: blob_id.clone(),
+            role: "file".to_owned(),
+            optional: false,
+            size: 2080,
+            original_size: 2048,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/archive.zip".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![9_u8; 19]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        }];
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &item.sync_key,
+                item_key: &item_key,
+                item_id: Some(&item.id),
+                expected_local_seq: local_seq,
+                origin_device_id: "dev-a",
+                content_identity: Some("hash-archive"),
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+                blobs: &blobs,
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Metadata),
+            },
+        )
+        .await
+        .unwrap());
+
+        let mut seqs = HashMap::new();
+        seqs.insert(item_key.clone(), u64::try_from(local_seq).unwrap());
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key,
+                hub_rev: 1,
+                seq: 1,
+                available_blob_ids: vec![blob_id],
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+
+        let statuses = item_statuses(&pool, std::slice::from_ref(&item.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses[0].cloud.availability,
+            SyncContentAvailability::Complete
+        );
+        assert_eq!(statuses[0].cloud.action, SyncItemAction::None);
+        assert_eq!(statuses[0].cloud.activity, SyncItemActivity::Idle);
+        assert!(pending_cloud_blob_uploads(&pool, false, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_cloud_blob_verification_promotes_lan_routed_and_metadata_items() {
+        let pool = memory_pool().await;
+        let key = [42_u8; 32];
+
+        // 1. Local oversized item routed via LAN (`delivery_route = 'lan'`, never pushed to Cloud).
+        let mut lan_item = sample_item("lan-file", 1_700_005_000);
+        lan_item.kind = ClipboardKind::Files;
+        upsert_item_with_sync_outbox(
+            &pool,
+            &lan_item,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                delivery_route: Some(ContentDeliveryRoute::Lan),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let lan_seq = local_seq_of(&pool, &lan_item.sync_key).await;
+        let lan_blob_id = "e".repeat(64);
+        let lan_item_key = crypto::derive_item_key(&key, &lan_item.sync_key);
+        let lan_snapshot = SyncedItemSnapshot {
+            version: SNAPSHOT_VERSION,
+            sync_key: lan_item.sync_key.clone(),
+            content_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            presence_version: FieldVersion {
+                seq: 1,
+                device_id: "dev-a".to_owned(),
+            },
+            favorite_version: FieldVersion::default(),
+            pinned_version: FieldVersion::default(),
+            note_version: FieldVersion::default(),
+            is_present: true,
+            is_favorite: false,
+            is_pinned: false,
+            note: None,
+            item: None,
+            blobs: Vec::new(),
+            source_app: None,
+            content_identity: Some("hash-lan".to_owned()),
+        };
+        let (lan_nonce, lan_ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &lan_item_key, false, false, &lan_snapshot)
+                .unwrap();
+        let lan_blobs = vec![SyncItemBlobRow {
+            blob_id: lan_blob_id.clone(),
+            role: "file".to_owned(),
+            optional: false,
+            size: 2048,
+            original_size: 2016,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/lan.bin".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![3_u8; 19]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        }];
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &lan_item.sync_key,
+                item_key: &lan_item_key,
+                item_id: Some(&lan_item.id),
+                expected_local_seq: lan_seq,
+                origin_device_id: "dev-a",
+                content_identity: Some("hash-lan"),
+                group_id: "group-1",
+                snapshot: &lan_snapshot,
+                nonce: &lan_nonce,
+                ciphertext: &lan_ciphertext,
+                blobs: &lan_blobs,
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Metadata),
+            },
+        )
+        .await
+        .unwrap());
+
+        // 2. Local oversized item whose metadata already reached Cloud with `confirmed_content = 'metadata'`.
+        let mut meta_item = sample_item("meta-file", 1_700_005_100);
+        meta_item.kind = ClipboardKind::Files;
+        upsert_item_with_sync_outbox(&pool, &meta_item, Some(ContentSyncOptions::default()))
+            .await
+            .unwrap();
+        let meta_seq = local_seq_of(&pool, &meta_item.sync_key).await;
+        let meta_blob_id = "f".repeat(64);
+        let meta_item_key = crypto::derive_item_key(&key, &meta_item.sync_key);
+        let (meta_nonce, meta_ciphertext) =
+            crypto::encrypt_item_snapshot(&key, &meta_item_key, false, false, &lan_snapshot)
+                .unwrap();
+        let meta_blobs = vec![SyncItemBlobRow {
+            blob_id: meta_blob_id.clone(),
+            role: "file".to_owned(),
+            optional: false,
+            size: 4096,
+            original_size: 4064,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/meta.bin".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![4_u8; 19]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        }];
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &meta_item.sync_key,
+                item_key: &meta_item_key,
+                item_id: Some(&meta_item.id),
+                expected_local_seq: meta_seq,
+                origin_device_id: "dev-a",
+                content_identity: Some("hash-meta"),
+                group_id: "group-1",
+                snapshot: &lan_snapshot,
+                nonce: &meta_nonce,
+                ciphertext: &meta_ciphertext,
+                blobs: &meta_blobs,
+                content_objects: &[],
+                cloud_desired: Some(ContentLevel::Metadata),
+            },
+        )
+        .await
+        .unwrap());
+        let mut seqs = HashMap::new();
+        seqs.insert(meta_item_key.clone(), u64::try_from(meta_seq).unwrap());
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: meta_item_key.clone(),
+                hub_rev: 1,
+                seq: 1,
+                available_blob_ids: Vec::new(),
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+
+        let checks = pending_cloud_blob_verifications(&pool, false, 10)
+            .await
+            .unwrap();
+        assert_eq!(checks.len(), 2);
+        assert!(checks
+            .iter()
+            .any(|check| check.blob_id == lan_blob_id && check.size == 2048));
+        assert!(checks
+            .iter()
+            .any(|check| check.blob_id == meta_blob_id && check.size == 4096));
+
+        let promotion =
+            promote_cloud_blobs_available(&pool, &[lan_blob_id.clone(), meta_blob_id.clone()])
+                .await
+                .unwrap();
+        assert_eq!(
+            promotion,
+            CloudBlobVerifyPromotion {
+                promoted_items: 2,
+                needs_control_push: true,
+            }
+        );
+        assert!(pending_cloud_blob_verifications(&pool, false, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // `meta_item` immediately turns green without waiting for another push or blob upload.
+        let meta_status = item_statuses(&pool, std::slice::from_ref(&meta_item.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_status[0].cloud.availability,
+            SyncContentAvailability::Complete
+        );
+        assert_eq!(meta_status[0].cloud.action, SyncItemAction::None);
+
+        // `lan_item` pushes 1 KB metadata without queueing attachment upload, then turns green on acceptance.
+        assert!(pending_cloud_blob_uploads(&pool, false, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let outbound = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+            .await
+            .unwrap();
+        assert_eq!(outbound.writes.len(), 1);
+        assert_eq!(outbound.writes[0].item_key, lan_item_key);
+
+        let mut lan_seqs = HashMap::new();
+        lan_seqs.insert(lan_item_key.clone(), outbound.writes[0].local_seq);
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: lan_item_key,
+                hub_rev: 2,
+                seq: 2,
+                available_blob_ids: vec![lan_blob_id],
+            }],
+            &lan_seqs,
+        )
+        .await
+        .unwrap();
+
+        let lan_status = item_statuses(&pool, std::slice::from_ref(&lan_item.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            lan_status[0].cloud.availability,
+            SyncContentAvailability::Complete
+        );
+        assert_eq!(lan_status[0].cloud.action, SyncItemAction::None);
     }
 }

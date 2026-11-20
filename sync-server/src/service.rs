@@ -384,16 +384,34 @@ impl HubService {
         })
     }
 
+    async fn blob_file_exists(&self, group_id: &str, blob_id: &str) -> bool {
+        tokio::fs::metadata(blob_path(&self.blob_root, group_id, blob_id))
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    }
+
     async fn upsert_items_with_quota_recovery(
         &self,
         group_id: &str,
         writes: &[SyncItemWrite],
     ) -> Result<UpsertItemsResult> {
-        let result = self.repository.upsert_items(group_id, writes, None).await;
-        if matches!(&result, Ok(upserted) if !upserted.accepted.is_empty()) {
+        let mut result = self.repository.upsert_items(group_id, writes, None).await?;
+        for item in &mut result.accepted {
+            if item.available_blob_ids.is_empty() {
+                continue;
+            }
+            let mut verified = Vec::with_capacity(item.available_blob_ids.len());
+            for blob_id in item.available_blob_ids.drain(..) {
+                if self.blob_file_exists(group_id, &blob_id).await {
+                    verified.push(blob_id);
+                }
+            }
+            item.available_blob_ids = verified;
+        }
+        if !result.accepted.is_empty() {
             self.request_policy_cleanup_if_needed(group_id).await;
         }
-        result
+        Ok(result)
     }
 
     /// Reconciles blob files with durable metadata while no upload can publish a new path.
@@ -1182,6 +1200,43 @@ impl HubService {
                     },
                 )
                 .await?;
+            }
+            Request::CheckCloudBlobs {
+                group_id,
+                access_token,
+                blobs,
+            } => {
+                self.repository
+                    .authenticate(&group_id, &access_token)
+                    .await?;
+                self.ensure_endpoint_active(&group_id, remote_endpoint_id)
+                    .await?;
+                if blobs.len() > usize::from(MAX_ITEMS_PER_BATCH) {
+                    bail!("too many blob checks");
+                }
+                for entry in &blobs {
+                    validate_blob(&entry.blob_id, entry.size)?;
+                }
+                let group_lock = self.group_sync_lock(&group_id).await;
+                let _group_guard = group_lock.lock().await;
+                let mut seen = HashSet::with_capacity(blobs.len());
+                let mut available_blob_ids = Vec::new();
+                for entry in blobs {
+                    if !seen.insert(entry.blob_id.clone()) {
+                        continue;
+                    }
+                    let existing_size =
+                        self.repository.blob_size(&group_id, &entry.blob_id).await?;
+                    if existing_size == Some(entry.size)
+                        && self.blob_file_exists(&group_id, &entry.blob_id).await
+                    {
+                        self.repository
+                            .touch_blob(&group_id, &entry.blob_id)
+                            .await?;
+                        available_blob_ids.push(entry.blob_id);
+                    }
+                }
+                write_frame(send, &Response::CloudBlobsChecked { available_blob_ids }).await?;
             }
             Request::Health
             | Request::SyncItems { .. }

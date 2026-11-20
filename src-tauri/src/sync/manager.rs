@@ -97,9 +97,9 @@ use super::{
         CloudRecord, CloudRecordPage, FieldVersion, IncomingJoinRequest, NearbyJoinAttempt,
         NearbyJoinState, NearbySyncDevice, NearbySyncSpace, OutgoingBlobSource, SourceAppRef,
         SourceIconRef, StoredBlob, StoredContentObject, SyncChannelState, SyncChannelStatus,
-        SyncContentAvailability, SyncItemAction, SyncItemStatus, SyncLocalContentState,
-        SyncPairingPreview, SyncPeer, SyncStatus, SyncTarget, SyncedClipboardItem,
-        SyncedItemSnapshot,
+        SyncContentAvailability, SyncInboundCatchupProgress, SyncInboundCatchupSources,
+        SyncItemAction, SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer,
+        SyncPeerCatchupStatus, SyncStatus, SyncTarget, SyncedClipboardItem, SyncedItemSnapshot,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -519,12 +519,14 @@ impl std::error::Error for RemoteBlobUnavailable {}
 struct RemoteBlobTransportFailure {
     message: String,
     unavailable: bool,
+    timed_out: bool,
 }
 
 impl RemoteBlobTransportFailure {
     fn from_error(error: anyhow::Error) -> Self {
         Self {
             unavailable: error.downcast_ref::<RemoteBlobUnavailable>().is_some(),
+            timed_out: is_cloud_data_timeout(&error),
             message: format!("{error:#}"),
         }
     }
@@ -843,6 +845,76 @@ fn remove_legacy_sync_blob_path(legacy: &Path) -> Result<()> {
         fs::remove_file(legacy)
     };
     result.with_context(|| format!("remove retired sync blob path {legacy:?}"))
+}
+
+const SERVING_CATCHUP_IDLE_RETENTION: Duration = Duration::from_secs(30);
+pub(super) const REALTIME_TRANSFER_RECENCY_MS: i64 = 120_000;
+
+/// Returns whether an attachment transfer should appear as an individual `TransferCenter` row:
+/// all file transfers (realtime and backfill), plus realtime/manual images, while historical
+/// images report through aggregate catch-up/backfill progress instead of flooding transfer history.
+pub(super) fn tracks_individual_transfer(
+    kind: &str,
+    is_realtime: bool,
+    manual_share: bool,
+    payload_updated_at_ms: i64,
+    now_ms: i64,
+) -> bool {
+    if kind == "files" {
+        return true;
+    }
+    kind == "image"
+        && (manual_share
+            || (is_realtime
+                && payload_updated_at_ms >= now_ms.saturating_sub(REALTIME_TRANSFER_RECENCY_MS)))
+}
+
+/// Applies a session-monotonic percentage floor while inbound metadata catch-up is active so
+/// one faster channel completing never causes the combined progress to jump backward.
+fn stabilize_metadata_progress(peak_bp: &AtomicU64, completed: u64, total: u64) -> (u64, u64) {
+    if total == 0 {
+        peak_bp.store(0, Ordering::Release);
+        return (0, 0);
+    }
+    let raw_bp = u64::try_from((u128::from(completed) * 10_000 / u128::from(total)).min(10_000))
+        .unwrap_or(10_000);
+    let mut prev = peak_bp.load(Ordering::Acquire);
+    let effective_bp = loop {
+        if raw_bp <= prev {
+            break prev;
+        }
+        match peak_bp.compare_exchange_weak(prev, raw_bp, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break raw_bp,
+            Err(actual) => prev = actual,
+        }
+    };
+    if raw_bp >= effective_bp {
+        return (completed.min(total), total);
+    }
+    let adjusted_completed =
+        u64::try_from((u128::from(total) * u128::from(effective_bp)).div_ceil(10_000))
+            .unwrap_or(total)
+            .min(total);
+    (adjusted_completed, total)
+}
+
+/// Combine completed inbound attachment pulls with remaining pending pulls.
+fn combine_attachment_catchup_counts(completed: u64, remaining: u64) -> (u64, u64) {
+    if remaining == 0 {
+        (0, 0)
+    } else {
+        (completed, completed.saturating_add(remaining))
+    }
+}
+
+fn retain_serving_catchup(
+    now: Instant,
+    entry: &runtime_state::ServingCatchupEntry,
+    active_transfers: u64,
+) -> bool {
+    active_transfers > 0
+        || entry.active_window
+        || now.saturating_duration_since(entry.last_activity) < SERVING_CATCHUP_IDLE_RETENTION
 }
 
 impl SyncManager {
@@ -1314,17 +1386,6 @@ impl SyncManager {
         });
     }
 
-    pub(super) fn schedule_attachment_wake(&self, delay: chrono::Duration) {
-        let delay = delay.to_std().unwrap_or(Duration::ZERO);
-        let app = self.app.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(delay).await;
-            if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
-                manager.wake_attachments();
-            }
-        });
-    }
-
     async fn sync_activity_guard(&self) -> SyncReadGuard<'_> {
         SyncReadGuard {
             guard: Some(self.runtime_state.lan_cycle_lock.read().await),
@@ -1502,17 +1563,24 @@ impl SyncManager {
             .read()
             .expect("cloud connection route poisoned")
             .clone();
-        let backfill = if settings.enabled && identity.group.is_some() {
-            repository::backfill_progress(
-                &pool,
-                settings.sync_sensitive,
-                settings.cloud_enabled && server_is_configured(&settings),
-                settings.lan_enabled,
-            )
-            .await?
-        } else {
-            None
-        };
+        let (backfill, inbound_catchup, serving_catchups) =
+            if settings.enabled && identity.group.is_some() {
+                let cloud_active = settings.cloud_enabled && server_is_configured(&settings);
+                let backfill = repository::backfill_progress(
+                    &pool,
+                    settings.sync_sensitive,
+                    cloud_active,
+                    settings.lan_enabled,
+                )
+                .await?;
+                let inbound_catchup = self
+                    .inbound_catchup_progress(&pool, cloud_active, settings.lan_enabled)
+                    .await?;
+                let serving_catchups = self.serving_catchup_statuses();
+                (backfill, inbound_catchup, serving_catchups)
+            } else {
+                (None, None, Vec::new())
+            };
         Ok(SyncStatus {
             enabled: settings.enabled,
             lan_enabled: settings.lan_enabled,
@@ -1547,8 +1615,186 @@ impl SyncManager {
                 .expect("cloud server version poisoned")
                 .clone(),
             backfill,
+            inbound_catchup,
+            serving_catchups,
             peers,
         })
+    }
+
+    async fn inbound_catchup_progress(
+        &self,
+        pool: &SqlitePool,
+        cloud_enabled: bool,
+        lan_enabled: bool,
+    ) -> Result<Option<SyncInboundCatchupProgress>> {
+        let mut metadata_completed = 0_u64;
+        let mut metadata_total = 0_u64;
+        let mut metadata_sources = SyncInboundCatchupSources::default();
+        if cloud_enabled {
+            let cursor = repository::cloud_window_cursor(pool).await?;
+            if let Some(before) = cursor.catchup_before {
+                let pulled =
+                    repository::count_pulled_items_in_window(pool, CLOUD_TARGET, before).await?;
+                let (cloud_completed, cloud_total) = cursor.catchup_counts(pulled);
+                metadata_completed = metadata_completed.saturating_add(cloud_completed);
+                metadata_total = metadata_total.saturating_add(cloud_total);
+                if cloud_total > 0 {
+                    metadata_sources.cloud = true;
+                }
+            }
+        }
+        if lan_enabled {
+            let (lan_completed, lan_total, lan_peers) =
+                repository::inbound_lan_catchup_window(pool).await?;
+            metadata_completed = metadata_completed.saturating_add(lan_completed);
+            metadata_total = metadata_total.saturating_add(lan_total);
+            metadata_sources.peers = lan_peers;
+        }
+        let (metadata_completed, metadata_total) = stabilize_metadata_progress(
+            &self.runtime_state.inbound_metadata_peak_bp,
+            metadata_completed,
+            metadata_total,
+        );
+        if metadata_total == 0 {
+            metadata_sources = SyncInboundCatchupSources::default();
+        }
+
+        let (remaining_attachments, attachment_sources) =
+            repository::reachable_pending_blob_pull_summary(pool, cloud_enabled, lan_enabled)
+                .await?;
+        let attachment_completed = self
+            .runtime_state
+            .inbound_attachment_completed
+            .load(Ordering::Acquire);
+        if metadata_total == 0 && remaining_attachments == 0 {
+            if attachment_completed > 0 {
+                self.runtime_state
+                    .inbound_attachment_completed
+                    .store(0, Ordering::Release);
+            }
+            return Ok(None);
+        }
+        let (attachment_completed, attachment_total) =
+            combine_attachment_catchup_counts(attachment_completed, remaining_attachments);
+
+        Ok(Some(SyncInboundCatchupProgress {
+            metadata_completed,
+            metadata_total,
+            metadata_sources,
+            attachment_completed,
+            attachment_total,
+            attachment_sources,
+        }))
+    }
+
+    pub(super) fn record_peer_catchup_serve(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        served_count: u64,
+        remaining_count: u64,
+        has_more: bool,
+    ) {
+        let now = Instant::now();
+        let mut sessions = self
+            .runtime_state
+            .serving_catchup_sessions
+            .write()
+            .expect("serving catchup sessions poisoned");
+        sessions.retain(|_, entry| retain_serving_catchup(now, entry, 0));
+        if !has_more && served_count < 8 {
+            if let Some(existing) = sessions.get_mut(device_id) {
+                existing.served_items = existing.served_items.saturating_add(served_count);
+                existing.remaining_items = 0;
+                existing.active_window = false;
+                existing.last_activity = now;
+            }
+            return;
+        }
+        let entry = sessions.entry(device_id.to_owned()).or_insert_with(|| {
+            runtime_state::ServingCatchupEntry {
+                device_id: device_id.to_owned(),
+                device_name: device_name.to_owned(),
+                served_items: 0,
+                remaining_items: 0,
+                served_attachments: 0,
+                active_window: has_more,
+                last_activity: now,
+            }
+        });
+        entry.device_name = device_name.to_owned();
+        entry.served_items = entry.served_items.saturating_add(served_count);
+        entry.remaining_items = if has_more { remaining_count.max(1) } else { 0 };
+        entry.active_window = has_more;
+        entry.last_activity = now;
+    }
+
+    pub(super) fn touch_peer_catchup(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        attachment_completed: bool,
+    ) {
+        let now = Instant::now();
+        let mut sessions = self
+            .runtime_state
+            .serving_catchup_sessions
+            .write()
+            .expect("serving catchup sessions poisoned");
+        if let Some(entry) = sessions.get_mut(device_id) {
+            entry.device_name = device_name.to_owned();
+            if attachment_completed {
+                entry.served_attachments = entry.served_attachments.saturating_add(1);
+            }
+            entry.last_activity = now;
+        }
+    }
+
+    fn serving_catchup_statuses(&self) -> Vec<SyncPeerCatchupStatus> {
+        let now = Instant::now();
+        let mut active_by_target: HashMap<String, u64> = HashMap::new();
+        for task in self.delivery.tasks() {
+            if task.direction != super::progress::TransferDirection::Serve {
+                continue;
+            }
+            let active = !matches!(
+                task.phase,
+                super::progress::TransferPhase::Available
+                    | super::progress::TransferPhase::Completed
+                    | super::progress::TransferPhase::Failed
+                    | super::progress::TransferPhase::Canceled
+            );
+            if active {
+                let entry = active_by_target.entry(task.target).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+
+        let mut sessions = self
+            .runtime_state
+            .serving_catchup_sessions
+            .write()
+            .expect("serving catchup sessions poisoned");
+        sessions.retain(|device_id, entry| {
+            let target = format!("peer:{device_id}");
+            let active_transfers = active_by_target.get(&target).copied().unwrap_or(0);
+            retain_serving_catchup(now, entry, active_transfers)
+        });
+        sessions
+            .values()
+            .map(|entry| {
+                let target = format!("peer:{}", entry.device_id);
+                let active_transfers = active_by_target.get(&target).copied().unwrap_or(0);
+                SyncPeerCatchupStatus {
+                    device_id: entry.device_id.clone(),
+                    device_name: entry.device_name.clone(),
+                    served_items: entry.served_items,
+                    remaining_items: entry.remaining_items,
+                    served_attachments: entry.served_attachments,
+                    active_transfers,
+                }
+            })
+            .collect()
     }
 
     pub async fn run_now(self: &Arc<Self>) -> Result<()> {
@@ -1914,8 +2160,9 @@ impl SyncManager {
     pub async fn item_statuses(&self, item_ids: &[String]) -> Result<Vec<SyncItemStatus>> {
         let pool = self.pool().await;
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
-        let lan_actionable = settings.enabled && settings.lan_enabled;
-        let cloud_actionable = settings.enabled && server_is_configured(&settings);
+        let paired = self.identity.snapshot().group.is_some();
+        let lan_actionable = settings.enabled && paired && settings.lan_enabled;
+        let cloud_actionable = settings.enabled && paired && server_is_configured(&settings);
         let mut statuses = repository::item_statuses(&pool, item_ids).await?;
         let sessions = repository::external_download_sessions(&pool, item_ids).await?;
         let mut known_external_items = HashSet::new();
@@ -2750,6 +2997,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresponsive_data_connection_probe_marks_connection_for_invalidation() {
+        let (_client, _server, connection, incoming) = upload_test_connection().await;
+        let peer = tokio::spawn(async move {
+            let (_send, mut recv) = incoming.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_frame(&mut recv).await.unwrap(),
+                Request::CloudHealth
+            ));
+            incoming.closed().await;
+        });
+        let timeout_error = super::super::upload::timed(
+            Duration::from_millis(1),
+            super::super::upload::UploadPhase::WaitForReady,
+            Language::ZhCN,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(should_invalidate_cloud_data_connection(&connection, &timeout_error).await);
+        assert!(
+            !should_invalidate_cloud_data_connection(
+                &connection,
+                &anyhow::anyhow!("non-network validation error")
+            )
+            .await
+        );
+        connection.close(0_u32.into(), b"test complete");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn uploaded_attachment_is_confirmed_and_reports_upload_readiness() {
         let (_client, _server, connection, incoming) = upload_test_connection().await;
         let directory = tempfile::tempdir().unwrap();
@@ -3527,5 +3805,85 @@ mod tests {
         assert_eq!(recovered.favorite_version, FieldVersion::new(2, "dev-a"));
         assert_eq!(recovered.note.as_deref(), Some("pinned note"));
         assert_eq!(recovered.note_version, FieldVersion::new(3, "dev-a"));
+    }
+
+    #[test]
+    fn combine_attachment_catchup_counts_preserves_monotonic_completed_across_batches() {
+        assert_eq!(combine_attachment_catchup_counts(0, 0), (0, 0));
+        assert_eq!(combine_attachment_catchup_counts(5, 0), (0, 0));
+        assert_eq!(combine_attachment_catchup_counts(0, 20), (0, 20));
+        // Growing pending pulls from subsequent metadata batches must not reset completed to zero.
+        assert_eq!(combine_attachment_catchup_counts(3, 45), (3, 48));
+        assert_eq!(combine_attachment_catchup_counts(12, 60), (12, 72));
+    }
+
+    #[test]
+    fn retain_serving_catchup_keeps_sessions_during_idle_retention_window() {
+        let now = Instant::now();
+        let recent_idle = runtime_state::ServingCatchupEntry {
+            device_id: "peer-1".into(),
+            device_name: "Phone".into(),
+            served_items: 24,
+            remaining_items: 0,
+            served_attachments: 3,
+            active_window: false,
+            last_activity: now - Duration::from_secs(20),
+        };
+        assert!(retain_serving_catchup(now, &recent_idle, 0));
+
+        let expired_idle = runtime_state::ServingCatchupEntry {
+            last_activity: now - SERVING_CATCHUP_IDLE_RETENTION,
+            ..recent_idle
+        };
+        assert!(!retain_serving_catchup(now, &expired_idle, 0));
+        assert!(retain_serving_catchup(now, &expired_idle, 1));
+
+        let active_window_entry = runtime_state::ServingCatchupEntry {
+            active_window: true,
+            ..expired_idle
+        };
+        assert!(retain_serving_catchup(now, &active_window_entry, 0));
+    }
+
+    #[test]
+    fn tracks_individual_transfer_includes_all_files_and_only_realtime_images() {
+        let now_ms = 1_700_000_200_000_i64;
+        let fresh_ms = now_ms - 30_000;
+        let stale_ms = now_ms - REALTIME_TRANSFER_RECENCY_MS - 1;
+
+        assert!(tracks_individual_transfer(
+            "files", false, false, stale_ms, now_ms
+        ));
+        assert!(tracks_individual_transfer(
+            "files", true, false, fresh_ms, now_ms
+        ));
+
+        assert!(tracks_individual_transfer(
+            "image", true, false, fresh_ms, now_ms
+        ));
+        assert!(tracks_individual_transfer(
+            "image", false, true, stale_ms, now_ms
+        ));
+        assert!(!tracks_individual_transfer(
+            "image", false, false, fresh_ms, now_ms
+        ));
+        assert!(!tracks_individual_transfer(
+            "image", true, false, stale_ms, now_ms
+        ));
+
+        assert!(!tracks_individual_transfer(
+            "text", true, false, fresh_ms, now_ms
+        ));
+    }
+
+    #[test]
+    fn stabilize_metadata_progress_is_monotonic_and_resets_when_empty() {
+        let peak = AtomicU64::new(0);
+        assert_eq!(stabilize_metadata_progress(&peak, 250, 1000), (250, 1000));
+        // When a faster channel finishes and drops from the sum, percentage must not regress.
+        assert_eq!(stabilize_metadata_progress(&peak, 100, 1000), (250, 1000));
+        assert_eq!(stabilize_metadata_progress(&peak, 600, 1000), (600, 1000));
+        assert_eq!(stabilize_metadata_progress(&peak, 0, 0), (0, 0));
+        assert_eq!(stabilize_metadata_progress(&peak, 50, 1000), (50, 1000));
     }
 }

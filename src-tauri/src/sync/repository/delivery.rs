@@ -47,6 +47,7 @@ pub struct PendingCloudBlobUpload {
     pub kind: String,
     pub history_backfill: bool,
     pub manual_share: bool,
+    pub payload_updated_at_ms: i64,
     pub blobs: Vec<SyncItemBlobRow>,
 }
 
@@ -912,6 +913,53 @@ pub async fn list_items_window_for_peer(
     Ok((records, latest_seq, had_more))
 }
 
+/// Counts remaining ready local items for an active LAN peer catch-up window (`after_seq < local_seq < before_seq`).
+pub async fn count_items_remaining_for_peer(
+    pool: &SqlitePool,
+    after_seq: u64,
+    before_seq: u64,
+) -> Result<u64> {
+    if before_seq <= after_seq {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_items
+        WHERE prep_state = 'ready'
+          AND item_key IS NOT NULL
+          AND nonce IS NOT NULL
+          AND ciphertext IS NOT NULL
+          AND (delivery_route IS NULL OR delivery_route <> 'cloud')
+          AND local_seq > ?
+          AND local_seq < ?
+        "#,
+    )
+    .bind(i64::try_from(after_seq).unwrap_or(i64::MAX))
+    .bind(i64::try_from(before_seq).unwrap_or(i64::MAX))
+    .fetch_one(pool)
+    .await
+    .context("count remaining LAN sync items for peer")?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Counts items pulled from `target_id` within the active catch-up range (`remote_seq >= min_remote_seq`).
+pub async fn count_pulled_items_in_window(
+    pool: &SqlitePool,
+    target_id: &str,
+    min_remote_seq: u64,
+) -> Result<u64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_item_targets WHERE target_id = ? AND remote_seq >= ?",
+    )
+    .bind(target_id)
+    .bind(i64::try_from(min_remote_seq).unwrap_or(i64::MAX))
+    .fetch_one(pool)
+    .await
+    .context("count pulled items in active catchup window")?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// Applies accepted Hub CAS writes, advancing `hub_rev` and immediately confirming inline items.
 pub async fn record_cloud_accepted(
     pool: &SqlitePool,
@@ -945,6 +993,25 @@ pub async fn record_cloud_accepted(
             .execute(&mut *transaction)
             .await
             .context("update item hub_rev")?;
+
+        if !deleted && !item.available_blob_ids.is_empty() {
+            let mut mark = sqlx::QueryBuilder::new(
+                "UPDATE sync_item_blobs SET cloud_available = 1, updated_at = ",
+            );
+            mark.push_bind(now)
+                .push(" WHERE sync_key = ")
+                .push_bind(&sync_key)
+                .push(" AND blob_id IN (");
+            let mut separated = mark.separated(", ");
+            for blob_id in &item.available_blob_ids {
+                separated.push_bind(blob_id);
+            }
+            mark.push(")");
+            mark.build()
+                .execute(&mut *transaction)
+                .await
+                .context("mark already-stored cloud blobs available on acceptance")?;
+        }
 
         let missing_cloud_blobs: i64 = if deleted {
             0
@@ -991,6 +1058,10 @@ pub async fn record_cloud_accepted(
                 pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
             ) VALUES (?, 'cloud', ?, ?, ?, ?, ?, NULL, ?, ?)
             ON CONFLICT(sync_key, target_id) DO UPDATE SET
+                desired_content = CASE
+                    WHEN excluded.confirmed_content = 'complete' THEN 'complete'
+                    ELSE sync_item_targets.desired_content
+                END,
                 confirmed_content = CASE
                     WHEN excluded.confirmed_content = 'complete' THEN 'complete'
                     WHEN sync_item_targets.confirmed_content = 'complete' AND excluded.confirmed_content = 'metadata'
@@ -1117,6 +1188,262 @@ pub async fn record_lan_acks(
     Ok(())
 }
 
+/// One unuploaded content blob belonging to a LAN-routed or metadata-only Cloud item that can
+/// be verified against the Hub without re-uploading attachment bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCloudBlobCheck {
+    pub sync_key: String,
+    pub blob_id: String,
+    pub size: u64,
+}
+
+/// Summary of local item promotions after verifying blobs already stored on the Cloud Hub.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CloudBlobVerifyPromotion {
+    pub promoted_items: usize,
+    pub needs_control_push: bool,
+}
+
+/// Lists non-optional unuploaded blobs for local LAN-routed or metadata-only Cloud items so
+/// existing Hub storage can be confirmed via `CheckCloudBlobs`.
+pub async fn pending_cloud_blob_verifications(
+    pool: &SqlitePool,
+    include_sensitive: bool,
+    limit: u16,
+) -> Result<Vec<PendingCloudBlobCheck>> {
+    let effective_limit = i64::from(limit.max(1));
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT s.sync_key, b.blob_id, b.size, s.payload_updated_at_ms, s.local_seq
+        FROM sync_items s
+        JOIN sync_item_blobs b
+          ON b.sync_key = s.sync_key
+         AND b.optional = 0
+         AND b.cloud_available = 0
+         AND b.size > 0
+        LEFT JOIN sync_item_targets t
+          ON t.sync_key = s.sync_key AND t.target_id = 'cloud'
+        WHERE s.prep_state = 'ready'
+          AND s.deleted = 0
+          AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
+          AND (
+              (s.origin = 'local' AND s.delivery_route = 'lan')
+              OR (t.target_id = 'cloud' AND t.confirmed_content = 'metadata')
+          )
+          AND (t.status IS NULL OR t.status NOT IN ('blocked', 'canceled'))
+        ORDER BY s.payload_updated_at_ms DESC, s.local_seq DESC, b.blob_id ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(include_sensitive)
+    .bind(effective_limit)
+    .fetch_all(pool)
+    .await
+    .context("query sync blobs needing cloud availability verification")?;
+
+    let mut checks = Vec::with_capacity(rows.len());
+    for row in rows {
+        let size = u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0);
+        if size == 0 {
+            continue;
+        }
+        checks.push(PendingCloudBlobCheck {
+            sync_key: row.try_get("sync_key")?,
+            blob_id: row.try_get("blob_id")?,
+            size,
+        });
+    }
+    Ok(checks)
+}
+
+/// Marks Hub-confirmed blobs available and promotes complete metadata-only or LAN-routed items
+/// to confirmed Cloud completion (or queues their metadata push when never pushed to Cloud).
+pub async fn promote_cloud_blobs_available(
+    pool: &SqlitePool,
+    available_blob_ids: &[String],
+) -> Result<CloudBlobVerifyPromotion> {
+    if available_blob_ids.is_empty() {
+        return Ok(CloudBlobVerifyPromotion::default());
+    }
+
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin promoting existing cloud blobs")?;
+    let now = Utc::now();
+
+    let mut affected_query = sqlx::QueryBuilder::new(
+        "SELECT DISTINCT sync_key FROM sync_item_blobs WHERE optional = 0 AND cloud_available = 0 AND blob_id IN (",
+    );
+    let mut separated = affected_query.separated(", ");
+    for blob_id in available_blob_ids {
+        separated.push_bind(blob_id);
+    }
+    affected_query.push(")");
+    let affected_sync_keys: Vec<String> = affected_query
+        .build_query_scalar()
+        .fetch_all(&mut *transaction)
+        .await
+        .context("list items affected by verified cloud blobs")?;
+
+    let mut mark =
+        sqlx::QueryBuilder::new("UPDATE sync_item_blobs SET cloud_available = 1, updated_at = ");
+    mark.push_bind(now)
+        .push(" WHERE cloud_available = 0 AND blob_id IN (");
+    let mut separated = mark.separated(", ");
+    for blob_id in available_blob_ids {
+        separated.push_bind(blob_id);
+    }
+    mark.push(")");
+    mark.build()
+        .execute(&mut *transaction)
+        .await
+        .context("mark verified cloud blobs available")?;
+
+    let mut promotion = CloudBlobVerifyPromotion::default();
+    for sync_key in affected_sync_keys {
+        let missing_blobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_item_blobs \
+             WHERE sync_key = ? AND optional = 0 AND cloud_available = 0",
+        )
+        .bind(&sync_key)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("count remaining unuploaded blobs after cloud verification")?;
+        if missing_blobs > 0 {
+            continue;
+        }
+
+        let Some((origin, current_local_seq, delivery_route)): Option<(
+            String,
+            i64,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT origin, local_seq, delivery_route \
+                 FROM sync_items WHERE sync_key = ? AND prep_state = 'ready' AND deleted = 0",
+        )
+        .bind(&sync_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("load sync item for cloud verification promotion")?
+        else {
+            continue;
+        };
+
+        let existing_target: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT confirmed_content, status, pushed_local_seq \
+             FROM sync_item_targets WHERE sync_key = ? AND target_id = 'cloud'",
+        )
+        .bind(&sync_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("load cloud target for cloud verification promotion")?;
+
+        if existing_target
+            .as_ref()
+            .is_some_and(|(_, status, _)| status == "blocked" || status == "canceled")
+        {
+            continue;
+        }
+
+        if let Some((confirmed_content, _, pushed_local_seq)) = existing_target {
+            if confirmed_content == "metadata" {
+                let still_current = pushed_local_seq >= current_local_seq;
+                let status = if still_current {
+                    "confirmed"
+                } else {
+                    "pending"
+                };
+                sqlx::query(
+                    r#"
+                    UPDATE sync_item_targets
+                    SET desired_content = 'complete',
+                        confirmed_content = 'complete',
+                        status = ?,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE sync_key = ? AND target_id = 'cloud'
+                    "#,
+                )
+                .bind(status)
+                .bind(now)
+                .bind(&sync_key)
+                .execute(&mut *transaction)
+                .await
+                .context("promote metadata-only cloud target to complete")?;
+
+                if origin == "local" && delivery_route.as_deref() == Some("lan") {
+                    sqlx::query(
+                        "UPDATE sync_items SET delivery_route = NULL, updated_at = ? WHERE sync_key = ?",
+                    )
+                    .bind(now)
+                    .bind(&sync_key)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("clear LAN route after cloud completion promotion")?;
+                }
+                promotion.promoted_items += 1;
+                if !still_current {
+                    promotion.needs_control_push = true;
+                }
+                continue;
+            }
+        }
+
+        if origin == "local" && delivery_route.as_deref() == Some("lan") {
+            let local_seq = if current_local_seq > 0 {
+                current_local_seq
+            } else {
+                crate::db::sync_items::next_local_seq_on(&mut transaction).await?
+            };
+            sqlx::query(
+                "UPDATE sync_items SET local_seq = ?, delivery_route = NULL, updated_at = ? WHERE sync_key = ?",
+            )
+            .bind(local_seq)
+            .bind(now)
+            .bind(&sync_key)
+            .execute(&mut *transaction)
+            .await
+            .context("clear LAN route to push metadata for cloud-present blobs")?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO sync_item_targets (
+                    sync_key, target_id, desired_content, confirmed_content, status,
+                    pushed_local_seq, acked_local_seq, last_error, created_at, updated_at
+                ) VALUES (?, 'cloud', 'complete', 'none', 'pending', 0, 0, NULL, ?, ?)
+                ON CONFLICT(sync_key, target_id) DO UPDATE SET
+                    desired_content = 'complete',
+                    status = CASE
+                        WHEN sync_item_targets.status IN ('blocked', 'canceled')
+                        THEN sync_item_targets.status
+                        WHEN sync_item_targets.confirmed_content = 'complete'
+                        THEN 'confirmed'
+                        ELSE 'pending'
+                    END,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(&sync_key)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .context("queue cloud metadata push after verifying existing blobs")?;
+
+            promotion.promoted_items += 1;
+            promotion.needs_control_push = true;
+        }
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("commit existing cloud blob verification promotions")?;
+    Ok(promotion)
+}
+
 /// Lists local items that still have un-uploaded content blobs desired on the Cloud Hub.
 /// Ordered realtime-first (`history_backfill ASC, payload_updated_at_ms DESC`). When
 /// `realtime_only` is `true`, only freshly captured or manually shared items are returned for the
@@ -1176,6 +1503,7 @@ pub async fn pending_cloud_blob_uploads(
             kind: row.try_get("kind")?,
             history_backfill: row.try_get("history_backfill")?,
             manual_share: row.try_get("manual_share")?,
+            payload_updated_at_ms: row.try_get("payload_updated_at_ms")?,
             blobs,
         });
     }
@@ -2501,6 +2829,201 @@ async fn load_lan_available_blobs_map(
         }
     }
     Ok(map)
+}
+
+/// Metadata needed to track passive LAN blob transfers (`GetBlob`) in the transfer center.
+#[derive(Debug, Clone)]
+pub struct BlobServeInfo {
+    pub sync_key: String,
+    pub item_id: String,
+    pub kind: String,
+    pub history_backfill: bool,
+    pub manual_share: bool,
+    pub payload_updated_at_ms: i64,
+    pub single_file_name: Option<String>,
+}
+
+/// Resolves card identity and transfer tracking attributes for an outgoing `GetBlob`.
+pub async fn blob_serve_info(pool: &SqlitePool, blob_id: &str) -> Result<Option<BlobServeInfo>> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.sync_key, s.item_id, s.kind, s.history_backfill, s.manual_share,
+               s.payload_updated_at_ms, c.content
+        FROM sync_item_blobs b
+        JOIN sync_items s ON s.sync_key = b.sync_key
+        LEFT JOIN clipboard_items c ON c.id = s.item_id
+        WHERE b.blob_id = ? AND b.optional = 0 AND s.item_id IS NOT NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(blob_id)
+    .fetch_optional(pool)
+    .await
+    .context("find clipboard item info for outgoing blob")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let sync_key: String = row.try_get("sync_key")?;
+    let item_id: String = row.try_get("item_id")?;
+    let kind: String = row.try_get("kind")?;
+    let history_backfill: bool = row.try_get("history_backfill")?;
+    let manual_share: bool = row.try_get("manual_share")?;
+    let payload_updated_at_ms: i64 = row.try_get("payload_updated_at_ms")?;
+    let content: Option<String> = row.try_get("content")?;
+    let single_file_name = if kind == "files" {
+        let lines = content
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.len() == 1 {
+            std::path::Path::new(lines[0])
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(Some(BlobServeInfo {
+        sync_key,
+        item_id,
+        kind,
+        history_backfill,
+        manual_share,
+        payload_updated_at_ms,
+        single_file_name,
+    }))
+}
+
+/// Counts remote items awaiting automatic attachment pull from currently reachable sources.
+pub async fn count_reachable_pending_blob_pulls(
+    pool: &SqlitePool,
+    cloud_enabled: bool,
+    lan_enabled: bool,
+) -> Result<u64> {
+    if !cloud_enabled && !lan_enabled {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_items s
+        WHERE s.needs_blob_pull = 1
+          AND s.deleted = 0
+          AND s.item_key IS NOT NULL
+          AND s.nonce IS NOT NULL
+          AND s.ciphertext IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM sync_item_targets t
+              WHERE t.sync_key = s.sync_key
+                AND t.confirmed_content = 'complete'
+                AND (
+                    (? AND t.target_id = 'cloud')
+                    OR (
+                        ? AND EXISTS (
+                            SELECT 1
+                            FROM sync_peer_connections c
+                            WHERE c.state = 'online'
+                              AND t.target_id = ('peer:' || c.device_id)
+                        )
+                    )
+                )
+          )
+        "#,
+    )
+    .bind(cloud_enabled)
+    .bind(lan_enabled)
+    .fetch_one(pool)
+    .await
+    .context("count reachable pending remote blob pulls")?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Summarizes reachable pending automatic attachment pulls alongside the active source routes
+/// that can satisfy them (`attachment_worker` prefers online LAN peers before Cloud).
+pub async fn reachable_pending_blob_pull_summary(
+    pool: &SqlitePool,
+    cloud_enabled: bool,
+    lan_enabled: bool,
+) -> Result<(u64, crate::sync::model::SyncInboundCatchupSources)> {
+    let remaining = count_reachable_pending_blob_pulls(pool, cloud_enabled, lan_enabled).await?;
+    if remaining == 0 {
+        return Ok((0, crate::sync::model::SyncInboundCatchupSources::default()));
+    }
+
+    let mut sources = crate::sync::model::SyncInboundCatchupSources::default();
+    if lan_enabled {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT p.device_name
+            FROM sync_peers p
+            JOIN sync_peer_connections c ON c.device_id = p.device_id AND c.state = 'online'
+            WHERE EXISTS (
+                SELECT 1
+                FROM sync_items s
+                JOIN sync_item_targets t ON t.sync_key = s.sync_key
+                WHERE s.needs_blob_pull = 1
+                  AND s.deleted = 0
+                  AND s.item_key IS NOT NULL
+                  AND s.nonce IS NOT NULL
+                  AND s.ciphertext IS NOT NULL
+                  AND t.target_id = ('peer:' || p.device_id)
+                  AND t.confirmed_content = 'complete'
+            )
+            ORDER BY p.device_name ASC, p.device_id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("list LAN sources for pending blob pulls")?;
+        for name in rows {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !sources.peers.iter().any(|existing| existing == trimmed) {
+                sources.peers.push(trimmed.to_owned());
+            }
+        }
+    }
+
+    if cloud_enabled {
+        let needs_cloud: i64 = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM sync_items s
+                JOIN sync_item_targets t ON t.sync_key = s.sync_key
+                WHERE s.needs_blob_pull = 1
+                  AND s.deleted = 0
+                  AND s.item_key IS NOT NULL
+                  AND s.nonce IS NOT NULL
+                  AND s.ciphertext IS NOT NULL
+                  AND t.target_id = 'cloud'
+                  AND t.confirmed_content = 'complete'
+                  AND NOT (
+                      ? AND EXISTS (
+                          SELECT 1
+                          FROM sync_item_targets tp
+                          JOIN sync_peer_connections cp
+                            ON cp.state = 'online'
+                           AND tp.target_id = ('peer:' || cp.device_id)
+                          WHERE tp.sync_key = s.sync_key
+                            AND tp.confirmed_content = 'complete'
+                      )
+                  )
+            )
+            "#,
+        )
+        .bind(lan_enabled)
+        .fetch_one(pool)
+        .await
+        .context("check Cloud source for pending blob pulls")?;
+        sources.cloud = needs_cloud != 0;
+    }
+
+    Ok((remaining, sources))
 }
 
 /// Builds a compact `SyncedItemSnapshot` from a `StoredSyncItemMeta` row (for tombstones or fallback).

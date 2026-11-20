@@ -32,10 +32,12 @@ import {
   type SyncStatus,
   setCloudRelayAuthToken,
   setSyncDeviceName,
+  showWindow,
   syncNow,
 } from "@/commands";
 import Modal from "@/components/Modal";
 import { TAURI_EVENT } from "@/constants/events";
+import { WINDOW_LABEL } from "@/constants/windows";
 import { useAndroidBack } from "@/hooks/useAndroidBack";
 import CloudDevicesDrawer from "@/pages/Clipboard/components/CloudDevicesDrawer";
 import CloudRecordsDrawer from "@/pages/Clipboard/components/CloudRecordsDrawer";
@@ -405,6 +407,10 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   }
 
   function handleOpenRecords() {
+    if (!isAndroid) {
+      void showWindow(WINDOW_LABEL.CLOUD_RECORDS);
+      return;
+    }
     setRecordsOpen(true);
   }
 
@@ -413,6 +419,10 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
   }
 
   function handleOpenDevices() {
+    if (!isAndroid) {
+      void showWindow(WINDOW_LABEL.CLOUD_DEVICES);
+      return;
+    }
     setDevicesOpen(true);
   }
 
@@ -1111,8 +1121,12 @@ const SyncManagerControl: FC<SyncManagerControlProps> = (props) => {
           )}
         </div>
       </Modal>
-      <CloudDevicesDrawer onClose={handleCloseDevices} open={devicesOpen} />
-      <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
+      {isAndroid ? (
+        <>
+          <CloudDevicesDrawer onClose={handleCloseDevices} open={devicesOpen} />
+          <CloudRecordsDrawer onClose={handleCloseRecords} open={recordsOpen} />
+        </>
+      ) : null}
     </div>
   );
 };

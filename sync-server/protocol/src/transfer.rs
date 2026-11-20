@@ -76,7 +76,11 @@ async fn read_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> R
     Ok(())
 }
 
-async fn write_bytes<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<()> {
+async fn write_bytes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    on_write: Option<&mpsc::UnboundedSender<u64>>,
+) -> Result<()> {
     for block in bytes.chunks(IO_BLOCK_BYTES) {
         let mut offset = 0;
         while offset < block.len() {
@@ -86,6 +90,9 @@ async fn write_bytes<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Res
                 bail!("transfer part write stopped");
             }
             offset += count;
+            if let Some(tx) = on_write {
+                let _ = tx.send(count as u64);
+            }
         }
     }
     Ok(())
@@ -286,12 +293,17 @@ impl PartPeer {
         }
     }
 
-    async fn send_part(&self, index: u64, data: &[u8]) -> Result<()> {
+    async fn send_part(
+        &self,
+        index: u64,
+        data: &[u8],
+        on_write: Option<mpsc::UnboundedSender<u64>>,
+    ) -> Result<()> {
         let (mut send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
         // Leave control frames (priority 0) ahead of attachment bytes, while letting realtime
         // attachments preempt historical backfill and optional source icons.
         send.set_priority(self.priority())?;
-        write_bytes(&mut send, data).await?;
+        write_bytes(&mut send, data, on_write.as_ref()).await?;
         send.finish()?;
         // Peer receivers acknowledge Response::BlobStored right after writing the part and
         // may drop RecvStream before consuming FIN, which emits a benign STOP_SENDING(0).
@@ -322,8 +334,11 @@ pub async fn send<R: AsyncRead + Unpin>(
 ) -> Result<()> {
     let total_parts = part_count(size);
     let mut tasks = JoinSet::new();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let mut index = 0;
-    let mut completed = 0;
+    let mut active_bytes = 0_u64;
+    let mut confirmed_bytes = 0_u64;
+    let mut last_reported = 0_u64;
     let mut prefetched: Option<(u64, Vec<u8>)> = None;
     loop {
         while tasks.len() < PARALLEL_PARTS {
@@ -339,8 +354,9 @@ pub async fn send<R: AsyncRead + Unpin>(
                 break;
             };
             let peer = peer.clone();
+            let tx = progress_tx.clone();
             tasks.spawn(async move {
-                peer.send_part(part, &data).await?;
+                peer.send_part(part, &data, Some(tx)).await?;
                 Ok::<_, anyhow::Error>(data.len() as u64)
             });
         }
@@ -351,11 +367,44 @@ pub async fn send<R: AsyncRead + Unpin>(
             prefetched = Some((index, data));
             index += 1;
         }
-        let Some(done) = tasks.join_next().await else {
+        if tasks.is_empty() {
             break;
-        };
-        completed += done??;
-        progress(completed);
+        }
+        loop {
+            tokio::select! {
+                biased;
+                done = tasks.join_next() => {
+                    let Some(done) = done else {
+                        break;
+                    };
+                    confirmed_bytes += done??;
+                    let all_done = tasks.is_empty() && index >= total_parts && prefetched.is_none();
+                    let reported = if all_done {
+                        confirmed_bytes
+                    } else {
+                        active_bytes.max(confirmed_bytes).min(size.saturating_sub(1))
+                    };
+                    if reported > last_reported {
+                        last_reported = reported;
+                        progress(reported);
+                    }
+                    break;
+                }
+                chunk = progress_rx.recv() => {
+                    if let Some(chunk) = chunk {
+                        active_bytes = active_bytes.saturating_add(chunk);
+                        let reported = active_bytes.max(confirmed_bytes).min(size.saturating_sub(1));
+                        if reported > last_reported {
+                            last_reported = reported;
+                            progress(reported);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if confirmed_bytes > last_reported {
+        progress(confirmed_bytes);
     }
     Ok(())
 }

@@ -189,6 +189,7 @@ pub(super) async fn call_cloud(
 ) -> Result<Response> {
     let request_kind = match &request {
         Request::CloudSyncItems { .. } => "items",
+        Request::CheckCloudBlobs { .. } => "check-blobs",
         Request::ListItems { .. } => "list-items",
         Request::ListDevices { .. } => "list-devices",
         _ => "control",
@@ -236,7 +237,6 @@ pub(super) async fn call_cloud(
     result
 }
 
-#[cfg(test)]
 pub(super) fn is_cloud_attempt_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudAttemptTimeout>().is_some()
 }
@@ -257,6 +257,25 @@ pub(super) fn should_invalidate_cloud_connection(
     error: &anyhow::Error,
 ) -> bool {
     is_shared_sync_failure(connection, error)
+}
+
+pub(super) fn is_cloud_data_timeout(error: &anyhow::Error) -> bool {
+    super::super::upload::is_network_timeout(error)
+        || is_cloud_attempt_timeout(error)
+        || error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+}
+
+/// Evaluates whether the dedicated Cloud attachment connection should be evicted after a failed
+/// download/transfer stream so a blackholed socket does not stall retries indefinitely.
+pub(super) async fn should_invalidate_cloud_data_connection(
+    connection: &Connection,
+    error: &anyhow::Error,
+) -> bool {
+    is_shared_sync_failure(connection, error)
+        || (is_cloud_data_timeout(error)
+            && check_stalled_cloud_upload(connection).await != "healthy")
 }
 
 /// A failed card stream does not invalidate the shared connection while it remains authenticated.

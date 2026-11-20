@@ -30,7 +30,10 @@ export const useClipboardItems = (
   query: ClipboardItemQuery,
   trackStartup = true,
 ) => {
+  const queryKey = serializeClipboardQuery(query);
   const queryRef = useRef(query);
+  const queryKeyRef = useRef(queryKey);
+  queryKeyRef.current = queryKey;
   const trackStartupRef = useRef(trackStartup);
   trackStartupRef.current = trackStartup;
 
@@ -49,6 +52,7 @@ export const useClipboardItems = (
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadedInitial, setLoadedInitial] = useState(false);
+  const [committedQueryKey, setCommittedQueryKey] = useState("");
   const [loadingRangeCount, setLoadingRangeCount] = useState(0);
 
   const commitItems = useCallback((nextItems: Map<number, ClipboardItem>) => {
@@ -114,6 +118,8 @@ export const useClipboardItems = (
         ranges = [range];
       }
 
+      const requestQueryKey = queryKeyRef.current;
+
       await Promise.all(
         ranges.map(async (range) => {
           addLoadingRange(range);
@@ -150,6 +156,7 @@ export const useClipboardItems = (
             trimCache(nextItems, viewRangeRef.current, nextTotal);
             commitItems(nextItems);
             commitTotal(nextTotal);
+            setCommittedQueryKey(requestQueryKey);
             commitLoadedInitial(true);
           } catch {
             if (trackStartupRef.current) {
@@ -164,6 +171,7 @@ export const useClipboardItems = (
             ) {
               commitItems(new Map());
               commitTotal(0);
+              setCommittedQueryKey(requestQueryKey);
               commitLoadedInitial(true);
             }
           } finally {
@@ -237,6 +245,7 @@ export const useClipboardItems = (
     resetLoadingRanges();
     commitItems(new Map());
     commitTotal(0);
+    setCommittedQueryKey("");
     commitLoadedInitial(false);
     setLoading(true);
     viewRangeRef.current = {
@@ -472,6 +481,7 @@ export const useClipboardItems = (
     loadRange,
     patchItemById,
     patchSourceApp,
+    queryReady: loadedInitial && committedQueryKey === queryKey,
     reload,
     reloadCurrentRange,
     removeItemById,
@@ -479,6 +489,17 @@ export const useClipboardItems = (
     upsertItem,
   };
 };
+
+function serializeClipboardQuery(query: ClipboardItemQuery) {
+  return [
+    query.favorite ? "1" : "0",
+    query.groupId ?? "",
+    query.keyword ?? "",
+    query.kind ?? "",
+    query.pinned ? "1" : "0",
+    query.sort ?? "",
+  ].join("\0");
+}
 
 function normalizeFetchRange(
   rawStartIndex: number,

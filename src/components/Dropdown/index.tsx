@@ -100,7 +100,15 @@ const renderDropdownTrigger = (
  * antd Dropdown 的统一封装：保留原生能力，并收口菜单项图标默认尺寸。
  */
 const Dropdown: FC<AppDropdownProps> = (props) => {
-  const { children, menu, onOpenChange, open, tooltip, ...rest } = props;
+  const {
+    children,
+    destroyOnHidden = true,
+    menu,
+    onOpenChange,
+    open,
+    tooltip,
+    ...rest
+  } = props;
   const [innerOpen, setInnerOpen] = useState(false);
   const normalizedMenu = menu
     ? { ...menu, items: normalizeMenuItems(menu.items) }
@@ -118,12 +126,14 @@ const Dropdown: FC<AppDropdownProps> = (props) => {
   useAndroidBack(mergedOpen, () => {
     handleOpenChange(false, { source: "trigger" });
   });
-  useCloseAppOverlay(mergedOpen, () => {
+  const overlayResetKey = useCloseAppOverlay(mergedOpen, () => {
     handleOpenChange(false, { source: "trigger" });
   });
 
   return (
     <AntdDropdown
+      destroyOnHidden={destroyOnHidden}
+      key={overlayResetKey}
       menu={normalizedMenu}
       onOpenChange={handleOpenChange}
       open={mergedOpen}

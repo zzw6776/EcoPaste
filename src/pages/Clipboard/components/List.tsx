@@ -146,6 +146,10 @@ const List: FC<ListProps> = (props) => {
   const cardKeyboardModeRef = useRef(false);
   const pendingCardFocusRef = useRef<string | null>(null);
   const fileDetailsRequestRef = useRef(0);
+  const pendingScrollAlignRef = useRef<{
+    index: number;
+    itemId: string;
+  } | null>(null);
   const closePreviewRef = useRef<(reason: string) => void>(() => {});
   const displaySettingsMountedRef = useRef(false);
   const keywordRef = useRef("");
@@ -227,6 +231,7 @@ const List: FC<ListProps> = (props) => {
     loadedItems,
     patchItemById,
     patchSourceApp,
+    queryReady,
     reload,
     reloadCurrentRange,
     removeItemById,
@@ -255,9 +260,10 @@ const List: FC<ListProps> = (props) => {
     };
   }, [active, loadedInitial, loadedItems.size, total]);
 
-  /** 按后端权威排序定位记录，虚拟列表只加载目标附近的一页。 */
+  /** 按后端权威排序定位记录，待目标查询就绪后再加载并对齐滚动选中态。 */
   async function locateRequestedItem(request: ClipboardItemLocationRequest) {
     locatingRequestRef.current = request.requestId;
+    let shouldConsume = false;
     try {
       const index = await getClipboardItemIndex(request.itemId, {
         favorite: request.range === "favorite" ? true : void 0,
@@ -272,28 +278,54 @@ const List: FC<ListProps> = (props) => {
         clipboardViewState.category !== request.category ||
         clipboardViewState.range !== request.range ||
         clipboardViewState.keyword !== ""
-      )
+      ) {
         return;
+      }
+
+      shouldConsume = true;
       if (index === null) return;
 
       setSelectedId(request.itemId);
-      loadRange(index, index);
-      virtuosoRef.current?.scrollToIndex({ behavior: "auto", index });
+      loadRange(Math.max(0, index - 5), index + 5);
+      pendingScrollAlignRef.current = { index, itemId: request.itemId };
+      virtuosoRef.current?.scrollToIndex({
+        align: "center",
+        behavior: "auto",
+        index,
+      });
       focusClipboardCard(request.itemId);
+
+      const mountedNode = itemElementMapRef.current.get(request.itemId);
+      if (mountedNode) {
+        pendingScrollAlignRef.current = null;
+        window.requestAnimationFrame(() => {
+          if (itemElementMapRef.current.get(request.itemId) !== mountedNode) {
+            return;
+          }
+          virtuosoRef.current?.scrollToIndex({
+            align: "center",
+            behavior: "auto",
+            index,
+          });
+          mountedNode.focus({ preventScroll: true });
+        });
+      }
     } catch {
-      // 命令层已统一显示错误；定位请求在 finally 中结束。
+      shouldConsume = true;
     } finally {
-      consumeClipboardItemLocation(request.requestId);
+      if (shouldConsume) {
+        consumeClipboardItemLocation(request.requestId);
+      }
       if (locatingRequestRef.current === request.requestId) {
         locatingRequestRef.current = null;
       }
     }
   }
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 请求内容由共享状态携带，函数读取当前列表句柄。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 请求内容由共享状态携带，需等待目标查询真实提交后再定位。
   useEffect(() => {
     const request = clipboardItemLocationState.request;
-    if (!active || !loadedInitial || !request) return;
+    if (!active || !queryReady || loading || !request) return;
     if (locatingRequestRef.current === request.requestId) return;
     if (
       request.requestId !== itemLocationSnapshot.request?.requestId ||
@@ -311,7 +343,8 @@ const List: FC<ListProps> = (props) => {
     groupId,
     itemLocationSnapshot.request?.requestId,
     keyword,
-    loadedInitial,
+    loading,
+    queryReady,
     range,
     sort,
   ]);
@@ -701,6 +734,27 @@ const List: FC<ListProps> = (props) => {
     return (node: HTMLDivElement | null) => {
       if (node) {
         itemElementMapRef.current.set(id, node);
+        const pendingAlign = pendingScrollAlignRef.current;
+        if (pendingAlign?.itemId === id) {
+          pendingScrollAlignRef.current = null;
+          window.requestAnimationFrame(() => {
+            if (itemElementMapRef.current.get(id) !== node) return;
+
+            virtuosoRef.current?.scrollToIndex({
+              align: "center",
+              behavior: "auto",
+              index: pendingAlign.index,
+            });
+            if (
+              cardKeyboardModeRef.current &&
+              pendingCardFocusRef.current === id
+            ) {
+              pendingCardFocusRef.current = null;
+            }
+            node.focus({ preventScroll: true });
+          });
+          return;
+        }
         if (cardKeyboardModeRef.current && pendingCardFocusRef.current === id) {
           window.requestAnimationFrame(() => {
             if (

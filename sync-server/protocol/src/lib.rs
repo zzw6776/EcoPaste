@@ -1,4 +1,4 @@
-//! EcoPaste sync wire protocol (Per-Item State v30).
+//! EcoPaste sync wire protocol (Per-Item State v31).
 //!
 //! The cloud service only handles encrypted item snapshots and blob payloads.
 //! Clipboard plaintext and the group content key never cross this boundary.
@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod batch_tests;
 
 pub const ALPN: &[u8] = b"ecopaste/sync/2";
-pub const PROTOCOL_VERSION: u16 = 30;
+pub const PROTOCOL_VERSION: u16 = 31;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ITEMS_PER_BATCH: u16 = 256;
 
@@ -234,7 +234,8 @@ pub struct SyncItemRecord {
     pub available_blob_ids: Vec<String>,
 }
 
-/// Confirms one accepted Hub item write and returns its newly assigned revision and cursor.
+/// Confirms one accepted Hub item write and returns its newly assigned revision, cursor,
+/// and any referenced blobs already stored on the Hub.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 pub struct AcceptedItem {
@@ -244,6 +245,18 @@ pub struct AcceptedItem {
     pub hub_rev: u64,
     #[n(2)]
     pub seq: u64,
+    #[n(3)]
+    pub available_blob_ids: Vec<String>,
+}
+
+/// Identifies one encrypted content blob whose presence on the Hub can skip re-uploading.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct CloudBlobCheck {
+    #[n(0)]
+    pub blob_id: String,
+    #[n(1)]
+    pub size: u64,
 }
 
 /// Delivery completeness confirmed by a LAN receiver.
@@ -481,6 +494,16 @@ pub enum Request {
         #[n(3)]
         acks: Vec<LanItemAck>,
     },
+    /// Queries which already-encrypted content blobs already exist on the Cloud Hub.
+    #[n(26)]
+    CheckCloudBlobs {
+        #[n(0)]
+        group_id: String,
+        #[n(1)]
+        access_token: Vec<u8>,
+        #[n(2)]
+        blobs: Vec<CloudBlobCheck>,
+    },
 }
 
 impl Request {
@@ -592,6 +615,11 @@ pub enum Response {
     },
     #[n(18)]
     LanAcknowledged,
+    #[n(19)]
+    CloudBlobsChecked {
+        #[n(0)]
+        available_blob_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -869,7 +897,31 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
-        assert_eq!(PROTOCOL_VERSION, 30);
+        assert_eq!(PROTOCOL_VERSION, 31);
+    }
+
+    #[tokio::test]
+    async fn check_cloud_blobs_round_trip() {
+        let request = Request::CheckCloudBlobs {
+            group_id: "group_123".into(),
+            access_token: vec![7; 32],
+            blobs: vec![CloudBlobCheck {
+                blob_id: "b".repeat(64),
+                size: 4096,
+            }],
+        };
+        let response = Response::CloudBlobsChecked {
+            available_blob_ids: vec!["b".repeat(64)],
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        write_frame(&mut client, &request).await.unwrap();
+        let decoded_req: Request = read_frame(&mut server).await.unwrap();
+        assert_eq!(decoded_req, request);
+
+        write_frame(&mut client, &response).await.unwrap();
+        let decoded_resp: Response = read_frame(&mut server).await.unwrap();
+        assert_eq!(decoded_resp, response);
     }
 
     #[tokio::test]

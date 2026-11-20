@@ -7,7 +7,7 @@ import { App as AntdApp, ConfigProvider } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
 import type { FC } from "react";
-import { lazy, Suspense, useEffect, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { RouterProvider } from "react-router";
 import { useSnapshot } from "valtio";
@@ -17,6 +17,7 @@ import { WINDOW_LABEL } from "@/constants/windows";
 import { useAppTheme } from "@/hooks/useAppTheme";
 import { closeAppOverlays } from "@/hooks/useCloseAppOverlay";
 import { useTauriListen } from "@/hooks/useTauriListen";
+import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
 import { router } from "./router";
 import { settingsInitializationState, settingsState } from "./stores/settings";
 import type { Language } from "./types/settings";
@@ -103,6 +104,7 @@ const AppContent: FC<AppContentProps> = (props) => {
   const { windowLabel } = props;
   const { message, modal } = AntdApp.useApp();
   const androidSnapshot = useSnapshot(androidState);
+  const lifecycle = useWindowLifecycle();
   const androidBackListenerRef = useRef<PluginListener | null>(null);
   const mountedRef = useRef(false);
 
@@ -151,6 +153,12 @@ const AppContent: FC<AppContentProps> = (props) => {
     void listener.unregister();
   });
 
+  const clearTransientOverlays = useCallback(() => {
+    closeAppOverlays();
+    message.destroy();
+    closeModalDialogs();
+  }, [message]);
+
   useTauriListen<WindowVisibilityPayload>(
     TAURI_EVENT.WINDOW_VISIBILITY,
     (event) => {
@@ -162,11 +170,26 @@ const AppContent: FC<AppContentProps> = (props) => {
         return;
       }
 
-      closeAppOverlays();
-      message.destroy();
-      closeModalDialogs();
+      clearTransientOverlays();
     },
   );
+
+  useEffect(() => {
+    if (
+      windowLabel !== WINDOW_LABEL.CLIPBOARD ||
+      !lifecycle.initialized ||
+      lifecycle.visible
+    ) {
+      return;
+    }
+
+    clearTransientOverlays();
+  }, [
+    clearTransientOverlays,
+    lifecycle.initialized,
+    lifecycle.visible,
+    windowLabel,
+  ]);
 
   return (
     <>

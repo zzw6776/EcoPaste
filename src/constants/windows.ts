@@ -7,6 +7,18 @@ export const WINDOW_LABEL = {
    */
   CLIPBOARD: "clipboard",
   /**
+   * 云端节点与网络详情弹窗窗口。
+   */
+  CLOUD_DETAILS: "cloud-details",
+  /**
+   * 云端设备管理弹窗窗口。
+   */
+  CLOUD_DEVICES: "cloud-devices",
+  /**
+   * 云端剪贴板记录弹窗窗口。
+   */
+  CLOUD_RECORDS: "cloud-records",
+  /**
    * 自定义右键菜单窗口（仅 Windows，绕开 muda `TrackPopupMenu` 抢焦点的问题）。
    */
   CONTEXT_MENU: "context-menu",
@@ -14,6 +26,10 @@ export const WINDOW_LABEL = {
    * Custom context submenu window on Windows.
    */
   CONTEXT_SUBMENU: "context-submenu",
+  /**
+   * 局域网节点与设备详情弹窗窗口。
+   */
+  LAN_DETAILS: "lan-details",
   /**
    * 首次启动引导窗口。
    */
