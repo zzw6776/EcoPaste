@@ -23,6 +23,7 @@ use crate::sync::SyncManager;
 
 const STORAGE_USAGE_UPDATED_EVENT: &str = "storage://usage-updated";
 const WRITE_COALESCE: Duration = Duration::from_secs(2);
+const STARTUP_CLEANUP_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StorageQuota {
@@ -93,6 +94,14 @@ pub fn spawn(app: AppHandle) {
         let manager = app.state::<Arc<SyncManager>>();
         let mut changes = store.subscribe_changes();
         let mut capacity = CapacityPolicy::from_history(&store.snapshot().clipboard.history);
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(STARTUP_CLEANUP_DELAY) => {}
+        }
         manager
             .run_local_retention_cleanup(CleanupTrigger::Scheduled)
             .await;
@@ -199,7 +208,10 @@ pub(crate) async fn apply_retention(
     // Reclaim orphans on every run so a transient file lock is retried at startup or the next
     // scheduled pass even when all retention and capacity policies are disabled.
     manager.reclaim_released_sync_content(pool).await?;
-    shared_files::cleanup_resources_locked(pool, resources.clone()).await?;
+    {
+        let _files_guard = shared_files::lock().await;
+        shared_files::cleanup_resources_locked(pool, resources.clone()).await?;
+    }
     super::cache::reclaim_unreferenced_images(pool, &resources).await?;
     let measured = storage_bytes(app).await?;
     if quota.limit_bytes == 0 {
@@ -222,7 +234,10 @@ pub(crate) async fn apply_retention(
         let exhausted = outcome.removed == 0;
         if !exhausted {
             finish_deletion(app, pool, outcome).await?;
-            shared_files::cleanup_resources_locked(pool, resources.clone()).await?;
+            {
+                let _files_guard = shared_files::lock().await;
+                shared_files::cleanup_resources_locked(pool, resources.clone()).await?;
+            }
             manager.reclaim_released_sync_content(pool).await?;
         }
         used = compacted_usage(pool, &root, target, exhausted).await?;

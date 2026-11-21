@@ -493,6 +493,7 @@ impl SyncManager {
         if !should_watch {
             return;
         }
+        self.on_route_connected();
 
         let manager = Arc::downgrade(self);
         let device_id = device_id.to_owned();
@@ -836,6 +837,7 @@ impl SyncManager {
         let _enqueue_guard = self.delivery.lock_enqueue().await;
         self.identity.set_group(None)?;
         repository::clear_group_state(pool).await?;
+        self.delivery.clear_all_transfers();
         self.runtime_state.clear_group_caches();
         self.pending_observations
             .lock()

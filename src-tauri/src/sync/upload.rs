@@ -69,6 +69,14 @@ pub(super) fn is_network_timeout(error: &anyhow::Error) -> bool {
         .is_some_and(|timeout| !matches!(timeout.phase, UploadPhase::ReadFile))
 }
 
+/// Creates a network-classified write timeout error when wire progress stalls.
+pub(super) fn write_timeout_error(language: Language) -> anyhow::Error {
+    anyhow::Error::new(UploadTimeout {
+        phase: UploadPhase::WriteData,
+        language,
+    })
+}
+
 /// Bounds one operation and retains its phase for connection recovery and user feedback.
 pub(super) async fn timed<F, T, E>(
     duration: Duration,
@@ -185,7 +193,13 @@ where
             if progress.canceled() {
                 anyhow::bail!("transfer canceled");
             }
-            let written = writer.write(remaining).await?;
+            let written = timed(
+                idle_timeout,
+                progress.phase,
+                language,
+                writer.write(remaining),
+            )
+            .await?;
             if written == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
             }
@@ -194,7 +208,7 @@ where
         }
     }
     progress.phase = UploadPhase::Flush;
-    writer.flush().await?;
+    timed(idle_timeout, progress.phase, language, writer.flush()).await?;
     Ok(())
 }
 
@@ -326,7 +340,9 @@ where
                 break;
             }
         };
-        if let Err(error) = write_encrypted_chunk(writer, &next, progress).await {
+        if let Err(error) =
+            write_encrypted_chunk(writer, &next, idle_timeout, language, progress).await
+        {
             cancel_flag.store(true, Ordering::Release);
             write_result = Err(error);
             break;
@@ -337,7 +353,7 @@ where
     write_result?;
     let plaintext_hash = producer_result?;
     progress.phase = UploadPhase::Flush;
-    writer.flush().await?;
+    timed(idle_timeout, progress.phase, language, writer.flush()).await?;
     if progress.written_bytes != expected_encrypted_size {
         anyhow::bail!("encrypted sync blob size mismatch");
     }
@@ -347,6 +363,8 @@ where
 async fn write_encrypted_chunk<W>(
     writer: &mut W,
     mut bytes: &[u8],
+    idle_timeout: Duration,
+    language: Language,
     progress: &mut UploadProgress,
 ) -> Result<()>
 where
@@ -357,7 +375,7 @@ where
         if progress.canceled() {
             anyhow::bail!("transfer canceled");
         }
-        let written = writer.write(bytes).await?;
+        let written = timed(idle_timeout, progress.phase, language, writer.write(bytes)).await?;
         if written == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
         }
@@ -506,6 +524,7 @@ mod tests {
             UploadPhase::OpenStream,
             UploadPhase::SendRequest,
             UploadPhase::WaitForReady,
+            UploadPhase::WriteData,
             UploadPhase::Flush,
             UploadPhase::WaitForConfirmation,
         ] {

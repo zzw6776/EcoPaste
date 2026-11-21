@@ -98,8 +98,8 @@ use super::{
         NearbyJoinState, NearbySyncDevice, NearbySyncSpace, OutgoingBlobSource, SourceAppRef,
         SourceIconRef, StoredBlob, StoredContentObject, SyncChannelState, SyncChannelStatus,
         SyncContentAvailability, SyncInboundCatchupProgress, SyncInboundCatchupSources,
-        SyncItemAction, SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer,
-        SyncPeerCatchupStatus, SyncStatus, SyncTarget, SyncedClipboardItem, SyncedItemSnapshot,
+        SyncItemStatus, SyncLocalContentState, SyncPairingPreview, SyncPeer, SyncPeerCatchupStatus,
+        SyncStatus, SyncTarget, SyncedClipboardItem, SyncedItemSnapshot,
     },
     pairing::{
         comparison_code, discovery_space_id, DiscoveryMetadata, JoinAcknowledgement,
@@ -127,8 +127,9 @@ const MAX_SYNC_BATCHES_PER_CONNECTION: usize = 8;
 const MAX_CONCURRENT_BLOB_TRANSFERS: usize = 3;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const CLOUD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-const CLOUD_UPLOAD_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CLOUD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+const CLOUD_UPLOAD_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const CLOUD_DATA_IDLE_REUSE_TTL: Duration = Duration::from_secs(30);
 const CLOUD_RECORD_CACHE_DIR: &str = "cloud-records";
 pub(crate) const SYNC_STAGING_DIR: &str = "sync-staging";
 pub(crate) const LEGACY_SYNC_BLOB_DIR: &str = "sync-blobs";
@@ -185,15 +186,22 @@ async fn available_materialized_file_item(
 const MAX_SOURCE_ICON_UPLOADS_PER_BATCH: u16 = 64;
 const LOCAL_SYNC_GC_BATCH_SIZE: u32 = 500;
 const CLOUD_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const CLOUD_STREAM_RECEIVE_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
+const CLOUD_SEND_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+const LAN_STREAM_RECEIVE_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+const LAN_SEND_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 const RETRY_SECONDS: [u64; 6] = [2, 5, 15, 30, 60, 300];
 
 /// Applies transfer flow-control windows and cloud keep-alive intervals.
 fn sync_transport_config(cloud: bool) -> QuicTransportConfig {
+    let (stream_receive_window, send_window) = if cloud {
+        (CLOUD_STREAM_RECEIVE_WINDOW_BYTES, CLOUD_SEND_WINDOW_BYTES)
+    } else {
+        (LAN_STREAM_RECEIVE_WINDOW_BYTES, LAN_SEND_WINDOW_BYTES)
+    };
     let builder = QuicTransportConfig::builder()
-        .stream_receive_window(iroh::endpoint::VarInt::from_u32(
-            multipart::STREAM_RECEIVE_WINDOW_BYTES,
-        ))
-        .send_window(multipart::SEND_WINDOW_BYTES);
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(stream_receive_window))
+        .send_window(send_window);
     let builder = if cloud {
         builder
             .keep_alive_interval(CLOUD_PATH_KEEP_ALIVE_INTERVAL)
@@ -771,6 +779,9 @@ async fn start_runtime(manager: Arc<SyncManager>) {
     if let Err(error) = repository::clear_stale_transfer_locks(&pool).await {
         log::warn!("clear stale sync transfer locks failed: {error:#}");
     }
+    if let Err(error) = repository::reset_peer_connections_offline(&pool).await {
+        log::warn!("reset stale sync peer connections offline failed: {error:#}");
+    }
     tauri::async_runtime::spawn(lan_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_transfer_worker(manager.clone()));
     tauri::async_runtime::spawn(cloud_watch_worker(manager.clone()));
@@ -920,8 +931,7 @@ fn retain_serving_catchup(
 }
 
 impl SyncManager {
-    /// Android shares use LAN only while synchronization and a direct peer are both available.
-    #[cfg(target_os = "android")]
+    /// Returns whether synchronization and at least one direct LAN peer connection are active.
     pub fn has_connected_lan_peer(&self) -> bool {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         if !settings.enabled || !settings.lan_enabled || self.identity.snapshot().group.is_none() {
@@ -984,17 +994,6 @@ impl SyncManager {
     }
 
     #[cfg(target_os = "android")]
-    pub(crate) fn bind_shared_file_import(
-        &self,
-        task_id: &str,
-        operation_order: i64,
-        source_revision: String,
-    ) {
-        self.delivery
-            .bind_local_import(task_id, operation_order, source_revision);
-    }
-
-    #[cfg(target_os = "android")]
     pub(crate) fn fail_shared_file_import(&self, task_id: &str, bytes: u64, error: String) {
         self.delivery.fail_local_import(task_id, bytes, error);
     }
@@ -1014,15 +1013,27 @@ impl SyncManager {
     pub async fn cancel_transfer(&self, task_id: &str) -> Result<bool> {
         match self.delivery.cancel(&self.pool().await, task_id).await? {
             DeliveryCancel::NotFound => Ok(false),
-            DeliveryCancel::Canceled => Ok(true),
+            DeliveryCancel::Canceled => {
+                self.emit_updated();
+                Ok(true)
+            }
             DeliveryCancel::Preparation {
                 item_id,
                 source_revision,
             } => {
                 self.discard_pending_observation(&item_id, &source_revision);
+                self.emit_updated();
                 Ok(true)
             }
         }
+    }
+
+    pub fn cancel_transfers_for_item(&self, item_id: &str) {
+        self.delivery.cancel_item_transfers(item_id);
+    }
+
+    pub fn cancel_all_transfers(&self) {
+        self.delivery.clear_all_transfers();
     }
 
     pub fn wake(&self) {
@@ -1100,6 +1111,7 @@ impl SyncManager {
 
     /// Reloads identity config from the current data directory and clears pending captures.
     pub(crate) fn reconcile_after_storage_replacement(&self, app: &AppHandle) -> Result<()> {
+        self.delivery.clear_all_transfers();
         self.runtime_state.clear_group_caches();
         self.pending_observations
             .lock()
@@ -1141,6 +1153,15 @@ impl SyncManager {
     /// Preserves the existing desktop connection unless Iroh has already marked it unavailable.
     #[cfg(not(target_os = "android"))]
     fn notify_cloud_connectivity_changed(&self) {
+        if let Some(data) = self
+            .runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned")
+            .take()
+        {
+            data.close(0_u32.into(), b"cloud network path changed");
+        }
         self.runtime_state
             .cloud_force_reconnect
             .store(true, Ordering::Release);
@@ -1431,10 +1452,15 @@ impl SyncManager {
         self.runtime_state.lan_transfer_wake.notify_one();
     }
 
-    fn wake_cloud_transfer(&self) {
+    /// Wakes file preparation and attachment workers whenever any Cloud or LAN route becomes ready.
+    pub(super) fn on_route_connected(&self) {
         self.runtime_state.local_outbox_wake[1].notify_one();
         self.runtime_state.local_outbox_wake[2].notify_one();
         self.wake_attachments();
+    }
+
+    fn wake_cloud_transfer(&self) {
+        self.on_route_connected();
         self.runtime_state.cloud_transfer_wake.notify_one();
     }
 
@@ -1485,8 +1511,17 @@ impl SyncManager {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let identity = self.identity.snapshot();
         let pool = self.pool().await;
+        let paired = identity.group.is_some();
+        let cloud_active =
+            settings.enabled && paired && settings.cloud_enabled && server_is_configured(&settings);
+        let online_peers = if settings.enabled && paired && settings.lan_enabled {
+            self.runtime_state.online_lan_peer_ids()
+        } else {
+            Vec::new()
+        };
         let (pending_events, pending_manual_items, peer_count) =
-            repository::status_counts(&pool, settings.sync_sensitive).await?;
+            repository::status_counts(&pool, settings.sync_sensitive, cloud_active, &online_peers)
+                .await?;
         let mut peers = repository::list_peer_statuses(&pool).await?;
         let mut lan = self
             .runtime_state
@@ -1567,16 +1602,15 @@ impl SyncManager {
             .clone();
         let (backfill, inbound_catchup, serving_catchups) =
             if settings.enabled && identity.group.is_some() {
-                let cloud_active = settings.cloud_enabled && server_is_configured(&settings);
                 let backfill = repository::backfill_progress(
                     &pool,
                     settings.sync_sensitive,
                     cloud_active,
-                    settings.lan_enabled,
+                    &online_peers,
                 )
                 .await?;
                 let inbound_catchup = self
-                    .inbound_catchup_progress(&pool, cloud_active, settings.lan_enabled)
+                    .inbound_catchup_progress(&pool, cloud_active, &online_peers)
                     .await?;
                 let serving_catchups = self.serving_catchup_statuses();
                 (backfill, inbound_catchup, serving_catchups)
@@ -1627,7 +1661,7 @@ impl SyncManager {
         &self,
         pool: &SqlitePool,
         cloud_enabled: bool,
-        lan_enabled: bool,
+        online_peer_ids: &[String],
     ) -> Result<Option<SyncInboundCatchupProgress>> {
         let mut metadata_completed = 0_u64;
         let mut metadata_total = 0_u64;
@@ -1645,9 +1679,9 @@ impl SyncManager {
                 }
             }
         }
-        if lan_enabled {
+        if !online_peer_ids.is_empty() {
             let (lan_completed, lan_total, lan_peers) =
-                repository::inbound_lan_catchup_window(pool).await?;
+                repository::inbound_lan_catchup_window(pool, online_peer_ids).await?;
             metadata_completed = metadata_completed.saturating_add(lan_completed);
             metadata_total = metadata_total.saturating_add(lan_total);
             metadata_sources.peers = lan_peers;
@@ -1662,7 +1696,7 @@ impl SyncManager {
         }
 
         let (remaining_attachments, attachment_sources) =
-            repository::reachable_pending_blob_pull_summary(pool, cloud_enabled, lan_enabled)
+            repository::reachable_pending_blob_pull_summary(pool, cloud_enabled, online_peer_ids)
                 .await?;
         let attachment_completed = self
             .runtime_state
@@ -1951,11 +1985,6 @@ impl SyncManager {
                 .insert((item.id.clone(), item.source_revision.clone()), observation);
         }
         if ready {
-            if item.kind != ClipboardKind::Files {
-                self.runtime_state
-                    .realtime_pending
-                    .store(true, Ordering::Release);
-            }
             self.wake_content_outbox();
         }
     }
@@ -1969,9 +1998,6 @@ impl SyncManager {
 
     /// Item-state mutations wake local snapshot re-encryption and route workers immediately.
     pub fn wake_local_outbox(&self) {
-        self.runtime_state
-            .realtime_pending
-            .store(true, Ordering::Release);
         self.notify_local_outbox();
         self.wake_transfer();
     }
@@ -2078,7 +2104,7 @@ impl SyncManager {
                 Key::RemoteFileNotDownloaded,
             ));
         }
-        if target == SyncTarget::Lan && !repository::has_online_peer(&pool).await? {
+        if target == SyncTarget::Lan && !self.has_connected_lan_peer() {
             bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
         let lane = match item.kind {
@@ -2117,6 +2143,7 @@ impl SyncManager {
             } else {
                 self.wake_lan_transfer();
             }
+            self.emit_updated();
             return self
                 .item_statuses(&[item.id])
                 .await?
@@ -2136,7 +2163,7 @@ impl SyncManager {
             &pool,
             &item,
             crate::db::sync_items::ContentSyncOptions {
-                force_files: true,
+                force_files: target == SyncTarget::Cloud,
                 manual_share: true,
                 cloud_blob_policy: (target == SyncTarget::Cloud)
                     .then_some(crate::db::sync_items::CloudBlobPolicy::Requested),
@@ -2149,6 +2176,7 @@ impl SyncManager {
         } else {
             self.wake_lan_transfer();
         }
+        self.emit_updated();
         self.item_statuses(&[item.id])
             .await?
             .into_iter()
@@ -2161,15 +2189,19 @@ impl SyncManager {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let paired = self.identity.snapshot().group.is_some();
         let lan_actionable = settings.enabled && paired && settings.lan_enabled;
-        let cloud_actionable = settings.enabled && paired && server_is_configured(&settings);
-        let mut statuses = repository::item_statuses(&pool, item_ids).await?;
+        let cloud_actionable =
+            settings.enabled && paired && settings.cloud_enabled && server_is_configured(&settings);
+        let online_peers = if lan_actionable {
+            self.runtime_state.online_lan_peer_ids()
+        } else {
+            Vec::new()
+        };
+
         let sessions = repository::external_download_sessions(&pool, item_ids).await?;
-        let mut known_external_items = HashSet::new();
-        let mut valid_items = HashSet::new();
+        let mut external_states = HashMap::new();
         #[cfg(target_os = "android")]
         let mut uploadable_external_items = HashSet::new();
         for session in sessions {
-            known_external_items.insert(session.item_id.clone());
             let mut valid = !session.targets.is_empty();
             for target in &session.targets {
                 if !external_download_target_available(target).await {
@@ -2186,28 +2218,29 @@ impl SyncManager {
                 {
                     uploadable_external_items.insert(session.item_id.clone());
                 }
-                valid_items.insert(session.item_id);
+                external_states.insert(session.item_id, SyncLocalContentState::External);
+            } else {
+                external_states.insert(session.item_id, SyncLocalContentState::ExternalMissing);
             }
         }
+
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+        let mut statuses = repository::item_statuses(
+            &pool,
+            item_ids,
+            cloud_actionable,
+            &online_peers,
+            &external_states,
+        )
+        .await?;
+
+        #[cfg(target_os = "android")]
         for status in &mut statuses {
-            if valid_items.contains(&status.item_id) {
-                status.local_state = SyncLocalContentState::External;
-            } else if known_external_items.contains(&status.item_id) {
-                status.local_state = SyncLocalContentState::ExternalMissing;
-                status.lan.action = SyncItemAction::None;
-                status.cloud.action = SyncItemAction::None;
-            }
-            #[cfg(target_os = "android")]
             if status.local_state == SyncLocalContentState::External
                 && !uploadable_external_items.contains(&status.item_id)
+                && status.cloud.action == super::model::SyncItemAction::Upload
             {
-                status.cloud.action = SyncItemAction::None;
-            }
-            if !lan_actionable {
-                status.lan.action = SyncItemAction::None;
-            }
-            if !cloud_actionable {
-                status.cloud.action = SyncItemAction::None;
+                status.cloud.action = super::model::SyncItemAction::None;
             }
         }
         Ok(statuses)
@@ -3789,9 +3822,11 @@ mod tests {
             is_pinned: false,
             note: Some("pinned note".into()),
             payload_updated_at_ms: 1_700_000_000_000,
+            prep_state: "pending_state".into(),
             nonce: Some(nonce),
             ciphertext: Some(ciphertext),
             local_state: "managed".into(),
+            remote_file_state: None,
             needs_blob_pull: false,
         };
         overlay_meta_crdt_fields(&mut recovered, &meta, "dev-a");

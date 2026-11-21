@@ -56,20 +56,6 @@ impl SyncManager {
         if target.route == super::super::progress::TransferRoute::Lan {
             return Ok(None);
         }
-        if let Some(handle) =
-            self.delivery
-                .promote_local_import(super::super::progress::LocalImportPromotion {
-                    item_id: item.id.clone(),
-                    operation_id: operation_id.to_owned(),
-                    route: target.route,
-                    target: target.target.clone(),
-                    total_bytes,
-                    operation_order: operation.local_seq,
-                    source_revision: item.source_revision.clone(),
-                })
-        {
-            return Ok(Some(handle));
-        }
         let task_key = format!("{operation_id}\0prepare");
         let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
         Ok(Some(self.delivery.start_preparation(
@@ -135,9 +121,6 @@ impl SyncManager {
         target: &PreparationTarget,
         cycle: &SyncCycleContext,
     ) -> Result<bool> {
-        self.runtime_state
-            .realtime_pending
-            .store(false, Ordering::Release);
         let _ = self.materialize_dirty_states(Some(cycle)).await?;
         let text_run = self
             .materialize_content_lane(
@@ -215,7 +198,6 @@ impl SyncManager {
         let language = crate::i18n::current_language(&self.app);
         let prep_target = PreparationTarget {
             route: super::super::progress::TransferRoute::Cloud,
-            target: CLOUD_TARGET.to_owned(),
         };
 
         let mut local_has_more = self
@@ -249,10 +231,8 @@ impl SyncManager {
                 }
             }
             if batch_index > 0
-                && self
-                    .runtime_state
-                    .realtime_pending
-                    .swap(false, Ordering::AcqRel)
+                && db::sync_items::has_pending_realtime_outbox(&pool, cycle.settings.sync_sensitive)
+                    .await?
             {
                 local_has_more |= self
                     .prepare_realtime_outbound_lanes(&prep_target, cycle)
@@ -634,7 +614,6 @@ impl SyncManager {
 
         let prep_target = PreparationTarget {
             route: super::super::progress::TransferRoute::Lan,
-            target: target_id.to_owned(),
         };
         let mut local_has_more = self
             .prepare_realtime_outbound_lanes(&prep_target, cycle)
@@ -652,10 +631,8 @@ impl SyncManager {
 
         for batch_index in 0..MAX_SYNC_BATCHES_PER_CONNECTION {
             if batch_index > 0
-                && self
-                    .runtime_state
-                    .realtime_pending
-                    .swap(false, Ordering::AcqRel)
+                && db::sync_items::has_pending_realtime_outbox(&pool, cycle.settings.sync_sensitive)
+                    .await?
             {
                 local_has_more |= self
                     .prepare_realtime_outbound_lanes(&prep_target, cycle)
@@ -836,13 +813,18 @@ impl SyncManager {
     ) -> Result<bool> {
         let prep_target = PreparationTarget {
             route: super::super::progress::TransferRoute::Cloud,
-            target: CLOUD_TARGET.to_owned(),
         };
         let mut uploads = repository::pending_cloud_blob_uploads(pool, realtime_only, 4).await?;
         if uploads.is_empty() {
+            let sync_sensitive = self
+                .app
+                .state::<SettingsStore>()
+                .snapshot()
+                .sync
+                .sync_sensitive;
             let scope = if realtime_only {
                 Some(db::sync_items::OutboxContentScope::RealtimeOnly)
-            } else if !self.runtime_state.realtime_pending.load(Ordering::Acquire) {
+            } else if !db::sync_items::has_pending_realtime_outbox(pool, sync_sensitive).await? {
                 Some(db::sync_items::OutboxContentScope::BackfillOnly)
             } else {
                 None
@@ -898,6 +880,8 @@ impl SyncManager {
             BLOB_PRIORITY_BACKFILL
         };
 
+        let _cloud_data_activity = self.acquire_cloud_data_activity();
+        let mut active_connection = data_connection.clone();
         let mut item_failed = false;
         let mut needs_control_push = false;
         for blob_row in &upload.blobs {
@@ -920,12 +904,16 @@ impl SyncManager {
                 {
                     UploadTransferStart::Ready(transfer) => transfer,
                     UploadTransferStart::Canceled => {
+                        self.delivery
+                            .cancel_upload_operation(&upload.sync_key, CLOUD_TARGET);
                         item_failed = true;
                         break;
                     }
                 }
             } else {
                 if repository::is_delivery_canceled(pool, CLOUD_TARGET, &upload.sync_key).await? {
+                    self.delivery
+                        .cancel_upload_operation(&upload.sync_key, CLOUD_TARGET);
                     item_failed = true;
                     break;
                 }
@@ -953,10 +941,44 @@ impl SyncManager {
                         }
                     };
                 upload_started = true;
-                let (result, unhealthy) =
-                    upload_blob_with_probe(data_connection, group, &staged, options).await;
-                unhealthy_connection = unhealthy;
-                result
+                let (first_result, first_unhealthy, first_written_bytes) =
+                    upload_blob_attempt(&active_connection, group, &staged, options.clone(), false)
+                        .await;
+                let Err(first_error) = first_result else {
+                    unhealthy_connection = first_unhealthy;
+                    return Ok(());
+                };
+                let canceled = transfer
+                    .as_ref()
+                    .is_some_and(super::super::progress::TransferHandle::canceled);
+                let connection_failure = first_unhealthy
+                    || is_cloud_data_timeout(&first_error)
+                    || should_invalidate_cloud_connection(&active_connection, &first_error);
+                if !canceled
+                    && connection_failure
+                    && first_error
+                        .downcast_ref::<RemoteBlobUnavailable>()
+                        .is_none()
+                {
+                    self.invalidate_cloud_data_connection(active_connection.stable_id());
+                    let settings = self.app.state::<SettingsStore>().snapshot().sync;
+                    if let Ok(fresh_connection) = self.ensure_cloud_data_connection(&settings).await
+                    {
+                        active_connection = fresh_connection;
+                        let (retry_result, retry_unhealthy, _) =
+                            upload_blob_attempt(&active_connection, group, &staged, options, true)
+                                .await;
+                        unhealthy_connection = retry_unhealthy;
+                        return retry_result;
+                    }
+                }
+                if !canceled {
+                    if let Some(handle) = &transfer {
+                        handle.failed(first_written_bytes, first_error.to_string());
+                    }
+                }
+                unhealthy_connection = first_unhealthy;
+                Err(first_error)
             }
             .await;
 
@@ -993,8 +1015,12 @@ impl SyncManager {
                         }
                     }
                     if error.downcast_ref::<RemoteBlobUnavailable>().is_some() {
-                        let _ =
-                            repository::mark_blob_local_unavailable(pool, &blob_row.blob_id).await;
+                        let _ = repository::mark_blob_local_unavailable(
+                            pool,
+                            &upload.sync_key,
+                            &blob_row.blob_id,
+                        )
+                        .await;
                         self.delivery
                             .blocked(pool, CLOUD_TARGET, &upload.sync_key, &error.to_string())
                             .await?;
@@ -1007,10 +1033,12 @@ impl SyncManager {
                                 &error.to_string(),
                             )
                             .await?;
+                        self.emit_updated();
                         if unhealthy_connection
-                            || should_invalidate_cloud_connection(data_connection, &error)
+                            || is_cloud_data_timeout(&error)
+                            || should_invalidate_cloud_connection(&active_connection, &error)
                         {
-                            self.invalidate_cloud_data_connection(data_connection.stable_id());
+                            self.invalidate_cloud_data_connection(active_connection.stable_id());
                         }
                         return Err(error);
                     }

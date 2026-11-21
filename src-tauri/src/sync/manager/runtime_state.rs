@@ -31,9 +31,10 @@ pub(super) struct RuntimeCoordinator {
     pub(super) local_outbox_wake: [Notify; 3],
     pub(super) attachment_wakes: [Notify; 4],
     pub(super) exchange_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub(super) sync_key_locks:
+        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     pub(super) nearby_wake: Notify,
     pub(super) cleanup_ready: Notify,
-    pub(super) realtime_pending: AtomicBool,
     /// Highest cloud Hub sequence observed via `WatchCloud`, enabling batch-0 pull preemption.
     pub(super) cloud_observed_latest_seq: AtomicU64,
     /// Session-scoped memoization for `(group_id, icon_file)` encryption during backfill.
@@ -59,6 +60,8 @@ pub(super) struct RuntimeCoordinator {
     pub(super) cloud_connection: RwLock<Option<Connection>>,
     /// Lazy secondary QUIC connection dedicated exclusively to Cloud blob uploads & downloads.
     pub(super) cloud_data_connection: RwLock<Option<Connection>>,
+    pub(super) cloud_data_active_transfers: AtomicUsize,
+    pub(super) cloud_data_last_active_at: RwLock<Option<Instant>>,
     pub(super) cloud_session: RwLock<Option<CloudSessionState>>,
     /// Dedicated low-latency control QUIC connections to LAN peers (`SyncItems`, `AckLanItems`).
     pub(super) lan_connections: RwLock<HashMap<String, Connection>>,
@@ -90,9 +93,9 @@ impl RuntimeCoordinator {
             local_outbox_wake: std::array::from_fn(|_| Notify::new()),
             attachment_wakes: std::array::from_fn(|_| Notify::new()),
             exchange_locks: Mutex::new(HashMap::new()),
+            sync_key_locks: std::sync::Mutex::new(HashMap::new()),
             nearby_wake: Notify::new(),
             cleanup_ready: Notify::new(),
-            realtime_pending: AtomicBool::new(false),
             cloud_observed_latest_seq: AtomicU64::new(0),
             prepared_source_icons: RwLock::new(HashMap::new()),
             uploaded_source_icons: RwLock::new(HashSet::new()),
@@ -112,6 +115,8 @@ impl RuntimeCoordinator {
             cloud_server_version: RwLock::new(None),
             cloud_connection: RwLock::new(None),
             cloud_data_connection: RwLock::new(None),
+            cloud_data_active_transfers: AtomicUsize::new(0),
+            cloud_data_last_active_at: RwLock::new(None),
             cloud_session: RwLock::new(None),
             lan_connections: RwLock::new(HashMap::new()),
             lan_data_connections: RwLock::new(HashMap::new()),
@@ -145,5 +150,36 @@ impl RuntimeCoordinator {
             .write()
             .expect("checked cloud blobs poisoned")
             .clear();
+    }
+
+    /// Acquires an exclusive per-`sync_key` async lock to serialize CRDT merges, local snapshot
+    /// commits, and blob-pull application for the same logical clipboard item.
+    pub(super) async fn lock_sync_key(&self, sync_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut locks = self.sync_key_locks.lock().expect("sync key locks poisoned");
+            locks.retain(|_, weak| weak.strong_count() > 0);
+            if let Some(existing) = locks.get(sync_key).and_then(std::sync::Weak::upgrade) {
+                existing
+            } else {
+                let created = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(sync_key.to_owned(), Arc::downgrade(&created));
+                created
+            }
+        };
+        mutex.lock_owned().await
+    }
+
+    /// Returns the sorted device IDs of all LAN peers with an active open QUIC control connection.
+    pub(super) fn online_lan_peer_ids(&self) -> Vec<String> {
+        let mut peers = self
+            .lan_connections
+            .read()
+            .expect("LAN connections poisoned")
+            .iter()
+            .filter(|(_, connection)| connection.close_reason().is_none())
+            .map(|(device_id, _)| device_id.clone())
+            .collect::<Vec<_>>();
+        peers.sort();
+        peers
     }
 }

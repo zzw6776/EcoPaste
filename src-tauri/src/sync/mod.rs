@@ -70,6 +70,22 @@ pub fn notify_local_state_changed(app: &AppHandle) {
     }
 }
 
+/// Cancels active transfers for a deleted item and wakes outbound tombstone sync.
+pub fn notify_local_item_deleted(app: &AppHandle, item_id: &str) {
+    if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
+        manager.cancel_transfers_for_item(item_id);
+        manager.wake_local_outbox();
+    }
+}
+
+/// Cancels all active transfers when history is cleared and wakes outbound tombstone sync.
+pub fn notify_local_items_cleared(app: &AppHandle) {
+    if let Some(manager) = app.try_state::<Arc<SyncManager>>() {
+        manager.cancel_all_transfers();
+        manager.wake_local_outbox();
+    }
+}
+
 pub fn notify_settings_changed(app: &AppHandle) {
     wake_manager(app);
 }

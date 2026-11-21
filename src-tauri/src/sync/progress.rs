@@ -136,27 +136,10 @@ pub(super) struct CanceledPreparation {
     pub source_revision: String,
 }
 
-pub(super) struct LocalImportPromotion {
-    pub item_id: String,
-    pub operation_id: String,
-    pub route: TransferRoute,
-    pub target: String,
-    pub total_bytes: u64,
-    pub operation_order: i64,
-    pub source_revision: String,
-}
-
-pub(super) enum PreparationClaim {
-    Claimed(TransferHandle),
-    Canceled,
-    Missing,
-}
-
 #[derive(Default)]
 struct RegistryState {
     entries: HashMap<String, TransferEntry>,
     active_operations: HashMap<TransferOperationKey, String>,
-    local_imports: HashMap<String, String>,
     next_revision: u64,
 }
 
@@ -202,7 +185,7 @@ impl TransferRegistry {
                 operation_order,
                 source_revision,
             }),
-            TransferPersistence::Durable,
+            TransferPersistence::Transient,
             false,
         )
     }
@@ -255,8 +238,6 @@ impl TransferRegistry {
         });
         task.revision = 0;
         let cancel = Arc::new(AtomicBool::new(false));
-        let item_id = task.item_id.clone();
-        let local_import = task.target == LOCAL_IMPORT_TARGET;
         state.entries.insert(
             entry_id.clone(),
             TransferEntry {
@@ -277,9 +258,6 @@ impl TransferRegistry {
         state
             .active_operations
             .insert(operation_key, entry_id.clone());
-        if local_import {
-            state.local_imports.insert(item_id, entry_id.clone());
-        }
         drop(state);
         self.emit_removed(superseded);
         self.emit(&entry_id, true);
@@ -297,14 +275,14 @@ impl TransferRegistry {
 
     pub fn item_has_active_local_import(&self, item_id: &str) -> bool {
         let state = self.state.lock().expect("transfer registry poisoned");
-        state
-            .local_imports
-            .get(item_id)
-            .and_then(|id| state.entries.get(id))
-            .is_some_and(|entry| entry.task.phase == TransferPhase::Preparing)
+        state.entries.values().any(|entry| {
+            entry.task.item_id == item_id
+                && entry.task.target == LOCAL_IMPORT_TARGET
+                && entry.task.phase == TransferPhase::Preparing
+        })
     }
 
-    /// Ends every component of a failed card operation, including queued preparation.
+    /// Ends an active upload operation in the registry as failed.
     pub fn fail_upload_operation(&self, operation_id: &str, target: &str, error: &str) {
         let route = if target == "cloud" {
             TransferRoute::Cloud
@@ -321,34 +299,74 @@ impl TransferRegistry {
         };
         entry.cancel.store(true, Ordering::Release);
         entry.preparation = None;
-        let item_id = entry.task.item_id.clone();
         let bytes = entry.task.transferred_bytes;
         finish_entry(entry, TransferPhase::Failed, bytes, Some(error.to_owned()));
-        state.local_imports.remove(&item_id);
         drop(state);
         self.emit(&entry_id, false);
     }
 
-    /// Ends an imported file task when another route materialized its outgoing event.
-    pub fn complete_local_import_for_item(&self, item_id: &str) {
+    /// Ends an active upload operation in the registry as canceled when aborted between blobs.
+    pub fn cancel_upload_operation(&self, operation_id: &str, target: &str) {
         let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry_id) = state.local_imports.get(item_id).cloned() else {
+        let Some(entry_id) = cancel_upload_operation_state(&mut state, operation_id, target) else {
             return;
         };
-        let Some(entry) = state.entries.get_mut(&entry_id) else {
-            return;
-        };
-        if entry.task.target != LOCAL_IMPORT_TARGET || entry.task.phase != TransferPhase::Queued {
-            return;
-        }
-        let key = TransferOperationKey::from_task(&entry.task);
-        let bytes = entry.task.transferred_bytes;
-        entry.preparation = None;
-        finish_entry(entry, TransferPhase::Completed, bytes, None);
-        state.active_operations.remove(&key);
-        state.local_imports.remove(item_id);
         drop(state);
         self.emit(&entry_id, false);
+    }
+
+    /// Cancels and removes every tracked transfer when switching or leaving a sync group.
+    pub fn clear_all(&self) {
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let removed = clear_all_state(&mut state);
+        drop(state);
+        self.emit_removed(removed);
+    }
+
+    /// Cancels all active transfers belonging to `item_id` (e.g. when the local item is deleted).
+    pub fn cancel_by_item_id(&self, item_id: &str) {
+        self.cancel_matching(|entry| entry.task.item_id == item_id);
+    }
+
+    /// Cancels all active transfers belonging to `operation_id` (`sync_key`, e.g. on remote tombstone).
+    pub fn cancel_by_operation_id(&self, operation_id: &str) {
+        self.cancel_matching(|entry| entry.task.operation_id == operation_id);
+    }
+
+    fn cancel_matching(&self, predicate: impl Fn(&TransferEntry) -> bool) {
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let matching_ids = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.task.phase.terminal() && predicate(entry))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if matching_ids.is_empty() {
+            return;
+        }
+        let mut updated_ids = Vec::with_capacity(matching_ids.len());
+        for entry_id in matching_ids {
+            if let Some(entry) = state.entries.get_mut(&entry_id) {
+                entry.cancel.store(true, Ordering::Release);
+                entry.preparation = None;
+                let key = operation_key(
+                    &entry.task.operation_id,
+                    entry.task.direction,
+                    entry.task.route,
+                    &entry.task.target,
+                );
+                let bytes = entry.task.transferred_bytes;
+                finish_entry(entry, TransferPhase::Canceled, bytes, None);
+                if state.active_operations.get(&key) == Some(&entry_id) {
+                    state.active_operations.remove(&key);
+                }
+                updated_ids.push(entry_id);
+            }
+        }
+        drop(state);
+        for entry_id in updated_ids {
+            self.emit(&entry_id, false);
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -368,143 +386,12 @@ impl TransferRegistry {
 
     #[cfg(target_os = "android")]
     pub fn finish_local_import(&self, id: &str, total_bytes: u64) {
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry) = state.entries.get_mut(id) else {
-            return;
-        };
-        if entry.task.target != LOCAL_IMPORT_TARGET || entry.task.phase.terminal() {
-            return;
-        }
-        entry.task.transferred_bytes = total_bytes;
-        entry.task.total_bytes = total_bytes;
-        entry.task.phase = TransferPhase::Queued;
-        entry.task.speed_bytes_per_second = 0;
-        entry.task.eta_seconds = None;
-        entry.active_components = 0;
-        entry.last_sample_bytes = total_bytes;
-        drop(state);
-        self.emit(id, false);
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn bind_local_import(&self, id: &str, operation_order: i64, source_revision: String) {
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry) = state.entries.get_mut(id) else {
-            return;
-        };
-        if entry.task.target != LOCAL_IMPORT_TARGET || entry.task.phase.terminal() {
-            return;
-        }
-        entry.preparation = Some(PreparationContext {
-            operation_order,
-            source_revision,
-        });
+        self.update_absolute(id, TransferPhase::Completed, total_bytes, None, true);
     }
 
     #[cfg(target_os = "android")]
     pub fn fail_local_import(&self, id: &str, bytes: u64, error: String) {
         self.update_absolute(id, TransferPhase::Failed, bytes, Some(error), true);
-    }
-
-    /// Continues the Android import operation as upload preparation without a second task.
-    pub fn promote_local_import(&self, promotion: LocalImportPromotion) -> Option<TransferHandle> {
-        let LocalImportPromotion {
-            item_id,
-            operation_id,
-            route,
-            target,
-            total_bytes,
-            operation_order,
-            source_revision,
-        } = promotion;
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let entry_id = state.local_imports.get(&item_id)?.clone();
-        let old_key = TransferOperationKey::from_task(&state.entries.get(&entry_id)?.task);
-        state.active_operations.remove(&old_key);
-        state.local_imports.remove(&item_id);
-        let entry = state.entries.get_mut(&entry_id)?;
-        if entry.task.phase != TransferPhase::Queued || entry.cancel.load(Ordering::Acquire) {
-            return None;
-        }
-        entry.preparation = Some(PreparationContext {
-            operation_order,
-            source_revision,
-        });
-        entry.task.operation_id = operation_id;
-        entry.task.route = route;
-        entry.task.target = target;
-        entry.persistence = TransferPersistence::Durable;
-        reset_entry(entry, TransferPhase::Preparing, total_bytes);
-        let key = TransferOperationKey::from_task(&entry.task);
-        let cancel = entry.cancel.clone();
-        state.active_operations.insert(key, entry_id.clone());
-        drop(state);
-        self.emit(&entry_id, false);
-        Some(self.handle(entry_id, cancel))
-    }
-
-    /// Converts upload preparation into the first attachment stream of the same operation.
-    pub fn claim_preparation(
-        &self,
-        operation_id: &str,
-        route: TransferRoute,
-        target: &str,
-        total_bytes: u64,
-    ) -> PreparationClaim {
-        let key = operation_key(operation_id, TransferDirection::Upload, route, target);
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(entry_id) = state.active_operations.get(&key).cloned() else {
-            return PreparationClaim::Missing;
-        };
-        let Some(entry) = state.entries.get_mut(&entry_id) else {
-            return PreparationClaim::Missing;
-        };
-        if entry.preparation.is_none() {
-            return PreparationClaim::Missing;
-        }
-        if entry.cancel.load(Ordering::Acquire) || entry.task.phase == TransferPhase::Canceled {
-            return PreparationClaim::Canceled;
-        }
-        if entry.task.phase != TransferPhase::Queued || !entry.task.cancellable {
-            return PreparationClaim::Missing;
-        }
-        entry.preparation = None;
-        reset_entry(entry, TransferPhase::Queued, total_bytes);
-        let cancel = entry.cancel.clone();
-        drop(state);
-        self.emit(&entry_id, false);
-        PreparationClaim::Claimed(self.handle(entry_id, cancel))
-    }
-
-    fn prepared(&self, id: &str, route: TransferRoute, target: String) {
-        let mut state = self.state.lock().expect("transfer registry poisoned");
-        let Some(old_key) = state
-            .entries
-            .get(id)
-            .map(|entry| TransferOperationKey::from_task(&entry.task))
-        else {
-            return;
-        };
-        state.active_operations.remove(&old_key);
-        let entry = state.entries.get_mut(id).expect("entry checked above");
-        if entry.task.phase.terminal() || entry.cancel.load(Ordering::Acquire) {
-            return;
-        }
-        entry.task.route = route;
-        entry.task.target = target;
-        entry.task.phase = TransferPhase::Queued;
-        entry.task.transferred_bytes = 0;
-        entry.task.speed_bytes_per_second = 0;
-        entry.task.eta_seconds = None;
-        entry.task.error = None;
-        entry.task.cancellable = true;
-        entry.active_components = 0;
-        entry.last_sample_bytes = 0;
-        entry.last_sample_at = Instant::now();
-        let new_key = TransferOperationKey::from_task(&entry.task);
-        state.active_operations.insert(new_key, id.to_owned());
-        drop(state);
-        self.emit(id, false);
     }
 
     pub fn list(&self) -> Vec<TransferTask> {
@@ -569,15 +456,7 @@ impl TransferRegistry {
         let mut state = self.state.lock().expect("transfer registry poisoned");
         let entry = state.entries.get_mut(id)?;
         let preparation = entry.preparation.clone()?;
-        let cancelable_phase = if entry.task.target == LOCAL_IMPORT_TARGET {
-            matches!(
-                entry.task.phase,
-                TransferPhase::Preparing | TransferPhase::Queued
-            )
-        } else {
-            entry.task.phase == TransferPhase::Preparing
-        };
-        if !cancelable_phase || !entry.task.cancellable {
+        if entry.task.phase != TransferPhase::Preparing || !entry.task.cancellable {
             return None;
         }
         entry.cancel.store(true, Ordering::Release);
@@ -608,9 +487,7 @@ impl TransferRegistry {
         let bytes = entry.task.transferred_bytes;
         finish_entry(entry, phase, bytes, error);
         let key = TransferOperationKey::from_task(&entry.task);
-        let item_id = entry.task.item_id.clone();
         state.active_operations.remove(&key);
-        state.local_imports.remove(&item_id);
         drop(state);
         self.emit(id, false);
     }
@@ -626,9 +503,7 @@ impl TransferRegistry {
         finish_entry(entry, TransferPhase::Canceled, bytes, None);
         let task = entry.task.clone();
         let key = TransferOperationKey::from_task(&entry.task);
-        let item_id = entry.task.item_id.clone();
         state.active_operations.remove(&key);
-        state.local_imports.remove(&item_id);
         drop(state);
         self.emit(id, false);
         Some(task)
@@ -735,12 +610,8 @@ impl TransferRegistry {
         }
         let terminal = phase.terminal();
         let key = terminal.then(|| TransferOperationKey::from_task(&entry.task));
-        let item_id = terminal.then(|| entry.task.item_id.clone());
         if let Some(key) = key {
             state.active_operations.remove(&key);
-        }
-        if let Some(item_id) = item_id {
-            state.local_imports.remove(&item_id);
         }
         drop(state);
         if should_emit {
@@ -837,12 +708,8 @@ impl TransferRegistry {
         }
         let terminal = entry.task.phase.terminal();
         let key = terminal.then(|| TransferOperationKey::from_task(&entry.task));
-        let item_id = terminal.then(|| entry.task.item_id.clone());
         if let Some(key) = key {
             state.active_operations.remove(&key);
-        }
-        if let Some(item_id) = item_id {
-            state.local_imports.remove(&item_id);
         }
         drop(state);
         if should_emit {
@@ -894,7 +761,6 @@ impl TransferRegistry {
             if let Some(entry) = state.entries.remove(id) {
                 let key = TransferOperationKey::from_task(&entry.task);
                 state.active_operations.remove(&key);
-                state.local_imports.remove(&entry.task.item_id);
                 vec![id.to_owned()]
             } else {
                 Vec::new()
@@ -944,27 +810,6 @@ fn operation_key(
         route,
         target: target.to_owned(),
     }
-}
-
-fn reset_entry(entry: &mut TransferEntry, phase: TransferPhase, total_bytes: u64) {
-    let now = Instant::now();
-    entry.task.started_at_ms = chrono::Utc::now().timestamp_millis();
-    entry.task.phase = phase;
-    entry.task.transferred_bytes = 0;
-    entry.task.total_bytes = total_bytes;
-    entry.task.speed_bytes_per_second = 0;
-    entry.task.elapsed_ms = 0;
-    entry.task.eta_seconds = None;
-    entry.task.error = None;
-    entry.task.cancellable = true;
-    entry.active_components = 1;
-    entry.completed_bytes = 0;
-    entry.skipped_bytes = 0;
-    entry.started_at = now;
-    entry.finished_at = None;
-    entry.last_sample_at = now;
-    entry.last_sample_bytes = 0;
-    entry.last_emit_at = now.checked_sub(EMIT_INTERVAL).unwrap_or(now);
 }
 
 fn finish_entry(
@@ -1079,10 +924,6 @@ impl TransferHandle {
 
     pub fn preparing(&self, bytes: u64) {
         self.update(TransferPhase::Preparing, bytes, None, None, false);
-    }
-
-    pub fn prepared(&self, route: TransferRoute, target: String) {
-        self.registry.prepared(&self.entry_id, route, target);
     }
 
     pub fn begin_preparation_commit(&self) -> bool {
@@ -1264,4 +1105,93 @@ mod tests {
             .max(total_bytes.saturating_sub(entry.skipped_bytes));
         assert_eq!(joined_total, upload_bytes);
     }
+
+    #[test]
+    fn cancel_upload_operation_terminates_active_multi_blob_task_and_clear_all_purges_entries() {
+        let now = Instant::now();
+        let mut state = RegistryState::default();
+        let entry_id = "upload-entry".to_owned();
+        let task = TransferTask {
+            id: entry_id.clone(),
+            revision: 0,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
+            operation_id: "sync-key-1".into(),
+            item_id: "item-1".into(),
+            direction: TransferDirection::Upload,
+            route: TransferRoute::Cloud,
+            target: "cloud".into(),
+            file_name: None,
+            phase: TransferPhase::Queued,
+            transferred_bytes: 50,
+            total_bytes: 100,
+            speed_bytes_per_second: 0,
+            elapsed_ms: 0,
+            eta_seconds: None,
+            error: None,
+            cancellable: true,
+        };
+        let key = TransferOperationKey::from_task(&task);
+        state
+            .active_operations
+            .insert(key.clone(), entry_id.clone());
+        state.entries.insert(
+            entry_id.clone(),
+            TransferEntry {
+                task,
+                preparation: None,
+                persistence: TransferPersistence::Durable,
+                cancel: Arc::new(AtomicBool::new(false)),
+                active_components: 0,
+                completed_bytes: 50,
+                skipped_bytes: 0,
+                started_at: now,
+                finished_at: None,
+                last_sample_at: now,
+                last_sample_bytes: 50,
+                last_emit_at: now,
+            },
+        );
+
+        let canceled_id = cancel_upload_operation_state(&mut state, "sync-key-1", "cloud");
+        assert_eq!(canceled_id.as_deref(), Some("upload-entry"));
+        assert!(!state.active_operations.contains_key(&key));
+        let entry = state.entries.get(&entry_id).unwrap();
+        assert_eq!(entry.task.phase, TransferPhase::Canceled);
+        assert!(!entry.task.cancellable);
+
+        let removed = clear_all_state(&mut state);
+        assert_eq!(removed, vec!["upload-entry".to_owned()]);
+        assert!(state.entries.is_empty());
+        assert!(state.active_operations.is_empty());
+    }
+}
+
+fn cancel_upload_operation_state(
+    state: &mut RegistryState,
+    operation_id: &str,
+    target: &str,
+) -> Option<String> {
+    let route = if target == "cloud" {
+        TransferRoute::Cloud
+    } else {
+        TransferRoute::Lan
+    };
+    let key = operation_key(operation_id, TransferDirection::Upload, route, target);
+    let entry_id = state.active_operations.remove(&key)?;
+    let entry = state.entries.get_mut(&entry_id)?;
+    entry.cancel.store(true, Ordering::Release);
+    entry.preparation = None;
+    let bytes = entry.task.transferred_bytes;
+    finish_entry(entry, TransferPhase::Canceled, bytes, None);
+    Some(entry_id)
+}
+
+fn clear_all_state(state: &mut RegistryState) -> Vec<String> {
+    let mut removed = Vec::with_capacity(state.entries.len());
+    for (id, entry) in state.entries.drain() {
+        entry.cancel.store(true, Ordering::Release);
+        removed.push(id);
+    }
+    state.active_operations.clear();
+    removed
 }

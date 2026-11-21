@@ -334,14 +334,45 @@ impl SyncManager {
             .cloned()
     }
 
-    pub(super) fn cached_cloud_data_connection(&self) -> Option<Connection> {
+    pub(super) fn acquire_cloud_data_activity(&self) -> CloudDataActivityGuard<'_> {
         self.runtime_state
+            .cloud_data_active_transfers
+            .fetch_add(1, Ordering::AcqRel);
+        *self
+            .runtime_state
+            .cloud_data_last_active_at
+            .write()
+            .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
+        CloudDataActivityGuard {
+            runtime: &self.runtime_state,
+        }
+    }
+
+    pub(super) fn cached_cloud_data_connection(&self) -> Option<Connection> {
+        let existing = self
+            .runtime_state
             .cloud_data_connection
             .read()
             .expect("cloud data connection cache poisoned")
             .as_ref()
             .filter(|connection| connection.close_reason().is_none())
-            .cloned()
+            .cloned()?;
+        let active = self
+            .runtime_state
+            .cloud_data_active_transfers
+            .load(Ordering::Acquire);
+        let idle_expired = active == 0
+            && self
+                .runtime_state
+                .cloud_data_last_active_at
+                .read()
+                .expect("cloud data last active timestamp poisoned")
+                .is_some_and(|last_active| last_active.elapsed() >= CLOUD_DATA_IDLE_REUSE_TTL);
+        if idle_expired {
+            self.invalidate_cloud_data_connection(existing.stable_id());
+            return None;
+        }
+        Some(existing)
     }
 
     /// Opens or reuses a dedicated secondary QUIC connection for Cloud blob transfers so large
@@ -370,6 +401,11 @@ impl SyncManager {
         .context("云端数据通道连接超时")??;
         *self
             .runtime_state
+            .cloud_data_last_active_at
+            .write()
+            .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
+        *self
+            .runtime_state
             .cloud_data_connection
             .write()
             .expect("cloud data connection cache poisoned") = Some(connection.clone());
@@ -389,6 +425,11 @@ impl SyncManager {
             if let Some(existing) = connection.take() {
                 existing.close(0_u32.into(), b"cloud data connection invalidated");
             }
+            self.runtime_state
+                .cloud_data_last_active_at
+                .write()
+                .expect("cloud data last active timestamp poisoned")
+                .take();
         }
     }
 
@@ -495,14 +536,6 @@ impl SyncManager {
     /// Atomically evicts the shared cloud connection after an external network-path change.
     #[cfg(target_os = "android")]
     pub(super) fn invalidate_current_cloud_connection(&self) -> Option<usize> {
-        let connection = self
-            .runtime_state
-            .cloud_connection
-            .write()
-            .expect("cloud connection cache poisoned")
-            .take()?;
-        let stable_id = connection.stable_id();
-        connection.close(0_u32.into(), b"cloud network path changed");
         if let Some(data) = self
             .runtime_state
             .cloud_data_connection
@@ -512,6 +545,14 @@ impl SyncManager {
         {
             data.close(0_u32.into(), b"cloud network path changed");
         }
+        let connection = self
+            .runtime_state
+            .cloud_connection
+            .write()
+            .expect("cloud connection cache poisoned")
+            .take()?;
+        let stable_id = connection.stable_id();
+        connection.close(0_u32.into(), b"cloud network path changed");
         self.set_channel_status(SyncTarget::Cloud, SyncChannelState::Idle, None, false);
         let mut session = self
             .runtime_state
@@ -548,6 +589,11 @@ impl SyncManager {
             .cloud_data_connection
             .write()
             .expect("cloud data connection cache poisoned")
+            .take();
+        self.runtime_state
+            .cloud_data_last_active_at
+            .write()
+            .expect("cloud data last active timestamp poisoned")
             .take();
         self.runtime_state
             .cloud_session
@@ -591,5 +637,22 @@ impl SyncManager {
             #[cfg(target_os = "android")]
             crate::commands::android::notify_overlay_sync_status_changed();
         });
+    }
+}
+
+pub(super) struct CloudDataActivityGuard<'a> {
+    runtime: &'a RuntimeCoordinator,
+}
+
+impl Drop for CloudDataActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime
+            .cloud_data_active_transfers
+            .fetch_sub(1, Ordering::AcqRel);
+        *self
+            .runtime
+            .cloud_data_last_active_at
+            .write()
+            .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
     }
 }

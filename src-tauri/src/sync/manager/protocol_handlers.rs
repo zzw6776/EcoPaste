@@ -592,6 +592,12 @@ async fn dispatch_peer(
             if repository::is_peer_removed(&pool, "", &connection.remote_id().to_string()).await? {
                 bail!("device was removed; pair it again before syncing");
             }
+            let serve_info =
+                repository::blob_serve_info(&pool, &blob_id, item_sync_key.as_deref()).await?;
+            let serve_sync_key = serve_info
+                .as_ref()
+                .map(|info| info.sync_key.as_str())
+                .or(item_sync_key.as_deref());
             let Some(blob) = repository::outgoing_blob(&pool, &blob_id).await? else {
                 write_frame(
                     send,
@@ -609,7 +615,14 @@ async fn dispatch_peer(
                     stream_nonce,
                 }) => {
                     if !source_path.starts_with("content://") && !Path::new(source_path).is_file() {
-                        let _ = repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
+                        if let Some(sync_key) = serve_sync_key {
+                            let _ = repository::mark_blob_local_unavailable(
+                                &pool,
+                                sync_key,
+                                &blob.blob_id,
+                            )
+                            .await;
+                        }
                         write_frame(
                             send,
                             &Response::Error {
@@ -626,8 +639,14 @@ async fn dispatch_peer(
                     match manager.lease_outgoing_staging(&group, &blob).await {
                         Ok(staged) => (None, Some(staged)),
                         Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
-                            let _ =
-                                repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
+                            if let Some(sync_key) = serve_sync_key {
+                                let _ = repository::mark_blob_local_unavailable(
+                                    &pool,
+                                    sync_key,
+                                    &blob.blob_id,
+                                )
+                                .await;
+                            }
                             write_frame(
                                 send,
                                 &Response::Error {
@@ -642,7 +661,11 @@ async fn dispatch_peer(
                     }
                 }
                 None => {
-                    let _ = repository::mark_blob_local_unavailable(&pool, &blob.blob_id).await;
+                    if let Some(sync_key) = serve_sync_key {
+                        let _ =
+                            repository::mark_blob_local_unavailable(&pool, sync_key, &blob.blob_id)
+                                .await;
+                    }
                     write_frame(
                         send,
                         &Response::Error {
@@ -656,8 +679,6 @@ async fn dispatch_peer(
             };
             let peer_info =
                 repository::peer_by_endpoint_id(&pool, &connection.remote_id().to_string()).await?;
-            let serve_info =
-                repository::blob_serve_info(&pool, &blob.blob_id, item_sync_key.as_deref()).await?;
             if let Some((ref peer_device_id, ref peer_name)) = peer_info {
                 manager.touch_peer_catchup(peer_device_id, peer_name, false);
             }

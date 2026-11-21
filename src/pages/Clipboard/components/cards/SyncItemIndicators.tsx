@@ -153,13 +153,14 @@ const ChannelButton: FC<ChannelButtonProps> = (props) => {
     transferTask?.direction,
   );
   const lastError = channel.lastError;
-  const title = lastError
-    ? t(`syncItem.${target}.errorWithReason`, { reason: lastError })
-    : t(`syncItem.${target}.${titleState}`, {
-        content: channel.contentTargets,
-        delivered: channel.deliveredTargets,
-        total: channel.totalTargets,
-      });
+  const title =
+    activity === "error" && lastError
+      ? t(`syncItem.${target}.errorWithReason`, { reason: lastError })
+      : t(`syncItem.${target}.${titleState}`, {
+          content: channel.contentTargets,
+          delivered: channel.deliveredTargets,
+          total: channel.totalTargets,
+        });
 
   return (
     <Tooltip mouseEnterDelay={0.3} title={title}>

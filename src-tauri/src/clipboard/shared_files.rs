@@ -84,6 +84,11 @@ fn clean_paths(root: &Path, references: &HashSet<PathBuf>) -> Result<CleanupStat
     if !root.exists() {
         return Ok(stats);
     }
+    let referenced_dirs: HashSet<&Path> = references
+        .iter()
+        .filter_map(|path| path.parent())
+        .filter(|parent| *parent != root)
+        .collect();
     for entry in WalkDir::new(root).contents_first(true).follow_links(false) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -106,6 +111,16 @@ fn clean_paths(root: &Path, references: &HashSet<PathBuf>) -> Result<CleanupStat
                 }
             }
         } else if entry.file_type().is_file() && !references.contains(path) {
+            let active_import_temp = path
+                .parent()
+                .is_some_and(|parent| referenced_dirs.contains(parent))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tmp"));
+            if active_import_temp {
+                continue;
+            }
             let bytes = match entry.metadata() {
                 Ok(metadata) => metadata.len(),
                 Err(error) => {

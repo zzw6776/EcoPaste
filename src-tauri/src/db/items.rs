@@ -37,11 +37,27 @@ macro_rules! evictable_history {
               AND julianday(sync_row.updated_at) > julianday('now', '-24 hours')
               AND (
                   (sync_row.manual_share = 1 AND sync_row.prep_state <> 'ready')
-                  OR EXISTS (
-                      SELECT 1 FROM sync_item_targets target
-                      WHERE target.sync_key = sync_row.sync_key
-                        AND target.status IN ('pending', 'awaiting_receipt')
-                        AND julianday(target.updated_at) > julianday('now', '-24 hours')
+                  OR (
+                      sync_row.prep_state = 'ready'
+                      AND sync_row.deleted = 0
+                      AND (
+                          sync_row.cloud_blob_policy = 'requested'
+                          OR (sync_row.manual_share = 1 AND sync_row.origin = 'local')
+                      )
+                      AND (
+                          (sync_row.local_seq > 0 AND NOT EXISTS (
+                              SELECT 1 FROM sync_item_targets target
+                              WHERE target.sync_key = sync_row.sync_key
+                                AND target.pushed_local_seq >= sync_row.local_seq
+                          ))
+                          OR EXISTS (
+                              SELECT 1 FROM sync_item_blobs blob
+                              WHERE blob.sync_key = sync_row.sync_key
+                                AND blob.optional = 0
+                                AND blob.cloud_available = 0
+                                AND blob.local_available = 1
+                          )
+                      )
                   )
               )
         )"
@@ -243,9 +259,9 @@ pub async fn upsert_remote_file_item(
     sqlx::query(
         r#"
         INSERT INTO sync_items (
-            sync_key, item_id, origin, origin_device_id, kind,
+            sync_key, item_id, origin, origin_device_id, kind, cloud_blob_policy,
             local_state, remote_file_state, created_at, updated_at
-        ) VALUES (?, ?, 'remote', ?, 'files', 'metadata', 'available', ?, ?)
+        ) VALUES (?, ?, 'remote', ?, 'files', 'defer', 'metadata', 'available', ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = excluded.item_id,
             origin_device_id = COALESCE(excluded.origin_device_id, sync_items.origin_device_id),
@@ -798,8 +814,8 @@ pub struct DeleteItemOutcome {
 /// 翻转 `is_favorite`（收藏 / 取消收藏），原子记录待同步状态并返回新值。
 pub async fn toggle_item_favorite(pool: &SqlitePool, id: &str) -> Result<ToggleFavoriteOutcome> {
     let mut transaction = pool.begin().await.context("begin favorite update")?;
-    let row: (bool, bool, String, bool) = sqlx::query_as(
-        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
+    let row: (bool, bool, String, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = NOT is_favorite WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, kind, is_sensitive",
     )
     .bind(id)
     .fetch_one(&mut *transaction)
@@ -809,7 +825,8 @@ pub async fn toggle_item_favorite(pool: &SqlitePool, id: &str) -> Result<ToggleF
         &mut transaction,
         &row.2,
         id,
-        row.3,
+        &row.3,
+        row.4,
         row.0,
         row.1,
     )
@@ -830,18 +847,19 @@ pub async fn mark_item_favorite(
         .begin()
         .await
         .context("begin automatic favorite update")?;
-    let row: Option<(bool, bool, String, bool)> = sqlx::query_as(
-        "UPDATE clipboard_items SET is_favorite = 1 WHERE id = ? AND is_favorite = 0 RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
+    let row: Option<(bool, bool, String, String, bool)> = sqlx::query_as(
+        "UPDATE clipboard_items SET is_favorite = 1 WHERE id = ? AND is_favorite = 0 RETURNING is_favorite, is_pinned, sync_key, kind, is_sensitive",
     )
     .bind(id)
     .fetch_optional(&mut *transaction)
     .await
     .context("failed to mark clipboard item favorite")?;
-    if let Some((is_favorite, is_pinned, sync_key, is_sensitive)) = row.as_ref() {
+    if let Some((is_favorite, is_pinned, sync_key, kind, is_sensitive)) = row.as_ref() {
         crate::db::sync_items::mark_local_favorite_on(
             &mut transaction,
             sync_key,
             id,
+            kind,
             *is_sensitive,
             *is_favorite,
             *is_pinned,
@@ -852,21 +870,29 @@ pub async fn mark_item_favorite(
         .commit()
         .await
         .context("commit automatic favorite update")?;
-    Ok(row.map(|(is_favorite, _, _, _)| ToggleFavoriteOutcome { is_favorite }))
+    Ok(row.map(|(is_favorite, _, _, _, _)| ToggleFavoriteOutcome { is_favorite }))
 }
 
 /// 翻转 `is_pinned`（置顶 / 取消置顶），原子记录待同步状态并返回新值。
 pub async fn toggle_item_pinned(pool: &SqlitePool, id: &str) -> Result<TogglePinnedOutcome> {
     let mut transaction = pool.begin().await.context("begin pinned update")?;
-    let row: (bool, bool, String, bool) = sqlx::query_as(
-        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, is_sensitive",
+    let row: (bool, bool, String, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET is_pinned = NOT is_pinned WHERE id = ? RETURNING is_favorite, is_pinned, sync_key, kind, is_sensitive",
     )
     .bind(id)
     .fetch_one(&mut *transaction)
     .await
     .context("failed to toggle clipboard item pinned")?;
-    crate::db::sync_items::mark_local_pinned_on(&mut transaction, &row.2, id, row.3, row.0, row.1)
-        .await?;
+    crate::db::sync_items::mark_local_pinned_on(
+        &mut transaction,
+        &row.2,
+        id,
+        &row.3,
+        row.4,
+        row.0,
+        row.1,
+    )
+    .await?;
     transaction.commit().await.context("commit pinned update")?;
     Ok(TogglePinnedOutcome { is_pinned: row.1 })
 }
@@ -874,15 +900,16 @@ pub async fn toggle_item_pinned(pool: &SqlitePool, id: &str) -> Result<TogglePin
 /// 更新备注，传 `None` 清空备注，并在同一事务中记录待同步状态。
 pub async fn update_item_note(pool: &SqlitePool, id: &str, note: Option<&str>) -> Result<()> {
     let mut transaction = pool.begin().await.context("begin note update")?;
-    let row: (String, bool) = sqlx::query_as(
-        "UPDATE clipboard_items SET note = ? WHERE id = ? RETURNING sync_key, is_sensitive",
+    let row: (String, String, bool) = sqlx::query_as(
+        "UPDATE clipboard_items SET note = ? WHERE id = ? RETURNING sync_key, kind, is_sensitive",
     )
     .bind(note)
     .bind(id)
     .fetch_one(&mut *transaction)
     .await
     .context("failed to update clipboard item note")?;
-    crate::db::sync_items::mark_local_note_on(&mut transaction, &row.0, id, row.1, note).await?;
+    crate::db::sync_items::mark_local_note_on(&mut transaction, &row.0, id, &row.1, row.2, note)
+        .await?;
     transaction.commit().await.context("commit note update")?;
     Ok(())
 }
@@ -2782,17 +2809,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let now = chrono::Utc::now();
-        sqlx::query(
-            "INSERT INTO sync_item_targets (sync_key, target_id, confirmed_content, status, created_at, updated_at) \
-             VALUES (?, 'cloud', 'none', 'pending', ?, ?)",
-        )
-        .bind(&item.sync_key)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
 
         assert_eq!(
             evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
@@ -2802,6 +2818,12 @@ mod tests {
             0
         );
 
+        let local_seq: i64 =
+            sqlx::query_scalar("SELECT local_seq FROM sync_items WHERE sync_key = ?")
+                .bind(&item.sync_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         sqlx::query(
             "UPDATE sync_items SET prep_state = 'ready', manual_share = 0 WHERE sync_key = ?",
         )
@@ -2809,10 +2831,24 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Still protected while `cloud_blob_policy = 'requested'` has not pushed `local_seq` to any target.
+        assert_eq!(
+            evict_oldest_history(&pool, 1, crate::clipboard::shared_files::REFERENCE_PREFIX)
+                .await
+                .unwrap()
+                .removed,
+            0
+        );
+
+        let now = chrono::Utc::now();
         sqlx::query(
-            "UPDATE sync_item_targets SET status = 'confirmed', confirmed_content = 'complete' WHERE sync_key = ?",
+            "INSERT INTO sync_item_targets (sync_key, target_id, confirmed_content, pushed_local_seq, created_at, updated_at) \
+             VALUES (?, 'cloud', 'complete', ?, ?, ?)",
         )
         .bind(&item.sync_key)
+        .bind(local_seq)
+        .bind(now)
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
