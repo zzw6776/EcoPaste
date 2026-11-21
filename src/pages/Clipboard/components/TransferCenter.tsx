@@ -928,7 +928,7 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
           )}
         />
         {activeCount > 0 ? (
-          <span className="absolute top-0 right-0 flex size-4 items-center justify-center rounded-full bg-ant-info-bg text-[10px] text-ant-info tabular-nums">
+          <span className="pointer-events-none absolute top-0.5 right-0.5 origin-top-right scale-75 font-semibold text-ant-info text-xs tabular-nums leading-none">
             {Math.min(activeCount, 9)}
           </span>
         ) : hasCatchupActivity ? (

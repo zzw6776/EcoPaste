@@ -656,7 +656,7 @@ function renderStatusButton(options: StatusButtonOptions): ReactElement {
     <button
       aria-label={label}
       className={cn(
-        "relative flex cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary",
+        "relative flex cursor-pointer items-center justify-center rounded-full border-0 bg-transparent transition-colors hover:bg-ant-fill-tertiary",
         buttonClassName,
         channelTextClassName(state),
       )}
@@ -673,10 +673,8 @@ function renderStatusButton(options: StatusButtonOptions): ReactElement {
       {badgeCount > 0 ? (
         <span
           className={cn(
-            "pointer-events-none absolute top-0.5 right-0.5 flex size-4 origin-top-right scale-75 items-center justify-center rounded-full font-medium text-xs tabular-nums leading-none ring-1 ring-ant-container",
-            badgeTone === "success"
-              ? "bg-ant-success-bg text-ant-success"
-              : "bg-ant-warning-bg text-ant-warning",
+            "pointer-events-none absolute top-0.5 right-0.5 origin-top-right scale-75 font-semibold text-xs tabular-nums leading-none",
+            badgeTone === "success" ? "text-ant-success" : "text-ant-warning",
           )}
         >
           {Math.min(badgeCount, 9)}
