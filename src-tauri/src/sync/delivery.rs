@@ -55,17 +55,6 @@ pub(super) struct PreparationTarget {
     pub target: String,
 }
 
-impl PreparationTarget {
-    pub fn matches_delivery_route(&self, delivery_route: Option<&str>) -> bool {
-        match delivery_route {
-            Some("cloud") => self.route == TransferRoute::Cloud,
-            Some("lan") => self.route == TransferRoute::Lan,
-            Some(_) => false,
-            None => true,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct PreparationProgress {
     pub handle: TransferHandle,

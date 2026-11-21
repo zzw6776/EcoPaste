@@ -1020,6 +1020,7 @@ impl HubService {
                 blob_id,
                 transfer_id,
                 file_content: _,
+                item_sync_key: _,
             } => {
                 self.repository
                     .authenticate(&group_id, &access_token)

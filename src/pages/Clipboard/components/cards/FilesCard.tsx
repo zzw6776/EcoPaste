@@ -46,7 +46,10 @@ const FilesCard: FC<FilesCardProps> = (props) => {
     return task.direction === "download";
   });
   const uploadTasks = props.transferTasks?.filter((task) => {
-    return task.direction === "upload" && isTransferActive(task);
+    return (
+      (task.direction === "upload" || task.direction === "serve") &&
+      isTransferActive(task)
+    );
   });
 
   async function startDownload(event: MouseEvent<HTMLButtonElement>) {
@@ -76,18 +79,8 @@ const FilesCard: FC<FilesCardProps> = (props) => {
     event.stopPropagation();
   }
 
-  if (props.filesPreviewKind === "imagePreview") {
-    const [first] = entries;
-    return (
-      <ImageCard
-        {...props}
-        imageThumbnailPath={props.imageThumbnailPath ?? first?.path}
-      />
-    );
-  }
-
-  return (
-    <div className="relative flex flex-col gap-1">
+  const transferStatus = (
+    <>
       {props.remoteFileState && (
         <RemoteDownloadStatus
           downloadedExternally={props.downloadedExternally === true}
@@ -104,7 +97,7 @@ const FilesCard: FC<FilesCardProps> = (props) => {
       {uploadTasks?.map((task) => {
         return (
           <UploadTransferStatus
-            key={`${task.operationId}:${task.route}:${task.target}`}
+            key={task.id}
             onCancel={cancelTransfer}
             onMouseDown={stopPropagation}
             t={t}
@@ -112,6 +105,34 @@ const FilesCard: FC<FilesCardProps> = (props) => {
           />
         );
       })}
+    </>
+  );
+
+  if (props.filesPreviewKind === "imagePreview") {
+    const [first] = entries;
+    const hasTransferStatus =
+      Boolean(props.remoteFileState) || (uploadTasks?.length ?? 0) > 0;
+    const imageCard = (
+      <ImageCard
+        {...props}
+        imageThumbnailPath={props.imageThumbnailPath ?? first?.path}
+      />
+    );
+    if (!hasTransferStatus) {
+      return imageCard;
+    }
+
+    return (
+      <div className="relative flex h-full min-h-0 flex-col gap-1">
+        {transferStatus}
+        <div className="min-h-0 flex-1 overflow-hidden">{imageCard}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative flex flex-col gap-1">
+      {transferStatus}
       {entries.map((entry) => {
         return <FileRow entry={entry} key={entry.entryKey} keyword={keyword} />;
       })}
@@ -135,7 +156,9 @@ const UploadTransferStatus: FC<UploadTransferStatusProps> = (props) => {
   const phaseLabel =
     task.target === "import"
       ? t(`transfer.import.${task.phase}`)
-      : t(`transfer.upload.${task.phase}`);
+      : task.direction === "serve"
+        ? t(`transferCenter.serve.${task.phase}`)
+        : t(`transfer.upload.${task.phase}`);
 
   return (
     <div className="mb-1 flex flex-col gap-1 text-ant-secondary text-xs">

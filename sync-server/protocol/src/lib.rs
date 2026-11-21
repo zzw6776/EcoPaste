@@ -1,4 +1,4 @@
-//! EcoPaste sync wire protocol (Per-Item State v31).
+//! EcoPaste sync wire protocol (Per-Item State v32).
 //!
 //! The cloud service only handles encrypted item snapshots and blob payloads.
 //! Clipboard plaintext and the group content key never cross this boundary.
@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod batch_tests;
 
 pub const ALPN: &[u8] = b"ecopaste/sync/2";
-pub const PROTOCOL_VERSION: u16 = 31;
+pub const PROTOCOL_VERSION: u16 = 32;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ITEMS_PER_BATCH: u16 = 256;
 
@@ -362,6 +362,9 @@ pub enum Request {
         transfer_id: u64,
         #[n(4)]
         file_content: bool,
+        /// Exact `sync_key` of the requesting card when a peer pulls a deduplicated attachment.
+        #[n(5)]
+        item_sync_key: Option<String>,
     },
     /// Lists newest non-deleted cloud items for the cloud history drawer.
     #[n(6)]
@@ -897,7 +900,7 @@ mod tests {
         let decoded: Request = read_frame(&mut server).await.unwrap();
 
         assert_eq!(decoded, request);
-        assert_eq!(PROTOCOL_VERSION, 31);
+        assert_eq!(PROTOCOL_VERSION, 32);
     }
 
     #[tokio::test]

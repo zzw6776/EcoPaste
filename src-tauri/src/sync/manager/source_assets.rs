@@ -318,7 +318,7 @@ impl SyncManager {
         }
 
         let connection = connection.context("source app icon blob is unavailable")?;
-        download_blob(connection, group, &manifest, &encrypted, None).await?;
+        download_blob(connection, group, &manifest, &encrypted, None, None).await?;
         Ok(expected)
     }
 

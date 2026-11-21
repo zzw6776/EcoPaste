@@ -43,8 +43,13 @@ impl SyncManager {
             u64::try_from(total_bytes).context("invalid clipboard file size")?
         };
         if target.route == super::super::progress::TransferRoute::Cloud
-            && !(operation.force_files || operation.manual_share)
-            && !permits_automatic_file_upload(total_bytes, auto_upload_max_mb)
+            && super::super::delivery_plan::resolve_cloud_blob_policy(
+                true,
+                total_bytes,
+                auto_upload_max_mb,
+                operation.cloud_blob_policy,
+                operation.force_files,
+            ) == db::sync_items::CloudBlobPolicy::Defer
         {
             return Ok(None);
         }

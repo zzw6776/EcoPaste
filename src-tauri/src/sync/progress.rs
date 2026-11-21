@@ -12,7 +12,8 @@ use tauri::{AppHandle, Emitter};
 
 pub const TRANSFER_UPDATED_EVENT: &str = "sync-transfer://updated";
 pub const TRANSFER_REMOVED_EVENT: &str = "sync-transfer://removed";
-const EMIT_INTERVAL: Duration = Duration::from_millis(500);
+const EMIT_INTERVAL: Duration = Duration::from_millis(120);
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const FINISHED_TASK_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_FINISHED_TASKS: usize = 50;
 const LOCAL_IMPORT_TARGET: &str = "import";
@@ -109,6 +110,7 @@ struct TransferEntry {
     cancel: Arc<AtomicBool>,
     active_components: u32,
     completed_bytes: u64,
+    skipped_bytes: u64,
     started_at: Instant,
     finished_at: Option<Instant>,
     last_sample_at: Instant,
@@ -220,7 +222,10 @@ impl TransferRegistry {
             if let Some(entry_id) = state.active_operations.get(&operation_key).cloned() {
                 if let Some(entry) = state.entries.get_mut(&entry_id) {
                     entry.active_components = entry.active_components.saturating_add(1);
-                    entry.task.total_bytes = entry.task.total_bytes.max(task.total_bytes);
+                    entry.task.total_bytes = entry
+                        .task
+                        .total_bytes
+                        .max(task.total_bytes.saturating_sub(entry.skipped_bytes));
                     entry.task.file_name = None;
                     entry.task.cancellable = true;
                     let cancel = entry.cancel.clone();
@@ -261,6 +266,7 @@ impl TransferRegistry {
                 cancel: cancel.clone(),
                 active_components: 1,
                 completed_bytes: 0,
+                skipped_bytes: 0,
                 started_at: now,
                 finished_at: None,
                 last_sample_at: now,
@@ -785,19 +791,30 @@ impl TransferRegistry {
             match phase {
                 TransferPhase::Available | TransferPhase::Completed => {
                     entry.active_components = entry.active_components.saturating_sub(1);
-                    entry.completed_bytes = entry
-                        .completed_bytes
-                        .saturating_add(completion_bytes.unwrap_or(bytes));
+                    if phase == TransferPhase::Available {
+                        let skipped = completion_bytes.unwrap_or(0);
+                        entry.skipped_bytes = entry.skipped_bytes.saturating_add(skipped);
+                        entry.task.total_bytes = entry.task.total_bytes.saturating_sub(skipped);
+                        entry.task.transferred_bytes = bounded_transfer_bytes(
+                            entry.task.total_bytes,
+                            entry.task.transferred_bytes,
+                        );
+                    } else {
+                        entry.completed_bytes = entry
+                            .completed_bytes
+                            .saturating_add(completion_bytes.unwrap_or(bytes));
+                    }
                     if (entry.task.total_bytes == 0 && entry.active_components == 0)
                         || (entry.task.total_bytes > 0
                             && entry.completed_bytes >= entry.task.total_bytes)
                     {
-                        let completed_phase = if aggregate_bytes == 0 {
+                        let final_bytes = entry.task.transferred_bytes;
+                        let completed_phase = if final_bytes == 0 {
                             TransferPhase::Available
                         } else {
                             TransferPhase::Completed
                         };
-                        finish_entry(entry, completed_phase, aggregate_bytes, None);
+                        finish_entry(entry, completed_phase, final_bytes, None);
                     } else if entry.active_components == 0 {
                         entry.task.phase = TransferPhase::Queued;
                     }
@@ -942,6 +959,7 @@ fn reset_entry(entry: &mut TransferEntry, phase: TransferPhase, total_bytes: u64
     entry.task.cancellable = true;
     entry.active_components = 1;
     entry.completed_bytes = 0;
+    entry.skipped_bytes = 0;
     entry.started_at = now;
     entry.finished_at = None;
     entry.last_sample_at = now;
@@ -976,7 +994,7 @@ fn bounded_transfer_bytes(total_bytes: u64, bytes: u64) -> u64 {
 
 fn update_speed(entry: &mut TransferEntry, now: Instant, bytes: u64) {
     let sample_elapsed = now.saturating_duration_since(entry.last_sample_at);
-    if sample_elapsed < EMIT_INTERVAL {
+    if sample_elapsed < SPEED_SAMPLE_INTERVAL {
         return;
     }
     let sample_bytes = bytes.saturating_sub(entry.last_sample_bytes);
@@ -1171,6 +1189,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             active_components: 0,
             completed_bytes: 0,
+            skipped_bytes: 0,
             started_at: now,
             finished_at: None,
             last_sample_at: now,
@@ -1192,5 +1211,57 @@ mod tests {
             147 * 1024 * 1024
         );
         assert_eq!(bounded_transfer_bytes(100, 120), 100);
+    }
+
+    #[test]
+    fn skipped_available_component_shrinks_total_for_linear_multi_file_upload() {
+        let now = Instant::now();
+        let skipped_bytes = 50 * 1024 * 1024_u64;
+        let upload_bytes = 10 * 1024 * 1024_u64;
+        let total_bytes = skipped_bytes + upload_bytes;
+        let mut entry = TransferEntry {
+            task: TransferTask {
+                id: "task".into(),
+                revision: 0,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+                operation_id: "op".into(),
+                item_id: "item".into(),
+                direction: TransferDirection::Upload,
+                route: TransferRoute::Cloud,
+                target: "cloud".into(),
+                file_name: None,
+                phase: TransferPhase::Transferring,
+                transferred_bytes: 0,
+                total_bytes,
+                speed_bytes_per_second: 0,
+                elapsed_ms: 0,
+                eta_seconds: None,
+                error: None,
+                cancellable: true,
+            },
+            preparation: None,
+            persistence: TransferPersistence::Durable,
+            cancel: Arc::new(AtomicBool::new(false)),
+            active_components: 1,
+            completed_bytes: 0,
+            skipped_bytes: 0,
+            started_at: now,
+            finished_at: None,
+            last_sample_at: now,
+            last_sample_bytes: 0,
+            last_emit_at: now,
+        };
+
+        // First component is already stored on Hub -> shrink total to remaining real upload bytes.
+        entry.active_components -= 1;
+        entry.skipped_bytes += skipped_bytes;
+        entry.task.total_bytes = entry.task.total_bytes.saturating_sub(skipped_bytes);
+        assert_eq!(entry.task.total_bytes, upload_bytes);
+        // Joining the second component with full operation_total_bytes must not inflate total back up.
+        let joined_total = entry
+            .task
+            .total_bytes
+            .max(total_bytes.saturating_sub(entry.skipped_bytes));
+        assert_eq!(joined_total, upload_bytes);
     }
 }

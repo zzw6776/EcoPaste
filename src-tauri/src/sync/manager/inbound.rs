@@ -916,7 +916,13 @@ impl SyncManager {
                     completed_bytes,
                 });
             match self
-                .ensure_blob(data_connection, group, manifest, progress)
+                .ensure_blob(
+                    data_connection,
+                    group,
+                    manifest,
+                    Some(&meta.sync_key),
+                    progress,
+                )
                 .await
             {
                 Ok(path) => {
@@ -1620,10 +1626,11 @@ impl SyncManager {
         connection: &Connection,
         group: &GroupSecrets,
         manifest: &BlobManifest,
+        item_sync_key: Option<&str>,
         progress: Option<BlobDownloadProgress<'_>>,
     ) -> Result<PathBuf> {
         let root = crate::core::paths::resources_dir(&self.app)?.join(SYNC_STAGING_DIR);
-        self.ensure_blob_at(connection, group, manifest, &root, progress)
+        self.ensure_blob_at(connection, group, manifest, &root, item_sync_key, progress)
             .await
     }
 
@@ -1634,6 +1641,7 @@ impl SyncManager {
         group: &GroupSecrets,
         manifest: &BlobManifest,
         root: &Path,
+        item_sync_key: Option<&str>,
         progress: Option<BlobDownloadProgress<'_>>,
     ) -> Result<PathBuf> {
         validate_blob_manifest(manifest)?;
@@ -1660,7 +1668,7 @@ impl SyncManager {
             }
             return Ok(path);
         }
-        download_blob(connection, group, manifest, &path, progress).await?;
+        download_blob(connection, group, manifest, &path, item_sync_key, progress).await?;
         Ok(path)
     }
 
@@ -1690,6 +1698,7 @@ impl SyncManager {
                 group,
                 manifest,
                 &group_cache.join("blobs"),
+                Some(&snapshot.sync_key),
                 None,
             )
             .await?;

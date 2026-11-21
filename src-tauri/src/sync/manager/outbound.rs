@@ -111,9 +111,9 @@ impl SyncManager {
                 let item_key = crypto::derive_item_key(&key, &meta.sync_key);
                 let mut built_blobs: Option<Vec<repository::SyncItemBlobRow>> = None;
                 let mut built_content_objects: Vec<StoredContentObject> = Vec::new();
-                let mut cloud_desired: Option<super::super::item_status::ContentLevel> = None;
+                let mut cloud_blob_policy: Option<db::sync_items::CloudBlobPolicy> = None;
                 let mut snapshot = if pending.deleted {
-                    cloud_desired = Some(super::super::item_status::ContentLevel::Complete);
+                    cloud_blob_policy = Some(db::sync_items::CloudBlobPolicy::Auto);
                     repository::snapshot_from_meta(&meta, &device_id)
                 } else {
                     let decrypted = match (
@@ -151,22 +151,20 @@ impl SyncManager {
                                     snap.presence_version = FieldVersion::new(base_seq, &device_id);
                                 }
                             }
-                            cloud_desired = Some(if item.kind == ClipboardKind::Files {
-                                let total_size = snap
-                                    .blobs
-                                    .iter()
-                                    .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
-                                if permits_automatic_file_upload(
-                                    total_size,
-                                    settings.auto_upload_max_mb,
-                                ) {
-                                    super::super::item_status::ContentLevel::Complete
-                                } else {
-                                    super::super::item_status::ContentLevel::Metadata
-                                }
-                            } else {
-                                super::super::item_status::ContentLevel::Complete
-                            });
+                            let total_size = snap
+                                .blobs
+                                .iter()
+                                .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+                            let resolved = super::super::delivery_plan::resolve_cloud_blob_policy(
+                                item.kind == ClipboardKind::Files,
+                                total_size,
+                                settings.auto_upload_max_mb,
+                                db::sync_items::CloudBlobPolicy::Auto,
+                                false,
+                            );
+                            if resolved == db::sync_items::CloudBlobPolicy::Defer {
+                                cloud_blob_policy = Some(resolved);
+                            }
                             built_blobs = Some(blob_rows);
                             built_content_objects = content_objects;
                             snap
@@ -182,7 +180,7 @@ impl SyncManager {
                     snapshot.blobs.clear();
                     snapshot.source_app = None;
                     snapshot.content_identity = None;
-                    cloud_desired = Some(super::super::item_status::ContentLevel::Complete);
+                    cloud_blob_policy = Some(db::sync_items::CloudBlobPolicy::Auto);
                 }
                 let deleted = snapshot.deleted();
                 let protected = snapshot.protected();
@@ -210,7 +208,7 @@ impl SyncManager {
                         ciphertext: &ciphertext,
                         blobs: &existing_blobs,
                         content_objects: &built_content_objects,
-                        cloud_desired,
+                        cloud_blob_policy,
                     },
                 )
                 .await?;
@@ -386,14 +384,8 @@ impl SyncManager {
             && (!operation.history_backfill || operation.manual_share)
         {
             match preparation_target {
-                Some(target)
-                    if target.matches_delivery_route(
-                        operation
-                            .delivery_route
-                            .map(db::sync_items::ContentDeliveryRoute::as_str),
-                    ) =>
-                {
-                    self.start_preparation_transfer(
+                Some(target) => self
+                    .start_preparation_transfer(
                         pool,
                         operation,
                         &operation.sync_key,
@@ -402,9 +394,8 @@ impl SyncManager {
                         settings.auto_upload_max_mb,
                     )
                     .await?
-                    .map(|handle| PreparationProgress::new(handle, target.clone()))
-                }
-                Some(_) | None => None,
+                    .map(|handle| PreparationProgress::new(handle, target.clone())),
+                None => None,
             }
         } else {
             None
@@ -474,25 +465,17 @@ impl SyncManager {
             return Ok(ContentMaterialization::Completed);
         }
 
-        let cloud_desired =
-            if operation.delivery_route == Some(db::sync_items::ContentDeliveryRoute::Lan) {
-                None
-            } else if item.kind == ClipboardKind::Files
-                && !operation.manual_share
-                && !operation.force_files
-            {
-                let total_size = snapshot
-                    .blobs
-                    .iter()
-                    .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
-                if permits_automatic_file_upload(total_size, settings.auto_upload_max_mb) {
-                    Some(super::super::item_status::ContentLevel::Complete)
-                } else {
-                    Some(super::super::item_status::ContentLevel::Metadata)
-                }
-            } else {
-                Some(super::super::item_status::ContentLevel::Complete)
-            };
+        let total_size = snapshot
+            .blobs
+            .iter()
+            .fold(0_u64, |acc, b| acc.saturating_add(b.original_size));
+        let cloud_blob_policy = Some(super::super::delivery_plan::resolve_cloud_blob_policy(
+            item.kind == ClipboardKind::Files,
+            total_size,
+            settings.auto_upload_max_mb,
+            operation.cloud_blob_policy,
+            operation.force_files,
+        ));
 
         let committed = repository::commit_prepared_item(
             pool,
@@ -509,7 +492,7 @@ impl SyncManager {
                 ciphertext: &ciphertext,
                 blobs: &blob_rows,
                 content_objects: &content_objects,
-                cloud_desired,
+                cloud_blob_policy,
             },
         )
         .await?;

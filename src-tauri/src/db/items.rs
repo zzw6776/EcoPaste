@@ -1389,6 +1389,7 @@ mod tests {
             &item,
             Some(ContentSyncOptions {
                 manual_share: true,
+                force_files: true,
                 ..Default::default()
             }),
         )
@@ -2775,7 +2776,7 @@ mod tests {
             &item,
             Some(ContentSyncOptions {
                 manual_share: true,
-                delivery_route: Some(sync_items::ContentDeliveryRoute::Cloud),
+                cloud_blob_policy: Some(sync_items::CloudBlobPolicy::Requested),
                 ..Default::default()
             }),
         )
@@ -2783,8 +2784,8 @@ mod tests {
         .unwrap();
         let now = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO sync_item_targets (sync_key, target_id, desired_content, confirmed_content, status, created_at, updated_at) \
-             VALUES (?, 'cloud', 'complete', 'none', 'pending', ?, ?)",
+            "INSERT INTO sync_item_targets (sync_key, target_id, confirmed_content, status, created_at, updated_at) \
+             VALUES (?, 'cloud', 'none', 'pending', ?, ?)",
         )
         .bind(&item.sync_key)
         .bind(now)

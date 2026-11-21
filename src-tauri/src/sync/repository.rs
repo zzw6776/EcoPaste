@@ -96,7 +96,7 @@ mod tests {
         models::{ClipboardItem, ClipboardKind, Platform},
         sync_items::{
             mark_local_deleted_on, mark_local_favorite_on, next_pending_state,
-            stage_existing_content, ContentDeliveryRoute, ContentSyncOptions,
+            stage_existing_content, ContentSyncOptions,
         },
         test_support::memory_pool,
     };
@@ -244,7 +244,7 @@ mod tests {
                     ciphertext: &ciphertext,
                     blobs: &[],
                     content_objects: &[],
-                    cloud_desired: Some(ContentLevel::Complete),
+                    cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
                 },
             )
             .await
@@ -526,13 +526,13 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &stored_blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Metadata),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
         .unwrap());
 
-        // Simulate metadata edit (favorite) re-committing with `cloud_desired: None`.
+        // Simulate metadata edit (favorite) re-committing with `cloud_blob_policy: None`.
         let mut conn = pool.acquire().await.unwrap();
         crate::db::sync_items::mark_local_favorite_on(
             &mut conn,
@@ -565,21 +565,20 @@ mod tests {
                 ciphertext: &ciphertext2,
                 blobs: &stored_blobs,
                 content_objects: &[],
-                cloud_desired: None,
+                cloud_blob_policy: None,
             },
         )
         .await
         .unwrap());
 
-        // Deferred cloud metadata policy must stay intact (not upgraded to 'complete').
-        let desired: String = sqlx::query_scalar(
-            "SELECT desired_content FROM sync_item_targets WHERE sync_key = ? AND target_id = 'cloud'",
-        )
-        .bind(&item.sync_key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(desired, "metadata");
+        // Deferred cloud blob policy must stay intact (not upgraded to 'auto').
+        let policy: String =
+            sqlx::query_scalar("SELECT cloud_blob_policy FROM sync_items WHERE sync_key = ?")
+                .bind(&item.sync_key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(policy, "defer");
 
         // Mark one blob unavailable locally; LAN outbound write must advertise only local_available=1.
         sqlx::query(
@@ -700,7 +699,7 @@ mod tests {
                     ciphertext: &ciphertext,
                     blobs: &[blob],
                     content_objects: &[],
-                    cloud_desired: Some(ContentLevel::Complete),
+                    cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
                 },
             )
             .await
@@ -829,8 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_only_delivery_route_never_uploads_or_wedges_cloud_and_allows_manual_cloud_upload()
-    {
+    async fn cloud_blob_policy_decouples_metadata_fanout_from_attachment_uploads() {
         let pool = memory_pool().await;
         let key = [17_u8; 32];
         let mut item = sample_item("android-big-file", 1_700_000_600);
@@ -842,7 +840,7 @@ mod tests {
             &item,
             Some(ContentSyncOptions {
                 manual_share: true,
-                delivery_route: Some(ContentDeliveryRoute::Lan),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
                 ..Default::default()
             }),
         )
@@ -929,26 +927,41 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &[blob_row],
                 content_objects: &[],
-                cloud_desired: None,
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
         .unwrap());
 
-        // Neither Cloud Control-Plane nor Cloud Data-Plane may touch a LAN-only item.
-        assert!(pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+        // Control-plane 1 KB metadata fans out to Cloud even under `Defer`, while Data-Plane
+        // holds back oversized blob uploads until the user clicks Upload.
+        let cloud_batch = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
             .await
-            .unwrap()
-            .writes
-            .is_empty());
+            .unwrap();
+        assert_eq!(cloud_batch.writes.len(), 1);
+        assert_eq!(cloud_batch.writes[0].item_key, item_key);
         assert!(pending_cloud_blob_uploads(&pool, false, 10)
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(status_counts(&pool, false).await.unwrap().0, 0);
 
-        // Cloud badge must be gray/idle AND clickable for manual upload; LAN ack with Metadata
-        // settles cleanly to blue/idle (not stuck queued in awaiting_receipt).
+        let mut accepted_seqs = HashMap::new();
+        accepted_seqs.insert(item_key.clone(), u64::try_from(local_seq).unwrap());
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: item_key.clone(),
+                hub_rev: 1,
+                seq: 1,
+                available_blob_ids: Vec::new(),
+            }],
+            &accepted_seqs,
+        )
+        .await
+        .unwrap();
+
+        // Cloud settles cleanly to blue/idle (`MetadataOnly`) and remains clickable; LAN ack with
+        // Metadata also settles cleanly to blue/idle.
         record_lan_acks(
             &pool,
             "peer:dev-mac",
@@ -965,7 +978,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             statuses[0].cloud.availability,
-            SyncContentAvailability::None
+            SyncContentAvailability::MetadataOnly
         );
         assert_eq!(statuses[0].cloud.activity, SyncItemActivity::Idle);
         assert_eq!(statuses[0].cloud.action, SyncItemAction::Upload);
@@ -976,16 +989,8 @@ mod tests {
         assert_eq!(statuses[0].lan.activity, SyncItemActivity::Idle);
         assert_eq!(status_counts(&pool, false).await.unwrap().0, 0);
 
-        // Clicking Cloud clears `delivery_route` and queues both metadata and blob uploads.
+        // Clicking Cloud sets `cloud_blob_policy = 'requested'` and queues blob upload immediately.
         assert!(request_item_delivery(&pool, &item.id, true).await.unwrap());
-        assert_eq!(
-            pending_outbound_writes(&pool, CLOUD_TARGET, 10)
-                .await
-                .unwrap()
-                .writes
-                .len(),
-            1
-        );
         assert_eq!(
             pending_cloud_blob_uploads(&pool, false, 10)
                 .await
@@ -993,10 +998,71 @@ mod tests {
                 .len(),
             1
         );
+
+        // Conversely, an item flagged `Requested` (e.g. Android oversized share while LAN offline)
+        // queues BOTH Cloud blob uploads and LAN 1 KB metadata when LAN reconnects.
+        let mut offline_share = sample_item("android-offline-share", 1_700_000_650);
+        offline_share.kind = ClipboardKind::Files;
+        offline_share.size = Some(200 * 1024 * 1024);
+        upsert_item_with_sync_outbox(
+            &pool,
+            &offline_share,
+            Some(ContentSyncOptions {
+                manual_share: true,
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Requested),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let offline_seq = local_seq_of(&pool, &offline_share.sync_key).await;
+        let offline_key = crypto::derive_item_key(&key, &offline_share.sync_key);
+        let (off_nonce, off_cipher) =
+            crypto::encrypt_item_snapshot(&key, &offline_key, false, false, &snapshot).unwrap();
+        let mut off_blob = SyncItemBlobRow {
+            blob_id: "blob-offline-share".into(),
+            role: "file".into(),
+            optional: false,
+            size: 1024,
+            original_size: 900,
+            encrypted_path: String::new(),
+            source_path: Some("/data/offline.mp4".into()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![0x66; 24]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        };
+        off_blob.size = 200 * 1024 * 1024 + 64;
+        off_blob.original_size = 200 * 1024 * 1024;
+        assert!(commit_prepared_item(
+            &pool,
+            PreparedItemCommit {
+                sync_key: &offline_share.sync_key,
+                item_key: &offline_key,
+                item_id: Some(&offline_share.id),
+                expected_local_seq: offline_seq,
+                origin_device_id: "dev-android",
+                content_identity: None,
+                group_id: "group-1",
+                snapshot: &snapshot,
+                nonce: &off_nonce,
+                ciphertext: &off_cipher,
+                blobs: &[off_blob],
+                content_objects: &[],
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Requested),
+            },
+        )
+        .await
+        .unwrap());
+        let lan_batch = pending_outbound_writes(&pool, "peer:dev-mac", 10)
+            .await
+            .unwrap();
+        assert!(lan_batch.writes.iter().any(|w| w.item_key == offline_key));
     }
 
     #[tokio::test]
-    async fn favorite_and_delete_preserve_committed_aad_and_clear_route_locks() {
+    async fn favorite_and_delete_preserve_committed_aad_and_reset_policy() {
         let pool = memory_pool().await;
         let key = [19_u8; 32];
         let item = sample_item("fav-aad", 1_700_000_700);
@@ -1004,7 +1070,7 @@ mod tests {
             &pool,
             &item,
             Some(ContentSyncOptions {
-                delivery_route: Some(ContentDeliveryRoute::Lan),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
                 ..Default::default()
             }),
         )
@@ -1065,7 +1131,7 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &[],
                 content_objects: &[],
-                cloud_desired: None,
+                cloud_blob_policy: None,
             },
         )
         .await
@@ -1097,20 +1163,20 @@ mod tests {
             Some("important text")
         );
 
-        // Deleting must clear `delivery_route`, keep stored `deleted` AAD intact until re-encrypt,
+        // Deleting must reset `cloud_blob_policy` to `'auto'`, keep stored `deleted` AAD intact until re-encrypt,
         // and surface `deleted = true` via `next_pending_state`.
         let mut conn = pool.acquire().await.unwrap();
         mark_local_deleted_on(&mut conn, &item.sync_key, false)
             .await
             .unwrap();
         drop(conn);
-        let route: Option<String> =
-            sqlx::query_scalar("SELECT delivery_route FROM sync_items WHERE sync_key = ?")
+        let policy: String =
+            sqlx::query_scalar("SELECT cloud_blob_policy FROM sync_items WHERE sync_key = ?")
                 .bind(&item.sync_key)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(route, None);
+        assert_eq!(policy, "auto");
         let pending = next_pending_state(&pool, true).await.unwrap().unwrap();
         assert!(pending.deleted);
         assert!(!pending.is_present);
@@ -1205,7 +1271,7 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &[blob_row],
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Metadata),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
@@ -1279,7 +1345,7 @@ mod tests {
             ContentSyncOptions {
                 force_files: true,
                 manual_share: true,
-                delivery_route: Some(ContentDeliveryRoute::Cloud),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Requested),
                 ..Default::default()
             },
         )
@@ -1730,7 +1796,7 @@ mod tests {
                     ciphertext: &ciphertext,
                     blobs: &[],
                     content_objects: &[],
-                    cloud_desired: Some(ContentLevel::Complete),
+                    cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
                 },
             )
             .await
@@ -1899,7 +1965,7 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Complete),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
             },
         )
         .await
@@ -2064,13 +2130,13 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Complete),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
             },
         )
         .await
         .unwrap());
 
-        let info = blob_serve_info(&pool, &"c".repeat(64))
+        let info = blob_serve_info(&pool, &"c".repeat(64), None)
             .await
             .unwrap()
             .expect("serve info");
@@ -2125,8 +2191,8 @@ mod tests {
         // When an online LAN peer also holds the complete item, attachment summary prefers that peer.
         sqlx::query(
             "INSERT INTO sync_item_targets \
-             (sync_key, target_id, desired_content, confirmed_content, status, created_at, updated_at) \
-             VALUES (?, 'peer:dev-peer', 'complete', 'complete', 'confirmed', datetime('now'), datetime('now'))",
+             (sync_key, target_id, confirmed_content, status, created_at, updated_at) \
+             VALUES (?, 'peer:dev-peer', 'complete', 'confirmed', datetime('now'), datetime('now'))",
         )
         .bind(&item.sync_key)
         .execute(&pool)
@@ -2240,7 +2306,7 @@ mod tests {
                 ciphertext: &ciphertext,
                 blobs: &blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Metadata),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
@@ -2277,30 +2343,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_cloud_blob_verification_promotes_lan_routed_and_metadata_items() {
+    async fn existing_cloud_blob_verification_promotes_deferred_and_metadata_items() {
         let pool = memory_pool().await;
         let key = [42_u8; 32];
 
-        // 1. Local oversized item routed via LAN (`delivery_route = 'lan'`, never pushed to Cloud).
-        let mut lan_item = sample_item("lan-file", 1_700_005_000);
-        lan_item.kind = ClipboardKind::Files;
+        // 1. Local oversized item with `cloud_blob_policy = 'defer'`, before Cloud acceptance.
+        let mut defer_item = sample_item("lan-file", 1_700_005_000);
+        defer_item.kind = ClipboardKind::Files;
         upsert_item_with_sync_outbox(
             &pool,
-            &lan_item,
+            &defer_item,
             Some(ContentSyncOptions {
                 manual_share: true,
-                delivery_route: Some(ContentDeliveryRoute::Lan),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        let lan_seq = local_seq_of(&pool, &lan_item.sync_key).await;
+        let lan_seq = local_seq_of(&pool, &defer_item.sync_key).await;
         let lan_blob_id = "e".repeat(64);
-        let lan_item_key = crypto::derive_item_key(&key, &lan_item.sync_key);
+        let lan_item_key = crypto::derive_item_key(&key, &defer_item.sync_key);
         let lan_snapshot = SyncedItemSnapshot {
             version: SNAPSHOT_VERSION,
-            sync_key: lan_item.sync_key.clone(),
+            sync_key: defer_item.sync_key.clone(),
             content_version: FieldVersion {
                 seq: 1,
                 device_id: "dev-a".to_owned(),
@@ -2341,9 +2407,9 @@ mod tests {
         assert!(commit_prepared_item(
             &pool,
             PreparedItemCommit {
-                sync_key: &lan_item.sync_key,
+                sync_key: &defer_item.sync_key,
                 item_key: &lan_item_key,
-                item_id: Some(&lan_item.id),
+                item_id: Some(&defer_item.id),
                 expected_local_seq: lan_seq,
                 origin_device_id: "dev-a",
                 content_identity: Some("hash-lan"),
@@ -2353,7 +2419,7 @@ mod tests {
                 ciphertext: &lan_ciphertext,
                 blobs: &lan_blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Metadata),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
@@ -2400,7 +2466,7 @@ mod tests {
                 ciphertext: &meta_ciphertext,
                 blobs: &meta_blobs,
                 content_objects: &[],
-                cloud_desired: Some(ContentLevel::Metadata),
+                cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Defer),
             },
         )
         .await
@@ -2438,8 +2504,8 @@ mod tests {
         assert_eq!(
             promotion,
             CloudBlobVerifyPromotion {
-                promoted_items: 2,
-                needs_control_push: true,
+                promoted_items: 1,
+                needs_control_push: false,
             }
         );
         assert!(pending_cloud_blob_verifications(&pool, false, 10)
@@ -2457,7 +2523,7 @@ mod tests {
         );
         assert_eq!(meta_status[0].cloud.action, SyncItemAction::None);
 
-        // `lan_item` pushes 1 KB metadata without queueing attachment upload, then turns green on acceptance.
+        // `defer_item` pushes 1 KB metadata without queueing attachment upload, then turns green on acceptance.
         assert!(pending_cloud_blob_uploads(&pool, false, 10)
             .await
             .unwrap()
@@ -2483,7 +2549,7 @@ mod tests {
         .await
         .unwrap();
 
-        let lan_status = item_statuses(&pool, std::slice::from_ref(&lan_item.id))
+        let lan_status = item_statuses(&pool, std::slice::from_ref(&defer_item.id))
             .await
             .unwrap();
         assert_eq!(
@@ -2491,5 +2557,286 @@ mod tests {
             SyncContentAvailability::Complete
         );
         assert_eq!(lan_status[0].cloud.action, SyncItemAction::None);
+    }
+
+    #[tokio::test]
+    async fn blob_serve_lookup_binds_exact_sync_key_and_falls_back_to_newest() {
+        let pool = memory_pool().await;
+        let key = [5_u8; 32];
+        let shared_blob_id = "d".repeat(64);
+        let shared_blob = vec![SyncItemBlobRow {
+            blob_id: shared_blob_id.clone(),
+            role: "file".to_owned(),
+            optional: false,
+            size: 2083,
+            original_size: 2048,
+            encrypted_path: String::new(),
+            source_path: Some("/tmp/shared.apk".to_owned()),
+            source_is_directory: false,
+            stream_nonce: Some(vec![7_u8; 19]),
+            stream_commitment: true,
+            cloud_available: false,
+            local_available: true,
+        }];
+
+        let mut old_item = sample_item("old-apk", 1_700_000_100);
+        old_item.kind = ClipboardKind::Files;
+        old_item.content = "/tmp/shared.apk".to_owned();
+        let mut new_item = sample_item("new-apk", 1_700_000_200);
+        new_item.kind = ClipboardKind::Files;
+        new_item.content = "/tmp/shared.apk".to_owned();
+        let mut deleted_item = sample_item("deleted-apk", 1_700_000_300);
+        deleted_item.kind = ClipboardKind::Files;
+        deleted_item.content = "/tmp/shared.apk".to_owned();
+
+        for (item, ts, mark_deleted) in [
+            (&old_item, 1_700_000_100_i64, false),
+            (&new_item, 1_700_000_200_i64, false),
+            (&deleted_item, 1_700_000_300_i64, true),
+        ] {
+            upsert_item_with_sync_outbox(&pool, item, Some(ContentSyncOptions::default()))
+                .await
+                .unwrap();
+            let seq = local_seq_of(&pool, &item.sync_key).await;
+            let item_key = crypto::derive_item_key(&key, &item.sync_key);
+            let snapshot = SyncedItemSnapshot {
+                version: SNAPSHOT_VERSION,
+                sync_key: item.sync_key.clone(),
+                content_version: FieldVersion {
+                    seq: 1,
+                    device_id: "dev-a".to_owned(),
+                },
+                presence_version: FieldVersion {
+                    seq: 1,
+                    device_id: "dev-a".to_owned(),
+                },
+                favorite_version: FieldVersion::default(),
+                pinned_version: FieldVersion::default(),
+                note_version: FieldVersion::default(),
+                is_present: true,
+                is_favorite: false,
+                is_pinned: false,
+                note: None,
+                item: Some(SyncedClipboardItem {
+                    kind: "files".to_owned(),
+                    sub_kind: None,
+                    content: item.content.clone(),
+                    search_text: item.search_text.clone(),
+                    summary: None,
+                    file_types: None,
+                    size: Some(2048),
+                    width: None,
+                    height: None,
+                    is_sensitive: false,
+                    source_platform: "android".to_owned(),
+                    created_at_ms: ts,
+                    sync_key: item.sync_key.clone(),
+                    updated_at_ms: Some(ts),
+                    source_revision: Some(format!("rev-{}", item.id)),
+                    source_device_id: Some("dev-a".to_owned()),
+                    source_device_name: Some("Phone".to_owned()),
+                    source_updated_at_ms: Some(ts),
+                }),
+                blobs: vec![crate::sync::model::BlobManifest {
+                    blob_id: shared_blob_id.clone(),
+                    name: "shared.apk".to_owned(),
+                    original_size: 2048,
+                    encrypted_size: 2083,
+                    role: crate::sync::model::BlobRole::File,
+                    file_index: Some(0),
+                    is_directory_archive: false,
+                    stream_commitment: true,
+                }],
+                source_app: None,
+                content_identity: None,
+            };
+            let (nonce, ciphertext) =
+                crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+            assert!(commit_prepared_item(
+                &pool,
+                PreparedItemCommit {
+                    sync_key: &item.sync_key,
+                    item_key: &item_key,
+                    item_id: Some(&item.id),
+                    expected_local_seq: seq,
+                    origin_device_id: "dev-a",
+                    content_identity: None,
+                    group_id: "group-1",
+                    snapshot: &snapshot,
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                    blobs: &shared_blob,
+                    content_objects: &[],
+                    cloud_blob_policy: None,
+                },
+            )
+            .await
+            .unwrap());
+            if mark_deleted {
+                sqlx::query("UPDATE sync_items SET deleted = 1 WHERE sync_key = ?")
+                    .bind(&item.sync_key)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let serve_info = blob_serve_info(&pool, &shared_blob_id, None)
+            .await
+            .unwrap()
+            .expect("serve info");
+        assert_eq!(serve_info.item_id, new_item.id);
+        assert_eq!(serve_info.sync_key, new_item.sync_key);
+
+        let exact_serve_info = blob_serve_info(&pool, &shared_blob_id, Some(&old_item.sync_key))
+            .await
+            .unwrap()
+            .expect("exact serve info");
+        assert_eq!(exact_serve_info.item_id, old_item.id);
+        assert_eq!(exact_serve_info.sync_key, old_item.sync_key);
+
+        let (resolved_sync_key, resolved_item_id) = item_id_for_blob(&pool, &shared_blob_id, None)
+            .await
+            .unwrap()
+            .expect("item id for blob");
+        assert_eq!(resolved_item_id, new_item.id);
+        assert_eq!(resolved_sync_key, new_item.sync_key);
+
+        let (exact_sync_key, exact_item_id) =
+            item_id_for_blob(&pool, &shared_blob_id, Some(&old_item.sync_key))
+                .await
+                .unwrap()
+                .expect("exact item id for blob");
+        assert_eq!(exact_item_id, old_item.id);
+        assert_eq!(exact_sync_key, old_item.sync_key);
+    }
+
+    #[tokio::test]
+    async fn outgoing_blob_prefers_newest_non_deleted_source_when_blob_is_deduplicated() {
+        let pool = memory_pool().await;
+        let key = [6_u8; 32];
+        let shared_blob_id = "e".repeat(64);
+
+        let mut old_item = sample_item("old-source", 1_700_000_100);
+        old_item.kind = ClipboardKind::Files;
+        old_item.content = "/tmp/old.apk".to_owned();
+        let mut new_item = sample_item("new-source", 1_700_000_200);
+        new_item.kind = ClipboardKind::Files;
+        new_item.content = "/tmp/new.apk".to_owned();
+        let mut deleted_item = sample_item("deleted-source", 1_700_000_300);
+        deleted_item.kind = ClipboardKind::Files;
+        deleted_item.content = "/tmp/deleted.apk".to_owned();
+
+        for (item, ts, source_path, mark_deleted) in [
+            (&old_item, 1_700_000_100_i64, "/tmp/old.apk", false),
+            (&new_item, 1_700_000_200_i64, "/tmp/new.apk", false),
+            (&deleted_item, 1_700_000_300_i64, "/tmp/deleted.apk", true),
+        ] {
+            upsert_item_with_sync_outbox(&pool, item, Some(ContentSyncOptions::default()))
+                .await
+                .unwrap();
+            let seq = local_seq_of(&pool, &item.sync_key).await;
+            let item_key = crypto::derive_item_key(&key, &item.sync_key);
+            let snapshot = SyncedItemSnapshot {
+                version: SNAPSHOT_VERSION,
+                sync_key: item.sync_key.clone(),
+                content_version: FieldVersion {
+                    seq: 1,
+                    device_id: "dev-a".to_owned(),
+                },
+                presence_version: FieldVersion {
+                    seq: 1,
+                    device_id: "dev-a".to_owned(),
+                },
+                favorite_version: FieldVersion::default(),
+                pinned_version: FieldVersion::default(),
+                note_version: FieldVersion::default(),
+                is_present: true,
+                is_favorite: false,
+                is_pinned: false,
+                note: None,
+                item: Some(SyncedClipboardItem {
+                    kind: "files".to_owned(),
+                    sub_kind: None,
+                    content: item.content.clone(),
+                    search_text: item.search_text.clone(),
+                    summary: None,
+                    file_types: None,
+                    size: Some(2048),
+                    width: None,
+                    height: None,
+                    is_sensitive: false,
+                    source_platform: "android".to_owned(),
+                    created_at_ms: ts,
+                    sync_key: item.sync_key.clone(),
+                    updated_at_ms: Some(ts),
+                    source_revision: Some(format!("rev-{}", item.id)),
+                    source_device_id: Some("dev-a".to_owned()),
+                    source_device_name: Some("Phone".to_owned()),
+                    source_updated_at_ms: Some(ts),
+                }),
+                blobs: vec![crate::sync::model::BlobManifest {
+                    blob_id: shared_blob_id.clone(),
+                    name: "shared.apk".to_owned(),
+                    original_size: 2048,
+                    encrypted_size: 2083,
+                    role: crate::sync::model::BlobRole::File,
+                    file_index: Some(0),
+                    is_directory_archive: false,
+                    stream_commitment: true,
+                }],
+                source_app: None,
+                content_identity: None,
+            };
+            let (nonce, ciphertext) =
+                crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+            let blobs = vec![SyncItemBlobRow {
+                blob_id: shared_blob_id.clone(),
+                role: "file".to_owned(),
+                optional: false,
+                size: 2083,
+                original_size: 2048,
+                encrypted_path: String::new(),
+                source_path: Some(source_path.to_owned()),
+                source_is_directory: false,
+                stream_nonce: Some(vec![7_u8; 19]),
+                stream_commitment: true,
+                cloud_available: false,
+                local_available: true,
+            }];
+            assert!(commit_prepared_item(
+                &pool,
+                PreparedItemCommit {
+                    sync_key: &item.sync_key,
+                    item_key: &item_key,
+                    item_id: Some(&item.id),
+                    expected_local_seq: seq,
+                    origin_device_id: "dev-a",
+                    content_identity: None,
+                    group_id: "group-1",
+                    snapshot: &snapshot,
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                    blobs: &blobs,
+                    content_objects: &[],
+                    cloud_blob_policy: None,
+                },
+            )
+            .await
+            .unwrap());
+            if mark_deleted {
+                sqlx::query("UPDATE sync_items SET deleted = 1 WHERE sync_key = ?")
+                    .bind(&item.sync_key)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let resolved = outgoing_blob(&pool, &shared_blob_id)
+            .await
+            .unwrap()
+            .expect("outgoing blob");
+        assert_eq!(resolved.source_path.as_deref(), Some("/tmp/new.apk"));
     }
 }
