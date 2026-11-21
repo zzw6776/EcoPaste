@@ -914,26 +914,22 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
       <button
         aria-label={t("transferCenter.title")}
         className={cn(
-          "group relative flex cursor-pointer items-center justify-center rounded-full border-0 bg-transparent transition-colors hover:bg-ant-fill-tertiary",
+          "group relative flex cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 transition-colors hover:bg-ant-fill-tertiary",
           compact ? "size-8" : "size-7",
         )}
         type="button"
       >
         <i
           className={cn(
-            "i-lucide:arrow-up-down size-4 stroke-[1.5] transition-colors",
+            "i-lucide:arrow-up-down size-3.75 transition-colors",
             hasIndicatorActivity
               ? "text-ant-info"
               : "text-ant-tertiary group-hover:text-ant-text",
           )}
         />
-        {activeCount > 0 ? (
-          <span className="pointer-events-none absolute top-0.5 right-0.5 origin-top-right scale-75 font-semibold text-ant-info text-xs tabular-nums leading-none">
-            {Math.min(activeCount, 9)}
-          </span>
-        ) : hasCatchupActivity ? (
+        {(activeCount > 0 || hasCatchupActivity) && (
           <span className="absolute top-1 right-1 size-1.5 rounded-full bg-ant-info" />
-        ) : null}
+        )}
       </button>
     </Popover>
   );

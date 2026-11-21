@@ -386,7 +386,7 @@ const Header: FC = () => {
               trigger={MORE_ACTION_TRIGGER}
             >
               <button
-                className="group flex size-9 cursor-pointer items-center justify-center rounded-xl bg-ant-container shadow-xs transition-colors hover:bg-ant-fill-tertiary"
+                className="group flex size-8 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 transition-colors hover:bg-ant-fill-tertiary"
                 type="button"
               >
                 <i className="i-lucide:more-vertical size-4 text-ant-tertiary transition-colors group-hover:text-ant-text" />
@@ -779,7 +779,7 @@ const Header: FC = () => {
             <button
               aria-label={isPinned ? t("header.unpin") : t("header.pin")}
               className={cn(
-                "group flex size-7 cursor-pointer items-center justify-center rounded-full transition-all",
+                "group flex size-7 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 transition-all",
                 isPinned
                   ? "bg-ant-primary/15 text-ant-primary opacity-100"
                   : "hover:bg-ant-fill-tertiary",
@@ -791,10 +791,10 @@ const Header: FC = () => {
             >
               <i
                 className={cn(
-                  "size-3.5 transition-all",
+                  "size-3.75 transition-all",
                   isPinned
                     ? "i-lucide:pin-off"
-                    : "i-lucide:pin rotate-45 text-ant-tertiary group-hover:text-ant-text",
+                    : "i-lucide:pin translate-y-[0.5px] rotate-45 text-ant-tertiary group-hover:text-ant-text",
                 )}
               />
             </button>
@@ -806,7 +806,7 @@ const Header: FC = () => {
           trigger={MORE_ACTION_TRIGGER}
         >
           <button
-            className="group flex size-7 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-ant-fill-tertiary"
+            className="group flex size-7 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 transition-colors hover:bg-ant-fill-tertiary"
             type="button"
           >
             <i className="i-lucide:more-horizontal size-4 text-ant-tertiary transition-colors group-hover:text-ant-text" />

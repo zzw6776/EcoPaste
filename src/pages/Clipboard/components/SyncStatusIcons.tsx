@@ -35,10 +35,7 @@ import { LanNetworkDetailsContent } from "./LanNetworkDetailsPanel";
 import { channelTextClassName } from "./SyncChannelVisual";
 import SyncCloudDetails from "./SyncCloudDetails";
 import SyncLanDetails from "./SyncLanDetails";
-import {
-  createSyncStatusRefresh,
-  summarizeLanPeers,
-} from "./SyncStatusIcons.logic";
+import { createSyncStatusRefresh } from "./SyncStatusIcons.logic";
 
 const HIDDEN_WARM_REFRESH_DEBOUNCE_MS = 120;
 const PANEL_MAX_WIDTH = 360;
@@ -379,7 +376,6 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
   const buttonClassName = compact ? "size-8" : "size-7";
   const lanLabel = t(`syncStatus.lan.${lanState}`);
   const cloudLabel = t(`syncStatus.cloud.${cloudState}`);
-  const lanSummary = summarizeLanPeers(status?.peers ?? []);
 
   const activeDirectory =
     cloudSpaceKey && cloudDirectoryState.key === cloudSpaceKey
@@ -414,35 +410,27 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
     />
   );
 
-  const lanBadgeCount =
-    status?.enabled && status.lanEnabled && lanSummary.onlineCount > 0
-      ? lanSummary.onlineCount
-      : 0;
-  const cloudBadgeCount = 0;
-
   return (
     <>
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div className="flex shrink-0 items-center gap-1">
         {isAndroid ? (
           <>
             {renderStatusButton({
-              badgeCount: lanBadgeCount,
-              badgeTone: "success",
               buttonClassName,
               icon:
                 lanState === "disabled" ? "i-lucide:wifi-off" : "i-lucide:wifi",
+              iconClassName: "size-4 -translate-y-[0.5px]",
               label: lanLabel,
               onClick: handleOpenLanDetails,
               state: lanState,
             })}
             {renderStatusButton({
-              badgeCount: cloudBadgeCount,
-              badgeTone: "warning",
               buttonClassName,
               icon:
                 cloudState === "disabled"
                   ? "i-lucide:cloud-off"
                   : "i-lucide:cloud",
+              iconClassName: "size-4",
               label: cloudLabel,
               onClick: handleOpenCloudDetails,
               state: cloudState,
@@ -463,13 +451,12 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
               trigger="click"
             >
               {renderStatusButton({
-                badgeCount: lanBadgeCount,
-                badgeTone: "success",
                 buttonClassName,
                 icon:
                   lanState === "disabled"
                     ? "i-lucide:wifi-off"
                     : "i-lucide:wifi",
+                iconClassName: "size-4 -translate-y-[0.5px]",
                 label: lanLabel,
                 state: lanState,
               })}
@@ -488,13 +475,12 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
               trigger="click"
             >
               {renderStatusButton({
-                badgeCount: cloudBadgeCount,
-                badgeTone: "warning",
                 buttonClassName,
                 icon:
                   cloudState === "disabled"
                     ? "i-lucide:cloud-off"
                     : "i-lucide:cloud",
+                iconClassName: "size-4",
                 label: cloudLabel,
                 state: cloudState,
               })}
@@ -630,33 +616,25 @@ const SyncStatusIcons: FC<SyncStatusIconsProps> = (props) => {
 };
 
 interface StatusButtonOptions {
-  badgeCount: number;
-  badgeTone: "success" | "warning";
   buttonClassName: string;
   icon: string;
+  iconClassName: string;
   label: string;
   onClick?: MouseEventHandler<HTMLButtonElement>;
   state: SyncChannelState;
 }
 
-/** 渲染局域网与云端状态按钮，附带轻量角标。 */
+/** 渲染局域网与云端状态按钮。 */
 function renderStatusButton(options: StatusButtonOptions): ReactElement {
-  const {
-    badgeCount,
-    badgeTone,
-    buttonClassName,
-    icon,
-    label,
-    onClick,
-    state,
-  } = options;
+  const { buttonClassName, icon, iconClassName, label, onClick, state } =
+    options;
   const showErrorDot = state === "error" || state === "degraded";
 
   return (
     <button
       aria-label={label}
       className={cn(
-        "relative flex cursor-pointer items-center justify-center rounded-full border-0 bg-transparent transition-colors hover:bg-ant-fill-tertiary",
+        "relative flex cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 transition-colors hover:bg-ant-fill-tertiary",
         buttonClassName,
         channelTextClassName(state),
       )}
@@ -666,20 +644,11 @@ function renderStatusButton(options: StatusButtonOptions): ReactElement {
       <i
         className={cn(
           icon,
-          "size-4",
+          iconClassName,
           state === "connecting" && "animate-pulse",
         )}
       />
-      {badgeCount > 0 ? (
-        <span
-          className={cn(
-            "pointer-events-none absolute top-0.5 right-0.5 origin-top-right scale-75 font-semibold text-xs tabular-nums leading-none",
-            badgeTone === "success" ? "text-ant-success" : "text-ant-warning",
-          )}
-        >
-          {Math.min(badgeCount, 9)}
-        </span>
-      ) : showErrorDot ? (
+      {showErrorDot ? (
         <span
           className={cn(
             "absolute top-1 right-1 size-1.5 rounded-full",
