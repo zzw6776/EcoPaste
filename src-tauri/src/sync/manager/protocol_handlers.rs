@@ -585,6 +585,7 @@ async fn dispatch_peer(
             blob_id,
             transfer_id,
             file_content: _,
+            item_sync_key,
         } => {
             let group = authenticate_local(manager, &group_id, &access_token)?;
             let pool = manager.pool().await;
@@ -655,7 +656,8 @@ async fn dispatch_peer(
             };
             let peer_info =
                 repository::peer_by_endpoint_id(&pool, &connection.remote_id().to_string()).await?;
-            let serve_info = repository::blob_serve_info(&pool, &blob.blob_id).await?;
+            let serve_info =
+                repository::blob_serve_info(&pool, &blob.blob_id, item_sync_key.as_deref()).await?;
             if let Some((ref peer_device_id, ref peer_name)) = peer_info {
                 manager.touch_peer_catchup(peer_device_id, peer_name, false);
             }
@@ -701,7 +703,8 @@ async fn dispatch_peer(
                 _ => None,
             };
             manager.emit_updated();
-            let transfer_lock_id = lock_lan_pull_item(&pool, &blob).await?;
+            let transfer_lock_id =
+                lock_lan_pull_item(&pool, &blob, item_sync_key.as_deref()).await?;
             let mut progress = super::super::upload::UploadProgress::new(
                 connection.stable_id(),
                 blob_log_ref(&blob.blob_id),
@@ -743,11 +746,16 @@ async fn dispatch_peer(
                     writer.shutdown().await?;
                     Ok::<(), anyhow::Error>(())
                 };
-                let transmit = multipart::send(&mut reader, session.peer(), blob.size, |bytes| {
-                    if let Some(handle) = &serve_handle {
-                        handle.transferred(bytes);
-                    }
-                });
+                let transmit = multipart::send(
+                    &mut reader,
+                    session.peer_with_connection(connection.clone()),
+                    blob.size,
+                    |bytes| {
+                        if let Some(handle) = &serve_handle {
+                            handle.transferred(bytes);
+                        }
+                    },
+                );
                 super::cancelable_transfer(
                     multipart::until_stopped(send, async {
                         tokio::try_join!(produce, transmit)?;
@@ -805,8 +813,14 @@ async fn dispatch_peer(
 }
 
 /// Protects the local clipboard item from history cleanup while a LAN peer streams its blob.
-async fn lock_lan_pull_item(pool: &SqlitePool, blob: &StoredBlob) -> Result<Option<String>> {
-    let Some((sync_key, item_id)) = repository::item_id_for_blob(pool, &blob.blob_id).await? else {
+async fn lock_lan_pull_item(
+    pool: &SqlitePool,
+    blob: &StoredBlob,
+    item_sync_key: Option<&str>,
+) -> Result<Option<String>> {
+    let Some((sync_key, item_id)) =
+        repository::item_id_for_blob(pool, &blob.blob_id, item_sync_key).await?
+    else {
         return Ok(None);
     };
     let lock_id = format!(

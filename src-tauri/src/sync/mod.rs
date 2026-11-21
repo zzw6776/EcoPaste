@@ -12,7 +12,7 @@ pub(crate) mod repository;
 mod upload;
 
 #[cfg(target_os = "android")]
-pub(crate) use delivery_plan::android_share_delivery_target;
+pub(crate) use delivery_plan::android_share_cloud_blob_policy;
 pub use identity::PairingCode;
 pub use manager::SyncManager;
 pub(crate) use manager::{LEGACY_SYNC_BLOB_DIR, SYNC_STAGING_DIR};

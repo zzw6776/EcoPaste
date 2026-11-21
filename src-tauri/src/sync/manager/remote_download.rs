@@ -153,6 +153,7 @@ impl SyncManager {
                 .run_remote_file_download(
                     RemoteDownloadRequest {
                         origin_device_id: &origin_device_id,
+                        sync_key: &sync_key,
                         group: &group,
                         manifests: &manifests,
                         destination,
@@ -283,6 +284,7 @@ impl SyncManager {
     ) -> Result<RemoteFileDownloadResult> {
         let RemoteDownloadRequest {
             origin_device_id,
+            sync_key,
             group,
             manifests,
             destination,
@@ -333,6 +335,7 @@ impl SyncManager {
                                 connection: &connection,
                                 group,
                                 key: &key,
+                                item_sync_key: Some(sync_key),
                                 completed_bytes,
                                 handle,
                                 transferred,
@@ -422,6 +425,7 @@ impl SyncManager {
                                 connection: &connection,
                                 group,
                                 key: &key,
+                                item_sync_key: Some(sync_key),
                                 completed_bytes,
                                 handle,
                                 transferred,

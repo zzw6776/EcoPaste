@@ -640,6 +640,7 @@ enum RemoteDownloadDestination {
 
 struct RemoteDownloadRequest<'a> {
     origin_device_id: &'a str,
+    sync_key: &'a str,
     group: &'a GroupSecrets,
     manifests: &'a [BlobManifest],
     destination: RemoteDownloadDestination,
@@ -651,6 +652,7 @@ struct RemoteBlobTransferContext<'a> {
     connection: &'a Connection,
     group: &'a GroupSecrets,
     key: &'a [u8; 32],
+    item_sync_key: Option<&'a str>,
     completed_bytes: u64,
     handle: &'a super::progress::TransferHandle,
     transferred: &'a AtomicU64,
@@ -2136,11 +2138,8 @@ impl SyncManager {
             crate::db::sync_items::ContentSyncOptions {
                 force_files: true,
                 manual_share: true,
-                delivery_route: Some(if target == SyncTarget::Cloud {
-                    crate::db::sync_items::ContentDeliveryRoute::Cloud
-                } else {
-                    crate::db::sync_items::ContentDeliveryRoute::Lan
-                }),
+                cloud_blob_policy: (target == SyncTarget::Cloud)
+                    .then_some(crate::db::sync_items::CloudBlobPolicy::Requested),
                 ..Default::default()
             },
         )

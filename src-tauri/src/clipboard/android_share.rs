@@ -270,23 +270,19 @@ fn prepare_items(
     (items, outcome)
 }
 
-/// Applies the shared delivery policy and maps its exclusive route into the durable outbox model.
+/// Chooses the cloud attachment upload policy for an oversized Android share.
 #[cfg(target_os = "android")]
-fn shared_delivery_route(
+fn shared_cloud_blob_policy(
     item: &ClipboardItem,
     auto_upload_max_mb: u32,
     lan_connected: bool,
-) -> Option<crate::db::sync_items::ContentDeliveryRoute> {
-    let target = crate::sync::android_share_delivery_target(
+) -> Option<crate::db::sync_items::CloudBlobPolicy> {
+    crate::sync::android_share_cloud_blob_policy(
         item.kind == crate::db::models::ClipboardKind::Files,
         item.size.and_then(|size| u64::try_from(size).ok()),
         auto_upload_max_mb,
         lan_connected,
-    )?;
-    Some(match target {
-        crate::sync::SyncTarget::Lan => crate::db::sync_items::ContentDeliveryRoute::Lan,
-        crate::sync::SyncTarget::Cloud => crate::db::sync_items::ContentDeliveryRoute::Cloud,
-    })
+    )
 }
 
 #[cfg(target_os = "android")]
@@ -562,8 +558,8 @@ pub(crate) async fn receive(
         .is_some_and(|manager| manager.has_connected_lan_peer());
     for mut item in items.drain(..) {
         item.source_app_id = source_app.as_ref().map(|source| source.id.clone());
-        let initial_delivery_route =
-            shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
+        let cloud_blob_policy =
+            shared_cloud_blob_policy(&item, sync_settings.auto_upload_max_mb, lan_connected);
         match super::watcher::persist_and_notify_with_sync(
             app,
             &pool,
@@ -572,7 +568,7 @@ pub(crate) async fn receive(
             None,
             Some(crate::db::sync_items::ContentSyncOptions {
                 manual_share: true,
-                delivery_route: initial_delivery_route,
+                cloud_blob_policy,
                 ..Default::default()
             }),
         )
@@ -589,20 +585,23 @@ pub(crate) async fn receive(
         let pending = plan_file_import(direct_files, &store, &owned_root)?;
         let mut item = pending.item;
         item.source_app_id = source_app.as_ref().map(|source| source.id.clone());
-        let initial_delivery_route =
-            shared_delivery_route(&item, sync_settings.auto_upload_max_mb, lan_connected);
+        let initial_policy =
+            shared_cloud_blob_policy(&item, sync_settings.auto_upload_max_mb, lan_connected);
         let manager = app
             .try_state::<Arc<crate::sync::SyncManager>>()
             .map(|manager| manager.inner().clone());
-        let initial_route = match initial_delivery_route.unwrap_or({
-            if lan_connected {
-                crate::db::sync_items::ContentDeliveryRoute::Lan
-            } else {
-                crate::db::sync_items::ContentDeliveryRoute::Cloud
+        let initial_route = match initial_policy {
+            Some(crate::db::sync_items::CloudBlobPolicy::Defer) => crate::sync::TransferRoute::Lan,
+            Some(crate::db::sync_items::CloudBlobPolicy::Requested) => {
+                crate::sync::TransferRoute::Cloud
             }
-        }) {
-            crate::db::sync_items::ContentDeliveryRoute::Cloud => crate::sync::TransferRoute::Cloud,
-            crate::db::sync_items::ContentDeliveryRoute::Lan => crate::sync::TransferRoute::Lan,
+            Some(crate::db::sync_items::CloudBlobPolicy::Auto) | None => {
+                if lan_connected {
+                    crate::sync::TransferRoute::Lan
+                } else {
+                    crate::sync::TransferRoute::Cloud
+                }
+            }
         };
         let task_id = manager.as_ref().map(|manager| {
             manager.start_shared_file_import(&item.id, pending.declared_bytes, initial_route)
@@ -641,7 +640,7 @@ pub(crate) async fn receive(
                             .execute(&pool)
                             .await
                             .context("update imported shared file size")?;
-                        let delivery_route = shared_delivery_route(
+                        let cloud_blob_policy = shared_cloud_blob_policy(
                             &item,
                             app.state::<crate::settings::SettingsStore>()
                                 .snapshot()
@@ -669,7 +668,7 @@ pub(crate) async fn receive(
                                 &item,
                                 crate::db::sync_items::ContentSyncOptions {
                                     manual_share: true,
-                                    delivery_route,
+                                    cloud_blob_policy,
                                     ..Default::default()
                                 },
                             )

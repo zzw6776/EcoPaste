@@ -1,5 +1,7 @@
 //! Central policy for automatic routes, manual actions and file-content limits.
 
+use crate::db::sync_items::CloudBlobPolicy;
+
 use super::model::{
     SyncContentAvailability, SyncItemAction, SyncItemActivity, SyncItemOrigin,
     SyncLocalContentState, SyncTarget, SyncedItemSnapshot,
@@ -14,7 +16,6 @@ pub(super) struct ChannelActionContext {
     pub activity: SyncItemActivity,
     pub availability: SyncContentAvailability,
     pub remote_file_available: bool,
-    pub needs_complete_delivery: bool,
 }
 
 /// Resolves the only user action exposed by one card channel.
@@ -56,8 +57,7 @@ pub(super) fn channel_action(context: ChannelActionContext) -> SyncItemAction {
     if !local_content_available || !context.target_available {
         return SyncItemAction::None;
     }
-    if context.needs_complete_delivery || context.availability != SyncContentAvailability::Complete
-    {
+    if context.availability != SyncContentAvailability::Complete {
         return SyncItemAction::Upload;
     }
     SyncItemAction::None
@@ -68,23 +68,45 @@ pub(crate) fn permits_automatic_file_upload(total_size: u64, limit_mb: u32) -> b
     limit_mb > 0 && total_size <= u64::from(limit_mb) * 1024 * 1024
 }
 
-/// Chooses the one allowed route for an oversized Android share; normal shares stay dual-route.
+/// Resolves the data-plane cloud upload policy for an oversized Android share.
+/// Control-plane metadata always syncs to both Cloud and LAN regardless of this policy.
 #[cfg(any(target_os = "android", test))]
-pub(crate) fn android_share_delivery_target(
+pub(crate) fn android_share_cloud_blob_policy(
     is_file: bool,
     total_size: Option<u64>,
     auto_upload_max_mb: u32,
     lan_connected: bool,
-) -> Option<SyncTarget> {
+) -> Option<CloudBlobPolicy> {
     let total_size = total_size.filter(|_| is_file)?;
     if permits_automatic_file_upload(total_size, auto_upload_max_mb) {
         return None;
     }
     Some(if lan_connected {
-        SyncTarget::Lan
+        CloudBlobPolicy::Defer
     } else {
-        SyncTarget::Cloud
+        CloudBlobPolicy::Requested
     })
+}
+
+/// Computes the effective cloud attachment upload policy during materialization or transfer start.
+pub(crate) fn resolve_cloud_blob_policy(
+    is_files: bool,
+    total_size: u64,
+    auto_upload_max_mb: u32,
+    staged_policy: CloudBlobPolicy,
+    force_files: bool,
+) -> CloudBlobPolicy {
+    if force_files || staged_policy == CloudBlobPolicy::Requested {
+        return CloudBlobPolicy::Requested;
+    }
+    if staged_policy == CloudBlobPolicy::Defer {
+        return CloudBlobPolicy::Defer;
+    }
+    if is_files && !permits_automatic_file_upload(total_size, auto_upload_max_mb) {
+        CloudBlobPolicy::Defer
+    } else {
+        CloudBlobPolicy::Auto
+    }
 }
 
 /// Returns original plaintext bytes for one synchronized file collection.
@@ -136,19 +158,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exclusive_share_route_requires_a_known_oversized_file() {
-        assert_eq!(android_share_delivery_target(true, None, 100, true), None);
+    fn oversized_android_share_policy_defers_cloud_blobs_on_lan_and_requests_when_offline() {
+        assert_eq!(android_share_cloud_blob_policy(true, None, 100, true), None);
         assert_eq!(
-            android_share_delivery_target(true, Some(100 * 1024 * 1024), 100, true),
+            android_share_cloud_blob_policy(true, Some(100 * 1024 * 1024), 100, true),
             None
         );
         assert_eq!(
-            android_share_delivery_target(true, Some(101 * 1024 * 1024), 100, true),
-            Some(SyncTarget::Lan)
+            android_share_cloud_blob_policy(true, Some(101 * 1024 * 1024), 100, true),
+            Some(CloudBlobPolicy::Defer)
         );
         assert_eq!(
-            android_share_delivery_target(true, Some(101 * 1024 * 1024), 100, false),
-            Some(SyncTarget::Cloud)
+            android_share_cloud_blob_policy(true, Some(101 * 1024 * 1024), 100, false),
+            Some(CloudBlobPolicy::Requested)
+        );
+        assert_eq!(
+            resolve_cloud_blob_policy(true, 101 * 1024 * 1024, 100, CloudBlobPolicy::Auto, false),
+            CloudBlobPolicy::Defer
+        );
+        assert_eq!(
+            resolve_cloud_blob_policy(true, 101 * 1024 * 1024, 100, CloudBlobPolicy::Auto, true),
+            CloudBlobPolicy::Requested
         );
     }
 }

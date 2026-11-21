@@ -255,6 +255,7 @@ async fn per_item_snapshots_cas_blobs_and_watch_round_trip() -> Result<()> {
                 blob_id: uncommitted_blob_id,
                 transfer_id: next_transfer_id(),
                 file_content: true,
+                item_sync_key: None,
             },
         )
         .await?,
@@ -737,6 +738,7 @@ async fn download_blob(
             blob_id: blob_id.into(),
             transfer_id,
             file_content: true,
+            item_sync_key: None,
         },
     )
     .await?;

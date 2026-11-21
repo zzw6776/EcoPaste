@@ -24,14 +24,6 @@ impl ContentLevel {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Metadata => "metadata",
-            Self::Complete => "complete",
-        }
-    }
-
     fn availability(self) -> SyncContentAvailability {
         match self {
             Self::None => SyncContentAvailability::None,
@@ -65,7 +57,6 @@ impl DeliveryStatus {
 #[derive(Debug, Clone)]
 pub(super) struct DeliveryFact {
     pub target_id: String,
-    pub desired: ContentLevel,
     pub confirmed: ContentLevel,
     pub status: DeliveryStatus,
     pub last_error: Option<String>,
@@ -107,7 +98,7 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
     });
 
     for delivery in deliveries {
-        let satisfied = delivery.confirmed >= delivery.desired;
+        let satisfied = delivery.confirmed == ContentLevel::Complete;
         channel.total_targets = channel.total_targets.saturating_add(1);
         if delivery.confirmed != ContentLevel::None {
             channel.delivered_targets = channel.delivered_targets.saturating_add(1);
@@ -197,16 +188,6 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
         }
     }
 
-    let needs_complete_delivery = facts.deliveries.iter().any(|delivery| {
-        let same_channel = if cloud {
-            delivery.target_id == "cloud"
-        } else {
-            delivery.target_id.starts_with("peer:")
-        };
-        same_channel
-            && delivery.desired == ContentLevel::Complete
-            && delivery.confirmed != ContentLevel::Complete
-    });
     channel.action = channel_action(ChannelActionContext {
         origin: facts.origin,
         local_state: facts.local_state,
@@ -219,7 +200,6 @@ fn derive_channel(facts: &ItemStatusFacts, cloud: bool) -> SyncItemChannelStatus
         activity: channel.activity,
         availability: source_availability,
         remote_file_available: facts.remote_file_available,
-        needs_complete_delivery,
     });
 
     channel
@@ -249,7 +229,6 @@ mod tests {
         for status in [DeliveryStatus::Canceled, DeliveryStatus::Blocked] {
             let projected = derive_item_status(local_facts(DeliveryFact {
                 target_id: "cloud".into(),
-                desired: ContentLevel::Complete,
                 confirmed: ContentLevel::Complete,
                 status,
                 last_error: Some("later attempt failed".into()),
@@ -269,7 +248,6 @@ mod tests {
     fn pending_attempt_remains_visible_when_identical_content_was_already_delivered() {
         let projected = derive_item_status(local_facts(DeliveryFact {
             target_id: "cloud".into(),
-            desired: ContentLevel::Complete,
             confirmed: ContentLevel::Complete,
             status: DeliveryStatus::Pending,
             last_error: None,
@@ -284,10 +262,26 @@ mod tests {
     }
 
     #[test]
+    fn deferred_metadata_only_cloud_fact_stays_idle_and_uploadable() {
+        let projected = derive_item_status(local_facts(DeliveryFact {
+            target_id: "cloud".into(),
+            confirmed: ContentLevel::Metadata,
+            status: DeliveryStatus::Confirmed,
+            last_error: None,
+        }));
+
+        assert_eq!(projected.cloud.activity, SyncItemActivity::Idle);
+        assert_eq!(
+            projected.cloud.availability,
+            SyncContentAvailability::MetadataOnly
+        );
+        assert_eq!(projected.cloud.action, SyncItemAction::Upload);
+    }
+
+    #[test]
     fn metadata_only_remote_route_is_informational() {
         let mut facts = local_facts(DeliveryFact {
             target_id: "cloud".into(),
-            desired: ContentLevel::Metadata,
             confirmed: ContentLevel::Metadata,
             status: DeliveryStatus::Confirmed,
             last_error: None,
@@ -318,14 +312,12 @@ mod tests {
             deliveries: vec![
                 DeliveryFact {
                     target_id: "peer:android".into(),
-                    desired: ContentLevel::Complete,
                     confirmed: ContentLevel::Complete,
                     status: DeliveryStatus::Confirmed,
                     last_error: None,
                 },
                 DeliveryFact {
                     target_id: "cloud".into(),
-                    desired: ContentLevel::Complete,
                     confirmed: ContentLevel::Complete,
                     status: DeliveryStatus::Confirmed,
                     last_error: None,

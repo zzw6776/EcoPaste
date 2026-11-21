@@ -9,25 +9,29 @@ const MAX_PREP_RETRY_SECONDS: i64 = 300;
 const LOCAL_SEQ_KEY: &str = "local_seq";
 const LAMPORT_SEQ_KEY: &str = "origin_sequence";
 
+/// Controls whether a local item's file blobs auto-upload to Cloud (`auto`), stay deferred
+/// until manually requested (`defer`), or are explicitly queued for Cloud upload (`requested`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentDeliveryRoute {
-    Lan,
-    Cloud,
+pub enum CloudBlobPolicy {
+    Auto,
+    Defer,
+    Requested,
 }
 
-impl ContentDeliveryRoute {
+impl CloudBlobPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Lan => "lan",
-            Self::Cloud => "cloud",
+            Self::Auto => "auto",
+            Self::Defer => "defer",
+            Self::Requested => "requested",
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Self {
         match value {
-            "lan" => Some(Self::Lan),
-            "cloud" => Some(Self::Cloud),
-            _ => None,
+            "defer" => Self::Defer,
+            "requested" => Self::Requested,
+            _ => Self::Auto,
         }
     }
 }
@@ -37,7 +41,7 @@ pub struct ContentSyncOptions {
     pub history_backfill: bool,
     pub manual_share: bool,
     pub force_files: bool,
-    pub delivery_route: Option<ContentDeliveryRoute>,
+    pub cloud_blob_policy: Option<CloudBlobPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +80,7 @@ pub struct PendingContentPrep {
     pub history_backfill: bool,
     pub manual_share: bool,
     pub force_files: bool,
-    pub delivery_route: Option<ContentDeliveryRoute>,
+    pub cloud_blob_policy: CloudBlobPolicy,
     pub last_error: Option<String>,
 }
 
@@ -178,7 +182,13 @@ pub async fn stage_content_on(
     };
     let protected = item.is_favorite || item.is_pinned;
     let payload_updated_at_ms = item.updated_at.timestamp_millis();
-    let route = options.delivery_route.map(ContentDeliveryRoute::as_str);
+    let explicit_policy = if options.force_files {
+        Some(CloudBlobPolicy::Requested)
+    } else {
+        options.cloud_blob_policy
+    };
+    let policy_str = explicit_policy.unwrap_or(CloudBlobPolicy::Auto).as_str();
+    let preserve_existing_policy = explicit_policy.is_none();
 
     sqlx::query(
         r#"
@@ -193,7 +203,7 @@ pub async fn stage_content_on(
             is_present, is_favorite, is_pinned, note,
             local_seq, payload_updated_at_ms,
             prep_state, prep_error, prep_attempts, next_prep_at,
-            history_backfill, manual_share, delivery_route,
+            history_backfill, manual_share, cloud_blob_policy,
             local_state, remote_file_state, needs_apply,
             created_at, updated_at
         ) VALUES (
@@ -252,7 +262,11 @@ pub async fn stage_content_on(
             next_prep_at = NULL,
             history_backfill = MIN(sync_items.history_backfill, excluded.history_backfill),
             manual_share = MAX(sync_items.manual_share, excluded.manual_share),
-            delivery_route = excluded.delivery_route,
+            cloud_blob_policy = CASE
+                WHEN excluded.cloud_blob_policy = 'requested' THEN 'requested'
+                WHEN ? <> 0 THEN sync_items.cloud_blob_policy
+                ELSE excluded.cloud_blob_policy
+            END,
             local_state = CASE
                 WHEN sync_items.remote_file_state IS NOT NULL THEN sync_items.local_state
                 ELSE 'managed'
@@ -285,7 +299,8 @@ pub async fn stage_content_on(
     .bind(payload_updated_at_ms)
     .bind(options.history_backfill)
     .bind(options.manual_share || options.force_files)
-    .bind(route)
+    .bind(policy_str)
+    .bind(i64::from(preserve_existing_policy))
     .bind(now)
     .bind(now)
     .execute(&mut *connection)
@@ -540,7 +555,7 @@ pub async fn mark_local_deleted_on(
             next_prep_at = NULL,
             history_backfill = 0,
             manual_share = 0,
-            delivery_route = NULL,
+            cloud_blob_policy = 'auto',
             remote_file_state = NULL,
             needs_blob_pull = 0,
             updated_at = excluded.updated_at
@@ -584,7 +599,7 @@ pub async fn next_pending_content(
     let row = sqlx::query(
         r#"
         SELECT s.sync_key, s.item_id, s.source_revision, s.kind, s.local_seq,
-               s.history_backfill, s.manual_share, s.delivery_route, s.prep_error
+               s.history_backfill, s.manual_share, s.cloud_blob_policy, s.prep_error
         FROM sync_items s
         JOIN clipboard_items c ON c.id = s.item_id
         WHERE s.prep_state = 'pending_content'
@@ -626,7 +641,8 @@ pub async fn next_pending_content(
             _ => ClipboardKind::Text,
         };
         let manual_share = row.try_get::<bool, _>("manual_share")?;
-        let route_raw: Option<String> = row.try_get("delivery_route")?;
+        let policy_raw: String = row.try_get("cloud_blob_policy")?;
+        let cloud_blob_policy = CloudBlobPolicy::parse(&policy_raw);
         Ok(PendingContentPrep {
             sync_key: row.try_get("sync_key")?,
             item_id: row.try_get("item_id")?,
@@ -637,8 +653,8 @@ pub async fn next_pending_content(
             local_seq: row.try_get("local_seq")?,
             history_backfill: row.try_get("history_backfill")?,
             manual_share,
-            force_files: manual_share,
-            delivery_route: route_raw.as_deref().and_then(ContentDeliveryRoute::parse),
+            force_files: cloud_blob_policy == CloudBlobPolicy::Requested,
+            cloud_blob_policy,
             last_error: row.try_get("prep_error")?,
         })
     })();

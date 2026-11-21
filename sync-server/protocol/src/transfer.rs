@@ -3,7 +3,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,9 +16,134 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
+    time::MissedTickBehavior,
 };
 
 use crate::{Request, Response, read_frame, write_frame};
+
+static ACTIVE_WIRE_SENDS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct ActiveWireSendGuard {
+    connection_id: usize,
+}
+
+impl ActiveWireSendGuard {
+    fn enter(connection_id: usize) -> Self {
+        let mut counts = ACTIVE_WIRE_SENDS
+            .lock()
+            .expect("active wire sends poisoned");
+        *counts.entry(connection_id).or_insert(0) += 1;
+        Self { connection_id }
+    }
+
+    fn count(connection_id: usize) -> usize {
+        ACTIVE_WIRE_SENDS
+            .lock()
+            .expect("active wire sends poisoned")
+            .get(&connection_id)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
+impl Drop for ActiveWireSendGuard {
+    fn drop(&mut self) {
+        let mut counts = ACTIVE_WIRE_SENDS
+            .lock()
+            .expect("active wire sends poisoned");
+        if let Some(count) = counts.get_mut(&self.connection_id) {
+            if *count <= 1 {
+                counts.remove(&self.connection_id);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct WireTransferProgress {
+    buffered_bytes: u64,
+    confirmed_bytes: u64,
+    wire_bytes: u64,
+    last_reported: u64,
+    prev_tx: u64,
+    prev_lost: u64,
+    carry_lost: u64,
+}
+
+impl WireTransferProgress {
+    fn new(tx_bytes: u64, lost_bytes: u64) -> Self {
+        Self {
+            prev_tx: tx_bytes,
+            prev_lost: lost_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn record_buffered(&mut self, chunk: u64) {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(chunk);
+    }
+
+    fn record_wire_sample(
+        &mut self,
+        tx_bytes: u64,
+        lost_bytes: u64,
+        active_share: usize,
+        total_size: u64,
+    ) -> Option<u64> {
+        let delta_tx = tx_bytes.saturating_sub(self.prev_tx);
+        let delta_lost = lost_bytes.saturating_sub(self.prev_lost);
+        self.prev_tx = tx_bytes;
+        self.prev_lost = lost_bytes;
+        self.carry_lost = self.carry_lost.saturating_add(delta_lost);
+        let net_tx = delta_tx.saturating_sub(self.carry_lost);
+        self.carry_lost = self.carry_lost.saturating_sub(delta_tx);
+
+        let share = u64::try_from(active_share.max(1)).unwrap_or(1);
+        // Compensate ~6% QUIC/AEAD framing overhead and divide fairly across concurrent uploads on the same connection.
+        let payload_delta = (net_tx.saturating_mul(94) / 100) / share;
+        let ceiling = self.buffered_bytes.min(total_size.saturating_sub(1));
+        self.wire_bytes = self
+            .wire_bytes
+            .saturating_add(payload_delta)
+            .max(self.confirmed_bytes)
+            .min(ceiling);
+        if self.wire_bytes > self.last_reported {
+            self.last_reported = self.wire_bytes;
+            Some(self.wire_bytes)
+        } else {
+            None
+        }
+    }
+
+    fn record_confirmed(
+        &mut self,
+        part_bytes: u64,
+        all_done: bool,
+        total_size: u64,
+    ) -> Option<u64> {
+        self.confirmed_bytes = self.confirmed_bytes.saturating_add(part_bytes);
+        if self.wire_bytes < self.confirmed_bytes {
+            self.wire_bytes = self.confirmed_bytes;
+        }
+        let reported = if all_done {
+            self.confirmed_bytes
+        } else {
+            self.wire_bytes
+                .max(self.confirmed_bytes)
+                .min(total_size.saturating_sub(1))
+        };
+        if reported > self.last_reported {
+            self.last_reported = reported;
+            Some(reported)
+        } else {
+            None
+        }
+    }
+}
 
 pub const PARALLEL_PARTS: usize = 4;
 pub const ATTACHMENTS_PER_DIRECTION: usize = 2;
@@ -61,7 +189,11 @@ fn part_count(size: u64) -> u64 {
 }
 
 /// Deadlines measure idle time, including slow connections that take minutes per part.
-async fn read_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> Result<()> {
+async fn read_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    on_read: Option<&AtomicU64>,
+) -> Result<()> {
     for block in bytes.chunks_mut(IO_BLOCK_BYTES) {
         let mut offset = 0;
         while offset < block.len() {
@@ -71,6 +203,9 @@ async fn read_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> R
                 bail!("transfer part ended early");
             }
             offset += count;
+            if let Some(counter) = on_read {
+                counter.fetch_add(count as u64, Ordering::Relaxed);
+            }
         }
     }
     Ok(())
@@ -226,6 +361,7 @@ enum Peer {
     },
     Server {
         receivers: [Arc<tokio::sync::Mutex<mpsc::Receiver<PartRequest>>>; PARALLEL_PARTS],
+        connection: Option<Connection>,
     },
 }
 
@@ -233,6 +369,14 @@ impl RegisteredTransfer {
     pub fn peer(&self) -> PartPeer {
         PartPeer(Peer::Server {
             receivers: self.receivers.clone(),
+            connection: None,
+        })
+    }
+
+    pub fn peer_with_connection(&self, connection: Connection) -> PartPeer {
+        PartPeer(Peer::Server {
+            receivers: self.receivers.clone(),
+            connection: Some(connection),
         })
     }
 }
@@ -282,7 +426,7 @@ impl PartPeer {
                 .await?;
                 Ok((send, recv))
             }
-            Peer::Server { receivers } => {
+            Peer::Server { receivers, .. } => {
                 let mut receiver = receivers[index as usize % PARALLEL_PARTS].lock().await;
                 let request = receiver.recv().await.context("transfer ended")?;
                 if request.index != index {
@@ -316,12 +460,48 @@ impl PartPeer {
         }
     }
 
-    async fn receive_part(&self, index: u64, size: usize) -> Result<(Vec<u8>, SendStream)> {
+    async fn receive_part(
+        &self,
+        index: u64,
+        size: usize,
+        on_read: Option<Arc<AtomicU64>>,
+    ) -> Result<(Vec<u8>, SendStream)> {
         let (send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
         let mut data = vec![0u8; size];
-        read_bytes(&mut recv, &mut data).await?;
+        read_bytes(&mut recv, &mut data, on_read.as_deref()).await?;
         finish_read(&mut recv).await?;
         Ok((data, send))
+    }
+}
+
+#[derive(Default)]
+struct WireReceiveProgress {
+    completed_bytes: u64,
+    last_reported: u64,
+}
+
+impl WireReceiveProgress {
+    fn sample(&mut self, wire_received: u64, total_size: u64) -> Option<u64> {
+        let reported = wire_received
+            .max(self.completed_bytes)
+            .min(total_size.saturating_sub(1));
+        if reported > self.last_reported {
+            self.last_reported = reported;
+            Some(reported)
+        } else {
+            None
+        }
+    }
+
+    fn record_written(&mut self, written: u64, total_size: u64) -> Option<u64> {
+        self.completed_bytes = self.completed_bytes.saturating_add(written);
+        let reported = self.completed_bytes.min(total_size.saturating_sub(1));
+        if reported > self.last_reported {
+            self.last_reported = reported;
+            Some(reported)
+        } else {
+            None
+        }
     }
 }
 
@@ -335,10 +515,30 @@ pub async fn send<R: AsyncRead + Unpin>(
     let total_parts = part_count(size);
     let mut tasks = JoinSet::new();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
+    let wire_peer = match &peer.0 {
+        Peer::Client { connection, .. }
+        | Peer::Server {
+            connection: Some(connection),
+            ..
+        } => Some((
+            connection.clone(),
+            ActiveWireSendGuard::enter(connection.stable_id()),
+        )),
+        Peer::Server {
+            connection: None, ..
+        } => None,
+    };
+    let mut tracker = wire_peer
+        .as_ref()
+        .map(|(conn, _)| {
+            let stats = conn.stats();
+            WireTransferProgress::new(stats.udp_tx.bytes, stats.lost_bytes)
+        })
+        .unwrap_or_default();
+    let mut wire_tick = tokio::time::interval(Duration::from_millis(120));
+    wire_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    wire_tick.tick().await;
     let mut index = 0;
-    let mut active_bytes = 0_u64;
-    let mut confirmed_bytes = 0_u64;
-    let mut last_reported = 0_u64;
     let mut prefetched: Option<(u64, Vec<u8>)> = None;
     loop {
         while tasks.len() < PARALLEL_PARTS {
@@ -346,7 +546,7 @@ pub async fn send<R: AsyncRead + Unpin>(
                 ready
             } else if index < total_parts {
                 let mut data = vec![0u8; part_size(size, index)];
-                read_bytes(reader, &mut data).await?;
+                read_bytes(reader, &mut data, None).await?;
                 let part = index;
                 index += 1;
                 (part, data)
@@ -363,7 +563,7 @@ pub async fn send<R: AsyncRead + Unpin>(
         // Overlap reading/encrypting the next 4-MiB part with the four QUIC part transfers already in flight.
         if prefetched.is_none() && index < total_parts {
             let mut data = vec![0u8; part_size(size, index)];
-            read_bytes(reader, &mut data).await?;
+            read_bytes(reader, &mut data, None).await?;
             prefetched = Some((index, data));
             index += 1;
         }
@@ -377,25 +577,28 @@ pub async fn send<R: AsyncRead + Unpin>(
                     let Some(done) = done else {
                         break;
                     };
-                    confirmed_bytes += done??;
+                    let part_len = done??;
                     let all_done = tasks.is_empty() && index >= total_parts && prefetched.is_none();
-                    let reported = if all_done {
-                        confirmed_bytes
-                    } else {
-                        active_bytes.max(confirmed_bytes).min(size.saturating_sub(1))
-                    };
-                    if reported > last_reported {
-                        last_reported = reported;
+                    if let Some(reported) = tracker.record_confirmed(part_len, all_done, size) {
                         progress(reported);
                     }
                     break;
                 }
                 chunk = progress_rx.recv() => {
                     if let Some(chunk) = chunk {
-                        active_bytes = active_bytes.saturating_add(chunk);
-                        let reported = active_bytes.max(confirmed_bytes).min(size.saturating_sub(1));
-                        if reported > last_reported {
-                            last_reported = reported;
+                        tracker.record_buffered(chunk);
+                    }
+                }
+                _ = wire_tick.tick(), if wire_peer.is_some() => {
+                    if let Some((conn, _)) = &wire_peer {
+                        let stats = conn.stats();
+                        let share = ActiveWireSendGuard::count(conn.stable_id());
+                        if let Some(reported) = tracker.record_wire_sample(
+                            stats.udp_tx.bytes,
+                            stats.lost_bytes,
+                            share,
+                            size,
+                        ) {
                             progress(reported);
                         }
                     }
@@ -403,8 +606,8 @@ pub async fn send<R: AsyncRead + Unpin>(
             }
         }
     }
-    if confirmed_bytes > last_reported {
-        progress(confirmed_bytes);
+    if tracker.confirmed_bytes > tracker.last_reported {
+        progress(tracker.confirmed_bytes);
     }
     Ok(())
 }
@@ -418,11 +621,13 @@ pub async fn receive<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let buffer_permits = Arc::new(Semaphore::new(RECEIVE_BUFFER_PERMITS));
     let (tx, mut rx) = mpsc::channel(RECEIVE_BUFFER_PERMITS);
+    let wire_received = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
     for lane in 0..PARALLEL_PARTS {
         let peer = peer.clone();
         let tx = tx.clone();
         let buffer_permits = buffer_permits.clone();
+        let wire_received = wire_received.clone();
         tasks.spawn(async move {
             let mut index = lane as u64;
             while index < part_count(size) {
@@ -431,7 +636,9 @@ pub async fn receive<W: AsyncWrite + Unpin>(
                     .acquire_owned()
                     .await
                     .map_err(|_| anyhow::anyhow!("transfer canceled"))?;
-                let (data, mut send) = peer.receive_part(index, part_size(size, index)).await?;
+                let (data, mut send) = peer
+                    .receive_part(index, part_size(size, index), Some(wire_received.clone()))
+                    .await?;
                 // Memory stays strictly bounded by `buffer_permits`; releasing part credit now
                 // lets the sender pipeline the next part while decryption and disk I/O run.
                 write_frame(&mut send, &Response::BlobStored).await?;
@@ -447,26 +654,97 @@ pub async fn receive<W: AsyncWrite + Unpin>(
     drop(tx);
     let mut pending = std::collections::BTreeMap::new();
     let mut next = 0;
-    let mut completed = 0;
+    let mut tracker = WireReceiveProgress::default();
+    let mut receive_tick = tokio::time::interval(Duration::from_millis(120));
+    receive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    receive_tick.tick().await;
     while next < part_count(size) {
         tokio::select! {
+            biased;
             value = rx.recv() => {
                 let (index, data, permit) = value.context("transfer ended early")?;
                 pending.insert(index, (data, permit));
                 while let Some((data, permit)) = pending.remove(&next) {
                     writer.write_all(&data).await?;
-                    completed += data.len() as u64;
-                    progress(completed);
+                    let written = data.len() as u64;
                     drop(permit);
                     next += 1;
+                    if let Some(reported) = tracker.record_written(written, size) {
+                        progress(reported);
+                    }
                 }
             }
             done = tasks.join_next(), if !tasks.is_empty() => { done.context("transfer ended")???; }
+            _ = receive_tick.tick() => {
+                let wire = wire_received.load(Ordering::Relaxed);
+                if let Some(reported) = tracker.sample(wire, size) {
+                    progress(reported);
+                }
+            }
         }
     }
     while let Some(done) = tasks.join_next().await {
         done??;
     }
     writer.shutdown().await?;
+    if tracker.completed_bytes > tracker.last_reported {
+        progress(tracker.completed_bytes);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WireReceiveProgress, WireTransferProgress};
+
+    #[test]
+    fn wire_receive_progress_advances_linearly_while_waiting_for_ordered_parts() {
+        let total_size = 10 * 1024 * 1024;
+        let mut tracker = WireReceiveProgress::default();
+
+        // Parallel lanes receive chunks before part 0 flushes -> linear samples without jumping to 100%.
+        let first = tracker.sample(2 * 1024 * 1024, total_size).unwrap();
+        assert_eq!(first, 2 * 1024 * 1024);
+        let second = tracker.sample(6 * 1024 * 1024, total_size).unwrap();
+        assert_eq!(second, 6 * 1024 * 1024);
+
+        // Flushing ordered parts must never regress or prematurely hit 100% before shutdown.
+        assert_eq!(tracker.record_written(4 * 1024 * 1024, total_size), None);
+        assert_eq!(tracker.sample(total_size, total_size), Some(total_size - 1));
+    }
+
+    #[test]
+    fn wire_progress_tracks_real_tx_linearly_and_subtracts_retransmits() {
+        let total_size = 10 * 1024 * 1024;
+        let mut tracker = WireTransferProgress::new(1_000, 100);
+        // Simulate QUIC send-buffer burst of all 10 MiB immediately on stream write.
+        tracker.record_buffered(total_size);
+        assert_eq!(tracker.last_reported, 0);
+
+        // Actual wire samples advance linearly and never jump straight to 99%.
+        let first = tracker
+            .record_wire_sample(1_000 + 2 * 1024 * 1024, 100, 1, total_size)
+            .unwrap();
+        assert!(first > 1_800_000 && first < 2 * 1024 * 1024);
+
+        // Packet loss + retransmission of 1 MiB must not advance reported progress.
+        assert_eq!(
+            tracker.record_wire_sample(1_000 + 2 * 1024 * 1024, 100 + 1024 * 1024, 1, total_size),
+            None
+        );
+        assert_eq!(
+            tracker.record_wire_sample(1_000 + 3 * 1024 * 1024, 100 + 1024 * 1024, 1, total_size),
+            None
+        );
+
+        // Subsequent non-lost wire transmission advances proportionally, and final ACK finishes at 100%.
+        let second = tracker
+            .record_wire_sample(1_000 + 5 * 1024 * 1024, 100 + 1024 * 1024, 1, total_size)
+            .unwrap();
+        assert!(second > first && second < 5 * 1024 * 1024);
+        assert_eq!(
+            tracker.record_confirmed(total_size, true, total_size),
+            Some(total_size)
+        );
+    }
 }

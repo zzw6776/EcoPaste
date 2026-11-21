@@ -530,6 +530,7 @@ pub(super) async fn download_blob(
     group: &GroupSecrets,
     manifest: &BlobManifest,
     destination: &Path,
+    item_sync_key: Option<&str>,
     progress: Option<BlobDownloadProgress<'_>>,
 ) -> Result<()> {
     let limits = attachment_limits(connection);
@@ -552,6 +553,7 @@ pub(super) async fn download_blob(
             blob_id: manifest.blob_id.clone(),
             transfer_id,
             file_content: manifest.role == BlobRole::File,
+            item_sync_key: item_sync_key.map(str::to_owned),
         },
     )
     .await?;
@@ -575,7 +577,11 @@ pub(super) async fn download_blob(
         &mut writer,
         PartPeer::client(connection.clone(), transfer_id),
         size,
-        |_| {},
+        |bytes| {
+            if let Some(progress) = progress {
+                progress.transferred(bytes.min(size.saturating_sub(1)));
+            }
+        },
     );
     let save = receive_blob(
         &mut reader,
@@ -584,12 +590,16 @@ pub(super) async fn download_blob(
         &manifest.blob_id,
         size,
         !manifest.stream_commitment,
-        progress,
+        || progress.is_some_and(BlobDownloadProgress::canceled),
     );
     cancelable_transfer(
         async {
             tokio::try_join!(receive, save)?;
-            confirm_download(&mut recv).await
+            confirm_download(&mut recv).await?;
+            if let Some(progress) = progress {
+                progress.transferred(size);
+            }
+            Ok(())
         },
         || progress.is_some_and(BlobDownloadProgress::canceled),
     )
@@ -816,6 +826,7 @@ where
             blob_id: manifest.blob_id.clone(),
             transfer_id,
             file_content: manifest.role == BlobRole::File,
+            item_sync_key: context.item_sync_key.map(str::to_owned),
         },
     )
     .await?;
@@ -840,7 +851,13 @@ where
         &mut writer,
         PartPeer::client(context.connection.clone(), transfer_id),
         size,
-        |_| {},
+        |bytes| {
+            let total = context
+                .completed_bytes
+                .saturating_add(bytes.min(size.saturating_sub(1)));
+            context.transferred.store(total, Ordering::Release);
+            context.handle.transferred(total);
+        },
     );
     let decrypt = crypto::decrypt_blob_stream(
         &mut reader,
@@ -853,17 +870,16 @@ where
             key: context.key,
             write_timeout: BLOB_IDLE_TIMEOUT,
         },
-        |current| {
-            let total = context.completed_bytes.saturating_add(current);
-            context.transferred.store(total, Ordering::Release);
-            context.handle.transferred(total);
-        },
+        |_| {},
         || context.handle.canceled(),
     );
     cancelable_transfer(
         async {
             let ((), decrypted) = tokio::try_join!(receive, decrypt)?;
             confirm_download(&mut recv).await?;
+            let total = context.completed_bytes.saturating_add(size);
+            context.transferred.store(total, Ordering::Release);
+            context.handle.transferred(total);
             Ok(decrypted)
         },
         || context.handle.canceled(),
@@ -978,7 +994,7 @@ pub(super) async fn receive_blob<R: AsyncRead + Unpin>(
     expected_hash: &str,
     size: u64,
     verify_ciphertext_hash: bool,
-    progress: Option<BlobDownloadProgress<'_>>,
+    canceled: impl Fn() -> bool,
 ) -> Result<()> {
     let _sync_activity = SyncActivityGuard::acquire();
     let parent = destination.parent().context("blob path has no parent")?;
@@ -994,7 +1010,7 @@ pub(super) async fn receive_blob<R: AsyncRead + Unpin>(
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0_u8; 64 * 1024];
         while remaining > 0 {
-            if progress.is_some_and(BlobDownloadProgress::canceled) {
+            if canceled() {
                 bail!("transfer canceled");
             }
             let requested =
@@ -1007,11 +1023,8 @@ pub(super) async fn receive_blob<R: AsyncRead + Unpin>(
             file.write_all(&buffer[..read]).await?;
             hasher.update(&buffer[..read]);
             remaining -= read as u64;
-            if let Some(progress) = progress {
-                progress.transferred(size.saturating_sub(remaining));
-            }
         }
-        if progress.is_some_and(BlobDownloadProgress::canceled) {
+        if canceled() {
             bail!("transfer canceled");
         }
         file.flush().await?;
