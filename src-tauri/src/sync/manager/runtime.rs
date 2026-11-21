@@ -131,30 +131,27 @@ impl SyncManager {
                 self.set_channel_status(SyncTarget::Lan, SyncChannelState::Connecting, None, false);
             }
             lan_attempted = !peers.is_empty();
-            for batch in peers.chunks(3) {
-                let mut tasks = tokio::task::JoinSet::new();
-                for peer in batch.iter().cloned() {
-                    tasks.spawn(self.clone().sync_lan_peer(
-                        cycle.clone(),
-                        peer,
-                        lan_connect_timeout,
-                    ));
+            let mut tasks = tokio::task::JoinSet::new();
+            for peer in peers {
+                tasks.spawn(
+                    self.clone()
+                        .sync_lan_peer(cycle.clone(), peer, lan_connect_timeout),
+                );
+            }
+            while let Some(result) = tasks.join_next().await {
+                let outcome = result.context("LAN peer sync task failed")??;
+                if peer_device_id.is_some() {
+                    requested_lan_outcome = Some(outcome.clone());
                 }
-                while let Some(result) = tasks.join_next().await {
-                    let outcome = result.context("LAN peer sync task failed")??;
-                    if peer_device_id.is_some() {
-                        requested_lan_outcome = Some(outcome.clone());
+                match outcome {
+                    LanPeerSyncOutcome::Succeeded => lan_succeeded = true,
+                    LanPeerSyncOutcome::ConnectionFailed(message) => {
+                        lan_failed = true;
+                        lan_connection_error.get_or_insert(message);
                     }
-                    match outcome {
-                        LanPeerSyncOutcome::Succeeded => lan_succeeded = true,
-                        LanPeerSyncOutcome::ConnectionFailed(message) => {
-                            lan_failed = true;
-                            lan_connection_error.get_or_insert(message);
-                        }
-                        LanPeerSyncOutcome::TransferFailed(message) => {
-                            lan_failed = true;
-                            lan_transfer_error = Some(message);
-                        }
+                    LanPeerSyncOutcome::TransferFailed(message) => {
+                        lan_failed = true;
+                        lan_transfer_error = Some(message);
                     }
                 }
             }
@@ -353,44 +350,12 @@ impl SyncManager {
         let peer_lock = self.lan_peer_lock(&device_id);
         let _peer_guard = peer_lock.lock().await;
         let target = SyncConnectionTarget::peer(device_id.clone());
-        let address = match peer_endpoint_addr(&peer.announcement) {
-            Ok(value) => value,
-            Err(error) => {
-                log::debug!("ignore invalid discovered peer route: {error}");
-                let message = error.to_string();
-                repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
-            }
-        };
-        let cached_connection = self.cached_lan_connection(&device_id).filter(|connection| {
-            if lan_connection_matches_discovery(connection, &address) {
-                return true;
-            }
-            self.invalidate_lan_connection(&device_id, connection.stable_id());
-            connection.close(0_u32.into(), b"LAN route no longer discovered");
-            false
-        });
-        let connection = match cached_connection {
-            Some(connection) => connection,
-            None => {
-                repository::mark_peer_connecting(&pool, &device_id).await?;
-                match connect_peer(&endpoint, address, connect_timeout).await {
-                    Ok(connection) => {
-                        super::protocol_handlers::spawn_peer_connection_service(
-                            self.clone(),
-                            connection.clone(),
-                        );
-                        self.store_lan_connection(&device_id, connection.clone());
-                        connection
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        log::debug!("LAN peer {device_id} unavailable: {message}");
-                        repository::mark_peer_offline(&pool, &device_id, Some(&message)).await?;
-                        return Ok(LanPeerSyncOutcome::ConnectionFailed(message));
-                    }
-                }
-            }
+        let connection = match self
+            .acquire_lan_peer_connection(&pool, &endpoint, &peer, connect_timeout)
+            .await?
+        {
+            Ok(connection) => connection,
+            Err(message) => return Ok(LanPeerSyncOutcome::ConnectionFailed(message)),
         };
         match self.sync_lan_control(&connection, &target, &cycle).await {
             Ok(latest) => {
@@ -438,6 +403,126 @@ impl SyncManager {
                     Ok(LanPeerSyncOutcome::TransferFailed(message))
                 }
             }
+        }
+    }
+
+    pub(super) async fn latest_peer_endpoint_addr(
+        &self,
+        pool: &SqlitePool,
+        device_id: &str,
+    ) -> Option<EndpointAddr> {
+        repository::list_peers(pool)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|peer| peer.announcement.device_id == device_id)
+            .and_then(|peer| peer_endpoint_addr(&peer.announcement).ok())
+    }
+
+    async fn acquire_lan_peer_connection(
+        self: &Arc<Self>,
+        pool: &SqlitePool,
+        endpoint: &Endpoint,
+        peer: &SyncPeer,
+        connect_timeout: Duration,
+    ) -> Result<std::result::Result<Connection, String>> {
+        let device_id = &peer.announcement.device_id;
+        let endpoint_id = &peer.announcement.endpoint_id;
+        let mut discovered_address = self
+            .latest_peer_endpoint_addr(pool, device_id)
+            .await
+            .or_else(|| peer_endpoint_addr(&peer.announcement).ok());
+        if let Some(connection) = self.cached_lan_connection(device_id).filter(|connection| {
+            if cached_lan_connection_is_usable(connection, endpoint_id, discovered_address.as_ref())
+            {
+                return true;
+            }
+            self.invalidate_lan_connection(device_id, connection.stable_id());
+            connection.close(0_u32.into(), b"LAN route no longer discovered");
+            false
+        }) {
+            return Ok(Ok(connection));
+        }
+
+        let mut address = match discovered_address.take() {
+            Some(value) => value,
+            None => match peer_endpoint_addr(&peer.announcement) {
+                Ok(value) => value,
+                Err(error) => {
+                    log::debug!("ignore invalid discovered peer route: {error}");
+                    let message = error.to_string();
+                    repository::mark_peer_offline(pool, device_id, Some(&message)).await?;
+                    return Ok(Err(message));
+                }
+            },
+        };
+
+        repository::mark_peer_connecting(pool, device_id).await?;
+        let mut route_retried = false;
+        loop {
+            let target_address = address.clone();
+            let dial = connect_peer(endpoint, target_address, connect_timeout);
+            tokio::pin!(dial);
+            let next_address = loop {
+                let notified = self.runtime_state.lan_peer_route_ready.notified();
+                let latest_discovered = self.latest_peer_endpoint_addr(pool, device_id).await;
+                if let Some(connection) = self.cached_lan_connection(device_id).filter(|conn| {
+                    cached_lan_connection_is_usable(conn, endpoint_id, latest_discovered.as_ref())
+                }) {
+                    return Ok(Ok(connection));
+                }
+                if !route_retried {
+                    if let Some(updated) = latest_discovered {
+                        if updated != address {
+                            break updated;
+                        }
+                    }
+                }
+                tokio::select! {
+                    result = &mut dial => {
+                        match result {
+                            Ok(connection) => {
+                                super::protocol_handlers::spawn_peer_connection_service(
+                                    self.clone(),
+                                    connection.clone(),
+                                );
+                                self.store_lan_connection(device_id, connection.clone());
+                                return Ok(Ok(connection));
+                            }
+                            Err(error) => {
+                                let latest_discovered =
+                                    self.latest_peer_endpoint_addr(pool, device_id).await;
+                                if let Some(connection) =
+                                    self.cached_lan_connection(device_id).filter(|conn| {
+                                        cached_lan_connection_is_usable(
+                                            conn,
+                                            endpoint_id,
+                                            latest_discovered.as_ref(),
+                                        )
+                                    })
+                                {
+                                    return Ok(Ok(connection));
+                                }
+                                if !route_retried {
+                                    if let Some(updated) = latest_discovered {
+                                        if updated != address {
+                                            break updated;
+                                        }
+                                    }
+                                }
+                                let message = error.to_string();
+                                log::debug!("LAN peer {device_id} unavailable: {message}");
+                                repository::mark_peer_offline(pool, device_id, Some(&message))
+                                    .await?;
+                                return Ok(Err(message));
+                            }
+                        }
+                    }
+                    _ = notified => {}
+                }
+            };
+            route_retried = true;
+            address = next_address;
         }
     }
 
@@ -493,6 +578,7 @@ impl SyncManager {
         if !should_watch {
             return;
         }
+        self.runtime_state.lan_peer_route_ready.notify_waiters();
         self.on_route_connected();
 
         let manager = Arc::downgrade(self);

@@ -288,6 +288,10 @@ async fn serve_claimed_peer_connection(
     connection: Connection,
 ) -> Result<()> {
     if let Err(error) = ensure_lan_connection(&connection, LAN_PATH_SELECTION_TIMEOUT).await {
+        if connection.close_reason().is_some() {
+            log::debug!("LAN peer connection closed before path selection: {error}");
+            return Ok(());
+        }
         bail!("rejected non-LAN sync connection: {error}");
     }
     let connection_admission = Arc::new(Semaphore::new(8));
@@ -468,6 +472,10 @@ async fn dispatch_peer(
                 },
             )
             .await?;
+            let verified_routes = verified_lan_peer_addresses(connection, &device.direct_addresses);
+            let _ =
+                repository::update_peer_routes(&pool, &remote_endpoint_id, &verified_routes, true)
+                    .await?;
             let (connected_address, transport) = connection_path(connection);
             manager.store_lan_connection(&device.device_id, connection.clone());
             repository::mark_peer_online(

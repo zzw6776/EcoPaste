@@ -730,6 +730,9 @@ pub(super) async fn process_mdns_event(manager: &Arc<SyncManager>, event: Pendin
             .await
             {
                 Ok(routes_changed) => {
+                    if routes_changed {
+                        manager.runtime_state.lan_peer_route_ready.notify_waiters();
+                    }
                     match repository::peer_device_id_by_endpoint(&pool, &endpoint_id).await {
                         Ok(Some(device_id)) => manager.peer_route_available(
                             &device_id,

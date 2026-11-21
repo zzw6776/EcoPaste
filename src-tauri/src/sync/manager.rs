@@ -343,7 +343,6 @@ struct EndpointRuntime {
     endpoint: Endpoint,
     router: Router,
     config: EndpointRuntimeConfig,
-    #[cfg(target_os = "android")]
     mdns: Option<MdnsAddressLookup>,
 }
 
@@ -1386,7 +1385,6 @@ impl SyncManager {
         self.emit_updated();
     }
 
-    #[cfg(target_os = "android")]
     fn advance_presence_nonce(&self) {
         self.runtime_state
             .lan_presence_nonce
@@ -1843,9 +1841,8 @@ impl SyncManager {
         if let Err(error) = db::sync_items::reset_prep_backoff(&pool).await {
             log::debug!("reset sync prep backoff failed: {error}");
         }
-        #[cfg(target_os = "android")]
         if settings.lan_enabled {
-            self.refresh_android_lan_routes().await;
+            self.refresh_lan_routes().await;
         }
         if cloud_enabled {
             self.request_cloud_connection(Duration::from_secs(8))
@@ -1874,8 +1871,7 @@ impl SyncManager {
         {
             bail!("局域网同步已关闭");
         }
-        #[cfg(target_os = "android")]
-        self.refresh_android_lan_routes().await;
+        self.refresh_lan_routes().await;
         self.run_lan_peer_actors(device_id.as_deref()).await
     }
 
@@ -1905,18 +1901,15 @@ impl SyncManager {
 
         let mut first_error = None;
         let mut succeeded = false;
-        for batch in actors.chunks(3) {
-            let mut tasks = tokio::task::JoinSet::new();
-            for actor in batch {
-                let actor = actor.clone();
-                tasks.spawn(async move { actor.reconnect().await });
-            }
-            while let Some(result) = tasks.join_next().await {
-                match result.context("LAN reconnect task failed")? {
-                    Ok(()) => succeeded = true,
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
+        let mut tasks = tokio::task::JoinSet::new();
+        for actor in actors {
+            tasks.spawn(async move { actor.reconnect().await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result.context("LAN reconnect task failed")? {
+                Ok(()) => succeeded = true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -1958,13 +1951,39 @@ impl SyncManager {
     }
 
     #[cfg(target_os = "android")]
-    async fn refresh_android_lan_routes(&self) {
+    async fn refresh_lan_routes(self: &Arc<Self>) {
         let _guard = AndroidLanDiscoveryGuard::acquire();
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             self.runtime_state.nearby_wake.notified(),
         )
         .await;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn refresh_lan_routes(self: &Arc<Self>) {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        if !settings.enabled || !settings.lan_enabled {
+            return;
+        }
+        self.advance_presence_nonce();
+        let Ok(endpoint) = self.ensure_endpoint(&settings).await else {
+            return;
+        };
+        endpoint.network_change().await;
+        let mdns = self
+            .runtime_state
+            .endpoint
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|runtime| runtime.mdns.clone());
+        if let Some(mdns) = mdns {
+            self.configure_mdns_multicast(&mdns, &endpoint.addr()).await;
+        }
+        if let Err(error) = self.update_discovery_metadata(&endpoint, true) {
+            log::debug!("refresh desktop LAN discovery metadata failed: {error}");
+        }
     }
 
     /// Attaches ephemeral watcher context to an already durable content operation and wakes its

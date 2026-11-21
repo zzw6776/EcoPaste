@@ -442,6 +442,8 @@ fn lan_direct_addresses(addresses: &[String]) -> Vec<String> {
         .iter()
         .filter_map(|value| value.parse::<SocketAddr>().ok())
         .filter(|address| is_lan_ip(address.ip()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .map(|address| address.to_string())
         .collect()
 }

@@ -128,3 +128,56 @@ pub(super) fn lan_connection_matches_discovery(
     )
     .unwrap_or(false)
 }
+
+/// Checks whether a cached LAN connection still matches the peer identity and uses a valid private
+/// IPv4 path, even when persisted discovery routes have not been populated yet.
+pub(super) fn cached_lan_connection_is_usable(
+    connection: &Connection,
+    expected_endpoint_id: &str,
+    discovered: Option<&EndpointAddr>,
+) -> bool {
+    if let Some(discovered) = discovered {
+        return lan_connection_matches_discovery(connection, discovered);
+    }
+    let Ok(expected_id) = expected_endpoint_id.trim().parse::<EndpointId>() else {
+        return false;
+    };
+    if connection.remote_id() != expected_id {
+        return false;
+    }
+    let paths = connection.paths();
+    let selected = paths
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| path.remote_addr().clone());
+    lan_path_snapshot_is_usable(
+        selected,
+        paths.iter().map(|path| path.remote_addr().clone()),
+        None,
+    )
+    .unwrap_or(false)
+}
+
+/// Collects verified private IPv4 routes for an authenticated LAN peer connection from both the
+/// active QUIC socket path and the peer's announced LAN interface addresses.
+pub(super) fn verified_lan_peer_addresses(
+    connection: &Connection,
+    announced_direct_addresses: &[String],
+) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for path in connection.paths().iter() {
+        if let TransportAddr::Ip(address) = path.remote_addr() {
+            if is_lan_ip(address.ip()) {
+                addresses.push(address.to_string());
+            }
+        }
+    }
+    for announced in announced_direct_addresses {
+        if let Ok(address) = announced.parse::<SocketAddr>() {
+            if is_lan_ip(address.ip()) {
+                addresses.push(address.to_string());
+            }
+        }
+    }
+    addresses
+}

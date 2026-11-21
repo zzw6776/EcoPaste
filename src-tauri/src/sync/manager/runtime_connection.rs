@@ -113,7 +113,6 @@ impl SyncManager {
             endpoint: endpoint.clone(),
             router,
             config,
-            #[cfg(target_os = "android")]
             mdns,
         });
         Ok(endpoint)
@@ -482,15 +481,7 @@ impl SyncManager {
             return existing;
         }
         let pool = self.pool().await;
-        let peer = repository::list_peers(&pool).await.ok().and_then(|peers| {
-            peers
-                .into_iter()
-                .find(|peer| peer.announcement.device_id == device_id)
-        });
-        let Some(peer) = peer else {
-            return fallback_control.clone();
-        };
-        let Ok(addr) = peer_endpoint_addr(&peer.announcement) else {
+        let Some(addr) = self.latest_peer_endpoint_addr(&pool, device_id).await else {
             return fallback_control.clone();
         };
         let Ok(endpoint) = self.ensure_endpoint(settings).await else {
