@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.237"
+version = "1.1.238"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -110,6 +110,7 @@ windows = { version = "0.52", features = [
     "Win32_System_DataExchange",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Registry",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",

@@ -1,16 +1,19 @@
 //! 系统托盘：Rust 侧实现。
 //!
-//! - icon 沿用 `assets/tray.ico`（Windows）/ `assets/tray-mac.ico`（macOS），作为 Tauri 资源打包。
+//! - icon 使用单色线条资源：`assets/tray-mac.ico`（macOS 走模板图标）/ `assets/tray.ico`（Windows 按任务栏浅/深色自动切换黑白线条）。
 //! - 菜单文案做 i18n，跟随 `Appearance.language` 即时切换（见 [`crate::i18n::tray`]）。
 //! - 显隐跟随 `General.tray_icon`；语言或显隐变更后由 `commands/settings.rs` 调用 [`apply`] 同步。
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 #[cfg(not(target_os = "android"))]
 use anyhow::Context;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 use tauri::image::Image;
 #[cfg(not(target_os = "android"))]
 use tauri::menu::{Menu, MenuBuilder, MenuItem, PredefinedMenuItem};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 use tauri::path::BaseDirectory;
 #[cfg(not(target_os = "android"))]
 use tauri::tray::TrayIconBuilder;
@@ -69,6 +72,11 @@ pub fn init(app: &AppHandle, settings: &Settings) -> Result<()> {
         .map(|s| s.is_paused())
         .unwrap_or(false);
 
+    #[cfg(target_os = "windows")]
+    let initial_light = windows::is_taskbar_light();
+    #[cfg(target_os = "windows")]
+    let icon = windows::build_tray_icon(initial_light);
+    #[cfg(not(target_os = "windows"))]
     let icon = load_icon(app)?;
     let menu = build_menu(app, lang, &version, paused)?;
 
@@ -103,6 +111,9 @@ pub fn init(app: &AppHandle, settings: &Settings) -> Result<()> {
     if let Err(err) = tray.set_visible(settings.general.tray_icon) {
         log::warn!("tray set_visible on init failed: {err}");
     }
+
+    #[cfg(target_os = "windows")]
+    windows::spawn_theme_watcher(app.clone(), TRAY_ID, initial_light);
 
     Ok(())
 }
@@ -145,17 +156,12 @@ fn rebuild_menu(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
 fn load_icon(app: &AppHandle) -> Result<Image<'static>> {
-    let relative = if cfg!(target_os = "macos") {
-        "assets/tray-mac.ico"
-    } else {
-        "assets/tray.ico"
-    };
     let path = app
         .path()
-        .resolve(relative, BaseDirectory::Resource)
-        .with_context(|| format!("resolve tray icon resource {relative}"))?;
+        .resolve("assets/tray-mac.ico", BaseDirectory::Resource)
+        .context("resolve tray icon resource assets/tray-mac.ico")?;
     Ok(Image::from_path(&path).with_context(|| format!("load tray icon from {path:?}"))?)
 }
 
