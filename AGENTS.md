@@ -11,8 +11,8 @@ EcoPaste 是跨平台剪贴板管理器，采用 Rust-First 的 Tauri 架构。
 - **已发布版本按发布数据处理**：数据结构、配置格式、默认值和 migration 变更必须有明确迁移策略，不再直接覆盖已发布数据契约。
 - **升级只保证数据可迁移，不保证历史版本互通**：客户端、Hub、局域网协议和内部接口以当前版本为唯一实现，不为旧程序与新程序混用保留兼容分支、双协议、旧接口或运行时兜底；协议不兼容时提升版本并要求相关组件一起升级。已经发布到用户设备或服务端的数据仍必须支持一次性升级：数据库、配置、身份文件和 Hub 持久化数据通过原子、确定且可恢复的迁移进入当前结构，可再生成的缓存和传输状态可以安全删除重建。不得让已知旧数据、旧目录或旧配置导致升级后的应用启动报错、黑屏或核心功能不可用，也不得以静默清空用户数据作为迁移手段。
 - **每次改动必须升级版本**：每个进入 `master` 的提交都必须提升 `package.json` 版本，并同步更新 `src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`；Tauri 桌面包和 Android 包统一使用该版本。
-- **AI 默认只编译不打包运行**：完成代码修改后只执行必要的编译检查、静态检查和测试，不构建桌面安装包、Android APK 或 Docker 镜像，不安装、不启动应用或服务；交付时明确列出需要用户重启或重新构建的组件。只有用户明确要求时才执行打包、安装、启动或重启。
-- **耗时检查默认不跑**：日常改完代码只跑轻量快速检查——改前端时跑 `pnpm lint`、`pnpm tsc`、`pnpm test:unit`；改 Rust 时只跑受影响模块的编译检查或定向单测（如 `cargo test --lib sync::`）。以下耗时项默认不跑，仅在准备提交发布或用户明确要求时运行：`cargo clippy --all-targets -- -D warnings`、全量 `cargo test`、`sync-server` 全套编译与集成测试（未改 `sync-server/` 时一律不跑）。
+- **AI 默认不打包运行**：不构建桌面安装包、Android APK 或 Docker 镜像，不安装、不启动应用或服务；交付时明确列出需要用户重启或重新构建的组件。只有用户明确要求时才执行打包、安装、启动或重启。
+- **日常不跑编译检查和单测**：日常完成代码修改后，默认不运行任何编译检查（`cargo check`、`pnpm tsc`）、Lint 或单元测试（`cargo test`、`pnpm test:unit`、`cargo clippy`），全部留到准备提交推送前或用户明确要求时再统一执行；未改 `sync-server/` 时一律不跑 `sync-server` 编译与测试。
 - **用户可见结果先核对链路**：修复页面显示或跨端结果前，按实际问题范围核对“数据来源 → 跨端传递 → 状态更新 → 组件渲染”，确认失效层后再修改；某一层取值正确只能证明该层，不能据此判断最终显示已修复。
 - **固定 Rust 工具链**：所有本地和 AI 会话都使用仓库根目录 `rust-toolchain.toml` 管理的 rustup 工具链，不使用 Homebrew Rust 或绕过版本文件的 `cargo`；测试 profile 采用低磁盘配置。
 - **共享工作区的 WSL 构建隔离**：Windows 与 WSL 可以共同编辑 Windows 磁盘中的源码，但 WSL 的 `node_modules`、`src-tauri/target`、Android 项目 `.gradle`、各模块 `build` 与 `jniLibs` 必须 bind mount 到 `/root/.cache/ecopaste/` 下的 ext4 目录，Windows 使用这些挂载点下方的原生目录；挂载项由 WSL `/etc/fstab` 维护，缺失时先执行 `mount -a`，禁止在未挂载状态下构建或向 Windows 目录写入 WSL 符号链接。只有 `artifacts/` 中的最终产物跨系统共享，Windows 与 WSL 不得同时构建 Android。

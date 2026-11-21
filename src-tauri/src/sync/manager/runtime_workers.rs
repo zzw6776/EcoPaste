@@ -37,18 +37,14 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, mode: LocalOu
                     .expect("LAN connections poisoned")
                     .iter()
                     .find(|(_, connection)| connection.close_reason().is_none())
-                    .map(|(id, _)| PreparationTarget {
+                    .map(|_| PreparationTarget {
                         route: super::super::progress::TransferRoute::Lan,
-                        target: SyncConnectionTarget::peer(id.clone())
-                            .delivery_target()
-                            .to_owned(),
                     });
                 lan.or_else(|| {
                     manager
                         .cached_cloud_connection()
                         .map(|_| PreparationTarget {
                             route: super::super::progress::TransferRoute::Cloud,
-                            target: CLOUD_TARGET.to_owned(),
                         })
                 })
             } else {
@@ -86,24 +82,29 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, mode: LocalOu
                     if realtime_count > 0 {
                         return Ok::<usize, anyhow::Error>(realtime_count);
                     }
-                    if manager
-                        .runtime_state
-                        .realtime_pending
-                        .load(Ordering::Acquire)
-                        || manager.is_storage_suspended()
-                    {
+                    if manager.is_storage_suspended() {
                         return Ok(0);
                     }
                     let settings = manager.app.state::<SettingsStore>().snapshot().sync;
                     if !settings.enabled || manager.identity.snapshot().group.is_none() {
                         return Ok(0);
                     }
-                    let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
                     let pool = manager.pool().await;
+                    if db::sync_items::has_pending_realtime_outbox(&pool, settings.sync_sensitive)
+                        .await?
+                    {
+                        return Ok(0);
+                    }
+                    let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
+                    let online_peers = if settings.lan_enabled {
+                        manager.runtime_state.online_lan_peer_ids()
+                    } else {
+                        Vec::new()
+                    };
                     let (unpushed_items, pending_blobs) = repository::count_ready_backfill_backlog(
                         &pool,
                         cloud_enabled,
-                        settings.lan_enabled,
+                        &online_peers,
                     )
                     .await?;
                     let mut backfill_count = 0_usize;
@@ -158,23 +159,23 @@ pub(super) async fn local_outbox_worker(manager: Arc<SyncManager>, mode: LocalOu
                 db::sync_items::OutboxContentScope::BackfillOnly
             };
             if mode == LocalOutboxWorkerMode::BackfillFiles {
-                if manager
-                    .runtime_state
-                    .realtime_pending
-                    .load(Ordering::Acquire)
+                let settings = manager.app.state::<SettingsStore>().snapshot().sync;
+                let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
+                let pool = manager.pool().await;
+                if db::sync_items::has_pending_realtime_outbox(&pool, settings.sync_sensitive)
+                    .await
+                    .unwrap_or(false)
                 {
                     drop(activity);
                     break;
                 }
-                let settings = manager.app.state::<SettingsStore>().snapshot().sync;
-                let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
-                let pool = manager.pool().await;
-                match repository::count_ready_backfill_backlog(
-                    &pool,
-                    cloud_enabled,
-                    settings.lan_enabled,
-                )
-                .await
+                let online_peers = if settings.lan_enabled {
+                    manager.runtime_state.online_lan_peer_ids()
+                } else {
+                    Vec::new()
+                };
+                match repository::count_ready_backfill_backlog(&pool, cloud_enabled, &online_peers)
+                    .await
                 {
                     Ok((unpushed_items, pending_blobs))
                         if unpushed_items >= BACKFILL_READY_ITEMS_WATERMARK
@@ -1295,7 +1296,12 @@ pub(super) async fn attachment_worker(
             if had_error {
                 failure_count = failure_count.saturating_add(1);
                 let delay = retry_delay(usize::try_from(failure_count).unwrap_or(1).min(4));
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = manager.runtime_state.attachment_wakes[lane].notified() => {
+                        failure_count = 0;
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
                 continue;
             }
             failure_count = 0;

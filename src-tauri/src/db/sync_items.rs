@@ -10,12 +10,15 @@ const LOCAL_SEQ_KEY: &str = "local_seq";
 const LAMPORT_SEQ_KEY: &str = "origin_sequence";
 
 /// Controls whether a local item's file blobs auto-upload to Cloud (`auto`), stay deferred
-/// until manually requested (`defer`), or are explicitly queued for Cloud upload (`requested`).
+/// until manually requested (`defer`), are explicitly queued for Cloud upload (`requested`),
+/// were canceled by the user (`canceled`), or are blocked by a permanent Cloud limit (`blocked`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudBlobPolicy {
     Auto,
     Defer,
     Requested,
+    Canceled,
+    Blocked,
 }
 
 impl CloudBlobPolicy {
@@ -24,6 +27,8 @@ impl CloudBlobPolicy {
             Self::Auto => "auto",
             Self::Defer => "defer",
             Self::Requested => "requested",
+            Self::Canceled => "canceled",
+            Self::Blocked => "blocked",
         }
     }
 
@@ -31,8 +36,16 @@ impl CloudBlobPolicy {
         match value {
             "defer" => Self::Defer,
             "requested" => Self::Requested,
+            "canceled" => Self::Canceled,
+            "blocked" => Self::Blocked,
             _ => Self::Auto,
         }
+    }
+
+    /// Returns whether Cloud attachment upload/verification should proceed for an item
+    /// given whether the item originated on this device.
+    pub fn allows_cloud_upload(self, origin_is_local: bool) -> bool {
+        matches!(self, Self::Requested) || (origin_is_local && matches!(self, Self::Auto))
     }
 }
 
@@ -264,6 +277,9 @@ pub async fn stage_content_on(
             manual_share = MAX(sync_items.manual_share, excluded.manual_share),
             cloud_blob_policy = CASE
                 WHEN excluded.cloud_blob_policy = 'requested' THEN 'requested'
+                WHEN sync_items.remote_file_state IS NULL
+                     AND (sync_items.origin = 'remote' OR sync_items.cloud_blob_policy IN ('canceled', 'blocked'))
+                    THEN excluded.cloud_blob_policy
                 WHEN ? <> 0 THEN sync_items.cloud_blob_policy
                 ELSE excluded.cloud_blob_policy
             END,
@@ -339,6 +355,22 @@ pub async fn stage_existing_content(
 /// Cancels a staged content preparation matching `local_seq` without disturbing newer captures.
 pub async fn cancel_content_prep(pool: &SqlitePool, local_seq: i64) -> Result<()> {
     let now = Utc::now();
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin cancel pending sync item preparation")?;
+    sqlx::query(
+        r#"
+        DELETE FROM sync_items
+        WHERE local_seq = ?
+          AND prep_state = 'pending_content'
+          AND nonce IS NULL
+        "#,
+    )
+    .bind(local_seq)
+    .execute(&mut *tx)
+    .await
+    .context("delete canceled never-prepared sync item")?;
     sqlx::query(
         r#"
         UPDATE sync_items
@@ -352,9 +384,12 @@ pub async fn cancel_content_prep(pool: &SqlitePool, local_seq: i64) -> Result<()
     )
     .bind(now)
     .bind(local_seq)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("cancel pending sync item preparation")?;
+    tx.commit()
+        .await
+        .context("commit cancel pending sync item preparation")?;
     Ok(())
 }
 
@@ -363,6 +398,7 @@ pub async fn mark_local_favorite_on(
     connection: &mut SqliteConnection,
     sync_key: &str,
     item_id: &str,
+    kind: &str,
     is_sensitive: bool,
     is_favorite: bool,
     is_pinned: bool,
@@ -373,12 +409,13 @@ pub async fn mark_local_favorite_on(
     sqlx::query(
         r#"
         INSERT INTO sync_items (
-            sync_key, item_id, origin, is_sensitive, deleted, protected,
+            sync_key, item_id, origin, kind, is_sensitive, deleted, protected,
             favorite_seq, favorite_device_id, is_favorite, is_pinned,
             local_seq, payload_updated_at_ms, prep_state, created_at, updated_at
-        ) VALUES (?, ?, 'local', ?, 0, ?, ?, '', ?, ?, ?, ?, 'pending_state', ?, ?)
+        ) VALUES (?, ?, 'local', ?, ?, 0, ?, ?, '', ?, ?, ?, ?, 'pending_state', ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = COALESCE(sync_items.item_id, excluded.item_id),
+            kind = excluded.kind,
             is_sensitive = excluded.is_sensitive,
             is_favorite = excluded.is_favorite,
             protected = CASE
@@ -398,6 +435,7 @@ pub async fn mark_local_favorite_on(
     )
     .bind(sync_key)
     .bind(item_id)
+    .bind(kind)
     .bind(is_sensitive)
     .bind(is_favorite || is_pinned)
     .bind(lamport)
@@ -418,6 +456,7 @@ pub async fn mark_local_pinned_on(
     connection: &mut SqliteConnection,
     sync_key: &str,
     item_id: &str,
+    kind: &str,
     is_sensitive: bool,
     is_favorite: bool,
     is_pinned: bool,
@@ -428,12 +467,13 @@ pub async fn mark_local_pinned_on(
     sqlx::query(
         r#"
         INSERT INTO sync_items (
-            sync_key, item_id, origin, is_sensitive, deleted, protected,
+            sync_key, item_id, origin, kind, is_sensitive, deleted, protected,
             pinned_seq, pinned_device_id, is_favorite, is_pinned,
             local_seq, payload_updated_at_ms, prep_state, created_at, updated_at
-        ) VALUES (?, ?, 'local', ?, 0, ?, ?, '', ?, ?, ?, ?, 'pending_state', ?, ?)
+        ) VALUES (?, ?, 'local', ?, ?, 0, ?, ?, '', ?, ?, ?, ?, 'pending_state', ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = COALESCE(sync_items.item_id, excluded.item_id),
+            kind = excluded.kind,
             is_sensitive = excluded.is_sensitive,
             is_pinned = excluded.is_pinned,
             protected = CASE
@@ -453,6 +493,7 @@ pub async fn mark_local_pinned_on(
     )
     .bind(sync_key)
     .bind(item_id)
+    .bind(kind)
     .bind(is_sensitive)
     .bind(is_favorite || is_pinned)
     .bind(lamport)
@@ -473,6 +514,7 @@ pub async fn mark_local_note_on(
     connection: &mut SqliteConnection,
     sync_key: &str,
     item_id: &str,
+    kind: &str,
     is_sensitive: bool,
     note: Option<&str>,
 ) -> Result<()> {
@@ -482,12 +524,13 @@ pub async fn mark_local_note_on(
     sqlx::query(
         r#"
         INSERT INTO sync_items (
-            sync_key, item_id, origin, is_sensitive, deleted,
+            sync_key, item_id, origin, kind, is_sensitive, deleted,
             note_seq, note_device_id, note,
             local_seq, payload_updated_at_ms, prep_state, created_at, updated_at
-        ) VALUES (?, ?, 'local', ?, 0, ?, '', ?, ?, ?, 'pending_state', ?, ?)
+        ) VALUES (?, ?, 'local', ?, ?, 0, ?, '', ?, ?, ?, 'pending_state', ?, ?)
         ON CONFLICT(sync_key) DO UPDATE SET
             item_id = COALESCE(sync_items.item_id, excluded.item_id),
+            kind = excluded.kind,
             is_sensitive = excluded.is_sensitive,
             note = excluded.note,
             note_seq = excluded.note_seq,
@@ -502,6 +545,7 @@ pub async fn mark_local_note_on(
     )
     .bind(sync_key)
     .bind(item_id)
+    .bind(kind)
     .bind(is_sensitive)
     .bind(lamport)
     .bind(note)
@@ -555,7 +599,10 @@ pub async fn mark_local_deleted_on(
             next_prep_at = NULL,
             history_backfill = 0,
             manual_share = 0,
-            cloud_blob_policy = 'auto',
+            cloud_blob_policy = CASE
+                WHEN sync_items.origin = 'remote' THEN 'defer'
+                ELSE 'auto'
+            END,
             remote_file_state = NULL,
             needs_blob_pull = 0,
             updated_at = excluded.updated_at
@@ -785,4 +832,39 @@ pub async fn reset_prep_backoff(pool: &SqlitePool) -> Result<()> {
     .await
     .context("reset sync item prep backoff")?;
     Ok(())
+}
+
+/// Returns whether any realtime/manual item is ready for state or content preparation right now.
+pub async fn has_pending_realtime_outbox(
+    pool: &SqlitePool,
+    include_sensitive: bool,
+) -> Result<bool> {
+    let now = Utc::now();
+    let exists: i64 = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM sync_items s
+            WHERE s.prep_state = 'pending_state'
+              AND (? OR s.is_sensitive = 0)
+            UNION ALL
+            SELECT 1
+            FROM sync_items s
+            JOIN clipboard_items c ON c.id = s.item_id
+            WHERE s.prep_state = 'pending_content'
+              AND s.is_present = 1
+              AND (s.history_backfill = 0 OR s.manual_share = 1)
+              AND (s.next_prep_at IS NULL OR s.next_prep_at <= ?)
+              AND (? OR s.is_sensitive = 0 OR s.manual_share = 1)
+              AND (c.kind <> 'files' OR c.size IS NOT NULL)
+        )
+        "#,
+    )
+    .bind(include_sensitive)
+    .bind(now)
+    .bind(include_sensitive)
+    .fetch_one(pool)
+    .await
+    .context("check pending realtime sync outbox")?;
+    Ok(exists != 0)
 }

@@ -104,6 +104,7 @@ impl SyncManager {
                 else {
                     break;
                 };
+                let _key_lock = self.runtime_state.lock_sync_key(&pending.sync_key).await;
                 let Some(meta) = repository::load_sync_item_meta(&pool, &pending.sync_key).await?
                 else {
                     continue;
@@ -113,7 +114,6 @@ impl SyncManager {
                 let mut built_content_objects: Vec<StoredContentObject> = Vec::new();
                 let mut cloud_blob_policy: Option<db::sync_items::CloudBlobPolicy> = None;
                 let mut snapshot = if pending.deleted {
-                    cloud_blob_policy = Some(db::sync_items::CloudBlobPolicy::Auto);
                     repository::snapshot_from_meta(&meta, &device_id)
                 } else {
                     let decrypted = match (
@@ -180,7 +180,6 @@ impl SyncManager {
                     snapshot.blobs.clear();
                     snapshot.source_app = None;
                     snapshot.content_identity = None;
-                    cloud_blob_policy = Some(db::sync_items::CloudBlobPolicy::Auto);
                 }
                 let deleted = snapshot.deleted();
                 let protected = snapshot.protected();
@@ -394,7 +393,7 @@ impl SyncManager {
                         settings.auto_upload_max_mb,
                     )
                     .await?
-                    .map(|handle| PreparationProgress::new(handle, target.clone())),
+                    .map(PreparationProgress::new),
                 None => None,
             }
         } else {
@@ -477,6 +476,7 @@ impl SyncManager {
             operation.force_files,
         ));
 
+        let _key_lock = self.runtime_state.lock_sync_key(&item.sync_key).await;
         let committed = repository::commit_prepared_item(
             pool,
             repository::PreparedItemCommit {
@@ -496,7 +496,9 @@ impl SyncManager {
             },
         )
         .await?;
+        drop(_key_lock);
         if !committed {
+            preparation_guard.abandon();
             return Ok(ContentMaterialization::Completed);
         }
         let source_icon_blobs = {
@@ -520,7 +522,6 @@ impl SyncManager {
             self.runtime_state.source_asset_wake.notify_one();
         }
         preparation_guard.commit();
-        self.delivery.complete_local_import_for_item(&item.id);
         let observation = self
             .pending_observations
             .lock()

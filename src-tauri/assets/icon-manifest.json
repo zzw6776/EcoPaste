@@ -1,30 +1,31 @@
 {
   "outputs": {
     "src-tauri/gen/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": "760d4b8a06bf7163dd010c33ad2cac9e4a75fa0177afaba042f83e311eef0c3e",
-    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png": "2d01aa29b28c4131fe6af82b509fe768c3adb4d4ee7a5534f6c8de36f18c1497",
+    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png": "5aed652d61639b8bb3d6a44013616a7e11bd6dd8aa28db30b9793b5c83b09bc3",
     "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png": "eb1a7b07deec7aaf7e6fd53ed575984fb19eba7457b2b42b61d3dad948a1bd46",
     "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher.png": "4586d965141052631705d1931224ab862a4b2bbbc6c5924179f058f7cf487921",
-    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png": "3b6a374cc1a340102bc325f1109e6010bfee74eaf99b25a48ca1e71dcf1b4bbe",
+    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png": "192c677b673da50e8a0392f8bb47b6e9242a7c8da64a52bfd00b011e29213024",
     "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png": "f42dd0b2c3a625c51f7ed6ecbb09437cfd57916870b1750b662b36d38b23f28a",
     "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher.png": "034333d3049025153add518ff7c30f345f38427414f5e534b678a8e8164884f2",
-    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png": "abd3ea44e382568c093a4fe3e6b6202b419f05abeda26856ee01e2c6c7a19786",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png": "f837fc04f4687fb5cc63daf21d0c74d4b592470f6b67fbfe03df07c2baf45688",
     "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png": "a2d74fdb9a1225c65e2b5eeae0d34e034a4164db255a9f1825cb8344861271ec",
     "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png": "66f9792a8dc08ba592fcfddaf86464e60b21f98d5eba4cff81b898ac55535a13",
-    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png": "cea8ff9595af2da53891ad4f329fa35f14fb851b80cc808fdd25835dbea5bd0a",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png": "16ed4bf701f043f6f78d49e2dd5f8bc520dc3b374e65b94f56dbed74a9b38854",
     "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png": "b75d5cdf1084ca37b150698a7fb1c6be632966012b06c8f085949e29fcc69492",
     "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png": "2cd5d8a0933734a475fa4c4cdb10a03394942238c7e11f8a16379f747eb5455e",
-    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png": "fe686a97d47a752ca68ef7d58dfa3899b9f0d699fad1e3377f5445868d53c0d7",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png": "d1997534078f0f8180a2b7a1f195cee1976e5684ae9cae37d44edfced775c4c4",
     "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png": "27cd3a535b8c6d9cb837f634127953e8e7a6640f26c6868b1292c213961cc0a8",
     "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png": "53a38b5b0b7eb2789ee12f46b5574525f69bf95ce4b8d1084949550f9203d2ec",
     "src-tauri/gen/android/app/src/main/res/values/ic_launcher_background.xml": "0687336f0ccc6f7ee09c7c95110667c63b75931238df779a21af401fb864cd34",
-    "src-tauri/icons/32x32.png": "f010a46ceb71d423938fc2ef0d036d76792c999cdc4b18b1d3a9b7e92611ce75",
-    "src-tauri/icons/128x128.png": "7350318170eefdbb458f4cceefe402fdcf63ee7ab1f8259f587e1e231bd2206f",
-    "src-tauri/icons/128x128@2x.png": "58264cafc34d7f1dbdb8dfaec26d9d44a22ee68f757f6729165c993ff580780e",
+    "src-tauri/icons/32x32.png": "ba9345f2eaed28ff8b906b931722fc843da4f03eefb1ad5b8d56038ba5d181ed",
+    "src-tauri/icons/128x128.png": "caf5dfcb9ddba2ed97ac6869af8ce73e099ffa454d149db42ff9269cd1951a02",
+    "src-tauri/icons/128x128@2x.png": "86e680569474a07ae84fadb7ae53a68bf6bd4027fbf2a923f9306123a0daf607",
     "src-tauri/icons/icon.icns": "453d8fe4113d7732cf6085b31f2ebc796e35c505e4c0c8fd3ae30dd2074c9f2a",
-    "src-tauri/icons/icon.ico": "a35784ffea2c175709ceea3c239b1e0fcde1b2ecb3ce3efb1668a286c968471a"
+    "src-tauri/icons/icon.ico": "657bedae9f9bb70e9f41fda29032d65833809f876544d87b6f3ca82b12308c9e"
   },
   "sources": {
-    "default": "c83c36da885b335fa057b29a98a1c929a96468019cd74f452b57dd9d06f702c1",
+    "android": "8ca311a14ede54dbeb56da5744bf50a9ab2109a41aeaeb71fb300315883e8d51",
+    "default": "c1ad6850bd1c18f68c0081c2f9110e0d0891925ac26b56449b915b34b883b769",
     "macos": "c1ad6850bd1c18f68c0081c2f9110e0d0891925ac26b56449b915b34b883b769"
   },
   "tauriVersion": "tauri-cli 2.11.4"

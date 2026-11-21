@@ -5,6 +5,8 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "android")]
 use std::{collections::HashSet, io::Write, mem::ManuallyDrop, os::fd::FromRawFd, sync::Arc};
+#[cfg(target_os = "android")]
+use tauri::Emitter;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -595,7 +597,12 @@ pub(crate) async fn receive(
             Some(crate::db::sync_items::CloudBlobPolicy::Requested) => {
                 crate::sync::TransferRoute::Cloud
             }
-            Some(crate::db::sync_items::CloudBlobPolicy::Auto) | None => {
+            Some(
+                crate::db::sync_items::CloudBlobPolicy::Auto
+                | crate::db::sync_items::CloudBlobPolicy::Canceled
+                | crate::db::sync_items::CloudBlobPolicy::Blocked,
+            )
+            | None => {
                 if lan_connected {
                     crate::sync::TransferRoute::Lan
                 } else {
@@ -617,6 +624,7 @@ pub(crate) async fn receive(
         .await
         {
             Ok(result) => {
+                drop(_guard);
                 item = crate::db::items::find_item_by_id(&pool, &result.id)
                     .await?
                     .context("imported shared file record is missing")?;
@@ -640,6 +648,17 @@ pub(crate) async fn receive(
                             .execute(&pool)
                             .await
                             .context("update imported shared file size")?;
+                        if let Err(error) = app.emit(
+                            super::watcher::CLIPBOARD_UPDATED_EVENT,
+                            serde_json::json!({
+                                "id": item.id,
+                                "kind": item.kind,
+                                "deduplicated": true,
+                            }),
+                        ) {
+                            log::warn!("emit imported shared file size update failed: {error}");
+                        }
+                        crate::commands::android::notify_overlay_clipboard_changed();
                         let cloud_blob_policy = shared_cloud_blob_policy(
                             &item,
                             app.state::<crate::settings::SettingsStore>()
@@ -658,11 +677,6 @@ pub(crate) async fn receive(
                                 .await;
                             outcome.skipped += 1;
                         } else {
-                            if let Some((manager, task_id)) =
-                                manager.as_ref().zip(task_id.as_deref())
-                            {
-                                manager.finish_shared_file_import(task_id, total_bytes);
-                            }
                             match crate::db::sync_items::stage_existing_content(
                                 &pool,
                                 &item,
@@ -675,15 +689,6 @@ pub(crate) async fn receive(
                             .await
                             {
                                 Ok(operation_order) => {
-                                    if let Some((manager, task_id)) =
-                                        manager.as_ref().zip(task_id.as_deref())
-                                    {
-                                        manager.bind_shared_file_import(
-                                            task_id,
-                                            operation_order,
-                                            item.source_revision.clone(),
-                                        );
-                                    }
                                     let canceled = manager
                                         .as_ref()
                                         .zip(task_id.as_deref())
@@ -698,6 +703,11 @@ pub(crate) async fn receive(
                                         .await?;
                                         outcome.saved += 1;
                                     } else {
+                                        if let Some((manager, task_id)) =
+                                            manager.as_ref().zip(task_id.as_deref())
+                                        {
+                                            manager.finish_shared_file_import(task_id, total_bytes);
+                                        }
                                         crate::sync::notify_local_item_ready(app);
                                         outcome.saved += 1;
                                     }
@@ -744,6 +754,7 @@ pub(crate) async fn receive(
                 }
             }
             Err(error) => {
+                drop(_guard);
                 if let Some((manager, task_id)) = manager.as_ref().zip(task_id.as_deref()) {
                     manager.fail_shared_file_import(task_id, 0, error.to_string());
                 }
@@ -752,8 +763,11 @@ pub(crate) async fn receive(
                 log::error!("persist Android shared file placeholder failed: {error:#}");
             }
         }
+    } else {
+        drop(_guard);
     }
     if outcome.failed > 0 {
+        let _cleanup_guard = super::shared_files::lock().await;
         if let Err(error) = super::shared_files::cleanup_locked(&pool, owned_root).await {
             log::warn!("reclaim failed share attachments failed: {error:#}");
         }

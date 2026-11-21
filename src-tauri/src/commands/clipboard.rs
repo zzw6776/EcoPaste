@@ -1812,7 +1812,7 @@ pub async fn delete_clipboard_item(
         {
             log::warn!("reclaim deleted file resources failed: {error:#}");
         }
-        crate::sync::notify_local_state_changed(&app);
+        crate::sync::notify_local_item_deleted(&app, &id);
     }
     Ok(())
 }
@@ -1851,7 +1851,7 @@ pub async fn clear_clipboard_items(
     ) {
         log::warn!("emit {CLIPBOARD_UPDATED_EVENT} after clear failed: {err}");
     }
-    crate::sync::notify_local_state_changed(&app);
+    crate::sync::notify_local_items_cleared(&app);
 
     Ok(outcome.removed)
 }

@@ -162,11 +162,16 @@ impl SyncManager {
             return Ok(None);
         }
 
+        let _key_lock = self
+            .runtime_state
+            .lock_sync_key(&remote_snapshot.sync_key)
+            .await;
         let existing = repository::load_sync_item_meta(pool, &remote_snapshot.sync_key).await?;
         if let Some(existing_meta) = &existing {
             // If a newer local content capture is still encrypting in the background, only a
             // strictly newer remote deletion tombstone may supersede it before prep finishes.
-            let local_preparing_newer_content = existing_meta.nonce.is_none()
+            let local_preparing_newer_content = (existing_meta.nonce.is_none()
+                || existing_meta.prep_state == "pending_content")
                 && existing_meta.is_present
                 && existing_meta.content_version > remote_snapshot.content_version;
             let remote_deletes = !remote_snapshot.is_present
@@ -191,7 +196,10 @@ impl SyncManager {
                 && !merged.snapshot.blobs.is_empty()
                 && existing_meta.local_state != "managed"
                 && !input.available_blob_ids.is_empty();
-            let needs_apply = merged.local_changed;
+            let needs_apply = merged.local_changed
+                || (newly_available_blobs
+                    && !existing_meta.needs_blob_pull
+                    && existing_meta.remote_file_state.is_none());
             let needs_blob_wake = !merged.snapshot.deleted()
                 && (existing_meta.needs_blob_pull || newly_available_blobs);
             if merged.remote_changed {
@@ -251,6 +259,10 @@ impl SyncManager {
             },
         )
         .await?;
+        drop(_key_lock);
+        if final_snapshot.deleted() {
+            self.delivery.cancel_sync_key_transfers(&sync_key);
+        }
 
         Ok(Some((
             final_snapshot,
@@ -902,6 +914,9 @@ impl SyncManager {
             None
         };
 
+        let _cloud_data_activity = source
+            .is_cloud()
+            .then(|| self.acquire_cloud_data_activity());
         let transferred = AtomicU64::new(0);
         let mut completed_bytes = 0_u64;
         let mut staged_blobs = Vec::with_capacity(snapshot.blobs.len());
@@ -1025,6 +1040,24 @@ impl SyncManager {
                 .await?;
                 return Ok(true);
             }
+        }
+
+        let _key_lock = self.runtime_state.lock_sync_key(&meta.sync_key).await;
+        let latest_meta = repository::load_sync_item_meta(pool, &meta.sync_key).await?;
+        if latest_meta
+            .as_ref()
+            .is_none_or(|current| current.deleted || !current.is_present)
+        {
+            for blob in staged_blobs {
+                let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+            }
+            if let Some((task_id, handle)) = &transfer_handle {
+                handle.mark_canceled(completed_bytes);
+                let _ = repository::unlock_transfer_item(pool, task_id).await;
+            }
+            drop(download_claim);
+            self.emit_updated();
+            return Ok(true);
         }
 
         let apply_res = self
@@ -1176,10 +1209,13 @@ impl SyncManager {
                 log::warn!("reclaim deleted synchronized images failed: {error:#}");
             }
         }
-        if let Err(error) =
-            crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
         {
-            log::warn!("reclaim deleted synchronized files failed: {error:#}");
+            let _files_guard = crate::clipboard::shared_files::lock().await;
+            if let Err(error) =
+                crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
+            {
+                log::warn!("reclaim deleted synchronized files failed: {error:#}");
+            }
         }
         Ok(())
     }

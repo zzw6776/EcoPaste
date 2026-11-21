@@ -20,8 +20,8 @@ use crate::db;
 use super::{
     model::StoredBlob,
     progress::{
-        LocalImportPromotion, PreparationClaim, TransferDirection, TransferHandle, TransferPhase,
-        TransferRegistry, TransferRoute, TransferTask,
+        TransferDirection, TransferHandle, TransferPhase, TransferRegistry, TransferRoute,
+        TransferTask,
     },
     repository,
 };
@@ -49,25 +49,22 @@ pub(super) enum UploadTransferStart {
     Canceled,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(super) struct PreparationTarget {
     pub route: TransferRoute,
-    pub target: String,
 }
 
 #[derive(Clone)]
 pub(super) struct PreparationProgress {
     pub handle: TransferHandle,
     processed: Arc<AtomicU64>,
-    target: PreparationTarget,
 }
 
 impl PreparationProgress {
-    pub fn new(handle: TransferHandle, target: PreparationTarget) -> Self {
+    pub fn new(handle: TransferHandle) -> Self {
         Self {
             handle,
             processed: Arc::new(AtomicU64::new(0)),
-            target,
         }
     }
 
@@ -78,11 +75,6 @@ impl PreparationProgress {
     pub fn report(&self, bytes: u64) {
         self.processed.store(bytes, Ordering::Release);
         self.handle.preparing(bytes);
-    }
-
-    pub fn prepared(&self) {
-        self.handle
-            .prepared(self.target.route, self.target.target.clone());
     }
 }
 
@@ -271,9 +263,18 @@ impl PreparationCommitGuard {
         }
     }
 
+    /// Finishes the transient preparation task so it never lingers as an ownerless queued entry.
     pub fn commit(&mut self) {
         if let Some(progress) = &self.progress {
-            progress.prepared();
+            progress.handle.abandon();
+        }
+        self.committed = true;
+    }
+
+    /// Removes the transient preparation task when a newer revision supersedes this operation.
+    pub fn abandon(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.handle.abandon();
         }
         self.committed = true;
     }
@@ -417,18 +418,8 @@ impl DeliveryCoordinator {
     }
 
     #[cfg(target_os = "android")]
-    pub fn bind_local_import(&self, task_id: &str, operation_order: i64, source_revision: String) {
-        self.registry
-            .bind_local_import(task_id, operation_order, source_revision);
-    }
-
-    #[cfg(target_os = "android")]
     pub fn fail_local_import(&self, task_id: &str, bytes: u64, error: String) {
         self.registry.fail_local_import(task_id, bytes, error);
-    }
-
-    pub fn promote_local_import(&self, promotion: LocalImportPromotion) -> Option<TransferHandle> {
-        self.registry.promote_local_import(promotion)
     }
 
     pub fn start_preparation(
@@ -472,8 +463,20 @@ impl DeliveryCoordinator {
         self.registry.item_has_active_local_import(item_id)
     }
 
-    pub fn complete_local_import_for_item(&self, item_id: &str) {
-        self.registry.complete_local_import_for_item(item_id);
+    pub fn cancel_upload_operation(&self, sync_key: &str, target: &str) {
+        self.registry.cancel_upload_operation(sync_key, target);
+    }
+
+    pub fn clear_all_transfers(&self) {
+        self.registry.clear_all();
+    }
+
+    pub fn cancel_item_transfers(&self, item_id: &str) {
+        self.registry.cancel_by_item_id(item_id);
+    }
+
+    pub fn cancel_sync_key_transfers(&self, sync_key: &str) {
+        self.registry.cancel_by_operation_id(sync_key);
     }
 
     /// Cancels preparation or delivery while serializing the transition to confirmation.
@@ -537,16 +540,6 @@ impl DeliveryCoordinator {
         };
         let task_key = format!("{sync_key}\0{target}\0{}", blob.blob_id);
         let task_id = blake3::hash(task_key.as_bytes()).to_hex().to_string();
-        match self
-            .registry
-            .claim_preparation(sync_key, route, target, operation_total_bytes)
-        {
-            PreparationClaim::Claimed(transfer) => {
-                return Ok(UploadTransferStart::Ready(Some(transfer)));
-            }
-            PreparationClaim::Canceled => return Ok(UploadTransferStart::Canceled),
-            PreparationClaim::Missing => {}
-        }
 
         Ok(UploadTransferStart::Ready(Some(self.registry.start(
             TransferTask {

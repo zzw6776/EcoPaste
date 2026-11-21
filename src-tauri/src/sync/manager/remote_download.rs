@@ -54,11 +54,23 @@ impl SyncManager {
 
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         let origin_device_id = meta.origin_device_id.clone().unwrap_or_default();
-        let status = repository::item_statuses(&pool, std::slice::from_ref(&item_id))
-            .await?
-            .into_iter()
-            .next()
-            .context("远端文件状态不存在")?;
+        let cloud_enabled = settings.cloud_enabled && server_is_configured(&settings);
+        let online_peers = if settings.lan_enabled {
+            self.runtime_state.online_lan_peer_ids()
+        } else {
+            Vec::new()
+        };
+        let status = repository::item_statuses(
+            &pool,
+            std::slice::from_ref(&item_id),
+            cloud_enabled,
+            &online_peers,
+            &HashMap::new(),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .context("远端文件状态不存在")?;
         let cloud_content_available =
             status.cloud.availability == SyncContentAvailability::Complete;
         let active_lan_connection = self.cached_lan_connection(&origin_device_id).is_some();
@@ -186,13 +198,25 @@ impl SyncManager {
                     {
                         log::warn!("record downloaded external blob bindings failed: {error:#}");
                     }
-                    manager
-                        .send_lan_acks_for_completed_item(&pool, &group, &sync_key, &item_key_owned)
-                        .await;
+                    handle.completed(total_bytes);
                     manager.emit_updated();
                     #[cfg(target_os = "android")]
                     crate::commands::android::notify_overlay_clipboard_changed();
-                    handle.completed(total_bytes);
+                    let ack_manager = manager.clone();
+                    let ack_pool = pool.clone();
+                    let ack_group = group.clone();
+                    let ack_sync_key = sync_key.clone();
+                    let ack_item_key = item_key_owned.clone();
+                    tauri::async_runtime::spawn(async move {
+                        ack_manager
+                            .send_lan_acks_for_completed_item(
+                                &ack_pool,
+                                &ack_group,
+                                &ack_sync_key,
+                                &ack_item_key,
+                            )
+                            .await;
+                    });
                 }
                 Err(_error) if handle.canceled() => handle.mark_canceled(transferred),
                 Err(error) => handle.failed(transferred, error.to_string()),
@@ -290,6 +314,7 @@ impl SyncManager {
             destination,
             route,
         } = request;
+        let _cloud_data_activity = self.acquire_cloud_data_activity();
         handle.connecting();
         let (mut active_route, mut connection) =
             match self.remote_file_connection(origin_device_id, route).await {

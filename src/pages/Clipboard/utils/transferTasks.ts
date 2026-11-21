@@ -8,7 +8,6 @@ const terminalPhases: TransferPhase[] = [
 ];
 
 export function isTransferActive(task: TransferTask) {
-  if (task.target === "import" && task.phase === "queued") return false;
   return !terminalPhases.includes(task.phase);
 }
 

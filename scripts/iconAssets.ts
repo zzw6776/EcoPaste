@@ -15,7 +15,7 @@ export interface IconOutput {
   targetPath: string;
 }
 
-export type IconSource = "default" | "macos";
+export type IconSource = "default" | "macos" | "android";
 
 export const projectRoot = resolve(import.meta.dirname, "..");
 export const manifestPath = resolve(
@@ -23,6 +23,7 @@ export const manifestPath = resolve(
   "src-tauri/assets/icon-manifest.json",
 );
 export const iconSources: Record<IconSource, string> = {
+  android: "src-tauri/assets/logo-android.png",
   default: "src-tauri/assets/logo.png",
   macos: "src-tauri/assets/logo-mac.png",
 };
@@ -34,6 +35,14 @@ const androidFileNames = [
   "ic_launcher_foreground.png",
   "ic_launcher_round.png",
 ];
+
+function getAndroidFileSource(fileName: string): IconSource {
+  if (fileName === "ic_launcher_foreground.png") {
+    return "android";
+  }
+
+  return "macos";
+}
 
 export const iconOutputs: IconOutput[] = [
   {
@@ -63,21 +72,21 @@ export const iconOutputs: IconOutput[] = [
   },
   {
     generatedPath: "android/mipmap-anydpi-v26/ic_launcher.xml",
-    source: "default",
+    source: "android",
     targetPath: `${androidResourceRoot}/mipmap-anydpi-v26/ic_launcher.xml`,
   },
   ...androidDensities.flatMap((density) => {
     return androidFileNames.map((fileName) => {
       return {
         generatedPath: `android/mipmap-${density}/${fileName}`,
-        source: "default" as const,
+        source: getAndroidFileSource(fileName),
         targetPath: `${androidResourceRoot}/mipmap-${density}/${fileName}`,
       };
     });
   }),
   {
     generatedPath: "android/values/ic_launcher_background.xml",
-    source: "default",
+    source: "android",
     targetPath: `${androidResourceRoot}/values/ic_launcher_background.xml`,
   },
 ];
@@ -102,15 +111,18 @@ export function getTauriVersion(): string {
 /** 根据工作区中的源文件和目标文件创建只包含内容摘要的图标清单。 */
 export async function createIconManifest(): Promise<IconManifest> {
   const sources = {} as Record<IconSource, string>;
-  for (const [name, path] of Object.entries(iconSources) as [
-    IconSource,
-    string,
-  ][]) {
+  const sortedSourceEntries = (
+    Object.entries(iconSources) as [IconSource, string][]
+  ).sort(([a], [b]) => a.localeCompare(b));
+  for (const [name, path] of sortedSourceEntries) {
     sources[name] = await hashFile(resolve(projectRoot, path));
   }
 
   const outputs: Record<string, string> = {};
-  for (const output of iconOutputs) {
+  const sortedOutputs = [...iconOutputs].sort((a, b) =>
+    a.targetPath.localeCompare(b.targetPath),
+  );
+  for (const output of sortedOutputs) {
     outputs[output.targetPath] = await hashFile(
       resolve(projectRoot, output.targetPath),
     );

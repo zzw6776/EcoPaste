@@ -526,22 +526,20 @@ pub async fn update_peer_window_cursor(
     Ok(())
 }
 
-/// Returns whether at least one paired device currently has an active LAN connection.
-pub async fn has_online_peer(pool: &SqlitePool) -> Result<bool> {
-    sqlx::query_scalar(
+/// Resets stale persisted peer connection states to `offline` on runtime startup.
+pub async fn reset_peer_connections_offline(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
         r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM sync_peers peer
-            JOIN sync_peer_connections connection
-              ON connection.device_id = peer.device_id
-             AND connection.state = 'online'
-        )
+        UPDATE sync_peer_connections
+        SET state = 'offline', connected_address = NULL, transport = NULL, updated_at = ?
+        WHERE state <> 'offline'
         "#,
     )
-    .fetch_one(pool)
+    .bind(Utc::now())
+    .execute(pool)
     .await
-    .context("check online LAN delivery targets")
+    .context("reset stale sync peer connections offline")?;
+    Ok(())
 }
 
 pub async fn mark_peer_connecting(pool: &SqlitePool, device_id: &str) -> Result<()> {
@@ -691,8 +689,14 @@ pub async fn peer_by_endpoint_id(
 /// Collapses sparse sequence gaps above `catchup_before_seq` to the actual count of pulled items
 /// recorded in `sync_item_targets` when available so historical sequence holes do not inflate the
 /// initial catch-up percentage.
-pub async fn inbound_lan_catchup_window(pool: &SqlitePool) -> Result<(u64, u64, Vec<String>)> {
-    let rows = sqlx::query(
+pub async fn inbound_lan_catchup_window(
+    pool: &SqlitePool,
+    online_peer_ids: &[String],
+) -> Result<(u64, u64, Vec<String>)> {
+    if online_peer_ids.is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+    let mut query = sqlx::QueryBuilder::new(
         r#"
         SELECT p.device_name, p.pull_cursor, p.catchup_before_seq, p.window_high_seq,
                (
@@ -702,14 +706,20 @@ pub async fn inbound_lan_catchup_window(pool: &SqlitePool) -> Result<(u64, u64, 
                      AND t.remote_seq >= p.catchup_before_seq
                ) AS pulled_in_window
         FROM sync_peers p
-        JOIN sync_peer_connections c ON c.device_id = p.device_id AND c.state = 'online'
         WHERE p.catchup_before_seq IS NOT NULL
-        ORDER BY p.device_name ASC, p.device_id ASC
+          AND p.device_id IN (
         "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("read inbound LAN peer catchup cursors")?;
+    );
+    let mut separated = query.separated(", ");
+    for peer_id in online_peer_ids {
+        separated.push_bind(peer_id);
+    }
+    query.push(") ORDER BY p.device_name ASC, p.device_id ASC");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("read inbound LAN peer catchup cursors")?;
 
     let mut completed = 0_u64;
     let mut total = 0_u64;

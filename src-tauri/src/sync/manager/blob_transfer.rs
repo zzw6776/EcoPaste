@@ -110,17 +110,30 @@ pub(super) async fn upload_blob_with_probe(
     blob: &StoredBlob,
     options: BlobUploadOptions,
 ) -> (Result<()>, bool) {
+    let (result, unhealthy, _) = upload_blob_attempt(connection, group, blob, options, true).await;
+    (result, unhealthy)
+}
+
+/// Runs one attachment upload attempt; callers that may immediately retry on a fresh connection
+/// pass `finalize_failure = false` so the UI task does not flash `Failed` before the retry.
+pub(super) async fn upload_blob_attempt(
+    connection: &Connection,
+    group: &GroupSecrets,
+    blob: &StoredBlob,
+    options: BlobUploadOptions,
+    finalize_failure: bool,
+) -> (Result<()>, bool, u64) {
     let _slot = match options.kind {
         BlobUploadKind::Content => {
             let limits = attachment_limits(connection);
             match limits.acquire(options.file_content, true).await {
                 Ok(permit) => permit,
-                Err(error) => return (Err(error), false),
+                Err(error) => return (Err(error), false, 0),
             }
         }
         BlobUploadKind::SourceIcon => match source_icon_limits(connection).acquire_owned().await {
             Ok(permit) => permit,
-            Err(error) => return (Err(error.into()), false),
+            Err(error) => return (Err(error.into()), false, 0),
         },
     };
     let _sync_activity = SyncActivityGuard::acquire();
@@ -173,10 +186,17 @@ pub(super) async fn upload_blob_with_probe(
             Ok(BlobUploadOutcome::AlreadyAvailable) => transfer.already_available(blob.size),
             Ok(BlobUploadOutcome::Uploaded) => transfer.completed(blob.size),
             Err(_) if transfer.canceled() => transfer.mark_canceled(progress.written_bytes),
-            Err(error) => transfer.failed(progress.written_bytes, error.to_string()),
+            Err(error) if finalize_failure => {
+                transfer.failed(progress.written_bytes, error.to_string())
+            }
+            Err(_) => {}
         }
     }
-    (result.map(|_| ()), unhealthy_connection)
+    (
+        result.map(|_| ()),
+        unhealthy_connection,
+        progress.written_bytes,
+    )
 }
 
 /// Diagnoses a stalled upload; the watch supervisor owns connection recovery.
@@ -365,12 +385,16 @@ pub(super) async fn upload_blob_inner(
             encrypted_writer.shutdown().await?;
             Ok::<_, anyhow::Error>(())
         };
+        let last_wire_activity = StdMutex::new(Instant::now());
         let transmit = multipart::send(&mut encrypted_reader, peer, blob.size, |bytes| {
+            *last_wire_activity
+                .lock()
+                .expect("upload wire activity timestamp poisoned") = Instant::now();
             if let Some(handle) = &options.transfer {
                 handle.transferred(bytes);
             }
         });
-        cancelable_transfer(
+        cancelable_transfer_with_idle_timeout(
             async {
                 tokio::try_join!(produce, transmit)?;
                 Ok(())
@@ -380,6 +404,13 @@ pub(super) async fn upload_blob_inner(
                     .transfer
                     .as_ref()
                     .is_some_and(|handle| handle.canceled())
+            },
+            idle_timeout,
+            options.language,
+            || {
+                *last_wire_activity
+                    .lock()
+                    .expect("upload wire activity timestamp poisoned")
             },
         )
         .await?;
@@ -1139,6 +1170,33 @@ where
             result = &mut work => return result,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if canceled() { bail!("transfer canceled"); }
+            }
+        }
+    }
+}
+
+/// Cancels all part streams on user cancellation or when wire progress stalls beyond `idle_timeout`.
+pub(super) async fn cancelable_transfer_with_idle_timeout<F, T>(
+    work: F,
+    canceled: impl Fn() -> bool,
+    idle_timeout: Duration,
+    language: Language,
+    last_activity: impl Fn() -> Instant,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if canceled() {
+                    bail!("transfer canceled");
+                }
+                if last_activity().elapsed() >= idle_timeout {
+                    return Err(super::super::upload::write_timeout_error(language));
+                }
             }
         }
     }

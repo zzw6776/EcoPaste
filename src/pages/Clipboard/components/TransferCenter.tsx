@@ -221,10 +221,7 @@ const TransferCenter: FC<TransferCenterProps> = (props) => {
   const sorted = useMemo(() => {
     return sortTransferTasksForDisplay(
       transferTasks.filter((task) => {
-        return (
-          task.target !== "import" ||
-          (task.phase !== "queued" && task.phase !== "completed")
-        );
+        return task.target !== "import" || task.phase !== "completed";
       }),
     );
   }, [transferTasks]);
