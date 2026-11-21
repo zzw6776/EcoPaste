@@ -108,7 +108,11 @@ pub async fn live_sync_blob_ids(pool: &SqlitePool) -> Result<HashSet<String>> {
 
 /// Drops non-deleted sync metadata rows whose local clipboard record was evicted and that are
 /// no longer needed for outbound delivery. Tombstones stay so deletion propagates across devices.
-pub async fn prune_released_items(pool: &SqlitePool, limit: u32) -> Result<u64> {
+pub async fn prune_released_items(
+    pool: &SqlitePool,
+    cloud_enabled: bool,
+    limit: u32,
+) -> Result<u64> {
     let rows = sqlx::query_scalar::<_, String>(
         r#"
         SELECT s.sync_key
@@ -119,10 +123,50 @@ pub async fn prune_released_items(pool: &SqlitePool, limit: u32) -> Result<u64> 
           AND s.prep_state = 'ready'
           AND s.needs_apply = 0
           AND s.needs_blob_pull = 0
+          AND NOT (
+              s.origin = 'local'
+              AND julianday(s.updated_at) > julianday('now', '-24 hours')
+              AND (
+                  (
+                      ?
+                      AND (
+                          (
+                              s.local_seq > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM sync_item_targets t
+                                  WHERE t.sync_key = s.sync_key
+                                    AND t.target_id = 'cloud'
+                                    AND t.pushed_local_seq >= s.local_seq
+                              )
+                          )
+                          OR (
+                              s.cloud_blob_policy IN ('auto', 'requested')
+                              AND EXISTS (
+                                  SELECT 1 FROM sync_item_blobs b
+                                  WHERE b.sync_key = s.sync_key
+                                    AND b.optional = 0
+                                    AND b.cloud_available = 0
+                                    AND b.local_available = 1
+                              )
+                          )
+                      )
+                  )
+                  OR (
+                      s.local_seq > 0
+                      AND EXISTS (
+                          SELECT 1 FROM sync_peers p
+                          LEFT JOIN sync_item_targets t
+                            ON t.sync_key = s.sync_key AND t.target_id = ('peer:' || p.device_id)
+                          WHERE t.target_id IS NULL OR t.pushed_local_seq < s.local_seq
+                      )
+                  )
+              )
+          )
         ORDER BY s.updated_at ASC
         LIMIT ?
         "#,
     )
+    .bind(cloud_enabled)
     .bind(i64::from(limit.max(1)))
     .fetch_all(pool)
     .await
@@ -496,9 +540,9 @@ pub async fn item_statuses(
         item_facts.cloud_blob_policy =
             crate::db::sync_items::CloudBlobPolicy::parse(&cloud_blob_policy);
         item_facts.remote_file_available = remote_file_state.as_deref() == Some("available");
+        item_facts.prep_error = prep_error;
         if prep_state != "ready" {
             item_facts.prep_pending = true;
-            item_facts.prep_error = prep_error;
             item_facts.local_seq = local_seq;
         } else {
             item_facts.local_seq = if has_snapshot { local_seq } else { 0 };

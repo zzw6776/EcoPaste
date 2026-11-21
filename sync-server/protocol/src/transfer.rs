@@ -188,6 +188,20 @@ fn part_count(size: u64) -> u64 {
         .max(1)
 }
 
+/// Reads from a local source (`duplex` pipe or local file) without imposing a network timeout;
+/// upstream producers own local disk I/O deadlines.
+async fn read_source_bytes<R: AsyncRead + Unpin>(reader: &mut R, bytes: &mut [u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = reader.read(&mut bytes[offset..]).await?;
+        if count == 0 {
+            bail!("transfer part ended early");
+        }
+        offset += count;
+    }
+    Ok(())
+}
+
 /// Deadlines measure idle time, including slow connections that take minutes per part.
 async fn read_bytes<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -215,12 +229,12 @@ async fn write_bytes<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     on_write: Option<&mpsc::UnboundedSender<u64>>,
+    timeout: Duration,
 ) -> Result<()> {
     for block in bytes.chunks(IO_BLOCK_BYTES) {
         let mut offset = 0;
         while offset < block.len() {
-            let count =
-                tokio::time::timeout(IDLE_TIMEOUT, writer.write(&block[offset..])).await??;
+            let count = tokio::time::timeout(timeout, writer.write(&block[offset..])).await??;
             if count == 0 {
                 bail!("transfer part write stopped");
             }
@@ -234,9 +248,9 @@ async fn write_bytes<W: AsyncWrite + Unpin>(
 }
 
 /// Consumes FIN before releasing a successful stream; dropping it earlier sends STOP_SENDING.
-async fn finish_read(recv: &mut RecvStream) -> Result<()> {
+async fn finish_read(recv: &mut RecvStream, timeout: Duration) -> Result<()> {
     let mut trailing = [0u8; 1];
-    let count = tokio::time::timeout(IDLE_TIMEOUT, AsyncReadExt::read(recv, &mut trailing))
+    let count = tokio::time::timeout(timeout, AsyncReadExt::read(recv, &mut trailing))
         .await
         .context("wait for transfer part finish timeout")?
         .context("read transfer part finish")?;
@@ -350,7 +364,10 @@ impl Transfers {
 }
 
 #[derive(Clone)]
-pub struct PartPeer(Peer);
+pub struct PartPeer {
+    peer: Peer,
+    idle_timeout: Duration,
+}
 
 #[derive(Clone)]
 enum Peer {
@@ -367,49 +384,64 @@ enum Peer {
 
 impl RegisteredTransfer {
     pub fn peer(&self) -> PartPeer {
-        PartPeer(Peer::Server {
-            receivers: self.receivers.clone(),
-            connection: None,
-        })
+        PartPeer {
+            peer: Peer::Server {
+                receivers: self.receivers.clone(),
+                connection: None,
+            },
+            idle_timeout: IDLE_TIMEOUT,
+        }
     }
 
     pub fn peer_with_connection(&self, connection: Connection) -> PartPeer {
-        PartPeer(Peer::Server {
-            receivers: self.receivers.clone(),
-            connection: Some(connection),
-        })
+        PartPeer {
+            peer: Peer::Server {
+                receivers: self.receivers.clone(),
+                connection: Some(connection),
+            },
+            idle_timeout: IDLE_TIMEOUT,
+        }
     }
 }
 
 impl PartPeer {
     pub fn client(connection: Connection, transfer_id: u64) -> Self {
-        Self(Peer::Client {
-            connection,
-            transfer_id,
-            priority: -1,
-        })
+        Self {
+            peer: Peer::Client {
+                connection,
+                transfer_id,
+                priority: -1,
+            },
+            idle_timeout: IDLE_TIMEOUT,
+        }
     }
 
     /// Sets the QUIC stream send priority for outbound part streams (higher sends first).
     pub fn with_priority(mut self, priority: i32) -> Self {
         if let Peer::Client {
             priority: current, ..
-        } = &mut self.0
+        } = &mut self.peer
         {
             *current = priority;
         }
         self
     }
 
+    /// Overrides the per-block network idle timeout for part stream writes.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
     fn priority(&self) -> i32 {
-        match &self.0 {
+        match &self.peer {
             Peer::Client { priority, .. } => *priority,
             Peer::Server { .. } => -1,
         }
     }
 
     async fn stream(&self, index: u64) -> Result<(SendStream, RecvStream)> {
-        match &self.0 {
+        match &self.peer {
             Peer::Client {
                 connection,
                 transfer_id,
@@ -443,17 +475,19 @@ impl PartPeer {
         data: &[u8],
         on_write: Option<mpsc::UnboundedSender<u64>>,
     ) -> Result<()> {
-        let (mut send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
+        let io_timeout = self.idle_timeout;
+        let ack_timeout = self.idle_timeout.max(Duration::from_secs(30));
+        let (mut send, mut recv) = tokio::time::timeout(io_timeout, self.stream(index)).await??;
         // Leave control frames (priority 0) ahead of attachment bytes, while letting realtime
         // attachments preempt historical backfill and optional source icons.
         send.set_priority(self.priority())?;
-        write_bytes(&mut send, data, on_write.as_ref()).await?;
+        write_bytes(&mut send, data, on_write.as_ref(), io_timeout).await?;
         send.finish()?;
         // Peer receivers acknowledge Response::BlobStored right after writing the part and
         // may drop RecvStream before consuming FIN, which emits a benign STOP_SENDING(0).
-        match tokio::time::timeout(IDLE_TIMEOUT, read_frame(&mut recv)).await?? {
+        match tokio::time::timeout(ack_timeout, read_frame(&mut recv)).await?? {
             Response::BlobStored => {
-                let _ = finish_read(&mut recv).await;
+                let _ = finish_read(&mut recv, io_timeout).await;
                 Ok(())
             }
             _ => bail!("invalid part acknowledgement"),
@@ -469,7 +503,7 @@ impl PartPeer {
         let (send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, self.stream(index)).await??;
         let mut data = vec![0u8; size];
         read_bytes(&mut recv, &mut data, on_read.as_deref()).await?;
-        finish_read(&mut recv).await?;
+        finish_read(&mut recv, IDLE_TIMEOUT).await?;
         Ok((data, send))
     }
 }
@@ -515,7 +549,7 @@ pub async fn send<R: AsyncRead + Unpin>(
     let total_parts = part_count(size);
     let mut tasks = JoinSet::new();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
-    let wire_peer = match &peer.0 {
+    let wire_peer = match &peer.peer {
         Peer::Client { connection, .. }
         | Peer::Server {
             connection: Some(connection),
@@ -546,7 +580,7 @@ pub async fn send<R: AsyncRead + Unpin>(
                 ready
             } else if index < total_parts {
                 let mut data = vec![0u8; part_size(size, index)];
-                read_bytes(reader, &mut data, None).await?;
+                read_source_bytes(reader, &mut data).await?;
                 let part = index;
                 index += 1;
                 (part, data)
@@ -563,7 +597,7 @@ pub async fn send<R: AsyncRead + Unpin>(
         // Overlap reading/encrypting the next 4-MiB part with the four QUIC part transfers already in flight.
         if prefetched.is_none() && index < total_parts {
             let mut data = vec![0u8; part_size(size, index)];
-            read_bytes(reader, &mut data, None).await?;
+            read_source_bytes(reader, &mut data).await?;
             prefetched = Some((index, data));
             index += 1;
         }

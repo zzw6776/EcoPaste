@@ -334,6 +334,12 @@ fn resolve_file_size_and_enqueue(
             Ok(Some(size)) => size,
             Ok(None) => {
                 if staged_for_sync {
+                    let _ = crate::db::sync_items::cancel_content_prep_for_item(
+                        &pool,
+                        &item.id,
+                        &item.source_revision,
+                    )
+                    .await;
                     crate::sync::notify_local_item_ready(&app);
                 }
                 return;
@@ -341,6 +347,12 @@ fn resolve_file_size_and_enqueue(
             Err(error) => {
                 log::warn!("calculate clipboard file size failed: {error:#}");
                 if staged_for_sync {
+                    let _ = crate::db::sync_items::cancel_content_prep_for_item(
+                        &pool,
+                        &item.id,
+                        &item.source_revision,
+                    )
+                    .await;
                     crate::sync::notify_local_item_ready(&app);
                 }
                 return;
@@ -362,6 +374,12 @@ fn resolve_file_size_and_enqueue(
             Err(error) => {
                 log::warn!("persist clipboard file size failed: {error:#}");
                 if staged_for_sync {
+                    let _ = crate::db::sync_items::cancel_content_prep_for_item(
+                        &pool,
+                        &item.id,
+                        &item.source_revision,
+                    )
+                    .await;
                     crate::sync::notify_local_item_ready(&app);
                 }
             }

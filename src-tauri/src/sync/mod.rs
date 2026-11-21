@@ -21,6 +21,10 @@ pub use model::{
     SyncItemStatus, SyncPairingPreview, SyncStatus, SyncTarget,
 };
 pub use progress::{TransferRoute, TransferTask};
+#[cfg(target_os = "android")]
+pub(crate) use repository::{
+    lock_transfer_item as lock_active_transfer, unlock_transfer_item as unlock_active_transfer,
+};
 
 use std::sync::Arc;
 

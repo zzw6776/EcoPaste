@@ -334,29 +334,27 @@ impl SyncManager {
             .cloned()
     }
 
-    pub(super) fn acquire_cloud_data_activity(&self) -> CloudDataActivityGuard<'_> {
-        self.runtime_state
-            .cloud_data_active_transfers
-            .fetch_add(1, Ordering::AcqRel);
-        *self
-            .runtime_state
-            .cloud_data_last_active_at
-            .write()
-            .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
-        CloudDataActivityGuard {
-            runtime: &self.runtime_state,
-        }
-    }
-
-    pub(super) fn cached_cloud_data_connection(&self) -> Option<Connection> {
-        let existing = self
+    /// Returns the cached Cloud data connection together with an active transfer guard, atomically
+    /// preventing concurrent idle-TTL eviction between checkout and transfer start.
+    pub(super) fn cached_active_cloud_data_connection(
+        &self,
+    ) -> Option<(Connection, CloudDataActivityGuard<'_>)> {
+        let mut slot = self
             .runtime_state
             .cloud_data_connection
-            .read()
-            .expect("cloud data connection cache poisoned")
+            .write()
+            .expect("cloud data connection cache poisoned");
+        let existing = slot
             .as_ref()
             .filter(|connection| connection.close_reason().is_none())
-            .cloned()?;
+            .cloned();
+        let Some(existing) = existing else {
+            if let Some(stale) = slot.take() {
+                stale.close(0_u32.into(), b"cloud data connection closed");
+            }
+            return None;
+        };
+
         let active = self
             .runtime_state
             .cloud_data_active_transfers
@@ -369,24 +367,46 @@ impl SyncManager {
                 .expect("cloud data last active timestamp poisoned")
                 .is_some_and(|last_active| last_active.elapsed() >= CLOUD_DATA_IDLE_REUSE_TTL);
         if idle_expired {
-            self.invalidate_cloud_data_connection(existing.stable_id());
+            if let Some(expired) = slot.take() {
+                expired.close(0_u32.into(), b"cloud data connection idle expired");
+            }
+            self.runtime_state
+                .cloud_data_last_active_at
+                .write()
+                .expect("cloud data last active timestamp poisoned")
+                .take();
             return None;
         }
-        Some(existing)
+
+        self.runtime_state
+            .cloud_data_active_transfers
+            .fetch_add(1, Ordering::AcqRel);
+        *self
+            .runtime_state
+            .cloud_data_last_active_at
+            .write()
+            .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
+        Some((
+            existing,
+            CloudDataActivityGuard {
+                runtime: &self.runtime_state,
+            },
+        ))
     }
 
-    /// Opens or reuses a dedicated secondary QUIC connection for Cloud blob transfers so large
-    /// uploads/downloads never contend with control-plane `CloudSyncItems` or `WatchCloud` frames.
-    pub(super) async fn ensure_cloud_data_connection(
-        self: &Arc<Self>,
+    /// Opens or reuses a dedicated secondary QUIC connection for Cloud blob transfers and returns
+    /// it paired with an active transfer guard so large uploads/downloads never contend with
+    /// control-plane `CloudSyncItems` or `WatchCloud` frames.
+    pub(super) async fn ensure_active_cloud_data_connection<'a>(
+        self: &'a Arc<Self>,
         settings: &SyncSettings,
-    ) -> Result<Connection> {
-        if let Some(connection) = self.cached_cloud_data_connection() {
-            return Ok(connection);
+    ) -> Result<(Connection, CloudDataActivityGuard<'a>)> {
+        if let Some(session) = self.cached_active_cloud_data_connection() {
+            return Ok(session);
         }
         let _guard = self.runtime_state.cloud_data_connect_lock.lock().await;
-        if let Some(connection) = self.cached_cloud_data_connection() {
-            return Ok(connection);
+        if let Some(session) = self.cached_active_cloud_data_connection() {
+            return Ok(session);
         }
         let endpoint = self.ensure_endpoint(settings).await?;
         let server = server_endpoint_addr(settings)
@@ -399,17 +419,26 @@ impl SyncManager {
         })
         .await
         .context("云端数据通道连接超时")??;
+        let mut slot = self
+            .runtime_state
+            .cloud_data_connection
+            .write()
+            .expect("cloud data connection cache poisoned");
+        *slot = Some(connection.clone());
+        self.runtime_state
+            .cloud_data_active_transfers
+            .fetch_add(1, Ordering::AcqRel);
         *self
             .runtime_state
             .cloud_data_last_active_at
             .write()
             .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
-        *self
-            .runtime_state
-            .cloud_data_connection
-            .write()
-            .expect("cloud data connection cache poisoned") = Some(connection.clone());
-        Ok(connection)
+        Ok((
+            connection,
+            CloudDataActivityGuard {
+                runtime: &self.runtime_state,
+            },
+        ))
     }
 
     pub(super) fn invalidate_cloud_data_connection(&self, stable_id: usize) {
@@ -646,13 +675,13 @@ pub(super) struct CloudDataActivityGuard<'a> {
 
 impl Drop for CloudDataActivityGuard<'_> {
     fn drop(&mut self) {
-        self.runtime
-            .cloud_data_active_transfers
-            .fetch_sub(1, Ordering::AcqRel);
         *self
             .runtime
             .cloud_data_last_active_at
             .write()
             .expect("cloud data last active timestamp poisoned") = Some(Instant::now());
+        self.runtime
+            .cloud_data_active_transfers
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }

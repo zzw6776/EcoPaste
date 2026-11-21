@@ -23,7 +23,7 @@ const ENCRYPT_CHUNK_SIZE: usize = 64 * 1024;
 const ENCRYPT_TAG_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) enum UploadPhase {
+pub(crate) enum UploadPhase {
     #[default]
     OpenStream,
     SendRequest,
@@ -69,12 +69,18 @@ pub(super) fn is_network_timeout(error: &anyhow::Error) -> bool {
         .is_some_and(|timeout| !matches!(timeout.phase, UploadPhase::ReadFile))
 }
 
-/// Creates a network-classified write timeout error when wire progress stalls.
-pub(super) fn write_timeout_error(language: Language) -> anyhow::Error {
-    anyhow::Error::new(UploadTimeout {
-        phase: UploadPhase::WriteData,
-        language,
-    })
+/// Converts a raw multipart stream timeout into a localized network write-timeout error.
+pub(super) fn map_write_timeout(error: anyhow::Error, language: Language) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        return anyhow::Error::new(UploadTimeout {
+            phase: UploadPhase::WriteData,
+            language,
+        });
+    }
+    error
 }
 
 /// Bounds one operation and retains its phase for connection recovery and user feedback.
@@ -179,7 +185,7 @@ where
         progress.phase = UploadPhase::ReadFile;
         let read = timed(
             idle_timeout,
-            progress.phase,
+            UploadPhase::ReadFile,
             language,
             reader.read(&mut buffer),
         )
@@ -187,19 +193,13 @@ where
         if read == 0 {
             break;
         }
-        let mut remaining = &buffer[..read];
         progress.phase = UploadPhase::WriteData;
+        let mut remaining = &buffer[..read];
         while !remaining.is_empty() {
             if progress.canceled() {
                 anyhow::bail!("transfer canceled");
             }
-            let written = timed(
-                idle_timeout,
-                progress.phase,
-                language,
-                writer.write(remaining),
-            )
-            .await?;
+            let written = writer.write(remaining).await?;
             if written == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
             }
@@ -208,7 +208,7 @@ where
         }
     }
     progress.phase = UploadPhase::Flush;
-    timed(idle_timeout, progress.phase, language, writer.flush()).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -223,6 +223,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let source = source.to_path_buf();
+    progress.phase = UploadPhase::ReadFile;
     let (file, original_size) = timed(
         spec.idle_timeout,
         UploadPhase::ReadFile,
@@ -340,9 +341,8 @@ where
                 break;
             }
         };
-        if let Err(error) =
-            write_encrypted_chunk(writer, &next, idle_timeout, language, progress).await
-        {
+        progress.phase = UploadPhase::WriteData;
+        if let Err(error) = write_encrypted_chunk(writer, &next, progress).await {
             cancel_flag.store(true, Ordering::Release);
             write_result = Err(error);
             break;
@@ -353,7 +353,7 @@ where
     write_result?;
     let plaintext_hash = producer_result?;
     progress.phase = UploadPhase::Flush;
-    timed(idle_timeout, progress.phase, language, writer.flush()).await?;
+    writer.flush().await?;
     if progress.written_bytes != expected_encrypted_size {
         anyhow::bail!("encrypted sync blob size mismatch");
     }
@@ -363,8 +363,6 @@ where
 async fn write_encrypted_chunk<W>(
     writer: &mut W,
     mut bytes: &[u8],
-    idle_timeout: Duration,
-    language: Language,
     progress: &mut UploadProgress,
 ) -> Result<()>
 where
@@ -375,7 +373,7 @@ where
         if progress.canceled() {
             anyhow::bail!("transfer canceled");
         }
-        let written = timed(idle_timeout, progress.phase, language, writer.write(bytes)).await?;
+        let written = writer.write(bytes).await?;
         if written == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
         }

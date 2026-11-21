@@ -393,6 +393,57 @@ pub async fn cancel_content_prep(pool: &SqlitePool, local_seq: i64) -> Result<()
     Ok(())
 }
 
+/// Cancels an unmaterialized file/directory preparation matching `source_revision` when
+/// asynchronous size calculation discovers the path vanished or could not be persisted.
+pub async fn cancel_content_prep_for_item(
+    pool: &SqlitePool,
+    item_id: &str,
+    source_revision: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin cancel pending item preparation by item_id")?;
+    sqlx::query(
+        r#"
+        DELETE FROM sync_items
+        WHERE item_id = ?
+          AND source_revision = ?
+          AND prep_state = 'pending_content'
+          AND nonce IS NULL
+        "#,
+    )
+    .bind(item_id)
+    .bind(source_revision)
+    .execute(&mut *tx)
+    .await
+    .context("delete never-prepared sync item with missing size")?;
+    sqlx::query(
+        r#"
+        UPDATE sync_items
+        SET prep_state = 'ready',
+            manual_share = 0,
+            prep_error = NULL,
+            next_prep_at = NULL,
+            updated_at = ?
+        WHERE item_id = ?
+          AND source_revision = ?
+          AND prep_state = 'pending_content'
+        "#,
+    )
+    .bind(now)
+    .bind(item_id)
+    .bind(source_revision)
+    .execute(&mut *tx)
+    .await
+    .context("cancel pending sync item preparation by item_id")?;
+    tx.commit()
+        .await
+        .context("commit cancel pending item preparation by item_id")?;
+    Ok(())
+}
+
 /// Records a local favorite toggle atomically alongside `clipboard_items`.
 pub async fn mark_local_favorite_on(
     connection: &mut SqliteConnection,
@@ -430,6 +481,9 @@ pub async fn mark_local_favorite_on(
                 WHEN sync_items.prep_state = 'pending_content' THEN 'pending_content'
                 ELSE 'pending_state'
             END,
+            prep_error = NULL,
+            prep_attempts = 0,
+            next_prep_at = NULL,
             updated_at = excluded.updated_at
         "#,
     )
@@ -488,6 +542,9 @@ pub async fn mark_local_pinned_on(
                 WHEN sync_items.prep_state = 'pending_content' THEN 'pending_content'
                 ELSE 'pending_state'
             END,
+            prep_error = NULL,
+            prep_attempts = 0,
+            next_prep_at = NULL,
             updated_at = excluded.updated_at
         "#,
     )
@@ -540,6 +597,9 @@ pub async fn mark_local_note_on(
                 WHEN sync_items.prep_state = 'pending_content' THEN 'pending_content'
                 ELSE 'pending_state'
             END,
+            prep_error = NULL,
+            prep_attempts = 0,
+            next_prep_at = NULL,
             updated_at = excluded.updated_at
         "#,
     )

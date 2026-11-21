@@ -49,11 +49,20 @@ where
     if source.starts_with("content://") {
         let original_size = super::super::crypto::original_blob_size(spec.expected_encrypted_size)?;
         let uri = source.to_owned();
-        let file = tauri::async_runtime::spawn_blocking(move || {
-            crate::commands::android::open_android_remote_download_source(&uri)
-        })
-        .await
-        .context("Android upload source task failed")??;
+        progress.phase = super::super::upload::UploadPhase::ReadFile;
+        let file = super::super::upload::timed(
+            spec.idle_timeout,
+            super::super::upload::UploadPhase::ReadFile,
+            spec.language,
+            async move {
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::commands::android::open_android_remote_download_source(&uri)
+                })
+                .await
+                .context("Android upload source task failed")?
+            },
+        )
+        .await?;
         return super::super::upload::encrypt_std_file(file, original_size, writer, spec, progress)
             .await;
     }
@@ -110,8 +119,7 @@ pub(super) async fn upload_blob_with_probe(
     blob: &StoredBlob,
     options: BlobUploadOptions,
 ) -> (Result<()>, bool) {
-    let (result, unhealthy, _) = upload_blob_attempt(connection, group, blob, options, true).await;
-    (result, unhealthy)
+    upload_blob_attempt(connection, group, blob, options, true).await
 }
 
 /// Runs one attachment upload attempt; callers that may immediately retry on a fresh connection
@@ -122,18 +130,18 @@ pub(super) async fn upload_blob_attempt(
     blob: &StoredBlob,
     options: BlobUploadOptions,
     finalize_failure: bool,
-) -> (Result<()>, bool, u64) {
+) -> (Result<()>, bool) {
     let _slot = match options.kind {
         BlobUploadKind::Content => {
             let limits = attachment_limits(connection);
             match limits.acquire(options.file_content, true).await {
                 Ok(permit) => permit,
-                Err(error) => return (Err(error), false, 0),
+                Err(error) => return (Err(error), false),
             }
         }
         BlobUploadKind::SourceIcon => match source_icon_limits(connection).acquire_owned().await {
             Ok(permit) => permit,
-            Err(error) => return (Err(error.into()), false, 0),
+            Err(error) => return (Err(error.into()), false),
         },
     };
     let _sync_activity = SyncActivityGuard::acquire();
@@ -182,21 +190,16 @@ pub(super) async fn upload_blob_attempt(
         );
     }
     if let Some(transfer) = &options.transfer {
+        let reported = transfer.reported_bytes();
         match &result {
             Ok(BlobUploadOutcome::AlreadyAvailable) => transfer.already_available(blob.size),
             Ok(BlobUploadOutcome::Uploaded) => transfer.completed(blob.size),
-            Err(_) if transfer.canceled() => transfer.mark_canceled(progress.written_bytes),
-            Err(error) if finalize_failure => {
-                transfer.failed(progress.written_bytes, error.to_string())
-            }
+            Err(_) if transfer.canceled() => transfer.mark_canceled(reported),
+            Err(error) if finalize_failure => transfer.failed(reported, error.to_string()),
             Err(_) => {}
         }
     }
-    (
-        result.map(|_| ()),
-        unhealthy_connection,
-        progress.written_bytes,
-    )
+    (result.map(|_| ()), unhealthy_connection)
 }
 
 /// Diagnoses a stalled upload; the watch supervisor owns connection recovery.
@@ -343,7 +346,8 @@ pub(super) async fn upload_blob_inner(
             BLOB_IDLE_TIMEOUT
         };
         let peer = PartPeer::client(connection.clone(), transfer_id)
-            .with_priority(options.stream_priority);
+            .with_priority(options.stream_priority)
+            .with_idle_timeout(idle_timeout);
         let (mut encrypted_reader, mut encrypted_writer) = tokio::io::duplex(2 * 1024 * 1024);
         progress.report_transferred = false;
         let produce = async {
@@ -363,7 +367,7 @@ pub(super) async fn upload_blob_inner(
                             expected_blob_id: &blob.blob_id,
                             key: group.content_key_bytes()?,
                             stream_nonce,
-                            idle_timeout,
+                            idle_timeout: BLOB_IDLE_TIMEOUT,
                             language: options.language,
                         },
                         progress,
@@ -375,7 +379,7 @@ pub(super) async fn upload_blob_inner(
                     upload::copy(
                         &mut file,
                         &mut encrypted_writer,
-                        idle_timeout,
+                        BLOB_IDLE_TIMEOUT,
                         options.language,
                         progress,
                     )
@@ -385,16 +389,16 @@ pub(super) async fn upload_blob_inner(
             encrypted_writer.shutdown().await?;
             Ok::<_, anyhow::Error>(())
         };
-        let last_wire_activity = StdMutex::new(Instant::now());
-        let transmit = multipart::send(&mut encrypted_reader, peer, blob.size, |bytes| {
-            *last_wire_activity
-                .lock()
-                .expect("upload wire activity timestamp poisoned") = Instant::now();
-            if let Some(handle) = &options.transfer {
-                handle.transferred(bytes);
-            }
-        });
-        cancelable_transfer_with_idle_timeout(
+        let transmit = async {
+            multipart::send(&mut encrypted_reader, peer, blob.size, |bytes| {
+                if let Some(handle) = &options.transfer {
+                    handle.transferred(bytes);
+                }
+            })
+            .await
+            .map_err(|error| upload::map_write_timeout(error, options.language))
+        };
+        cancelable_transfer(
             async {
                 tokio::try_join!(produce, transmit)?;
                 Ok(())
@@ -404,13 +408,6 @@ pub(super) async fn upload_blob_inner(
                     .transfer
                     .as_ref()
                     .is_some_and(|handle| handle.canceled())
-            },
-            idle_timeout,
-            options.language,
-            || {
-                *last_wire_activity
-                    .lock()
-                    .expect("upload wire activity timestamp poisoned")
             },
         )
         .await?;
@@ -1170,33 +1167,6 @@ where
             result = &mut work => return result,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if canceled() { bail!("transfer canceled"); }
-            }
-        }
-    }
-}
-
-/// Cancels all part streams on user cancellation or when wire progress stalls beyond `idle_timeout`.
-pub(super) async fn cancelable_transfer_with_idle_timeout<F, T>(
-    work: F,
-    canceled: impl Fn() -> bool,
-    idle_timeout: Duration,
-    language: Language,
-    last_activity: impl Fn() -> Instant,
-) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    tokio::pin!(work);
-    loop {
-        tokio::select! {
-            result = &mut work => return result,
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if canceled() {
-                    bail!("transfer canceled");
-                }
-                if last_activity().elapsed() >= idle_timeout {
-                    return Err(super::super::upload::write_timeout_error(language));
-                }
             }
         }
     }

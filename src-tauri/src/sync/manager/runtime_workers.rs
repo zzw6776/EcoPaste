@@ -824,9 +824,11 @@ pub(super) async fn source_asset_worker(manager: Arc<SyncManager>) {
             continue;
         }
 
-        let connection = manager
-            .cached_cloud_data_connection()
-            .or_else(|| manager.cached_cloud_connection());
+        let (connection, _cloud_data_activity) = match manager.cached_active_cloud_data_connection()
+        {
+            Some((conn, guard)) => (Some(conn), Some(guard)),
+            None => (manager.cached_cloud_connection(), None),
+        };
         let has_cloud_connection = connection.is_some();
         if has_cloud_connection && !had_cloud_connection {
             icon_cooldowns.clear();
@@ -1187,27 +1189,14 @@ pub(super) async fn attachment_worker(
                     && server_is_configured(&settings)
                     && manager.cached_cloud_connection().is_some()
                 {
-                    match manager.ensure_cloud_data_connection(&settings).await {
-                        Ok(data_conn) => {
-                            let _guard = manager.sync_activity_guard().await;
-                            match manager
-                                .upload_one_cloud_blob_item(
-                                    &data_conn,
-                                    &pool,
-                                    &group,
-                                    realtime_only,
-                                )
-                                .await
-                            {
-                                Ok(handled) => handled_item |= handled,
-                                Err(error) => {
-                                    log::warn!("cloud attachment upload deferred: {error:#}");
-                                    had_error = true;
-                                }
-                            }
-                        }
+                    let _guard = manager.sync_activity_guard().await;
+                    match manager
+                        .upload_one_cloud_blob_item(&settings, &pool, &group, realtime_only)
+                        .await
+                    {
+                        Ok(handled) => handled_item |= handled,
                         Err(error) => {
-                            log::debug!("cloud data connection unavailable for upload: {error:#}");
+                            log::warn!("cloud attachment upload deferred: {error:#}");
                             had_error = true;
                         }
                     }
@@ -1232,7 +1221,7 @@ pub(super) async fn attachment_worker(
                         let _guard = manager.sync_activity_guard().await;
                         match manager
                             .pull_one_remote_blob_item(
-                                &data_conn,
+                                Some(&data_conn),
                                 &pool,
                                 &group,
                                 &settings,
@@ -1258,31 +1247,21 @@ pub(super) async fn attachment_worker(
                     && server_is_configured(&settings)
                     && manager.cached_cloud_connection().is_some()
                 {
-                    match manager.ensure_cloud_data_connection(&settings).await {
-                        Ok(data_conn) => {
-                            let _guard = manager.sync_activity_guard().await;
-                            match manager
-                                .pull_one_remote_blob_item(
-                                    &data_conn,
-                                    &pool,
-                                    &group,
-                                    &settings,
-                                    &SyncConnectionTarget::Cloud,
-                                    realtime_only,
-                                )
-                                .await
-                            {
-                                Ok(handled) => handled_item |= handled,
-                                Err(error) => {
-                                    log::warn!("cloud attachment download deferred: {error:#}");
-                                    had_error = true;
-                                }
-                            }
-                        }
+                    let _guard = manager.sync_activity_guard().await;
+                    match manager
+                        .pull_one_remote_blob_item(
+                            None,
+                            &pool,
+                            &group,
+                            &settings,
+                            &SyncConnectionTarget::Cloud,
+                            realtime_only,
+                        )
+                        .await
+                    {
+                        Ok(handled) => handled_item |= handled,
                         Err(error) => {
-                            log::debug!(
-                                "cloud data connection unavailable for download: {error:#}"
-                            );
+                            log::warn!("cloud attachment download deferred: {error:#}");
                             had_error = true;
                         }
                     }

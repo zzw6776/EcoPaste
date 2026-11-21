@@ -743,7 +743,7 @@ impl SyncManager {
     /// cleanly, and `Err` on retryable transport failure so the worker applies backoff.
     pub(super) async fn pull_one_remote_blob_item(
         self: &Arc<Self>,
-        data_connection: &Connection,
+        preset_connection: Option<&Connection>,
         pool: &SqlitePool,
         group: &GroupSecrets,
         sync_settings: &SyncSettings,
@@ -874,6 +874,14 @@ impl SyncManager {
             return Ok(true);
         }
 
+        let (owned_connection, _cloud_data_activity) = if let Some(connection) = preset_connection {
+            (connection.clone(), None)
+        } else {
+            let (connection, guard) = self
+                .ensure_active_cloud_data_connection(sync_settings)
+                .await?;
+            (connection, Some(guard))
+        };
         let is_files = synced_item.kind == "files";
         let track_transfer = super::tracks_individual_transfer(
             &synced_item.kind,
@@ -914,9 +922,7 @@ impl SyncManager {
             None
         };
 
-        let _cloud_data_activity = source
-            .is_cloud()
-            .then(|| self.acquire_cloud_data_activity());
+        let data_connection = &owned_connection;
         let transferred = AtomicU64::new(0);
         let mut completed_bytes = 0_u64;
         let mut staged_blobs = Vec::with_capacity(snapshot.blobs.len());
@@ -1013,6 +1019,17 @@ impl SyncManager {
                 for blob in staged_blobs {
                     let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
                 }
+                if let Some(item_id) = meta.item_id.as_deref() {
+                    let _ = self.app.emit(
+                        crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                        serde_json::json!({
+                            "id": item_id,
+                            "deduplicated": true,
+                            "reconciled": true,
+                        }),
+                    );
+                }
+                self.emit_updated();
                 return Ok(true);
             }
             if source.is_cloud()
@@ -1025,6 +1042,9 @@ impl SyncManager {
 
         if let Some((_, handle)) = &transfer_handle {
             if !handle.begin_finalizing(completed_bytes) {
+                for blob in staged_blobs {
+                    let _ = tokio::fs::remove_file(&blob.encrypted_path).await;
+                }
                 handle.mark_canceled(completed_bytes);
                 if let Some((task_id, _)) = &transfer_handle {
                     let _ = repository::unlock_transfer_item(pool, task_id).await;
@@ -1038,6 +1058,17 @@ impl SyncManager {
                     Some("available"),
                 )
                 .await?;
+                if let Some(item_id) = meta.item_id.as_deref() {
+                    let _ = self.app.emit(
+                        crate::clipboard::CLIPBOARD_UPDATED_EVENT,
+                        serde_json::json!({
+                            "id": item_id,
+                            "deduplicated": true,
+                            "reconciled": true,
+                        }),
+                    );
+                }
+                self.emit_updated();
                 return Ok(true);
             }
         }
@@ -1209,13 +1240,10 @@ impl SyncManager {
                 log::warn!("reclaim deleted synchronized images failed: {error:#}");
             }
         }
+        if let Err(error) =
+            crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
         {
-            let _files_guard = crate::clipboard::shared_files::lock().await;
-            if let Err(error) =
-                crate::clipboard::shared_files::cleanup_resources_locked(pool, resources).await
-            {
-                log::warn!("reclaim deleted synchronized files failed: {error:#}");
-            }
+            log::warn!("reclaim deleted synchronized files failed: {error:#}");
         }
         Ok(())
     }

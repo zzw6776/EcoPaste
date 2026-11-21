@@ -1009,7 +1009,9 @@ mod tests {
         );
 
         // Clicking Cloud sets `cloud_blob_policy = 'requested'` and queues blob upload immediately.
-        assert!(request_item_delivery(&pool, &item.id, true).await.unwrap());
+        assert!(request_item_delivery(&pool, &item.id, true, true)
+            .await
+            .unwrap());
         assert_eq!(
             pending_cloud_blob_uploads(&pool, false, 10)
                 .await
@@ -1496,7 +1498,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(local_seq_of(&pool, &remote_text.sync_key).await, 0);
-        assert!(request_item_delivery(&pool, &remote_text.id, true)
+        assert!(request_item_delivery(&pool, &remote_text.id, true, true)
             .await
             .unwrap());
         assert!(local_seq_of(&pool, &remote_text.sync_key).await > 0);
@@ -2029,7 +2031,7 @@ mod tests {
         .unwrap());
 
         // Non-stream-committed image with empty encrypted_path must resolve to StagedLease, never DirectStream.
-        let loaded = outgoing_blob(&pool, &"b".repeat(64))
+        let (_, loaded) = outgoing_blob(&pool, &"b".repeat(64), None)
             .await
             .unwrap()
             .expect("outgoing image blob");
@@ -2912,7 +2914,7 @@ mod tests {
             }
         }
 
-        let resolved = outgoing_blob(&pool, &shared_blob_id)
+        let (_, resolved) = outgoing_blob(&pool, &shared_blob_id, None)
             .await
             .unwrap()
             .expect("outgoing blob");
@@ -3045,7 +3047,9 @@ mod tests {
             .is_empty());
 
         // Explicitly clicking Upload on this device switches policy to `requested` and enqueues it.
-        assert!(request_item_delivery(&pool, &item.id, true).await.unwrap());
+        assert!(request_item_delivery(&pool, &item.id, true, true)
+            .await
+            .unwrap());
         let uploads = pending_cloud_blob_uploads(&pool, false, 10).await.unwrap();
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].sync_key, item.sync_key);
@@ -3356,5 +3360,159 @@ mod tests {
             .unwrap();
         assert!(!early.completed);
         assert!(early.needs_control_push);
+    }
+
+    #[tokio::test]
+    async fn oversized_control_prep_error_skips_head_of_line_and_prune_keeps_unpushed_evicted_items(
+    ) {
+        let pool = memory_pool().await;
+        let key = [7_u8; 32];
+
+        let big = sample_item("oversized-ctrl", 1_700_000_800);
+        let normal = sample_item("normal-after", 1_700_000_700);
+        for item in [&big, &normal] {
+            upsert_item_with_sync_outbox(&pool, item, Some(ContentSyncOptions::default()))
+                .await
+                .unwrap();
+            let seq = local_seq_of(&pool, &item.sync_key).await;
+            let item_key = crypto::derive_item_key(&key, &item.sync_key);
+            let snapshot = SyncedItemSnapshot {
+                version: SNAPSHOT_VERSION,
+                sync_key: item.sync_key.clone(),
+                content_version: FieldVersion::new(1, "dev-a"),
+                presence_version: FieldVersion::new(1, "dev-a"),
+                favorite_version: FieldVersion::default(),
+                pinned_version: FieldVersion::default(),
+                note_version: FieldVersion::default(),
+                is_present: true,
+                is_favorite: false,
+                is_pinned: false,
+                note: None,
+                item: Some(SyncedClipboardItem {
+                    kind: "text".into(),
+                    sub_kind: None,
+                    content: item.content.clone(),
+                    search_text: None,
+                    summary: None,
+                    file_types: None,
+                    size: Some(10),
+                    width: None,
+                    height: None,
+                    is_sensitive: false,
+                    source_platform: "macos".into(),
+                    created_at_ms: 1_700_000_800_000,
+                    sync_key: item.sync_key.clone(),
+                    updated_at_ms: Some(1_700_000_800_000),
+                    source_revision: Some(item.id.clone()),
+                    source_device_id: Some("dev-a".into()),
+                    source_device_name: Some("Mac".into()),
+                    source_updated_at_ms: Some(1_700_000_800_000),
+                }),
+                blobs: Vec::new(),
+                source_app: None,
+                content_identity: None,
+            };
+            let (nonce, ciphertext) =
+                crypto::encrypt_item_snapshot(&key, &item_key, false, false, &snapshot).unwrap();
+            assert!(commit_prepared_item(
+                &pool,
+                PreparedItemCommit {
+                    sync_key: &item.sync_key,
+                    item_key: &item_key,
+                    item_id: Some(&item.id),
+                    expected_local_seq: seq,
+                    origin_device_id: "dev-a",
+                    content_identity: None,
+                    group_id: "group-1",
+                    snapshot: &snapshot,
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                    blobs: &[],
+                    content_objects: &[],
+                    cloud_blob_policy: Some(crate::db::sync_items::CloudBlobPolicy::Auto),
+                },
+            )
+            .await
+            .unwrap());
+        }
+
+        // Recording a terminal prep error for `big` must unblock `normal` on both Cloud and LAN
+        // without forging `sync_item_targets`, while keeping `Error + Retry` visible on the card.
+        let big_seq = local_seq_of(&pool, &big.sync_key).await;
+        assert!(record_terminal_prep_error(
+            &pool,
+            &big.sync_key,
+            Some(big_seq),
+            "frame too large",
+            false,
+        )
+        .await
+        .unwrap());
+
+        let cloud_batch = pending_outbound_writes(&pool, CLOUD_TARGET, 10)
+            .await
+            .unwrap();
+        assert_eq!(cloud_batch.writes.len(), 1);
+        assert_eq!(
+            cloud_batch.writes[0].item_key,
+            crypto::derive_item_key(&key, &normal.sync_key)
+        );
+        let lan_batch = pending_outbound_writes(&pool, "peer:dev-b", 10)
+            .await
+            .unwrap();
+        assert_eq!(lan_batch.writes.len(), 1);
+
+        let statuses = item_statuses(
+            &pool,
+            std::slice::from_ref(&big.id),
+            true,
+            &["dev-b".into()],
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(statuses[0].cloud.activity, SyncItemActivity::Error);
+        assert_eq!(statuses[0].cloud.action, SyncItemAction::Retry);
+        assert_eq!(statuses[0].lan.activity, SyncItemActivity::Error);
+        assert_eq!(statuses[0].lan.action, SyncItemAction::Retry);
+        assert!(
+            has_pending_control_delivery(&pool, &big.sync_key, true, &[])
+                .await
+                .unwrap()
+        );
+        assert!(request_item_delivery(&pool, &big.id, true, false)
+            .await
+            .unwrap());
+        let retried_meta = load_sync_item_meta(&pool, &big.sync_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried_meta.prep_state, "pending_state");
+
+        // Evicting `normal` from local `clipboard_items` while still unpushed to Cloud must keep its
+        // `sync_items` row until outbound delivery finishes.
+        sqlx::query("DELETE FROM clipboard_items WHERE id = ?")
+            .bind(&normal.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(prune_released_items(&pool, true, 100).await.unwrap(), 0);
+        let normal_seq = local_seq_of(&pool, &normal.sync_key).await;
+        let normal_item_key = crypto::derive_item_key(&key, &normal.sync_key);
+        let mut seqs = HashMap::new();
+        seqs.insert(normal_item_key.clone(), u64::try_from(normal_seq).unwrap());
+        record_cloud_accepted(
+            &pool,
+            &[AcceptedItem {
+                item_key: normal_item_key,
+                hub_rev: 1,
+                seq: 1,
+                available_blob_ids: Vec::new(),
+            }],
+            &seqs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prune_released_items(&pool, true, 100).await.unwrap(), 1);
     }
 }

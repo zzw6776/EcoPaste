@@ -314,11 +314,10 @@ impl SyncManager {
             destination,
             route,
         } = request;
-        let _cloud_data_activity = self.acquire_cloud_data_activity();
         handle.connecting();
-        let (mut active_route, mut connection) =
+        let (mut active_route, mut connection, mut _cloud_data_activity) =
             match self.remote_file_connection(origin_device_id, route).await {
-                Ok(connection) => (route, connection),
+                Ok((connection, guard)) => (route, connection, guard),
                 Err(error) => {
                     let Some(fallback) = self
                         .fallback_remote_file_connection(origin_device_id, route, handle, 0)
@@ -386,8 +385,8 @@ impl SyncManager {
                                     .downcast_ref::<RemoteBlobTransportFailure>()
                                     .is_some_and(|failure| failure.unavailable);
                                 transferred.store(completed_bytes, Ordering::Release);
-                                let Some((fallback_route, fallback_connection)) = self
-                                    .fallback_remote_file_connection(
+                                let Some((fallback_route, fallback_connection, fallback_guard)) =
+                                    self.fallback_remote_file_connection(
                                         origin_device_id,
                                         active_route,
                                         handle,
@@ -402,6 +401,7 @@ impl SyncManager {
                                 };
                                 active_route = fallback_route;
                                 connection = fallback_connection;
+                                _cloud_data_activity = fallback_guard;
                                 retried = true;
                             }
                             Err(error) => {
@@ -476,8 +476,8 @@ impl SyncManager {
                                     .downcast_ref::<RemoteBlobTransportFailure>()
                                     .is_some_and(|failure| failure.unavailable);
                                 transferred.store(completed_bytes, Ordering::Release);
-                                let Some((fallback_route, fallback_connection)) = self
-                                    .fallback_remote_file_connection(
+                                let Some((fallback_route, fallback_connection, fallback_guard)) =
+                                    self.fallback_remote_file_connection(
                                         origin_device_id,
                                         active_route,
                                         handle,
@@ -492,6 +492,7 @@ impl SyncManager {
                                 };
                                 active_route = fallback_route;
                                 connection = fallback_connection;
+                                _cloud_data_activity = fallback_guard;
                                 retried = true;
                             }
                             Err(error) => {
@@ -591,13 +592,19 @@ impl SyncManager {
     }
 
     /// Tries the other configured transport while keeping one logical download task.
-    async fn fallback_remote_file_connection(
-        self: &Arc<Self>,
+    async fn fallback_remote_file_connection<'a>(
+        self: &'a Arc<Self>,
         origin_device_id: &str,
         failed_route: super::super::progress::TransferRoute,
         handle: &super::super::progress::TransferHandle,
         transferred_bytes: u64,
-    ) -> Result<Option<(super::super::progress::TransferRoute, Connection)>> {
+    ) -> Result<
+        Option<(
+            super::super::progress::TransferRoute,
+            Connection,
+            Option<super::runtime_connection::CloudDataActivityGuard<'a>>,
+        )>,
+    > {
         if handle.canceled() {
             bail!("transfer canceled");
         }
@@ -616,26 +623,30 @@ impl SyncManager {
             super::super::progress::TransferRoute::Cloud => CLOUD_TARGET.to_owned(),
         };
         handle.reroute(fallback_route, target, transferred_bytes);
-        let connection = self
+        let (connection, guard) = self
             .remote_file_connection(origin_device_id, fallback_route)
             .await?;
         if handle.canceled() {
             bail!("transfer canceled");
         }
-        Ok(Some((fallback_route, connection)))
+        Ok(Some((fallback_route, connection, guard)))
     }
 
-    async fn remote_file_connection(
-        self: &Arc<Self>,
+    async fn remote_file_connection<'a>(
+        self: &'a Arc<Self>,
         origin_device_id: &str,
         route: super::super::progress::TransferRoute,
-    ) -> Result<Connection> {
+    ) -> Result<(
+        Connection,
+        Option<super::runtime_connection::CloudDataActivityGuard<'a>>,
+    )> {
         let settings = self.app.state::<SettingsStore>().snapshot().sync;
         if route == super::super::progress::TransferRoute::Cloud {
             if !server_is_configured(&settings) {
                 bail!("云端同步未配置");
             }
-            return self.ensure_cloud_data_connection(&settings).await;
+            let (connection, guard) = self.ensure_active_cloud_data_connection(&settings).await?;
+            return Ok((connection, Some(guard)));
         }
         if !settings.lan_enabled {
             bail!(crate::i18n::commands::label(
@@ -652,9 +663,11 @@ impl SyncManager {
         let address = peer_endpoint_addr(&peer.announcement)?;
         if let Some(control) = self.cached_lan_connection(origin_device_id) {
             if lan_connection_matches_discovery(&control, &address) {
-                return Ok(self
-                    .lan_data_connection_or_fallback(&settings, origin_device_id, &control)
-                    .await);
+                return Ok((
+                    self.lan_data_connection_or_fallback(&settings, origin_device_id, &control)
+                        .await,
+                    None,
+                ));
             }
             self.invalidate_lan_connection(origin_device_id, control.stable_id());
             control.close(0_u32.into(), b"LAN route no longer discovered");
@@ -663,8 +676,10 @@ impl SyncManager {
         let connection = connect_peer(&endpoint, address, Duration::from_secs(8)).await?;
         super::protocol_handlers::spawn_peer_connection_service(self.clone(), connection.clone());
         self.store_lan_connection(origin_device_id, connection.clone());
-        Ok(self
-            .lan_data_connection_or_fallback(&settings, origin_device_id, &connection)
-            .await)
+        Ok((
+            self.lan_data_connection_or_fallback(&settings, origin_device_id, &connection)
+                .await,
+            None,
+        ))
     }
 }

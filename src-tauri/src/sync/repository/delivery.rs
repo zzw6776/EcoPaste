@@ -1527,6 +1527,9 @@ pub async fn store_merged_remote_item(
                 ELSE sync_items.payload_updated_at_ms
             END,
             prep_state = 'ready',
+            prep_error = NULL,
+            prep_attempts = 0,
+            next_prep_at = NULL,
             cloud_blob_policy = CASE
                 WHEN sync_items.origin = 'remote' AND sync_items.deleted = 1 AND excluded.deleted = 0
                 THEN 'defer'
@@ -2016,15 +2019,20 @@ pub async fn load_item_blobs(pool: &SqlitePool, sync_key: &str) -> Result<Vec<Sy
         .collect()
 }
 
-pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<StoredBlob>> {
+pub async fn outgoing_blob(
+    pool: &SqlitePool,
+    blob_id: &str,
+    preferred_sync_key: Option<&str>,
+) -> Result<Option<(Option<String>, StoredBlob)>> {
     let row = sqlx::query(
         r#"
-        SELECT b.blob_id, b.encrypted_path, b.size, b.source_path, b.source_is_directory,
-               b.stream_nonce, b.stream_commitment
+        SELECT b.sync_key, b.blob_id, b.encrypted_path, b.size, b.source_path,
+               b.source_is_directory, b.stream_nonce, b.stream_commitment
         FROM sync_item_blobs b
         JOIN sync_items s ON s.sync_key = b.sync_key
         WHERE b.blob_id = ? AND b.local_available = 1
         ORDER BY s.deleted ASC,
+                 CASE WHEN ? IS NOT NULL AND s.sync_key = ? THEN 0 ELSE 1 END ASC,
                  CASE WHEN b.encrypted_path <> '' THEN 0 ELSE 1 END ASC,
                  s.payload_updated_at_ms DESC,
                  s.history_backfill ASC,
@@ -2034,10 +2042,13 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
         "#,
     )
     .bind(blob_id)
+    .bind(preferred_sync_key)
+    .bind(preferred_sync_key)
     .fetch_optional(pool)
     .await
     .context("lookup outgoing sync item blob")?;
     if let Some(row) = row {
+        let sync_key: String = row.try_get("sync_key")?;
         let raw_encrypted_path: String = row.try_get("encrypted_path")?;
         let stream_commitment: bool = row.try_get("stream_commitment")?;
         let encrypted_path = if !stream_commitment && raw_encrypted_path.is_empty() {
@@ -2045,14 +2056,17 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
         } else {
             raw_encrypted_path
         };
-        return Ok(Some(StoredBlob {
-            blob_id: row.try_get("blob_id")?,
-            encrypted_path,
-            size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
-            source_path: row.try_get("source_path")?,
-            source_is_directory: row.try_get("source_is_directory")?,
-            stream_nonce: row.try_get("stream_nonce")?,
-        }));
+        return Ok(Some((
+            Some(sync_key),
+            StoredBlob {
+                blob_id: row.try_get("blob_id")?,
+                encrypted_path,
+                size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
+                source_path: row.try_get("source_path")?,
+                source_is_directory: row.try_get("source_is_directory")?,
+                stream_nonce: row.try_get("stream_nonce")?,
+            },
+        )));
     }
     let icon_row = sqlx::query(
         r#"
@@ -2075,14 +2089,17 @@ pub async fn outgoing_blob(pool: &SqlitePool, blob_id: &str) -> Result<Option<St
     } else {
         raw_encrypted_path
     };
-    Ok(Some(StoredBlob {
-        blob_id: row.try_get("blob_id")?,
-        encrypted_path,
-        size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
-        source_path: row.try_get("source_path")?,
-        source_is_directory: false,
-        stream_nonce: row.try_get("stream_nonce")?,
-    }))
+    Ok(Some((
+        None,
+        StoredBlob {
+            blob_id: row.try_get("blob_id")?,
+            encrypted_path,
+            size: u64::try_from(row.try_get::<i64, _>("size")?).unwrap_or(0),
+            source_path: row.try_get("source_path")?,
+            source_is_directory: false,
+            stream_nonce: row.try_get("stream_nonce")?,
+        },
+    )))
 }
 
 pub async fn mark_blob_local_unavailable(
@@ -2158,25 +2175,128 @@ pub async fn update_blob_local_source(
     Ok(())
 }
 
+/// Returns whether this item has an unpushed control-plane change or terminal prep error.
+pub async fn has_pending_control_delivery(
+    pool: &SqlitePool,
+    sync_key: &str,
+    cloud: bool,
+    online_peer_ids: &[String],
+) -> Result<bool> {
+    let Some((local_seq, has_snapshot, has_prep_error)): Option<(i64, bool, bool)> =
+        sqlx::query_as(
+            "SELECT local_seq, (nonce IS NOT NULL), (prep_error IS NOT NULL) \
+             FROM sync_items WHERE sync_key = ?",
+        )
+        .bind(sync_key)
+        .fetch_optional(pool)
+        .await
+        .context("read sync item local_seq for manual control check")?
+    else {
+        return Ok(false);
+    };
+    if has_prep_error {
+        return Ok(true);
+    }
+    if !has_snapshot || local_seq <= 0 {
+        return Ok(false);
+    }
+    if cloud {
+        let pushed: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(pushed_local_seq, 0) FROM sync_item_targets \
+             WHERE sync_key = ? AND target_id = 'cloud'",
+        )
+        .bind(sync_key)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(0);
+        return Ok(pushed < local_seq);
+    }
+    if online_peer_ids.is_empty() {
+        return Ok(false);
+    }
+    for peer_id in online_peer_ids {
+        let target_id = format!("peer:{peer_id}");
+        let pushed: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(pushed_local_seq, 0) FROM sync_item_targets \
+             WHERE sync_key = ? AND target_id = ?",
+        )
+        .bind(sync_key)
+        .bind(&target_id)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(0);
+        if pushed < local_seq {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Promotes an item for manual delivery, sets `cloud_blob_policy = 'requested'` for Cloud
-/// requests, ensures a positive `local_seq` when Control-Plane metadata still needs pushing,
-/// and clears target errors.
-pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool) -> Result<bool> {
+/// attachment requests, ensures a positive `local_seq` when Control-Plane metadata still needs
+/// pushing, and clears target errors.
+pub async fn request_item_delivery(
+    pool: &SqlitePool,
+    item_id: &str,
+    cloud: bool,
+    request_blobs: bool,
+) -> Result<bool> {
     let mut transaction = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin manual item delivery request")?;
-    let Some((sync_key, current_local_seq)): Option<(String, i64)> =
-        sqlx::query_as("SELECT sync_key, local_seq FROM sync_items WHERE item_id = ?")
-            .bind(item_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .context("find sync_key for manual delivery")?
+    let Some((sync_key, current_local_seq, has_prep_error)): Option<(String, i64, bool)> =
+        sqlx::query_as(
+            "SELECT sync_key, local_seq, (prep_error IS NOT NULL) \
+             FROM sync_items WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("find sync_key for manual delivery")?
     else {
         transaction.rollback().await.ok();
         return Ok(false);
     };
     let now = Utc::now();
+
+    if has_prep_error {
+        let local_seq = crate::db::sync_items::next_local_seq_on(&mut transaction).await?;
+        sqlx::query(
+            r#"
+            UPDATE sync_items
+            SET local_seq = ?,
+                history_backfill = 0,
+                manual_share = MAX(manual_share, ?),
+                cloud_blob_policy = CASE
+                    WHEN ? <> 0 THEN 'requested'
+                    ELSE cloud_blob_policy
+                END,
+                prep_state = CASE
+                    WHEN prep_state = 'pending_content' THEN 'pending_content'
+                    ELSE 'pending_state'
+                END,
+                prep_error = NULL,
+                prep_attempts = 0,
+                next_prep_at = NULL,
+                updated_at = ?
+            WHERE sync_key = ?
+            "#,
+        )
+        .bind(local_seq)
+        .bind(request_blobs)
+        .bind(i64::from(cloud && request_blobs))
+        .bind(now)
+        .bind(&sync_key)
+        .execute(&mut *transaction)
+        .await
+        .context("requeue item after terminal prep error")?;
+        transaction
+            .commit()
+            .await
+            .context("commit manual prep retry request")?;
+        return Ok(true);
+    }
 
     if cloud {
         let existing_cloud: Option<(String, i64)> = sqlx::query_as(
@@ -2196,16 +2316,29 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
         } else {
             crate::db::sync_items::next_local_seq_on(&mut transaction).await?
         };
-        sqlx::query(
-            "UPDATE sync_items SET local_seq = ?, history_backfill = 0, manual_share = 1, \
-             cloud_blob_policy = 'requested', updated_at = ? WHERE sync_key = ?",
-        )
-        .bind(local_seq)
-        .bind(now)
-        .bind(&sync_key)
-        .execute(&mut *transaction)
-        .await
-        .context("promote item priority for manual cloud delivery")?;
+        if request_blobs {
+            sqlx::query(
+                "UPDATE sync_items SET local_seq = ?, history_backfill = 0, manual_share = 1, \
+                 cloud_blob_policy = 'requested', updated_at = ? WHERE sync_key = ?",
+            )
+            .bind(local_seq)
+            .bind(now)
+            .bind(&sync_key)
+            .execute(&mut *transaction)
+            .await
+            .context("promote item priority for manual cloud delivery")?;
+        } else {
+            sqlx::query(
+                "UPDATE sync_items SET local_seq = ?, history_backfill = 0, updated_at = ? \
+                 WHERE sync_key = ?",
+            )
+            .bind(local_seq)
+            .bind(now)
+            .bind(&sync_key)
+            .execute(&mut *transaction)
+            .await
+            .context("promote item priority for manual cloud metadata retry")?;
+        }
 
         if cloud_metadata_current {
             sqlx::query(
@@ -2222,7 +2355,7 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
                 r#"
                 UPDATE sync_item_targets
                 SET pushed_local_seq = CASE
-                        WHEN confirmed_content = 'complete' THEN pushed_local_seq
+                        WHEN confirmed_content = 'complete' AND ? <> 0 THEN pushed_local_seq
                         ELSE 0
                     END,
                     last_error = NULL,
@@ -2230,6 +2363,7 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
                 WHERE sync_key = ? AND target_id = 'cloud'
                 "#,
             )
+            .bind(i64::from(request_blobs))
             .bind(now)
             .bind(&sync_key)
             .execute(&mut *transaction)
@@ -2243,10 +2377,11 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
             crate::db::sync_items::next_local_seq_on(&mut transaction).await?
         };
         sqlx::query(
-            "UPDATE sync_items SET local_seq = ?, history_backfill = 0, manual_share = 1, \
+            "UPDATE sync_items SET local_seq = ?, history_backfill = 0, manual_share = MAX(manual_share, ?), \
              updated_at = ? WHERE sync_key = ?",
         )
         .bind(local_seq)
+        .bind(request_blobs)
         .bind(now)
         .bind(&sync_key)
         .execute(&mut *transaction)
@@ -2256,19 +2391,22 @@ pub async fn request_item_delivery(pool: &SqlitePool, item_id: &str, cloud: bool
         sqlx::query(
             r#"
             UPDATE sync_item_targets
-            SET pushed_local_seq = 0,
+            SET pushed_local_seq = CASE
+                    WHEN confirmed_content = 'complete' AND ? <> 0 THEN pushed_local_seq
+                    ELSE 0
+                END,
                 last_error = NULL,
                 updated_at = ?
             WHERE sync_key = ?
               AND target_id LIKE 'peer:%'
-              AND confirmed_content <> 'complete'
             "#,
         )
+        .bind(i64::from(request_blobs))
         .bind(now)
         .bind(&sync_key)
         .execute(&mut *transaction)
         .await
-        .context("requeue incomplete LAN peers for manual delivery")?;
+        .context("requeue LAN peers for manual delivery")?;
     }
 
     transaction
@@ -2289,6 +2427,79 @@ pub async fn block_delivery(
     error: &str,
 ) -> Result<()> {
     set_terminal_delivery_policy(pool, target_id, sync_key, "blocked", error).await
+}
+
+/// Records a terminal local snapshot preparation error (such as exceeding `MAX_FRAME_BYTES`) on
+/// `sync_items` without forging `sync_item_targets.pushed_local_seq` or blocking subsequent items.
+///
+/// When `reset_local_seq_to_zero` is `false` (caught before overwriting a previously committed
+/// snapshot), `local_seq` falls back to the highest already-pushed sequence so healthy earlier
+/// snapshots stay reachable while unpushed oversized edits exit the outbound queue. When `true`
+/// (fallback for a persisted oversized ciphertext), `local_seq` is cleared to `0`.
+pub async fn record_terminal_prep_error(
+    pool: &SqlitePool,
+    sync_key: &str,
+    expected_local_seq: Option<i64>,
+    error: &str,
+    reset_local_seq_to_zero: bool,
+) -> Result<bool> {
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin recording terminal sync prep error")?;
+    let current_seq: Option<i64> =
+        sqlx::query_scalar("SELECT local_seq FROM sync_items WHERE sync_key = ?")
+            .bind(sync_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .context("read local_seq before recording terminal sync prep error")?;
+    let Some(current_seq) = current_seq else {
+        transaction.rollback().await.ok();
+        return Ok(false);
+    };
+    if expected_local_seq.is_some_and(|expected| current_seq != expected) {
+        transaction.rollback().await.ok();
+        return Ok(false);
+    }
+
+    let fallback_seq = if reset_local_seq_to_zero {
+        0
+    } else {
+        let max_pushed: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(pushed_local_seq), 0) FROM sync_item_targets WHERE sync_key = ?",
+        )
+        .bind(sync_key)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("read max pushed_local_seq for terminal sync prep error")?;
+        current_seq.min(max_pushed)
+    };
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE sync_items
+        SET prep_state = 'ready',
+            prep_error = ?,
+            prep_attempts = 0,
+            next_prep_at = NULL,
+            manual_share = 0,
+            local_seq = ?,
+            updated_at = ?
+        WHERE sync_key = ?
+        "#,
+    )
+    .bind(error)
+    .bind(fallback_seq)
+    .bind(now)
+    .bind(sync_key)
+    .execute(&mut *transaction)
+    .await
+    .context("record terminal sync prep error")?;
+    transaction
+        .commit()
+        .await
+        .context("commit terminal sync prep error")?;
+    Ok(true)
 }
 
 async fn set_terminal_delivery_policy(

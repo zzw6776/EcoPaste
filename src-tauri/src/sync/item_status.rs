@@ -100,6 +100,10 @@ fn derive_cloud_channel(facts: &ItemStatusFacts) -> SyncItemChannelStatus {
     channel.availability = source_availability;
 
     let satisfied = confirmed == ContentLevel::Complete;
+    let local_content_available = matches!(
+        facts.local_state,
+        SyncLocalContentState::Managed | SyncLocalContentState::External
+    );
     let control_pending = facts.cloud_enabled
         && (facts.prep_pending || (facts.local_seq > 0 && pushed_local_seq < facts.local_seq));
     let blob_pending = facts.cloud_enabled
@@ -108,14 +112,15 @@ fn derive_cloud_channel(facts: &ItemStatusFacts) -> SyncItemChannelStatus {
             .cloud_blob_policy
             .allows_cloud_upload(facts.origin == SyncItemOrigin::Local);
 
-    if facts.prep_pending && facts.cloud_enabled {
-        if let Some(error) = &facts.prep_error {
+    if let Some(error) = &facts.prep_error {
+        if facts.cloud_enabled {
             channel.activity = SyncItemActivity::Error;
             channel.last_error = Some(error.clone());
-        } else {
-            channel.activity = SyncItemActivity::Queued;
         }
+    } else if facts.prep_pending && facts.cloud_enabled {
+        channel.activity = SyncItemActivity::Queued;
     } else if !satisfied
+        && (facts.origin == SyncItemOrigin::Local || local_content_available)
         && matches!(
             facts.cloud_blob_policy,
             CloudBlobPolicy::Canceled | CloudBlobPolicy::Blocked
@@ -127,7 +132,7 @@ fn derive_cloud_channel(facts: &ItemStatusFacts) -> SyncItemChannelStatus {
                 .then(|| "transfer canceled".to_owned())
         });
     } else if control_pending || blob_pending {
-        if target_error.is_some() && !satisfied {
+        if target_error.is_some() && (!satisfied || control_pending) {
             channel.activity = SyncItemActivity::Error;
             channel.last_error = target_error;
         } else {
@@ -211,29 +216,22 @@ fn derive_lan_channel(facts: &ItemStatusFacts) -> SyncItemChannelStatus {
                 .copied()
                 .find(|delivery| delivery.target_id == target_id);
             let pushed = fact.map(|delivery| delivery.pushed_local_seq).unwrap_or(0);
-            let confirmed = fact
-                .map(|delivery| delivery.confirmed)
-                .unwrap_or(ContentLevel::None);
             if facts.local_seq > 0 && pushed < facts.local_seq {
                 if let Some(error) = fact.and_then(|delivery| delivery.last_error.as_ref()) {
-                    if confirmed != ContentLevel::Complete {
-                        channel.activity = SyncItemActivity::Error;
-                        channel.last_error = Some(error.clone());
-                        continue;
-                    }
+                    channel.activity = SyncItemActivity::Error;
+                    channel.last_error = Some(error.clone());
+                    continue;
                 }
                 if channel.activity != SyncItemActivity::Error {
                     channel.activity = SyncItemActivity::Queued;
                 }
             }
         }
-        if facts.prep_pending {
-            if let Some(error) = &facts.prep_error {
-                channel.activity = SyncItemActivity::Error;
-                channel.last_error = Some(error.clone());
-            } else if channel.activity == SyncItemActivity::Idle {
-                channel.activity = SyncItemActivity::Queued;
-            }
+        if let Some(error) = &facts.prep_error {
+            channel.activity = SyncItemActivity::Error;
+            channel.last_error = Some(error.clone());
+        } else if facts.prep_pending && channel.activity == SyncItemActivity::Idle {
+            channel.activity = SyncItemActivity::Queued;
         }
     }
 
@@ -470,5 +468,82 @@ mod tests {
         );
         assert_eq!(ext_missing.lan.action, SyncItemAction::Download);
         assert_eq!(ext_missing.cloud.action, SyncItemAction::Download);
+    }
+
+    #[test]
+    fn terminal_prep_error_shows_error_even_after_prior_sync_and_missing_remote_file_ignores_stale_cancel(
+    ) {
+        let oversized = ItemStatusFacts {
+            item_id: "oversized".into(),
+            origin: SyncItemOrigin::Local,
+            local_state: SyncLocalContentState::Managed,
+            local_seq: 1,
+            prep_pending: false,
+            prep_error: Some("frame exceeds 8 MiB".into()),
+            cloud_blob_policy: CloudBlobPolicy::Auto,
+            has_pending_cloud_blobs: false,
+            cloud_enabled: true,
+            online_peer_ids: vec!["peer-a".into()],
+            remote_file_available: false,
+            deliveries: vec![
+                TargetFact {
+                    target_id: "cloud".into(),
+                    confirmed: ContentLevel::Complete,
+                    pushed_local_seq: 1,
+                    last_error: None,
+                },
+                TargetFact {
+                    target_id: "peer:peer-a".into(),
+                    confirmed: ContentLevel::Complete,
+                    pushed_local_seq: 1,
+                    last_error: None,
+                },
+            ],
+        };
+        let projected = derive_item_status(oversized);
+        assert_eq!(projected.cloud.activity, SyncItemActivity::Error);
+        assert_eq!(projected.cloud.action, SyncItemAction::Retry);
+        assert_eq!(
+            projected.cloud.last_error.as_deref(),
+            Some("frame exceeds 8 MiB")
+        );
+        assert_eq!(projected.lan.activity, SyncItemActivity::Error);
+        assert_eq!(projected.lan.action, SyncItemAction::Retry);
+        assert_eq!(
+            projected.lan.last_error.as_deref(),
+            Some("frame exceeds 8 MiB")
+        );
+
+        let remote_missing = ItemStatusFacts {
+            item_id: "remote-missing".into(),
+            origin: SyncItemOrigin::Remote,
+            local_state: SyncLocalContentState::ExternalMissing,
+            local_seq: 0,
+            prep_pending: false,
+            prep_error: None,
+            cloud_blob_policy: CloudBlobPolicy::Canceled,
+            has_pending_cloud_blobs: false,
+            cloud_enabled: true,
+            online_peer_ids: vec!["android".into()],
+            remote_file_available: true,
+            deliveries: vec![
+                TargetFact {
+                    target_id: "cloud".into(),
+                    confirmed: ContentLevel::Metadata,
+                    pushed_local_seq: 0,
+                    last_error: Some("transfer canceled".into()),
+                },
+                TargetFact {
+                    target_id: "peer:android".into(),
+                    confirmed: ContentLevel::Complete,
+                    pushed_local_seq: 0,
+                    last_error: None,
+                },
+            ],
+        };
+        let remote_projected = derive_item_status(remote_missing);
+        assert_eq!(remote_projected.cloud.activity, SyncItemActivity::Idle);
+        assert_eq!(remote_projected.cloud.action, SyncItemAction::None);
+        assert_eq!(remote_projected.lan.action, SyncItemAction::Download);
     }
 }

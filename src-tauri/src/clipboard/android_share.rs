@@ -624,59 +624,99 @@ pub(crate) async fn receive(
         .await
         {
             Ok(result) => {
+                let transfer_lock_id = task_id
+                    .clone()
+                    .unwrap_or_else(|| format!("android-share:{}", result.id));
+                if let Err(error) =
+                    crate::sync::lock_active_transfer(&pool, &transfer_lock_id, &result.id).await
+                {
+                    log::warn!("lock Android shared file import item failed: {error:#}");
+                }
                 drop(_guard);
-                item = crate::db::items::find_item_by_id(&pool, &result.id)
-                    .await?
-                    .context("imported shared file record is missing")?;
-                let files = pending.files;
-                let manager_for_task = manager.clone();
-                let task_id_for_task = task_id.clone();
-                let import_result = tauri::async_runtime::spawn_blocking(move || {
-                    materialize_file_import(
-                        files,
-                        manager_for_task.as_ref(),
-                        task_id_for_task.as_deref(),
-                    )
-                })
-                .await?;
-                match import_result {
-                    Ok(total_bytes) => {
-                        item.size = Some(i64::try_from(total_bytes).unwrap_or(i64::MAX));
-                        sqlx::query("UPDATE clipboard_items SET size = ? WHERE id = ?")
-                            .bind(item.size)
-                            .bind(&item.id)
-                            .execute(&pool)
-                            .await
-                            .context("update imported shared file size")?;
-                        if let Err(error) = app.emit(
-                            super::watcher::CLIPBOARD_UPDATED_EVENT,
-                            serde_json::json!({
-                                "id": item.id,
-                                "kind": item.kind,
-                                "deduplicated": true,
-                            }),
-                        ) {
-                            log::warn!("emit imported shared file size update failed: {error}");
+                let import_files = pending.files;
+                let import_directory = pending.directory;
+                let step_result: anyhow::Result<()> = async {
+                    let Some(loaded_item) =
+                        crate::db::items::find_item_by_id(&pool, &result.id).await?
+                    else {
+                        remove_import_placeholder(app, &pool, &result.id, &import_directory).await;
+                        if let Some((manager, task_id)) = manager.as_ref().zip(task_id.as_deref()) {
+                            manager.fail_shared_file_import(
+                                task_id,
+                                0,
+                                "imported shared file record is missing".to_owned(),
+                            );
                         }
-                        crate::commands::android::notify_overlay_clipboard_changed();
-                        let cloud_blob_policy = shared_cloud_blob_policy(
-                            &item,
-                            app.state::<crate::settings::SettingsStore>()
-                                .snapshot()
-                                .sync
-                                .auto_upload_max_mb,
-                            manager
-                                .as_ref()
-                                .is_some_and(|manager| manager.has_connected_lan_peer()),
-                        );
-                        let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
-                            |(manager, task_id)| manager.shared_file_import_canceled(task_id),
-                        );
-                        if canceled {
-                            remove_import_placeholder(app, &pool, &item.id, &pending.directory)
-                                .await;
-                            outcome.skipped += 1;
-                        } else {
+                        outcome.skipped += 1;
+                        return Ok(());
+                    };
+                    item = loaded_item;
+                    let manager_for_task = manager.clone();
+                    let task_id_for_task = task_id.clone();
+                    let import_result = tauri::async_runtime::spawn_blocking(move || {
+                        materialize_file_import(
+                            import_files,
+                            manager_for_task.as_ref(),
+                            task_id_for_task.as_deref(),
+                        )
+                    })
+                    .await?;
+                    match import_result {
+                        Ok(total_bytes) => {
+                            item.size = Some(i64::try_from(total_bytes).unwrap_or(i64::MAX));
+                            let updated_rows =
+                                sqlx::query("UPDATE clipboard_items SET size = ? WHERE id = ?")
+                                    .bind(item.size)
+                                    .bind(&item.id)
+                                    .execute(&pool)
+                                    .await
+                                    .context("update imported shared file size")?
+                                    .rows_affected();
+                            if updated_rows == 0 {
+                                remove_import_placeholder(app, &pool, &item.id, &import_directory)
+                                    .await;
+                                if let Some((manager, task_id)) =
+                                    manager.as_ref().zip(task_id.as_deref())
+                                {
+                                    manager.fail_shared_file_import(
+                                        task_id,
+                                        total_bytes,
+                                        "imported shared file record is missing".to_owned(),
+                                    );
+                                }
+                                outcome.skipped += 1;
+                                return Ok(());
+                            }
+                            if let Err(error) = app.emit(
+                                super::watcher::CLIPBOARD_UPDATED_EVENT,
+                                serde_json::json!({
+                                    "id": item.id,
+                                    "kind": item.kind,
+                                    "deduplicated": true,
+                                }),
+                            ) {
+                                log::warn!("emit imported shared file size update failed: {error}");
+                            }
+                            crate::commands::android::notify_overlay_clipboard_changed();
+                            let cloud_blob_policy = shared_cloud_blob_policy(
+                                &item,
+                                app.state::<crate::settings::SettingsStore>()
+                                    .snapshot()
+                                    .sync
+                                    .auto_upload_max_mb,
+                                manager
+                                    .as_ref()
+                                    .is_some_and(|manager| manager.has_connected_lan_peer()),
+                            );
+                            let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
+                                |(manager, task_id)| manager.shared_file_import_canceled(task_id),
+                            );
+                            if canceled {
+                                remove_import_placeholder(app, &pool, &item.id, &import_directory)
+                                    .await;
+                                outcome.skipped += 1;
+                                return Ok(());
+                            }
                             match crate::db::sync_items::stage_existing_content(
                                 &pool,
                                 &item,
@@ -726,31 +766,42 @@ pub(crate) async fn receive(
                                         app,
                                         &pool,
                                         &item.id,
-                                        &pending.directory,
+                                        &import_directory,
                                     )
                                     .await;
                                     outcome.failed += 1;
                                 }
                             }
                         }
-                    }
-                    Err(error) => {
-                        let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
-                            |(manager, task_id)| manager.shared_file_import_canceled(task_id),
-                        );
-                        if !canceled {
-                            if let Some((manager, task_id)) =
-                                manager.as_ref().zip(task_id.as_deref())
-                            {
-                                manager.fail_shared_file_import(task_id, 0, error.to_string());
+                        Err(error) => {
+                            let canceled = manager.as_ref().zip(task_id.as_deref()).is_some_and(
+                                |(manager, task_id)| manager.shared_file_import_canceled(task_id),
+                            );
+                            if !canceled {
+                                if let Some((manager, task_id)) =
+                                    manager.as_ref().zip(task_id.as_deref())
+                                {
+                                    manager.fail_shared_file_import(task_id, 0, error.to_string());
+                                }
+                                outcome.failed += 1;
+                                log::warn!("import Android shared files failed: {error:#}");
+                            } else {
+                                outcome.skipped += 1;
                             }
-                            outcome.failed += 1;
-                            log::warn!("import Android shared files failed: {error:#}");
-                        } else {
-                            outcome.skipped += 1;
+                            remove_import_placeholder(app, &pool, &item.id, &import_directory)
+                                .await;
                         }
-                        remove_import_placeholder(app, &pool, &item.id, &pending.directory).await;
                     }
+                    Ok(())
+                }
+                .await;
+                let _ = crate::sync::unlock_active_transfer(&pool, &transfer_lock_id).await;
+                if let Err(error) = step_result {
+                    if let Some((manager, task_id)) = manager.as_ref().zip(task_id.as_deref()) {
+                        manager.fail_shared_file_import(task_id, 0, error.to_string());
+                    }
+                    remove_import_placeholder(app, &pool, &result.id, &import_directory).await;
+                    return Err(error);
                 }
             }
             Err(error) => {

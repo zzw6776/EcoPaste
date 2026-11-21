@@ -594,11 +594,79 @@ async fn dispatch_peer(
             }
             let serve_info =
                 repository::blob_serve_info(&pool, &blob_id, item_sync_key.as_deref()).await?;
-            let serve_sync_key = serve_info
-                .as_ref()
-                .map(|info| info.sync_key.as_str())
-                .or(item_sync_key.as_deref());
-            let Some(blob) = repository::outgoing_blob(&pool, &blob_id).await? else {
+            let mut resolved_source = None;
+            for _ in 0..32 {
+                let Some((row_sync_key, candidate)) =
+                    repository::outgoing_blob(&pool, &blob_id, item_sync_key.as_deref()).await?
+                else {
+                    break;
+                };
+                match candidate.outgoing_source() {
+                    Some(OutgoingBlobSource::DirectStream {
+                        source_path,
+                        stream_nonce,
+                    }) => {
+                        if !source_path.starts_with("content://")
+                            && !Path::new(source_path).is_file()
+                        {
+                            if let Some(ref key) = row_sync_key {
+                                let _ = repository::mark_blob_local_unavailable(
+                                    &pool,
+                                    key,
+                                    &candidate.blob_id,
+                                )
+                                .await;
+                                continue;
+                            }
+                            break;
+                        }
+                        resolved_source = Some((
+                            row_sync_key,
+                            candidate.clone(),
+                            Some((source_path.to_owned(), stream_nonce.to_vec())),
+                            None,
+                        ));
+                        break;
+                    }
+                    Some(OutgoingBlobSource::StagedLease) => {
+                        match manager.lease_outgoing_staging(&group, &candidate).await {
+                            Ok(staged) => {
+                                resolved_source =
+                                    Some((row_sync_key, candidate, None, Some(staged)));
+                                break;
+                            }
+                            Err(error)
+                                if error.downcast_ref::<RemoteBlobUnavailable>().is_some() =>
+                            {
+                                if let Some(ref key) = row_sync_key {
+                                    let _ = repository::mark_blob_local_unavailable(
+                                        &pool,
+                                        key,
+                                        &candidate.blob_id,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => {
+                        if let Some(ref key) = row_sync_key {
+                            let _ = repository::mark_blob_local_unavailable(
+                                &pool,
+                                key,
+                                &candidate.blob_id,
+                            )
+                            .await;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            let Some((actual_sync_key, blob, streaming_source, staged)) = resolved_source else {
                 write_frame(
                     send,
                     &Response::Error {
@@ -608,74 +676,6 @@ async fn dispatch_peer(
                 )
                 .await?;
                 return Ok(());
-            };
-            let (streaming_source, staged) = match blob.outgoing_source() {
-                Some(OutgoingBlobSource::DirectStream {
-                    source_path,
-                    stream_nonce,
-                }) => {
-                    if !source_path.starts_with("content://") && !Path::new(source_path).is_file() {
-                        if let Some(sync_key) = serve_sync_key {
-                            let _ = repository::mark_blob_local_unavailable(
-                                &pool,
-                                sync_key,
-                                &blob.blob_id,
-                            )
-                            .await;
-                        }
-                        write_frame(
-                            send,
-                            &Response::Error {
-                                code: ErrorCode::NotFound,
-                                message: "blob is unavailable".to_owned(),
-                            },
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    (Some((source_path.to_owned(), stream_nonce.to_vec())), None)
-                }
-                Some(OutgoingBlobSource::StagedLease) => {
-                    match manager.lease_outgoing_staging(&group, &blob).await {
-                        Ok(staged) => (None, Some(staged)),
-                        Err(error) if error.downcast_ref::<RemoteBlobUnavailable>().is_some() => {
-                            if let Some(sync_key) = serve_sync_key {
-                                let _ = repository::mark_blob_local_unavailable(
-                                    &pool,
-                                    sync_key,
-                                    &blob.blob_id,
-                                )
-                                .await;
-                            }
-                            write_frame(
-                                send,
-                                &Response::Error {
-                                    code: ErrorCode::NotFound,
-                                    message: "blob is unavailable".to_owned(),
-                                },
-                            )
-                            .await?;
-                            return Ok(());
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                None => {
-                    if let Some(sync_key) = serve_sync_key {
-                        let _ =
-                            repository::mark_blob_local_unavailable(&pool, sync_key, &blob.blob_id)
-                                .await;
-                    }
-                    write_frame(
-                        send,
-                        &Response::Error {
-                            code: ErrorCode::NotFound,
-                            message: "blob is unavailable".to_owned(),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
             };
             let peer_info =
                 repository::peer_by_endpoint_id(&pool, &connection.remote_id().to_string()).await?;
@@ -724,8 +724,9 @@ async fn dispatch_peer(
                 _ => None,
             };
             manager.emit_updated();
-            let transfer_lock_id =
-                lock_lan_pull_item(&pool, &blob, item_sync_key.as_deref()).await?;
+            let lock_sync_key = actual_sync_key.as_deref().or(item_sync_key.as_deref());
+            let transfer_lock_id = lock_lan_pull_item(&pool, &blob, lock_sync_key).await?;
+            let language = crate::i18n::current_language(&manager.app);
             let mut progress = super::super::upload::UploadProgress::new(
                 connection.stable_id(),
                 blob_log_ref(&blob.blob_id),
@@ -747,7 +748,7 @@ async fn dispatch_peer(
                                 key: group.content_key_bytes()?,
                                 stream_nonce: &nonce,
                                 idle_timeout: BLOB_IDLE_TIMEOUT,
-                                language: crate::i18n::current_language(&manager.app),
+                                language,
                             },
                             &mut progress,
                         )
@@ -759,7 +760,7 @@ async fn dispatch_peer(
                             &mut file,
                             &mut writer,
                             BLOB_IDLE_TIMEOUT,
-                            crate::i18n::current_language(&manager.app),
+                            language,
                             &mut progress,
                         )
                         .await?;
@@ -794,10 +795,11 @@ async fn dispatch_peer(
             }
             .await;
             if let Some(handle) = &serve_handle {
+                let reported = handle.reported_bytes();
                 match &result {
                     Ok(()) => handle.completed(blob.size),
-                    Err(_) if handle.canceled() => handle.mark_canceled(progress.written_bytes),
-                    Err(error) => handle.failed(progress.written_bytes, error.to_string()),
+                    Err(_) if handle.canceled() => handle.mark_canceled(reported),
+                    Err(error) => handle.failed(reported, error.to_string()),
                 }
             }
             if let Some((ref peer_device_id, ref peer_name)) = peer_info {

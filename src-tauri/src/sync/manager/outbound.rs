@@ -1,5 +1,35 @@
 use super::*;
 
+/// Reserve headroom for CBOR envelope fields, device metadata, and small control-frame overhead.
+const MAX_SNAPSHOT_FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
+
+/// Returns the exact CBOR byte length of a `Vec<u8>` field encoded as a CBOR array of integers
+/// (matching `SyncItemWrite::{nonce, ciphertext}` without `minicbor::bytes`).
+fn cbor_u8_array_len(bytes: &[u8]) -> usize {
+    let body: usize = bytes.iter().map(|&b| if b <= 23 { 1 } else { 2 }).sum();
+    body.saturating_add(5)
+}
+
+/// Rejects snapshots whose encoded `SyncItemWrite` cannot fit inside one protocol control frame.
+fn ensure_snapshot_fits_frame(
+    nonce: &[u8],
+    ciphertext: &[u8],
+    blob_count: usize,
+) -> std::result::Result<(), String> {
+    let estimated = cbor_u8_array_len(nonce)
+        .saturating_add(cbor_u8_array_len(ciphertext))
+        .saturating_add(blob_count.saturating_mul(80))
+        .saturating_add(MAX_SNAPSHOT_FRAME_OVERHEAD_BYTES);
+    if estimated > MAX_FRAME_BYTES {
+        return Err(FrameError::TooLarge {
+            actual: estimated,
+            maximum: MAX_FRAME_BYTES,
+        }
+        .to_string());
+    }
+    Ok(())
+}
+
 fn is_missing_local_source_error(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause
@@ -192,6 +222,20 @@ impl SyncManager {
                 } else {
                     repository::load_item_blobs(&pool, &meta.sync_key).await?
                 };
+                if let Err(error) =
+                    ensure_snapshot_fits_frame(&nonce, &ciphertext, existing_blobs.len())
+                {
+                    repository::record_terminal_prep_error(
+                        &pool,
+                        &meta.sync_key,
+                        Some(pending.local_seq),
+                        &error,
+                        false,
+                    )
+                    .await?;
+                    processed += 1;
+                    continue;
+                }
                 repository::commit_prepared_item(
                     &pool,
                     repository::PreparedItemCommit {
@@ -455,6 +499,26 @@ impl SyncManager {
         let protected = snapshot.protected();
         let (nonce, ciphertext) =
             crypto::encrypt_item_snapshot(&key, &item_key, deleted, protected, &snapshot)?;
+        if let Err(error) = ensure_snapshot_fits_frame(&nonce, &ciphertext, blob_rows.len()) {
+            if let Some(preparation) = &preparation_guard.progress {
+                preparation
+                    .handle
+                    .failed(preparation.processed(), error.clone());
+            }
+            preparation_guard.abandon();
+            let _key_lock = self.runtime_state.lock_sync_key(&item.sync_key).await;
+            repository::record_terminal_prep_error(
+                pool,
+                &item.sync_key,
+                Some(operation.local_seq),
+                &error,
+                false,
+            )
+            .await?;
+            self.discard_pending_observation(&operation.item_id, &operation.source_revision);
+            self.emit_updated();
+            return Ok(ContentMaterialization::Completed);
+        }
         if !preparation_guard.begin_commit() {
             db::sync_items::cancel_content_prep(pool, operation.local_seq).await?;
             self.discard_pending_observation(&operation.item_id, &operation.source_revision);
@@ -1182,6 +1246,35 @@ impl SyncManager {
         }))
     }
 
+    /// Verifies that all underlying local or externally saved files still exist before staging
+    /// a manual retry/upload, surfacing a clear missing-file error instead of a silent no-op.
+    pub(super) async fn ensure_file_upload_sources_available(
+        &self,
+        pool: &SqlitePool,
+        item: &ClipboardItem,
+        lang: crate::settings::Language,
+    ) -> Result<()> {
+        let resources = crate::core::paths::resources_dir(&self.app)?;
+        let sources = self.file_upload_sources(pool, item, &resources).await?;
+        if sources.is_empty() {
+            bail!(crate::i18n::commands::label(
+                lang,
+                crate::i18n::commands::Key::AndroidFileMissing
+            ));
+        }
+        for source in &sources {
+            if let Some(path) = source.path() {
+                if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+                    bail!(crate::i18n::commands::label(
+                        lang,
+                        crate::i18n::commands::Key::AndroidFileMissing
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Computes total byte size for a local file entry and rejects items with missing paths.
     async fn backfill_file_item_size(
         &self,
@@ -1237,7 +1330,7 @@ impl SyncManager {
         let mut selected = Vec::new();
         let mut valid_count = 0_usize;
         for item_id in item_ids {
-            let Some(item) = db::items::find_item_by_id(pool, &item_id).await? else {
+            let Some(mut item) = db::items::find_item_by_id(pool, &item_id).await? else {
                 continue;
             };
             if !item.is_favorite && !item.is_pinned {
@@ -1277,6 +1370,17 @@ impl SyncManager {
                     else {
                         continue;
                     };
+                    if item.size.is_none() {
+                        let size_i64 = i64::try_from(size).unwrap_or(i64::MAX);
+                        let _ = db::items::fill_file_item_size(
+                            pool,
+                            &item.id,
+                            &item.source_revision,
+                            size_i64,
+                        )
+                        .await;
+                        item.size = Some(size_i64);
+                    }
                     if permits_automatic_file_upload(size, auto_upload_max_mb)
                         || sources.iter().all(|source| !source.is_directory)
                     {

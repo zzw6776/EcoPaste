@@ -717,6 +717,37 @@ impl TransferRegistry {
         }
     }
 
+    fn reset_component_attempt(&self, id: &str, component: &ComponentProgress) {
+        if component.terminal.load(Ordering::Acquire) {
+            return;
+        }
+        let previous = component.reported_bytes.swap(0, Ordering::AcqRel);
+        let mut state = self.state.lock().expect("transfer registry poisoned");
+        let Some(entry) = state.entries.get_mut(id) else {
+            return;
+        };
+        if entry.task.phase.terminal() || entry.cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        entry.task.transferred_bytes = entry
+            .task
+            .transferred_bytes
+            .saturating_sub(previous)
+            .max(entry.completed_bytes);
+        entry.task.speed_bytes_per_second = 0;
+        entry.task.eta_seconds = None;
+        entry.task.elapsed_ms = elapsed_ms(entry.started_at, now);
+        if entry.completed_bytes == 0 && entry.active_components <= 1 {
+            entry.task.phase = TransferPhase::Connecting;
+        }
+        entry.last_sample_bytes = entry.task.transferred_bytes;
+        entry.last_sample_at = now;
+        entry.last_emit_at = now;
+        drop(state);
+        self.emit(id, false);
+    }
+
     fn emit(&self, id: &str, prune: bool) {
         let (task, removed) = {
             let mut state = self.state.lock().expect("transfer registry poisoned");
@@ -916,6 +947,16 @@ struct ComponentHandleUpdate<'a> {
 impl TransferHandle {
     pub fn canceled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
+    }
+
+    pub fn reported_bytes(&self) -> u64 {
+        self.component.reported_bytes.load(Ordering::Acquire)
+    }
+
+    /// Rolls back uncommitted bytes from a failed connection attempt before retrying cleanly.
+    pub fn reset_attempt(&self) {
+        self.registry
+            .reset_component_attempt(&self.entry_id, &self.component);
     }
 
     pub fn connecting(&self) {

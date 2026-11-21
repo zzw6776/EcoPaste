@@ -2031,8 +2031,14 @@ impl SyncManager {
         &self,
         pool: &SqlitePool,
     ) -> Result<crate::clipboard::shared_files::CleanupStats> {
+        let settings = self.app.state::<SettingsStore>().snapshot().sync;
+        let paired = self.identity.snapshot().group.is_some();
+        let cloud_active =
+            settings.enabled && paired && settings.cloud_enabled && server_is_configured(&settings);
         loop {
-            let pruned = repository::prune_released_items(pool, LOCAL_SYNC_GC_BATCH_SIZE).await?;
+            let pruned =
+                repository::prune_released_items(pool, cloud_active, LOCAL_SYNC_GC_BATCH_SIZE)
+                    .await?;
             if pruned < u64::from(LOCAL_SYNC_GC_BATCH_SIZE) {
                 break;
             }
@@ -2081,6 +2087,14 @@ impl SyncManager {
             bail!("云端同步未配置");
         }
         let pool = self.pool().await;
+        if target == SyncTarget::Lan && !self.has_connected_lan_peer() {
+            bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
+        }
+        let online_peers = if target == SyncTarget::Lan {
+            self.runtime_state.online_lan_peer_ids()
+        } else {
+            Vec::new()
+        };
         let remote_content_state = if item.remote_file_state.is_some() {
             self.item_statuses(std::slice::from_ref(&item.id))
                 .await?
@@ -2096,16 +2110,23 @@ impl SyncManager {
                 SyncLocalContentState::Managed | SyncLocalContentState::External
             )
         });
-        if item.remote_file_state.is_some()
-            && (target != SyncTarget::Cloud || !remote_content_available)
-        {
+        let has_pending_control = repository::has_pending_control_delivery(
+            &pool,
+            &item.sync_key,
+            target == SyncTarget::Cloud,
+            &online_peers,
+        )
+        .await?;
+        let wants_blob_delivery = if item.remote_file_state.is_some() {
+            target == SyncTarget::Cloud && remote_content_available
+        } else {
+            true
+        };
+        if item.remote_file_state.is_some() && !wants_blob_delivery && !has_pending_control {
             bail!(crate::i18n::commands::label(
                 lang,
                 Key::RemoteFileNotDownloaded,
             ));
-        }
-        if target == SyncTarget::Lan && !self.has_connected_lan_peer() {
-            bail!(crate::i18n::commands::label(lang, Key::SyncNoLanDevice));
         }
         let lane = match item.kind {
             ClipboardKind::Text => crate::db::sync_items::OutboxContentLane::Text,
@@ -2117,27 +2138,37 @@ impl SyncManager {
         let content_pending = meta
             .as_ref()
             .is_some_and(|row| row.nonce.is_none() && row.is_present);
-        let external_local_ready = if remote_content_state == Some(SyncLocalContentState::External)
-            && meta.as_ref().is_some_and(|row| row.nonce.is_some())
-        {
-            let blobs = repository::load_item_blobs(&pool, &item.sync_key).await?;
-            let content_blobs = blobs
-                .iter()
-                .filter(|blob| !blob.optional)
-                .collect::<Vec<_>>();
-            !content_blobs.is_empty() && content_blobs.iter().all(|blob| blob.local_available)
+        let file_blobs_ready = if item.kind == ClipboardKind::Files && wants_blob_delivery {
+            if meta.as_ref().is_some_and(|row| row.nonce.is_some()) {
+                let blobs = repository::load_item_blobs(&pool, &item.sync_key).await?;
+                let content_blobs = blobs
+                    .iter()
+                    .filter(|blob| !blob.optional)
+                    .collect::<Vec<_>>();
+                !content_blobs.is_empty()
+                    && content_blobs.iter().all(|blob| {
+                        blob.local_available
+                            || (target == SyncTarget::Cloud && blob.cloud_available)
+                    })
+            } else {
+                false
+            }
         } else {
-            false
+            true
         };
-        let delivery_requested = if content_pending
-            || (remote_content_state == Some(SyncLocalContentState::External)
-                && !external_local_ready)
-        {
+        let delivery_requested = if content_pending || !file_blobs_ready {
             false
         } else {
-            repository::request_item_delivery(&pool, &item.id, target == SyncTarget::Cloud).await?
+            repository::request_item_delivery(
+                &pool,
+                &item.id,
+                target == SyncTarget::Cloud,
+                wants_blob_delivery,
+            )
+            .await?
         };
         if delivery_requested {
+            self.notify_local_outbox();
             if target == SyncTarget::Cloud {
                 self.wake_cloud_transfer();
             } else {
@@ -2159,6 +2190,10 @@ impl SyncManager {
                 Key::RemoteFileNotDownloaded,
             ));
         }
+        if item.kind == ClipboardKind::Files {
+            self.ensure_file_upload_sources_available(&pool, &item, lang)
+                .await?;
+        }
         db::sync_items::stage_existing_content(
             &pool,
             &item,
@@ -2171,6 +2206,7 @@ impl SyncManager {
             },
         )
         .await?;
+        self.notify_local_outbox();
         if target == SyncTarget::Cloud {
             self.wake_cloud_transfer();
         } else {
@@ -2372,10 +2408,7 @@ impl SyncManager {
             bail!("云端返回了无效的记录响应");
         };
 
-        let data_connection = self
-            .ensure_cloud_data_connection(&settings)
-            .await
-            .unwrap_or_else(|_| connection.clone());
+        let mut data_session = None;
         let identity = self.identity.snapshot();
         let mut device_names = repository::list_peer_statuses(&self.pool().await)
             .await?
@@ -2413,8 +2446,17 @@ impl SyncManager {
                 .as_ref()
                 .is_some_and(|item| item.kind == "image");
             let image_path = if is_image {
+                if data_session.is_none() {
+                    data_session = Some(
+                        match self.ensure_active_cloud_data_connection(&settings).await {
+                            Ok((conn, guard)) => (conn, Some(guard)),
+                            Err(_) => (connection.clone(), None),
+                        },
+                    );
+                }
+                let (data_connection, _) = data_session.as_ref().expect("data session initialized");
                 match self
-                    .cloud_record_image_path(&data_connection, &group, &snapshot)
+                    .cloud_record_image_path(data_connection, &group, &snapshot)
                     .await
                 {
                     Ok(path) => path,

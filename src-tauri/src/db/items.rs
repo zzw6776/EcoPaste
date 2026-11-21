@@ -50,12 +50,15 @@ macro_rules! evictable_history {
                               WHERE target.sync_key = sync_row.sync_key
                                 AND target.pushed_local_seq >= sync_row.local_seq
                           ))
-                          OR EXISTS (
-                              SELECT 1 FROM sync_item_blobs blob
-                              WHERE blob.sync_key = sync_row.sync_key
-                                AND blob.optional = 0
-                                AND blob.cloud_available = 0
-                                AND blob.local_available = 1
+                          OR (
+                              sync_row.cloud_blob_policy IN ('auto', 'requested')
+                              AND EXISTS (
+                                  SELECT 1 FROM sync_item_blobs blob
+                                  WHERE blob.sync_key = sync_row.sync_key
+                                    AND blob.optional = 0
+                                    AND blob.cloud_available = 0
+                                    AND blob.local_available = 1
+                              )
                           )
                       )
                   )

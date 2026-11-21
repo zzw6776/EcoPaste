@@ -2,13 +2,6 @@ use ecopaste_sync_protocol::{CloudBlobCheck, LanContentLevel, LanItemAck, MAX_IT
 
 use super::*;
 
-#[derive(Debug, thiserror::Error)]
-#[error("{source}")]
-struct OversizedOutgoingItem {
-    item_key: String,
-    source: anyhow::Error,
-}
-
 impl SyncManager {
     pub(super) async fn start_preparation_transfer(
         &self,
@@ -148,17 +141,22 @@ impl SyncManager {
         Ok(local_has_more)
     }
 
-    async fn block_oversized_item_key(
+    async fn fail_oversized_item_key(
         &self,
         pool: &SqlitePool,
-        target_id: &str,
         item_key: &str,
+        expected_local_seq: i64,
         error: &str,
     ) -> Result<()> {
         if let Some(meta) = repository::load_sync_item_meta_by_item_key(pool, item_key).await? {
-            self.delivery
-                .blocked(pool, target_id, &meta.sync_key, error)
-                .await?;
+            repository::record_terminal_prep_error(
+                pool,
+                &meta.sync_key,
+                Some(expected_local_seq),
+                error,
+                true,
+            )
+            .await?;
             self.emit_updated();
         }
         Ok(())
@@ -272,7 +270,12 @@ impl SyncManager {
             } else {
                 Vec::new()
             };
-            let first_item_key = writes.first().map(|w| w.item_key.clone());
+            let first_item = writes.first().map(|w| {
+                (
+                    w.item_key.clone(),
+                    i64::try_from(w.local_seq).unwrap_or(i64::MAX),
+                )
+            });
             let mut request = Request::CloudSyncItems {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
@@ -287,16 +290,12 @@ impl SyncManager {
                 Ok(count) => count,
                 Err(error) => {
                     drop(exchange_guard);
-                    if let Some(item_key) = first_item_key {
-                        let err = OversizedOutgoingItem {
-                            item_key: item_key.clone(),
-                            source: error.into(),
-                        };
-                        self.block_oversized_item_key(
+                    if let Some((item_key, local_seq)) = first_item {
+                        self.fail_oversized_item_key(
                             &pool,
-                            CLOUD_TARGET,
-                            &err.item_key,
-                            &err.to_string(),
+                            &item_key,
+                            local_seq,
+                            &error.to_string(),
                         )
                         .await?;
                         continue;
@@ -658,7 +657,12 @@ impl SyncManager {
                 break;
             }
 
-            let first_item_key = writes.first().map(|w| w.item_key.clone());
+            let first_item = writes.first().map(|w| {
+                (
+                    w.item_key.clone(),
+                    i64::try_from(w.local_seq).unwrap_or(i64::MAX),
+                )
+            });
             let mut request = Request::SyncItems {
                 group_id: group.group_id.clone(),
                 access_token: group.access_token_bytes()?,
@@ -672,11 +676,11 @@ impl SyncManager {
                 Ok(count) => count,
                 Err(error) => {
                     drop(exchange_guard);
-                    if let Some(item_key) = first_item_key {
-                        self.block_oversized_item_key(
+                    if let Some((item_key, local_seq)) = first_item {
+                        self.fail_oversized_item_key(
                             &pool,
-                            target_id,
                             &item_key,
+                            local_seq,
                             &error.to_string(),
                         )
                         .await?;
@@ -800,13 +804,13 @@ impl SyncManager {
         Ok(SyncConnectionOutcome { has_more })
     }
 
-    /// Uploads the single highest-priority pending local attachment item to Cloud Hub over
-    /// `data_connection`. Returns `Ok(true)` when an item was processed so the worker re-queries
-    /// fresh priority order, or `Ok(false)` when no eligible unclaimed item remains so the worker
-    /// sleeps cleanly without busy-looping.
+    /// Uploads the single highest-priority pending local attachment item to Cloud Hub.
+    /// Returns `Ok(true)` when an item was processed so the worker re-queries fresh priority
+    /// order, or `Ok(false)` when no eligible unclaimed item remains so the worker sleeps cleanly
+    /// without opening an idle secondary QUIC connection.
     pub(super) async fn upload_one_cloud_blob_item(
         self: &Arc<Self>,
-        data_connection: &Connection,
+        settings: &SyncSettings,
         pool: &SqlitePool,
         group: &GroupSecrets,
         realtime_only: bool,
@@ -880,8 +884,8 @@ impl SyncManager {
             BLOB_PRIORITY_BACKFILL
         };
 
-        let _cloud_data_activity = self.acquire_cloud_data_activity();
-        let mut active_connection = data_connection.clone();
+        let (mut active_connection, mut _cloud_data_activity) =
+            self.ensure_active_cloud_data_connection(settings).await?;
         let mut item_failed = false;
         let mut needs_control_push = false;
         for blob_row in &upload.blobs {
@@ -941,7 +945,7 @@ impl SyncManager {
                         }
                     };
                 upload_started = true;
-                let (first_result, first_unhealthy, first_written_bytes) =
+                let (first_result, first_unhealthy) =
                     upload_blob_attempt(&active_connection, group, &staged, options.clone(), false)
                         .await;
                 let Err(first_error) = first_result else {
@@ -952,7 +956,6 @@ impl SyncManager {
                     .as_ref()
                     .is_some_and(super::super::progress::TransferHandle::canceled);
                 let connection_failure = first_unhealthy
-                    || is_cloud_data_timeout(&first_error)
                     || should_invalidate_cloud_connection(&active_connection, &first_error);
                 if !canceled
                     && connection_failure
@@ -961,11 +964,17 @@ impl SyncManager {
                         .is_none()
                 {
                     self.invalidate_cloud_data_connection(active_connection.stable_id());
-                    let settings = self.app.state::<SettingsStore>().snapshot().sync;
-                    if let Ok(fresh_connection) = self.ensure_cloud_data_connection(&settings).await
+                    let current_settings = self.app.state::<SettingsStore>().snapshot().sync;
+                    if let Ok((fresh_connection, fresh_guard)) = self
+                        .ensure_active_cloud_data_connection(&current_settings)
+                        .await
                     {
+                        if let Some(handle) = &transfer {
+                            handle.reset_attempt();
+                        }
                         active_connection = fresh_connection;
-                        let (retry_result, retry_unhealthy, _) =
+                        _cloud_data_activity = fresh_guard;
+                        let (retry_result, retry_unhealthy) =
                             upload_blob_attempt(&active_connection, group, &staged, options, true)
                                 .await;
                         unhealthy_connection = retry_unhealthy;
@@ -974,7 +983,7 @@ impl SyncManager {
                 }
                 if !canceled {
                     if let Some(handle) = &transfer {
-                        handle.failed(first_written_bytes, first_error.to_string());
+                        handle.failed(handle.reported_bytes(), first_error.to_string());
                     }
                 }
                 unhealthy_connection = first_unhealthy;
@@ -1035,7 +1044,6 @@ impl SyncManager {
                             .await?;
                         self.emit_updated();
                         if unhealthy_connection
-                            || is_cloud_data_timeout(&error)
                             || should_invalidate_cloud_connection(&active_connection, &error)
                         {
                             self.invalidate_cloud_data_connection(active_connection.stable_id());
