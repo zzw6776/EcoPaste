@@ -15,8 +15,8 @@ import { resolve } from "node:path";
 import { acquireAndroidBuildLock } from "./androidBuildLock";
 
 const GIBIBYTE = 1024 ** 3;
-const DESKTOP_CACHE_LIMIT = 6 * GIBIBYTE;
-const ANDROID_CACHE_LIMIT = 3 * GIBIBYTE;
+const DESKTOP_CACHE_LIMIT = 5 * GIBIBYTE;
+const ANDROID_CACHE_LIMIT = 2 * GIBIBYTE;
 const CACHEDIR_TAG_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55";
 const CACHEDIR_TAG_CONTENT = `${CACHEDIR_TAG_SIGNATURE}
 # This file is a cache directory tag created by cargo.
@@ -148,7 +148,7 @@ async function cleanCargoProfiles(
   }
 }
 
-/** 桌面缓存超过 6 GiB 时，在构建前清理 host dev/release 并保留旧 bundle。 */
+/** 桌面缓存超过 5 GiB 时，在构建前清理 host dev/release 并保留旧 bundle。 */
 export async function cleanDesktopCacheIfNeeded(projectRoot: string) {
   const targetRoot = resolve(projectRoot, "src-tauri/target");
   const cachePaths = [
@@ -228,7 +228,7 @@ async function cleanDesktopCargoCache(
   }
 }
 
-/** Android 缓存超过 3 GiB 时，在构建前清理 arm64 Cargo 与 Gradle 产物。 */
+/** Android 缓存超过 2 GiB 时，在构建前清理 arm64 Cargo 与 Gradle 产物。 */
 export async function cleanAndroidCacheIfNeeded(
   projectRoot: string,
   cleanGradle: () => Promise<void>,

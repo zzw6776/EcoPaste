@@ -1,6 +1,6 @@
 [package]
 name = "EcoPaste"
-version = "1.1.242"
+version = "1.1.243"
 description = "A local-first clipboard manager for macOS, Windows, and Android."
 authors = ["ayangweb"]
 license = "Apache-2.0"
@@ -133,7 +133,7 @@ swarm-discovery = { path = "vendor/swarm-discovery" }
 # Keep enough symbols for normal debugging without retaining full debug metadata.
 [profile.dev]
 debug = 1
-incremental = true
+incremental = false
 
 # Dependencies do not need line tables; matching the test profile also avoids duplicate artifacts.
 [profile.dev.package."*"]

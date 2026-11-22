@@ -16,9 +16,10 @@ EcoPaste 是跨平台剪贴板管理器，采用 Rust-First 的 Tauri 架构。
 - **用户可见结果先核对链路**：修复页面显示或跨端结果前，按实际问题范围核对“数据来源 → 跨端传递 → 状态更新 → 组件渲染”，确认失效层后再修改；某一层取值正确只能证明该层，不能据此判断最终显示已修复。
 - **固定 Rust 工具链**：所有本地和 AI 会话都使用仓库根目录 `rust-toolchain.toml` 管理的 rustup 工具链，不使用 Homebrew Rust 或绕过版本文件的 `cargo`；测试 profile 采用低磁盘配置。
 - **共享工作区的 WSL 构建隔离**：Windows 与 WSL 可以共同编辑 Windows 磁盘中的源码，但 WSL 的 `node_modules`、`src-tauri/target`、Android 项目 `.gradle`、各模块 `build` 与 `jniLibs` 必须 bind mount 到 `/root/.cache/ecopaste/` 下的 ext4 目录，Windows 使用这些挂载点下方的原生目录；挂载项由 WSL `/etc/fstab` 维护，缺失时先执行 `mount -a`，禁止在未挂载状态下构建或向 Windows 目录写入 WSL 符号链接。只有 `artifacts/` 中的最终产物跨系统共享，Windows 与 WSL 不得同时构建 Android。
-- **Rust 构建低磁盘配置**：客户端只生成 macOS/Windows 使用的 `rlib` 与 Android 使用的 `cdylib`，不要恢复仅供 iOS 的 `staticlib`；桌面客户端、Android debug 和同步服务保留自身 `debug = 1` 与增量编译，release 使用 Cargo 默认策略，第三方依赖使用 `debug = 0`，测试使用 `debug = 0` 且关闭增量编译。不要为了省空间无条件删除完整客户端或服务端 `target`、Cargo registry，否则下次会重新编译或下载。
-- **本地构建缓存按阈值清理**：`pnpm tauri dev` / `pnpm tauri build` 在启动构建前检查桌面 host 的 dev + release 缓存，总量超过 6 GiB 才清理两个 profile，并保留已有桌面 bundle；Android arm64 打包前检查对应 Cargo profile 与项目 Gradle 构建目录，总量超过 3 GiB 时先清理非日常使用的 debug profile，复核仍超限才清理 release 与 Gradle 产物。Android 构建和显式清理必须通过项目脚本的互斥锁串行执行，禁止同时直接运行 Gradle/Cargo 操作相同产物目录。未超阈值时保留缓存，构建结束、应用启动、重启和热更新均不触发清理；当前最新版 APK 与 bundle、Cargo registry/git、Gradle 共享依赖缓存始终保留。不得把阈值清理扩大为 `pnpm clean:native`。
-- **Android 日常只构建 arm64 release**：本地开发和真机验收默认使用 `pnpm android:build:release`，针对 Android target 的 Rust 编译检查也必须使用 release profile；需要 ADB、WebView 或 JNI 调试时才使用 dev/debug profile 或 `pnpm android:build:debug`。两种 APK 成功后均保存在 `artifacts/android/`，新 APK 成功写入后必须删除该目录中的全部旧版本 APK，只保留最新版本；构建前按上述阈值决定是否清理，超限时优先清理非日常使用的 Android debug profile，复核仍超限才清理 release 与 Gradle 产物；只有正式多 ABI 发布流程才构建其它 Android targets。
+- **Rust 构建低磁盘配置**：客户端只生成 macOS/Windows 使用的 `rlib` 与 Android 使用的 `cdylib`，不要恢复仅供 iOS 的 `staticlib`；仓库根目录 `.cargo/config.toml` 将本地各端（客户端、`sync-server` 及 `vendor`）编译目录统一指向 `src-tauri/target` 并在本地开发 profile 下统一关闭增量编译（`incremental = false`，Docker 构建上下文隔离在 `sync-server/` 内不受影响）；桌面客户端、Android debug 和同步服务保留自身 `debug = 1`，release 使用 Cargo 默认策略，第三方依赖使用 `debug = 0`，测试使用 `debug = 0` 且关闭增量编译。全局 Cargo registry/git、Gradle 共享依赖缓存与 `node_modules/` 本体需要重新下载或安装，日常保留。
+- **本地构建缓存按阈值清理**：`pnpm tauri dev` / `pnpm tauri build` 在启动构建前检查桌面 host 的 dev + release 缓存，总量超过 5 GiB 才清理两个 profile，并保留已有桌面 bundle；Android arm64 打包前检查对应 Cargo profile 与项目 Gradle 构建目录，总量超过 2 GiB 时先清理非日常使用的 debug profile，复核仍超限才清理 release 与 Gradle 产物。Android 构建和显式清理必须通过项目脚本的互斥锁串行执行，禁止同时直接运行 Gradle/Cargo 操作相同产物目录。
+- **Android 日常只构建 arm64 release**：本地开发和真机验收默认使用 `pnpm android:build:release`，针对 Android target 的 Rust 编译检查也必须使用 release profile；需要 ADB、WebView 或 JNI 调试时才使用 dev/debug profile 或 `pnpm android:build:debug`。两种 APK 打包时临时输出到 `artifacts/android/`，并在写入新 APK 时覆盖或清除同目录旧 APK；只有正式多 ABI 发布流程才构建其它 Android targets。
+- **提交推送后全量清理输出物**：每次完成向远端提交并推送（`git commit` + `git push`）后，无需再次询问用户确认，在确认无活跃的 `EcoPaste` 调试进程、Cargo、Tauri 或 Gradle 构建进程占用后自动执行 `pnpm clean:outputs` 清理本仓库全部可重新生成的缓存与输出物，并向用户汇报本次清理释放的空间大小及当前磁盘可用空间。清理范围包括 `src-tauri/target`（含 `target/debug/deps`、`release`、`bundle`、`aarch64-linux-android` 及共享服务端产物）、历史孤儿 `target`（`sync-server/target`、`sync-server/protocol/target`、`src-tauri/vendor/**/target`）、Android Gradle 与中间构建目录（`.gradle`、`.kotlin`、`build`、`buildSrc/.gradle`、`buildSrc/build`、`app/build`、`hidden-api-stubs/build`、`app/src/main/jniLibs`）、`src-tauri/gen/schemas`、`dist/`、`dist-ssr/`、`node_modules/.vite`、`node_modules/.cache`、`artifacts/` 与 `apk/`；明确排除需要重新下载的项（全局 Cargo registry/git、Gradle 共享依赖缓存、`node_modules/` 本体）以及 `signing.properties`、源码和 `.git`。
 - **Docker 镜像由 CI 构建**：同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；服务端镜像构建输入发生变化时必须同步提升该版本及 `sync-server/Cargo.lock`，推送到 `master` 后由独立 GitHub Docker Image CI 构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。`sync-server/docker-up.sh` 只拉取远端镜像、替换本地容器并清理该服务的旧镜像，不在本机创建 Buildx builder 或 Rust 编译缓存。不要改回本地 `docker compose up --build`，也不要手动执行无过滤条件的 `docker image prune` 或 `docker builder prune`。
 - **本地同步服务数据持久化**：本机 Docker 服务的 `/data` 固定使用外部 Docker volume `ecopaste-sync-data`，`sync-server/docker-up.sh` 只替换容器和镜像，不得删除该数据卷；直接运行统一使用 `sync-server/run-local.sh` 的平台固定数据目录。停止或重建服务必须保留 Hub 数据、Iroh 服务端身份和密文文件，清理数据需要用户明确授权。
 - **共享依赖缓存保守清理**：默认保留 Cargo registry/git、pnpm store、当前 Gradle wrapper 和 Gradle modules；它们体积较小或跨项目共享，删除会导致重新下载。旧 Gradle 版本可能属于其它项目，未经用户明确授权不得删除。
@@ -109,6 +110,7 @@ pnpm android:build:debug
 pnpm lint
 pnpm format
 pnpm clean:native
+pnpm clean:outputs
 pnpm clean:app-cache
 
 source "$HOME/.cargo/env"
@@ -122,7 +124,7 @@ cargo test --workspace
 ./docker-up.sh
 ```
 
-`pnpm clean:app-cache` 只清理 EcoPaste 主包产物并保留第三方依赖，适合手动回收旧 hash；`pnpm clean:native` 会同时清空客户端与同步服务构建产物，只用于明确需要建立干净构建基线时。手动运行任一清理命令前先确认没有 Cargo、Tauri 或 Gradle 构建进程。服务端协议 crate 属于 `sync-server` workspace，不单独生成或清理 `sync-server/protocol/target`。
+`pnpm clean:app-cache` 只清理 EcoPaste 主包产物并保留第三方依赖，适合手动回收旧 hash；`pnpm clean:native` 只清空 Rust 与 Android 原生构建产物；`pnpm clean:outputs` 用于提交推送后全量清理本仓库全部可重新生成的缓存与打包输出物（含 `target/debug/deps`、`artifacts/`、`apk/`、`dist/` 等，保留 `node_modules/` 与全局下载缓存）。手动运行任一清理命令前先确认没有 Cargo、Tauri、Gradle 或调试应用进程。服务端协议 crate 属于 `sync-server` workspace，不单独生成或清理 `sync-server/protocol/target`。
 
 ## Rust 约定
 

@@ -1031,6 +1031,36 @@ impl TransferHandle {
     }
 }
 
+fn cancel_upload_operation_state(
+    state: &mut RegistryState,
+    operation_id: &str,
+    target: &str,
+) -> Option<String> {
+    let route = if target == "cloud" {
+        TransferRoute::Cloud
+    } else {
+        TransferRoute::Lan
+    };
+    let key = operation_key(operation_id, TransferDirection::Upload, route, target);
+    let entry_id = state.active_operations.remove(&key)?;
+    let entry = state.entries.get_mut(&entry_id)?;
+    entry.cancel.store(true, Ordering::Release);
+    entry.preparation = None;
+    let bytes = entry.task.transferred_bytes;
+    finish_entry(entry, TransferPhase::Canceled, bytes, None);
+    Some(entry_id)
+}
+
+fn clear_all_state(state: &mut RegistryState) -> Vec<String> {
+    let mut removed = Vec::with_capacity(state.entries.len());
+    for (id, entry) in state.entries.drain() {
+        entry.cancel.store(true, Ordering::Release);
+        removed.push(id);
+    }
+    state.active_operations.clear();
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,34 +1235,4 @@ mod tests {
         assert!(state.entries.is_empty());
         assert!(state.active_operations.is_empty());
     }
-}
-
-fn cancel_upload_operation_state(
-    state: &mut RegistryState,
-    operation_id: &str,
-    target: &str,
-) -> Option<String> {
-    let route = if target == "cloud" {
-        TransferRoute::Cloud
-    } else {
-        TransferRoute::Lan
-    };
-    let key = operation_key(operation_id, TransferDirection::Upload, route, target);
-    let entry_id = state.active_operations.remove(&key)?;
-    let entry = state.entries.get_mut(&entry_id)?;
-    entry.cancel.store(true, Ordering::Release);
-    entry.preparation = None;
-    let bytes = entry.task.transferred_bytes;
-    finish_entry(entry, TransferPhase::Canceled, bytes, None);
-    Some(entry_id)
-}
-
-fn clear_all_state(state: &mut RegistryState) -> Vec<String> {
-    let mut removed = Vec::with_capacity(state.entries.len());
-    for (id, entry) in state.entries.drain() {
-        entry.cancel.store(true, Ordering::Release);
-        removed.push(id);
-    }
-    state.active_operations.clear();
-    removed
 }
