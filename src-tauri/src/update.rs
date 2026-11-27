@@ -20,7 +20,7 @@ const UPDATE_PROGRESS_EVENT: &str = "update://progress";
 const UPDATE_STATUS_EVENT: &str = "update://status";
 const STABLE_ENDPOINT_ENV: &str = "ECOPASTE_UPDATE_ENDPOINT";
 const DEFAULT_STABLE_ENDPOINT: &str =
-    "https://github.com/zzw6776/EcoPaste/releases/latest/download/latest.json";
+    "https://github.com/git-blame-cat/EcoPaste/releases/latest/download/latest.json";
 const AUTO_CHECK_INITIAL_DELAY_SECONDS: u64 = 8;
 const AUTO_CHECK_SETTINGS_REFRESH_SECONDS: u64 = 60 * 60;
 const AUTO_CHECK_FAILURE_RETRY_SECONDS: u64 = 60 * 60;

@@ -1,6 +1,6 @@
 # Iroh fork 维护
 
-客户端与同步服务端使用 https://github.com/zzw6776/iroh 的 `ecopaste` 分支，
+客户端与同步服务端使用 https://github.com/git-blame-cat/iroh 的 `main` 分支，
 Cargo manifest 和 lockfile 固定到同一个完整提交 SHA，不直接跟随移动分支。
 Iroh、iroh-base、iroh-dns、iroh-relay 必须一起更新，避免混用不同来源的公共类型。
 

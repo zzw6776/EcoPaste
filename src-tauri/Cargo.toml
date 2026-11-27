@@ -121,10 +121,10 @@ tokio = { version = "1", features = ["macros", "rt"] }
 
 # Keep the maintained Iroh fork pinned to the same commit as the Hub.
 [patch.crates-io]
-iroh = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
-iroh-base = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
-iroh-dns = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
-iroh-relay = { git = "https://github.com/zzw6776/iroh", rev = "480c5c178d91eb00805bc4cbf3a7c370bb38a994" }
+iroh = { git = "https://github.com/git-blame-cat/iroh", rev = "614b62c73f623f1fced3dbab5754062ac93d961a" }
+iroh-base = { git = "https://github.com/git-blame-cat/iroh", rev = "614b62c73f623f1fced3dbab5754062ac93d961a" }
+iroh-dns = { git = "https://github.com/git-blame-cat/iroh", rev = "614b62c73f623f1fced3dbab5754062ac93d961a" }
+iroh-relay = { git = "https://github.com/git-blame-cat/iroh", rev = "614b62c73f623f1fced3dbab5754062ac93d961a" }
 
 # Remove these mDNS overrides once equivalent upstream fixes are released.
 iroh-mdns-address-lookup = { path = "vendor/iroh-mdns-address-lookup" }

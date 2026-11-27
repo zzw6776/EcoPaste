@@ -51,7 +51,7 @@ cd sync-server
 docker compose logs -f ecopaste-sync
 ```
 
-`docker-up.sh` 不在本机编译服务，而是从 GitHub Container Registry 拉取公开镜像 `ghcr.io/zzw6776/ecopaste-sync-server:latest`，因此本地不再保留 Rust Buildx 编译缓存。同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；升级该版本并推送到 `master` 时，GitHub Docker Image CI 自动构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。稳定版同时更新版本标签和 `latest`，预发布版只更新版本标签。需要固定版本时可在启动前设置 `ECOPASTE_SYNC_IMAGE_TAG`，例如 `ECOPASTE_SYNC_IMAGE_TAG=0.1.1 ./docker-up.sh`。
+`docker-up.sh` 不在本机编译服务，而是从 GitHub Container Registry 拉取公开镜像 `ghcr.io/git-blame-cat/ecopaste-sync-server:latest`，因此本地不再保留 Rust Buildx 编译缓存。同步服务使用 `sync-server/Cargo.toml` 中的独立版本号；升级该版本并推送到 `master` 时，GitHub Docker Image CI 自动构建并发布 `linux/amd64` 与 `linux/arm64` 镜像。稳定版同时更新版本标签和 `latest`，预发布版只更新版本标签。需要固定版本时可在启动前设置 `ECOPASTE_SYNC_IMAGE_TAG`，例如 `ECOPASTE_SYNC_IMAGE_TAG=0.1.1 ./docker-up.sh`。
 
 新镜像成功启动后，脚本会删除被替换的旧镜像，并清理该服务遗留的悬空镜像。本机容器的 `/data` 固定挂载外部 Docker volume `ecopaste-sync-data`，停止、重建容器或清理旧镜像都不会删除 Hub 数据和服务端身份；首次运行时脚本会自动创建该卷。如果拉取或启动失败，旧镜像会保留，避免失去回退基础。
 
